@@ -1,0 +1,64 @@
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Span {
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Spanned<T> {
+    pub span: Span,
+    pub value: T,
+}
+
+impl<T> Spanned<T> {
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Spanned<U> {
+        Spanned {
+            span: self.span,
+            value: f(self.value),
+        }
+    }
+
+    pub fn as_ref(&self) -> Spanned<&T> {
+        Spanned {
+            span: self.span,
+            value: &self.value,
+        }
+    }
+}
+
+impl<T> std::ops::Deref for Spanned<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.value
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
+    Error,
+    Warning,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LabelStyle {
+    Primary,
+    Secondary,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Label {
+    pub span: Span,
+    pub message: String,
+    pub style: LabelStyle,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Diagnostic {
+    pub severity: Severity,
+    pub code: String,
+    pub message: String,
+    pub labels: Vec<Label>,
+    pub notes: Vec<String>,
+    pub help: Vec<String>,
+}
