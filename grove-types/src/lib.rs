@@ -1,9 +1,15 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, ops::Range};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
     pub start: usize,
     pub end: usize,
+}
+
+impl Span {
+    pub fn range(&self) -> Range<usize> {
+        self.start..self.end
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
