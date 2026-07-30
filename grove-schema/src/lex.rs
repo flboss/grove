@@ -65,7 +65,8 @@ impl<'src> Lexer<'src> {
                 '.' => self.make_token(start, TokenKind::Dot),
                 '@' => self.make_token(start, TokenKind::At),
                 '?' => self.make_token(start, TokenKind::Question),
-                '<' => self.scan_arrow(start),
+                '>' => self.make_token(start, TokenKind::RAngle),
+                '<' => self.scan_arrow_or_langle(start),
                 '-' => self.scan_arrow_or_minus(start),
                 '"' => self.scan_string(start),
                 '`' => self.scan_backtick_ident(start),
@@ -116,7 +117,7 @@ impl<'src> Lexer<'src> {
         self.make_token(start, kind)
     }
 
-    fn scan_arrow(&mut self, start: usize) -> Token {
+    fn scan_arrow_or_langle(&mut self, start: usize) -> Token {
         for (pattern, kind) in [
             ("<->>", TokenKind::ManyToMany),
             ("<->", TokenKind::ManyToOne),
@@ -129,15 +130,7 @@ impl<'src> Lexer<'src> {
             }
         }
 
-        // Lone '<' is an error
-        self.emit_error(SchemaParseError::UnexpectedChar {
-            span: Span {
-                start,
-                end: self.pos,
-            },
-            ch: '<',
-        });
-        self.advance()
+        self.make_token(start, TokenKind::LAngle)
     }
 
     fn scan_arrow_or_minus(&mut self, start: usize) -> Token {
@@ -385,13 +378,15 @@ mod tests {
 
     #[test]
     fn punctuation() {
-        let mut lex = Lexer::new("{}[]():;,=.@?");
+        let mut lex = Lexer::new("{}[]()<>:;,=.@?");
         assert_token!(lex, TokenKind::LBrace);
         assert_token!(lex, TokenKind::RBrace);
         assert_token!(lex, TokenKind::LBracket);
         assert_token!(lex, TokenKind::RBracket);
         assert_token!(lex, TokenKind::LParen);
         assert_token!(lex, TokenKind::RParen);
+        assert_token!(lex, TokenKind::LAngle);
+        assert_token!(lex, TokenKind::RAngle);
         assert_token!(lex, TokenKind::Colon);
         assert_token!(lex, TokenKind::Semicolon);
         assert_token!(lex, TokenKind::Comma);
@@ -410,6 +405,38 @@ mod tests {
     }
 
     #[test]
+    fn type_bracket_after_keyword() {
+        let mut lex = Lexer::new("List<Int>");
+        assert_token!(lex, TokenKind::List);
+        assert_token!(lex, TokenKind::LAngle);
+        assert_token!(lex, TokenKind::Int);
+        assert_token!(lex, TokenKind::RAngle);
+        assert_eof!(lex);
+    }
+
+    #[test]
+    fn tuple_brackets() {
+        let mut lex = Lexer::new("Tuple<Int, String>");
+        assert_token!(lex, TokenKind::Tuple);
+        assert_token!(lex, TokenKind::LAngle);
+        assert_token!(lex, TokenKind::Int);
+        assert_token!(lex, TokenKind::Comma);
+        assert_token!(lex, TokenKind::String);
+        assert_token!(lex, TokenKind::RAngle);
+        assert_eof!(lex);
+    }
+
+    #[test]
+    fn langle_rangle_arrow_disambiguation() {
+        let mut lex = Lexer::new("< <<->> > <->");
+        assert_token!(lex, TokenKind::LAngle);
+        assert_token!(lex, TokenKind::ManyToMany);
+        assert_token!(lex, TokenKind::RAngle);
+        assert_token!(lex, TokenKind::OneToOne);
+        assert_eof!(lex);
+    }
+
+    #[test]
     fn relation_arrows() {
         let mut lex = Lexer::new("<<->> <<-> <->> <->");
         assert_token!(lex, TokenKind::ManyToMany);
@@ -420,10 +447,11 @@ mod tests {
     }
 
     #[test]
-    fn lone_less_than_is_error() {
+    fn lone_less_than_is_langle() {
         let mut lex = Lexer::new("<");
+        assert_token!(lex, TokenKind::LAngle);
         assert_eof!(lex);
-        assert_eq!(lex.finalize().len(), 1);
+        assert!(lex.finalize().is_empty());
     }
 
     #[test]
