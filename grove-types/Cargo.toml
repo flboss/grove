@@ -1,0 +1,4 @@
+[package]
+name = "grove-types"
+version.workspace = true
+edition.workspace = true

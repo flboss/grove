@@ -1,0 +1,7 @@
+[package]
+name = "grove-schema"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+grove-types.workspace = true
