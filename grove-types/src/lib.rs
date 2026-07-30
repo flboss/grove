@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
     pub start: usize,
@@ -34,6 +36,8 @@ impl<T> std::ops::Deref for Spanned<T> {
     }
 }
 
+pub type DiagStr = Cow<'static, str>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
     Error,
@@ -49,16 +53,16 @@ pub enum LabelStyle {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Label {
     pub span: Span,
-    pub message: String,
+    pub message: DiagStr,
     pub style: LabelStyle,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Diagnostic {
     pub severity: Severity,
-    pub code: String,
-    pub message: String,
+    pub code: DiagStr,
+    pub message: DiagStr,
     pub labels: Vec<Label>,
-    pub notes: Vec<String>,
-    pub help: Vec<String>,
+    pub notes: Vec<DiagStr>,
+    pub help: Vec<DiagStr>,
 }
