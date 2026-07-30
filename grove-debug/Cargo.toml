@@ -1,0 +1,11 @@
+[package]
+name = "grove-debug"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+grove-schema.workspace = true
+grove-types.workspace = true
+
+ariadne.workspace = true
+clap.workspace = true

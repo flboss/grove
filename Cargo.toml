@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["grove-types", "grove-schema"]
+members = ["grove-types", "grove-schema", "grove-debug"]
 
 [workspace.package]
 version = "0.1.0"
@@ -8,3 +8,7 @@ edition = "2024"
 
 [workspace.dependencies]
 grove-types = { path = "grove-types" }
+grove-schema = { path = "grove-schema" }
+
+ariadne = "0.6"
+clap = { version = "4", features = ["derive"] }
