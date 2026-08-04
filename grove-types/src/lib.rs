@@ -72,3 +72,20 @@ pub struct Diagnostic {
     pub notes: Vec<DiagStr>,
     pub help: Vec<DiagStr>,
 }
+
+impl Diagnostic {
+    pub fn with_label(mut self, label: Label) -> Self {
+        self.labels.push(label);
+        self
+    }
+
+    pub fn with_note(mut self, note: impl Into<DiagStr>) -> Self {
+        self.notes.push(note.into());
+        self
+    }
+
+    pub fn with_help(mut self, help: impl Into<DiagStr>) -> Self {
+        self.help.push(help.into());
+        self
+    }
+}
