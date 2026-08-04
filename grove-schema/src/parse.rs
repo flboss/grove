@@ -6,10 +6,10 @@ use grove_types::{Diagnostic, Span, Spanned};
 
 type PResult<T> = Result<T, ()>;
 
-const CONFIG_KEYS: &[&str] = &["int_arithmetic", "float_checks", "dec_arithmetic"];
-const INT_ARITHMETIC_VALUES: &str = "`checked`, `saturating`, or `wrapping`";
-const DEC_ARITHMETIC_VALUES: &str = "`checked` or `saturating`";
-const FLOAT_CHECKS_VALUES: &str = "`true` or `false`";
+const CONFIG_BLOCK_KEYS: &[&str] = &["int_arithmetic", "float_checks", "dec_arithmetic"];
+const HELP_INT_ARITHMETIC_VALUES: &str = "`checked`, `saturating`, or `wrapping`";
+const HELP_DEC_ARITHMETIC_VALUES: &str = "`checked` or `saturating`";
+const HELP_FLOAT_CHECKS_VALUES: &str = "`true` or `false`";
 
 pub struct Parser<'src> {
     lexer: Lexer<'src>,
@@ -127,7 +127,7 @@ impl<'src> Parser<'src> {
             unreachable!()
         };
 
-        if !CONFIG_KEYS.contains(&key.as_str()) {
+        if !CONFIG_BLOCK_KEYS.contains(&key.as_str()) {
             self.emit_error(SchemaParseError::UnknownConfigKey {
                 span: key_tok.span,
                 key,
@@ -198,7 +198,7 @@ impl<'src> Parser<'src> {
                         tok.span,
                         "int_arithmetic",
                         s.clone(),
-                        INT_ARITHMETIC_VALUES,
+                        HELP_INT_ARITHMETIC_VALUES,
                     );
                 }
             },
@@ -207,7 +207,7 @@ impl<'src> Parser<'src> {
                     tok.span,
                     "int_arithmetic",
                     token_text(&tok),
-                    INT_ARITHMETIC_VALUES,
+                    HELP_INT_ARITHMETIC_VALUES,
                 );
             }
         };
@@ -228,7 +228,7 @@ impl<'src> Parser<'src> {
                         tok.span,
                         "dec_arithmetic",
                         s.clone(),
-                        DEC_ARITHMETIC_VALUES,
+                        HELP_DEC_ARITHMETIC_VALUES,
                     );
                 }
             },
@@ -237,7 +237,7 @@ impl<'src> Parser<'src> {
                     tok.span,
                     "dec_arithmetic",
                     token_text(&tok),
-                    DEC_ARITHMETIC_VALUES,
+                    HELP_DEC_ARITHMETIC_VALUES,
                 );
             }
         };
@@ -253,7 +253,7 @@ impl<'src> Parser<'src> {
                         tok.span,
                         "float_checks",
                         s.clone(),
-                        FLOAT_CHECKS_VALUES,
+                        HELP_FLOAT_CHECKS_VALUES,
                     );
                     None
                 }
@@ -263,7 +263,7 @@ impl<'src> Parser<'src> {
                     tok.span,
                     "float_checks",
                     token_text(&tok),
-                    FLOAT_CHECKS_VALUES,
+                    HELP_FLOAT_CHECKS_VALUES,
                 );
                 None
             }
