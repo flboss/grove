@@ -4,7 +4,7 @@ use grove_types::Spanned;
 pub struct Schema {
     pub roots: Vec<RootCollection>,
     pub structs: Vec<StructDef>,
-    pub config: Option<ConfigBlock>,
+    pub config: Option<Spanned<ConfigBlock>>,
     pub relations: Vec<Relation>,
 }
 
@@ -26,6 +26,31 @@ pub enum IntArithmetic {
 pub enum DecArithmetic {
     Checked,
     Saturating,
+}
+
+impl TryFrom<&str> for IntArithmetic {
+    type Error = ();
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "checked" => Ok(Self::Checked),
+            "saturating" => Ok(Self::Saturating),
+            "wrapping" => Ok(Self::Wrapping),
+            _ => Err(()),
+        }
+    }
+}
+
+impl TryFrom<&str> for DecArithmetic {
+    type Error = ();
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "checked" => Ok(Self::Checked),
+            "saturating" => Ok(Self::Saturating),
+            _ => Err(()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

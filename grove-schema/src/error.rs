@@ -1,4 +1,4 @@
-use grove_types::{Diagnostic, Label, LabelStyle, Severity, Span};
+use grove_types::{DiagStr, Diagnostic, Label, LabelStyle, Severity, Span};
 
 #[rustfmt::skip] // preserve one-line-per-variant formatting
 #[derive(Debug, Clone)]
@@ -6,58 +6,151 @@ pub enum SchemaParseError {
     UnexpectedChar { span: Span, ch: char },
     UnclosedString { span: Span },
     UnclosedBacktickIdent { span: Span },
+
+    ExpectedTopLevelStmt { span: Span },
+    DuplicateConfigBlock { span: Span, previous: Span },
+
+    ExpectedConfigLBrace { span: Span },
+    ExpectedConfigKey { span: Span },
+    UnknownConfigKey { span: Span, key: String },
+    ExpectedConfigEquals { span: Span, key: String },
+    ExpectedConfigValue { span: Span, key: String },
+    InvalidConfigValue { span: Span, key: String, value: String, valid: String },
+    DuplicateConfigKey { span: Span, key: String, previous: Span },
+    ExpectedConfigCommaOrRBrace { span: Span, key: String },
+    UnclosedConfig { span: Span },
 }
 
 impl From<SchemaParseError> for Diagnostic {
     fn from(err: SchemaParseError) -> Self {
         use SchemaParseError::*;
 
-        let (severity, code, message, labels, notes, help) = match err {
-            UnexpectedChar { span, ch } => (
-                Severity::Error,
-                "SL0001".into(),
-                format!("unexpected character `{ch}`").into(),
-                vec![Label {
-                    span,
-                    message: "unexpected character".into(),
-                    style: LabelStyle::Primary,
-                }],
-                vec![],
-                vec![],
+        match err {
+            UnexpectedChar { span, ch } => error_simple(
+                "SL0001",
+                format!("unexpected character `{ch}`"),
+                span,
+                "unexpected character",
             ),
-            UnclosedString { span } => (
-                Severity::Error,
-                "SL0002".into(),
-                "unclosed string literal".into(),
-                vec![Label {
-                    span,
-                    message: "missing closing `\"`".into(),
-                    style: LabelStyle::Primary,
-                }],
-                vec![],
-                vec![],
+            UnclosedString { span } => error_simple(
+                "SL0002",
+                "unclosed string literal",
+                span,
+                "missing closing `\"`",
             ),
-            UnclosedBacktickIdent { span } => (
-                Severity::Error,
-                "SL0003".into(),
-                "unclosed backtick identifier".into(),
-                vec![Label {
-                    span,
-                    message: "missing closing '`'".into(),
-                    style: LabelStyle::Primary,
-                }],
-                vec![],
-                vec![],
+            UnclosedBacktickIdent { span } => error_simple(
+                "SL0003",
+                "unclosed backtick identifier",
+                span,
+                "missing closing '`'",
             ),
-        };
-
-        Diagnostic {
-            severity,
-            code,
-            message,
-            labels,
-            notes,
-            help,
+            ExpectedTopLevelStmt { span } => error_simple(
+                "SP0001",
+                "expected a top-level statement",
+                span,
+                "expected one of `config`, `root`, `struct`, or `rel`",
+            ),
+            ExpectedConfigLBrace { span } => error_simple(
+                "SP0002",
+                "expected `{` after `config`",
+                span,
+                "expected `{`",
+            ),
+            ExpectedConfigKey { span } => error_simple(
+                "SP0003",
+                "expected a config key",
+                span,
+                "expected an identifier",
+            ),
+            UnknownConfigKey { span, key } => error_simple(
+                "SP0004",
+                format!("unknown config key `{key}`"),
+                span,
+                "unknown config key",
+            )
+            .with_help("valid keys are `int_arithmetic`, `float_checks`, and `dec_arithmetic`"),
+            ExpectedConfigEquals { span, key } => error_simple(
+                "SP0005",
+                format!("expected `=` after config key `{key}`"),
+                span,
+                "expected `=`",
+            ),
+            ExpectedConfigValue { span, key } => error_simple(
+                "SP0006",
+                format!("expected a value for config key `{key}`"),
+                span,
+                "expected a value",
+            ),
+            InvalidConfigValue {
+                span,
+                key,
+                value,
+                valid,
+            } => error_simple(
+                "SP0007",
+                format!("invalid value `{value}` for config key `{key}`"),
+                span,
+                "invalid value",
+            )
+            .with_help(format!("expected one of {valid}")),
+            DuplicateConfigKey {
+                span,
+                key,
+                previous,
+            } => error_simple(
+                "SP0008",
+                format!("duplicate config key `{key}`"),
+                span,
+                "duplicate key",
+            )
+            .with_label(Label {
+                span: previous,
+                message: "first defined here".into(),
+                style: LabelStyle::Secondary,
+            }),
+            ExpectedConfigCommaOrRBrace { span, key } => error_simple(
+                "SP0009",
+                format!("expected `,` or `}}` after config key `{key}`"),
+                span,
+                "expected `,` or `}`",
+            ),
+            UnclosedConfig { span } => error_simple(
+                "SP0010",
+                "unclosed `config` block",
+                span,
+                "missing closing `}`",
+            ),
+            DuplicateConfigBlock { span, previous } => error_simple(
+                "SP0011",
+                "duplicate `config` block",
+                span,
+                "redundant `config` block",
+            )
+            .with_label(Label {
+                span: previous,
+                message: "first `config` block here".into(),
+                style: LabelStyle::Secondary,
+            }),
         }
+    }
+}
+
+fn error_simple(
+    code: &'static str,
+    message: impl Into<DiagStr>,
+    span: Span,
+    label: impl Into<DiagStr>,
+) -> Diagnostic {
+    Diagnostic {
+        severity: Severity::Error,
+        code: code.into(),
+        message: message.into(),
+        labels: vec![Label {
+            span,
+            message: label.into(),
+            style: LabelStyle::Primary,
+        }],
+        notes: Vec::new(),
+        help: Vec::new(),
     }
 }
