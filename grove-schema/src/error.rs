@@ -47,6 +47,8 @@ pub enum SchemaParseError {
         field: String,
         previous: Span,
     },
+    ExpectedColumn { span: Span },
+    ExpectedColumnCommaOrRParen { span: Span },
 }
 
 impl From<SchemaParseError> for Diagnostic {
@@ -237,9 +239,9 @@ impl From<SchemaParseError> for Diagnostic {
             }
             ExpectedAtColumn { span } => error_simple(
                 "SP0023",
-                "expected a column name after `@`",
+                "expected one or more column names after `@`",
                 span,
-                "expected an identifier",
+                "expected an identifier or `(`",
             ),
             ExpectedListLAngle { span } => {
                 error_simple("SP0024", "expected `<` after `List`", span, "expected `<`")
@@ -308,6 +310,18 @@ impl From<SchemaParseError> for Diagnostic {
                 message: "first defined here".into(),
                 style: LabelStyle::Secondary,
             }),
+            ExpectedColumn { span } => error_simple(
+                "SP0033",
+                "expected a column name",
+                span,
+                "expected an identifier",
+            ),
+            ExpectedColumnCommaOrRParen { span } => error_simple(
+                "SP0034",
+                "expected `,` or `)` after column",
+                span,
+                "expected `,` or `)`",
+            ),
         }
     }
 }

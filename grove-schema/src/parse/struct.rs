@@ -85,12 +85,9 @@ impl<'src> Parser<'src> {
 
         let column = if self.peek().value == TokenKind::At {
             self.advance();
-            match self.expect_ident() {
-                Ok(col) => Some(ColumnMapping::Single(col)),
-                Err(found) => {
-                    self.emit_error(SchemaParseError::ExpectedAtColumn { span: found.span });
-                    return self.sync_to_field_or_statement_boundary();
-                }
+            match self.parse_column_mapping() {
+                Ok(map) => Some(map),
+                Err(()) => return self.sync_to_field_or_statement_boundary(),
             }
         } else {
             None
@@ -130,6 +127,53 @@ impl<'src> Parser<'src> {
             }
         }
         Ok(())
+    }
+
+    fn parse_column_mapping(&mut self) -> PResult<ColumnMapping> {
+        if self.peek().value == TokenKind::LParen {
+            self.advance();
+            let mut columns = vec![self.parse_paren_column()?];
+            loop {
+                match self.peek().value {
+                    TokenKind::RParen => {
+                        self.advance();
+                        break;
+                    }
+                    TokenKind::Comma => {
+                        self.advance();
+                        if self.peek().value == TokenKind::RParen {
+                            self.advance();
+                            break;
+                        }
+                        columns.push(self.parse_paren_column()?);
+                    }
+                    _ => {
+                        let span = self.peek().span;
+                        self.emit_error(SchemaParseError::ExpectedColumnCommaOrRParen { span });
+                        return Err(());
+                    }
+                }
+            }
+            Ok(ColumnMapping::Multi(columns))
+        } else {
+            match self.expect_ident() {
+                Ok(col) => Ok(ColumnMapping::Single(col)),
+                Err(found) => {
+                    self.emit_error(SchemaParseError::ExpectedAtColumn { span: found.span });
+                    Err(())
+                }
+            }
+        }
+    }
+
+    fn parse_paren_column(&mut self) -> PResult<Spanned<String>> {
+        match self.expect_ident() {
+            Ok(col) => Ok(col),
+            Err(found) => {
+                self.emit_error(SchemaParseError::ExpectedColumn { span: found.span });
+                Err(())
+            }
+        }
     }
 
     fn parse_type_expr(&mut self) -> PResult<TypeExpr> {
@@ -404,6 +448,44 @@ mod tests {
     fn field_at_missing_column() {
         let (_, diags) = parse_schema("struct S { a: Int@, b: Int }");
         assert_eq!(codes(&diags), vec!["SP0023"]);
+    }
+
+    #[test]
+    fn struct_with_multi_column_mapping() {
+        let (schema, diags) =
+            parse_schema("struct S { rgb: Tuple<Int, Int, Int>@(red, green, blue) }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        match &schema.unwrap().structs[0].fields[0].column {
+            Some(ColumnMapping::Multi(cols)) => {
+                let names: Vec<&str> = cols.iter().map(|c| c.as_str()).collect();
+                assert_eq!(names, vec!["red", "green", "blue"]);
+            }
+            _ => panic!("expected Multi column mapping"),
+        }
+    }
+
+    #[test]
+    fn multi_column_empty_parens() {
+        let (_, diags) = parse_schema("struct S { rgb: Tuple<Int, Int, Int>@() }");
+        assert_eq!(codes(&diags), vec!["SP0033"]);
+    }
+
+    #[test]
+    fn multi_column_trailing_comma() {
+        let (_, diags) = parse_schema("struct S { rgb: Tuple<Int, Int, Int>@(red, ) }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn multi_column_unclosed() {
+        let (_, diags) = parse_schema("struct S { rgb: Tuple<Int, Int, Int>@(red, green");
+        assert_eq!(codes(&diags), vec!["SP0034"]);
+    }
+
+    #[test]
+    fn multi_column_missing_comma() {
+        let (_, diags) = parse_schema("struct S { rgb: Tuple<Int, Int, Int>@(red green) }");
+        assert_eq!(codes(&diags), vec!["SP0034"]);
     }
 
     #[test]
