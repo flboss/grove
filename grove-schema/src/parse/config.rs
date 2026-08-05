@@ -6,8 +6,8 @@ use grove_types::{Span, Spanned};
 use super::{PResult, Parser};
 
 const CONFIG_BLOCK_KEYS: &[&str] = &["int_arithmetic", "float_checks", "dec_arithmetic"];
-const HELP_INT_ARITHMETIC_VALUES: &str = "`checked`, `saturating`, or `wrapping`";
-const HELP_DEC_ARITHMETIC_VALUES: &str = "`checked` or `saturating`";
+const HELP_INT_ARITHMETIC_VALUES: &str = r#"`"checked"`, `"saturating"`, or `"wrapping"`"#;
+const HELP_DEC_ARITHMETIC_VALUES: &str = r#"`"checked"` or `"saturating"`"#;
 const HELP_FLOAT_CHECKS_VALUES: &str = "`true` or `false`";
 
 impl<'src> Parser<'src> {
