@@ -17,7 +17,10 @@ impl<'src> Parser<'src> {
         };
 
         if let Err(found) = self.expect(TokenKind::Colon) {
-            self.emit_error(SchemaParseError::ExpectedRootColon { span: found.span });
+            self.emit_error(SchemaParseError::ExpectedRootColon {
+                span: found.span,
+                name: name.value,
+            });
             self.sync_to_statement_boundary();
             return Err(());
         }

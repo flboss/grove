@@ -22,7 +22,7 @@ pub enum SchemaParseError {
     UnclosedConfig { span: Span },
 
     ExpectedRootName { span: Span },
-    ExpectedRootColon { span: Span },
+    ExpectedRootColon { span: Span, name: String },
     ExpectedRootStructName { span: Span },
     ExpectedRootUnderlyingTable { span: Span },
     ExpectedRootSemicolon { span: Span },
