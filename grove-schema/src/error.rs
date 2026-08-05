@@ -9,6 +9,7 @@ pub enum SchemaParseError {
 
     ExpectedTopLevelStmt { span: Span },
     DuplicateConfigBlock { span: Span, previous: Span },
+    DuplicateRoot { span: Span, name: String, previous: Span },
 
     ExpectedConfigLBrace { span: Span },
     ExpectedConfigKey { span: Span },
@@ -19,6 +20,12 @@ pub enum SchemaParseError {
     DuplicateConfigKey { span: Span, key: String, previous: Span },
     ExpectedConfigCommaOrRBrace { span: Span, key: String },
     UnclosedConfig { span: Span },
+
+    ExpectedRootName { span: Span },
+    ExpectedRootColon { span: Span },
+    ExpectedRootStructName { span: Span },
+    ExpectedRootUnderlyingTable { span: Span },
+    ExpectedRootSemicolon { span: Span },
 }
 
 impl From<SchemaParseError> for Diagnostic {
@@ -129,6 +136,51 @@ impl From<SchemaParseError> for Diagnostic {
             .with_label(Label {
                 span: previous,
                 message: "first `config` block here".into(),
+                style: LabelStyle::Secondary,
+            }),
+            ExpectedRootName { span } => error_simple(
+                "SP0012",
+                "expected a root name",
+                span,
+                "expected an identifier",
+            ),
+            ExpectedRootColon { span } => error_simple(
+                "SP0013",
+                "expected `:` after root name",
+                span,
+                "expected `:`",
+            ),
+            ExpectedRootStructName { span } => error_simple(
+                "SP0014",
+                "expected a struct type after `:`",
+                span,
+                "expected a struct name",
+            ),
+            ExpectedRootUnderlyingTable { span } => error_simple(
+                "SP0015",
+                "expected an underlying table name after `@`",
+                span,
+                "expected an identifier",
+            ),
+            ExpectedRootSemicolon { span } => error_simple(
+                "SP0016",
+                "expected `;` to end root statement",
+                span,
+                "expected `;`",
+            ),
+            DuplicateRoot {
+                span,
+                name,
+                previous,
+            } => error_simple(
+                "SP0017",
+                format!("duplicate root `{name}`"),
+                span,
+                "redundant root",
+            )
+            .with_label(Label {
+                span: previous,
+                message: "first defined here".into(),
                 style: LabelStyle::Secondary,
             }),
         }

@@ -1,4 +1,4 @@
-use crate::ast::{ConfigBlock, DecArithmetic, IntArithmetic, Schema};
+use crate::ast::{ConfigBlock, DecArithmetic, IntArithmetic, RootCollection, Schema};
 use crate::error::SchemaParseError;
 use crate::lex::Lexer;
 use crate::token::{Token, TokenKind};
@@ -32,6 +32,7 @@ impl<'src> Parser<'src> {
             relations: Vec::new(),
         };
         let mut config_span = None;
+        let mut root_spans: Vec<(String, Span)> = Vec::new();
 
         loop {
             let Spanned { span, value: token } = self.advance();
@@ -52,6 +53,26 @@ impl<'src> Parser<'src> {
                         None => {
                             config_span = Some(block.span);
                             schema.config = Some(block);
+                        }
+                    }
+                }
+                TokenKind::Root => {
+                    let Ok(mut root) = self.parse_root() else {
+                        continue;
+                    };
+
+                    root.span.start = span.start;
+
+                    let name = root.name.value.clone();
+                    match root_spans.iter().find(|(n, _)| n == &name) {
+                        Some((_, previous)) => self.emit_error(SchemaParseError::DuplicateRoot {
+                            span: root.span,
+                            name,
+                            previous: *previous,
+                        }),
+                        None => {
+                            root_spans.push((name, root.span));
+                            schema.roots.push(root.value);
                         }
                     }
                 }
@@ -303,6 +324,69 @@ impl<'src> Parser<'src> {
         }
     }
 
+    fn parse_root(&mut self) -> PResult<Spanned<RootCollection>> {
+        let name = match self.expect_ident() {
+            Ok(name) => name,
+            Err(found) => {
+                self.emit_error(SchemaParseError::ExpectedRootName { span: found.span });
+                self.sync_to_statement_boundary();
+                return Err(());
+            }
+        };
+
+        if let Err(found) = self.expect(TokenKind::Colon) {
+            self.emit_error(SchemaParseError::ExpectedRootColon { span: found.span });
+            self.sync_to_statement_boundary();
+            return Err(());
+        }
+
+        let struct_name = match self.expect_ident() {
+            Ok(name) => name,
+            Err(found) => {
+                self.emit_error(SchemaParseError::ExpectedRootStructName { span: found.span });
+                self.sync_to_statement_boundary();
+                return Err(());
+            }
+        };
+
+        let table = if self.peek().value == TokenKind::At {
+            self.advance();
+            match self.expect_ident() {
+                Ok(table) => Some(table),
+                Err(found) => {
+                    self.emit_error(SchemaParseError::ExpectedRootUnderlyingTable {
+                        span: found.span,
+                    });
+                    self.sync_to_statement_boundary();
+                    return Err(());
+                }
+            }
+        } else {
+            None
+        };
+
+        let semicolon = match self.expect(TokenKind::Semicolon) {
+            Ok(semi) => semi,
+            Err(found) => {
+                self.emit_error(SchemaParseError::ExpectedRootSemicolon { span: found.span });
+                self.sync_to_statement_boundary();
+                return Err(());
+            }
+        };
+
+        Ok(Spanned {
+            span: Span {
+                start: name.span.start,
+                end: semicolon.span.end,
+            },
+            value: RootCollection {
+                name,
+                table,
+                struct_name,
+            },
+        })
+    }
+
     fn sync_to(&mut self, targets: &[TokenKind]) {
         loop {
             let tok = self.peek();
@@ -358,6 +442,17 @@ impl<'src> Parser<'src> {
             Ok(token)
         } else {
             Err(token)
+        }
+    }
+
+    fn expect_ident(&mut self) -> Result<Spanned<String>, Token> {
+        let token = self.advance();
+        match token.value {
+            TokenKind::Ident(s) => Ok(Spanned {
+                span: token.span,
+                value: s,
+            }),
+            _ => Err(token),
         }
     }
 
@@ -624,5 +719,80 @@ mod tests {
     fn unknown_top_level() {
         let (_, diags) = parse_schema("foo bar; baz");
         assert_eq!(codes(&diags), vec!["SP0001", "SP0001"]);
+    }
+
+    #[test]
+    fn root_simple() {
+        let (schema, diags) = parse_schema("root users: User;");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let roots = schema.unwrap().roots;
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].name.value, "users");
+        assert!(roots[0].table.is_none());
+        assert_eq!(roots[0].struct_name.value, "User");
+    }
+
+    #[test]
+    fn root_with_table() {
+        let (schema, diags) = parse_schema("root new_name: SomeStruct @old_table;");
+        assert!(diags.is_empty());
+        let roots = schema.unwrap().roots;
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].name.value, "new_name");
+        assert_eq!(roots[0].table.as_ref().unwrap().value, "old_table");
+        assert_eq!(roots[0].struct_name.value, "SomeStruct");
+    }
+
+    #[test]
+    fn root_multiple() {
+        let (schema, diags) = parse_schema("root a: A; root b: B@b_table;");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let roots = schema.unwrap().roots;
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0].name.value, "a");
+        assert_eq!(roots[0].struct_name.value, "A");
+        assert!(roots[0].table.is_none());
+        assert_eq!(roots[1].name.value, "b");
+        assert_eq!(roots[1].struct_name.value, "B");
+        assert_eq!(roots[1].table.as_ref().unwrap().value, "b_table");
+    }
+
+    #[test]
+    fn root_duplicate_rejected() {
+        let (_, diags) = parse_schema("root users: U; root users: V;");
+        assert_eq!(codes(&diags), vec!["SP0017"]);
+        assert_eq!(diags[0].labels.len(), 2);
+        assert_eq!(diags[0].labels[0].span, Span { start: 15, end: 29 });
+        assert_eq!(diags[0].labels[1].span, Span { start: 0, end: 14 });
+    }
+
+    #[test]
+    fn root_missing_name() {
+        let (_, diags) = parse_schema("root : User;");
+        assert_eq!(codes(&diags), vec!["SP0012"]);
+    }
+
+    #[test]
+    fn root_missing_colon() {
+        let (_, diags) = parse_schema("root users User;");
+        assert_eq!(codes(&diags), vec!["SP0013"]);
+    }
+
+    #[test]
+    fn root_missing_struct_name() {
+        let (_, diags) = parse_schema("root users: ;");
+        assert_eq!(codes(&diags), vec!["SP0014"]);
+    }
+
+    #[test]
+    fn root_missing_underlying_table() {
+        let (_, diags) = parse_schema("root users: User@;");
+        assert_eq!(codes(&diags), vec!["SP0015"]);
+    }
+
+    #[test]
+    fn root_missing_semicolon() {
+        let (_, diags) = parse_schema("root users: User");
+        assert_eq!(codes(&diags), vec!["SP0016"]);
     }
 }
