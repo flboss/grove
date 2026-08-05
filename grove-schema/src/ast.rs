@@ -75,7 +75,7 @@ pub struct Field {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeExpr {
-    Named(Spanned<BuiltinType>),
+    Primitive(Spanned<BuiltinType>),
     Struct(Spanned<String>),
     Optional(Box<TypeExpr>),
     List {
