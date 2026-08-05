@@ -1,5 +1,6 @@
 mod config;
 mod root;
+mod r#struct;
 
 use crate::ast::Schema;
 use crate::error::SchemaParseError;
@@ -31,6 +32,7 @@ impl<'src> Parser<'src> {
         };
         let mut config_span = None;
         let mut root_spans: Vec<(String, Span)> = Vec::new();
+        let mut struct_spans: Vec<(String, Span)> = Vec::new();
 
         loop {
             let Spanned { span, value: token } = self.advance();
@@ -71,6 +73,28 @@ impl<'src> Parser<'src> {
                         None => {
                             root_spans.push((name, root.span));
                             schema.roots.push(root.value);
+                        }
+                    }
+                }
+                TokenKind::Struct => {
+                    let Ok(mut struct_def) = self.parse_struct() else {
+                        continue;
+                    };
+
+                    struct_def.span.start = span.start;
+
+                    let name = struct_def.name.value.clone();
+                    match struct_spans.iter().find(|(n, _)| n == &name) {
+                        Some((_, previous)) => {
+                            self.emit_error(SchemaParseError::DuplicateStruct {
+                                span: struct_def.span,
+                                name,
+                                previous: *previous,
+                            });
+                        }
+                        None => {
+                            struct_spans.push((name, struct_def.span));
+                            schema.structs.push(struct_def.value);
                         }
                     }
                 }

@@ -26,6 +26,27 @@ pub enum SchemaParseError {
     ExpectedRootStructName { span: Span },
     ExpectedRootUnderlyingTable { span: Span },
     ExpectedRootSemicolon { span: Span },
+
+    ExpectedStructName { span: Span },
+    ExpectedStructLBrace { span: Span, name: String },
+    ExpectedStructFieldName { span: Span, struct_name: String },
+    ExpectedStructFieldColon { span: Span, field: String, struct_name: String },
+    ExpectedType { span: Span },
+    ExpectedAtColumn { span: Span },
+    ExpectedListLAngle { span: Span },
+    ExpectedTupleLAngle { span: Span },
+    ExpectedListRAngle { span: Span },
+    ExpectedTupleCommaOrRAngle { span: Span },
+    ExpectedTupleCommaOrRParen { span: Span },
+    ExpectedStructCommaOrRBrace { span: Span, struct_name: String },
+    UnclosedStruct { span: Span },
+    DuplicateStruct { span: Span, name: String, previous: Span },
+    DuplicateStructField {
+        span: Span,
+        struct_name: String,
+        field: String,
+        previous: Span,
+    },
 }
 
 impl From<SchemaParseError> for Diagnostic {
@@ -144,9 +165,9 @@ impl From<SchemaParseError> for Diagnostic {
                 span,
                 "expected an identifier",
             ),
-            ExpectedRootColon { span } => error_simple(
+            ExpectedRootColon { span, name } => error_simple(
                 "SP0013",
-                "expected `:` after root name",
+                format!("expected `:` after root name `{name}`"),
                 span,
                 "expected `:`",
             ),
@@ -177,6 +198,110 @@ impl From<SchemaParseError> for Diagnostic {
                 format!("duplicate root `{name}`"),
                 span,
                 "redundant root",
+            )
+            .with_label(Label {
+                span: previous,
+                message: "first defined here".into(),
+                style: LabelStyle::Secondary,
+            }),
+            ExpectedStructName { span } => error_simple(
+                "SP0018",
+                "expected a struct name",
+                span,
+                "expected an identifier",
+            ),
+            ExpectedStructLBrace { span, name } => error_simple(
+                "SP0019",
+                format!("expected `{{` after struct name `{name}`"),
+                span,
+                "expected `{`",
+            ),
+            ExpectedStructFieldName { span, struct_name } => error_simple(
+                "SP0020",
+                format!("expected a field name in struct `{struct_name}`"),
+                span,
+                "expected an identifier",
+            ),
+            ExpectedStructFieldColon {
+                span,
+                field,
+                struct_name,
+            } => error_simple(
+                "SP0021",
+                format!("expected `:` after field `{field}` in struct `{struct_name}`"),
+                span,
+                "expected `:`",
+            ),
+            ExpectedType { span } => {
+                error_simple("SP0022", "expected a type", span, "expected a type")
+            }
+            ExpectedAtColumn { span } => error_simple(
+                "SP0023",
+                "expected a column name after `@`",
+                span,
+                "expected an identifier",
+            ),
+            ExpectedListLAngle { span } => {
+                error_simple("SP0024", "expected `<` after `List`", span, "expected `<`")
+            }
+            ExpectedTupleLAngle { span } => {
+                error_simple("SP0025", "expected `<` after `Tuple`", span, "expected `<`")
+            }
+            ExpectedListRAngle { span } => error_simple(
+                "SP0026",
+                "expected `>` to close the type arguments",
+                span,
+                "expected `>`",
+            ),
+            ExpectedTupleCommaOrRAngle { span } => error_simple(
+                "SP0027",
+                "expected `,` or `>` after tuple element",
+                span,
+                "expected `,` or `>`",
+            ),
+            ExpectedTupleCommaOrRParen { span } => error_simple(
+                "SP0028",
+                "expected `,` or `)` after tuple element",
+                span,
+                "expected `,` or `)`",
+            ),
+            ExpectedStructCommaOrRBrace { span, struct_name } => error_simple(
+                "SP0029",
+                format!("expected `,` or `}}` after field in struct `{struct_name}`"),
+                span,
+                "expected `,` or `}`",
+            ),
+            DuplicateStructField {
+                span,
+                struct_name,
+                field,
+                previous,
+            } => error_simple(
+                "SP0030",
+                format!("duplicate field `{field}` in struct `{struct_name}`"),
+                span,
+                "duplicate field",
+            )
+            .with_label(Label {
+                span: previous,
+                message: "first defined here".into(),
+                style: LabelStyle::Secondary,
+            }),
+            UnclosedStruct { span } => error_simple(
+                "SP0031",
+                "unclosed `struct` block",
+                span,
+                "missing closing `}`",
+            ),
+            DuplicateStruct {
+                span,
+                name,
+                previous,
+            } => error_simple(
+                "SP0032",
+                format!("duplicate struct `{name}`"),
+                span,
+                "redundant struct",
             )
             .with_label(Label {
                 span: previous,
