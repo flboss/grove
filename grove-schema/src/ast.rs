@@ -1,4 +1,4 @@
-use grove_types::Spanned;
+use grove_types::{Span, Spanned};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Schema {
@@ -77,12 +77,31 @@ pub struct Field {
 pub enum TypeExpr {
     Primitive(Spanned<BuiltinType>),
     Struct(Spanned<String>),
-    Optional(Box<TypeExpr>),
+    Optional {
+        inner: Box<TypeExpr>,
+        span: Span,
+    },
     List {
         element: Box<TypeExpr>,
         via: Option<ListStorage>,
+        span: Span,
     },
-    Tuple(Vec<TypeExpr>),
+    Tuple {
+        elements: Vec<TypeExpr>,
+        span: Span,
+    },
+}
+
+impl TypeExpr {
+    pub fn span(&self) -> Span {
+        match self {
+            TypeExpr::Primitive(spanned) => spanned.span,
+            TypeExpr::Struct(spanned) => spanned.span,
+            TypeExpr::Optional { span, .. } => *span,
+            TypeExpr::List { span, .. } => *span,
+            TypeExpr::Tuple { span, .. } => *span,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

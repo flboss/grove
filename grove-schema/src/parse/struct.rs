@@ -103,7 +103,7 @@ impl<'src> Parser<'src> {
             match &mut exposed_type {
                 TypeExpr::List { via, .. } => *via = Some(storage),
                 _ => self.emit_error(SchemaParseError::ExpectedListForVia {
-                    span: storage.table.span,
+                    span: exposed_type.span(),
                 }),
             }
         }
@@ -193,9 +193,16 @@ impl<'src> Parser<'src> {
 
     fn parse_type_expr(&mut self, skip_via: bool) -> PResult<TypeExpr> {
         if self.peek().value == TokenKind::Question {
-            self.advance();
+            let question = self.advance();
             let inner = self.parse_base_type_expr(skip_via)?;
-            Ok(TypeExpr::Optional(Box::new(inner)))
+            let span = Span {
+                start: question.span.start,
+                end: inner.span().end,
+            };
+            Ok(TypeExpr::Optional {
+                inner: Box::new(inner),
+                span,
+            })
         } else {
             self.parse_base_type_expr(skip_via)
         }
@@ -245,23 +252,34 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_list_type(&mut self, skip_via: bool) -> PResult<TypeExpr> {
-        self.advance();
+        let kw_tok = self.advance();
         if let Err(found) = self.expect(TokenKind::LAngle) {
             self.emit_error(SchemaParseError::ExpectedListLAngle { span: found.span });
             return Err(());
         }
         let element = Box::new(self.parse_type_expr(false)?);
-        if let Err(found) = self.expect(TokenKind::RAngle) {
-            self.emit_error(SchemaParseError::ExpectedListRAngle { span: found.span });
-            return Err(());
-        }
+        let rangle = match self.expect(TokenKind::RAngle) {
+            Ok(tok) => tok,
+            Err(found) => {
+                self.emit_error(SchemaParseError::ExpectedListRAngle { span: found.span });
+                return Err(());
+            }
+        };
         let via = if !skip_via && self.peek().value == TokenKind::Via {
             self.advance();
             Some(self.parse_via_storage()?)
         } else {
             None
         };
-        Ok(TypeExpr::List { element, via })
+
+        Ok(TypeExpr::List {
+            element,
+            via,
+            span: Span {
+                start: kw_tok.span.start,
+                end: rangle.span.end,
+            },
+        })
     }
 
     fn parse_via_storage(&mut self) -> PResult<ListStorage> {
@@ -300,18 +318,16 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_tuple_type(&mut self) -> PResult<TypeExpr> {
-        self.advance();
+        let kw_tok = self.advance();
         if let Err(found) = self.expect(TokenKind::LAngle) {
             self.emit_error(SchemaParseError::ExpectedTupleLAngle { span: found.span });
             return Err(());
         }
         let mut elements = vec![self.parse_type_expr(false)?];
-        loop {
+        let rangle = loop {
             match self.peek().value {
-                TokenKind::RAngle => {
-                    self.advance();
-                    break;
-                }
+                TokenKind::RAngle => break self.advance(),
+
                 TokenKind::Eof => {
                     let span = self.peek().span;
                     self.emit_error(SchemaParseError::ExpectedTupleCommaOrRAngle { span });
@@ -327,19 +343,22 @@ impl<'src> Parser<'src> {
                     elements.push(self.parse_type_expr(false)?);
                 }
             }
-        }
-        Ok(TypeExpr::Tuple(elements))
+        };
+        Ok(TypeExpr::Tuple {
+            elements,
+            span: Span {
+                start: kw_tok.span.start,
+                end: rangle.span.end,
+            },
+        })
     }
 
     fn parse_paren_tuple(&mut self) -> PResult<TypeExpr> {
-        self.advance();
+        let kw_tok = self.advance();
         let mut elements = vec![self.parse_type_expr(false)?];
-        loop {
+        let rparen = loop {
             match self.peek().value {
-                TokenKind::RParen => {
-                    self.advance();
-                    break;
-                }
+                TokenKind::RParen => break self.advance(),
                 TokenKind::Eof => {
                     let span = self.peek().span;
                     self.emit_error(SchemaParseError::ExpectedTupleCommaOrRParen { span });
@@ -355,8 +374,14 @@ impl<'src> Parser<'src> {
                     elements.push(self.parse_type_expr(false)?);
                 }
             }
-        }
-        Ok(TypeExpr::Tuple(elements))
+        };
+        Ok(TypeExpr::Tuple {
+            elements,
+            span: Span {
+                start: kw_tok.span.start,
+                end: rparen.span.end,
+            },
+        })
     }
 
     fn sync_to_field_or_statement_boundary(&mut self) -> PResult<()> {
@@ -413,7 +438,7 @@ mod tests {
         assert!(structs[0].fields[0].column.is_none());
         assert!(matches!(
             structs[0].fields[2].exposed_type,
-            TypeExpr::Optional(_)
+            TypeExpr::Optional { .. }
         ));
         assert!(matches!(
             structs[0].fields[3].exposed_type,
@@ -439,11 +464,11 @@ mod tests {
             parse_schema("struct P { a: Tuple<Float, Float>, b: List<(Int, String)> }");
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
         let fields = schema.unwrap().structs[0].fields.clone();
-        assert!(matches!(fields[0].exposed_type, TypeExpr::Tuple(_)));
+        assert!(matches!(fields[0].exposed_type, TypeExpr::Tuple { .. }));
         match fields[1].exposed_type.clone() {
-            TypeExpr::List { element, via } => {
+            TypeExpr::List { element, via, .. } => {
                 assert_eq!(via, None);
-                assert!(matches!(*element, TypeExpr::Tuple(_)));
+                assert!(matches!(*element, TypeExpr::Tuple { .. }));
             }
             _ => panic!("expected List<T> field type"),
         }
@@ -544,7 +569,7 @@ mod tests {
             _ => panic!("expected Single link column"),
         }
         match &field.exposed_type {
-            TypeExpr::List { element, via } => {
+            TypeExpr::List { element, via, .. } => {
                 assert!(matches!(**element, TypeExpr::Primitive(_)));
                 let storage = via.as_ref().expect("expected via storage");
                 assert_eq!(storage.table.value, "user_tags");
@@ -591,6 +616,7 @@ mod tests {
             TypeExpr::List {
                 element,
                 via: outer,
+                ..
             } => {
                 match &field.column {
                     Some(ColumnMapping::Single(col)) => assert_eq!(col.value, "outer_ref"),
@@ -602,6 +628,7 @@ mod tests {
                     TypeExpr::List {
                         element: inner,
                         via,
+                        ..
                     } => {
                         assert!(matches!(**inner, TypeExpr::Primitive(_)));
                         let storage = via.as_ref().expect("expected inner via storage");
