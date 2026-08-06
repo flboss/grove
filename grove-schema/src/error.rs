@@ -32,7 +32,7 @@ pub enum SchemaParseError {
     ExpectedStructFieldName { span: Span, struct_name: String },
     ExpectedStructFieldColon { span: Span, field: String, struct_name: String },
     ExpectedType { span: Span },
-    ExpectedAtColumn { span: Span },
+    ExpectedColumns { span: Span },
     ExpectedListLAngle { span: Span },
     ExpectedTupleLAngle { span: Span },
     ExpectedListRAngle { span: Span },
@@ -49,6 +49,13 @@ pub enum SchemaParseError {
     },
     ExpectedColumn { span: Span },
     ExpectedColumnCommaOrRParen { span: Span },
+
+    ExpectedListViaTable { span: Span },
+    ExpectedListViaLBracket { span: Span },
+    ExpectedListViaKeyCol { span: Span },
+    ExpectedListViaComma { span: Span },
+    ExpectedListViaRBracket { span: Span },
+    ExpectedListForVia { span: Span },
 }
 
 impl From<SchemaParseError> for Diagnostic {
@@ -237,9 +244,9 @@ impl From<SchemaParseError> for Diagnostic {
             ExpectedType { span } => {
                 error_simple("SP0022", "expected a type", span, "expected a type")
             }
-            ExpectedAtColumn { span } => error_simple(
+            ExpectedColumns { span } => error_simple(
                 "SP0023",
-                "expected one or more column names after `@`",
+                "expected one or more underlying column names",
                 span,
                 "expected an identifier or `(`",
             ),
@@ -312,7 +319,7 @@ impl From<SchemaParseError> for Diagnostic {
             }),
             ExpectedColumn { span } => error_simple(
                 "SP0033",
-                "expected a column name",
+                "expected an underlying column name",
                 span,
                 "expected an identifier",
             ),
@@ -321,6 +328,42 @@ impl From<SchemaParseError> for Diagnostic {
                 "expected `,` or `)` after column",
                 span,
                 "expected `,` or `)`",
+            ),
+            ExpectedListViaTable { span } => error_simple(
+                "SP0035",
+                "expected a table name after `via`",
+                span,
+                "expected an identifier",
+            ),
+            ExpectedListViaLBracket { span } => error_simple(
+                "SP0036",
+                "expected `[` after via table",
+                span,
+                "expected `[`",
+            ),
+            ExpectedListViaKeyCol { span } => error_simple(
+                "SP0037",
+                "expected a key column in `via` clause",
+                span,
+                "expected an identifier",
+            ),
+            ExpectedListViaComma { span } => error_simple(
+                "SP0038",
+                "expected `,` after key column in `via` clause",
+                span,
+                "expected `,`",
+            ),
+            ExpectedListViaRBracket { span } => error_simple(
+                "SP0039",
+                "expected `]` to close the `via` clause",
+                span,
+                "expected `]`",
+            ),
+            ExpectedListForVia { span } => error_simple(
+                "SP0040",
+                "cannot attach a `via` clause to type",
+                span,
+                "expected a `List` type",
             ),
         }
     }

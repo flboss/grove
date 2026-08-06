@@ -1,4 +1,4 @@
-use crate::ast::{BuiltinType, ColumnMapping, Field, StructDef, TypeExpr};
+use crate::ast::{BuiltinType, ColumnMapping, Field, ListStorage, StructDef, TypeExpr};
 use crate::error::SchemaParseError;
 use crate::token::TokenKind;
 use grove_types::{Span, Spanned};
@@ -78,7 +78,7 @@ impl<'src> Parser<'src> {
             return self.sync_to_field_or_statement_boundary();
         }
 
-        let exposed_type = match self.parse_type_expr() {
+        let mut exposed_type = match self.parse_type_expr(true) {
             Ok(ty) => ty,
             Err(()) => return self.sync_to_field_or_statement_boundary(),
         };
@@ -92,6 +92,21 @@ impl<'src> Parser<'src> {
         } else {
             None
         };
+
+        if self.peek().value == TokenKind::Via {
+            self.advance();
+            let storage = match self.parse_via_storage() {
+                Ok(storage) => storage,
+                Err(()) => return self.sync_to_field_or_statement_boundary(),
+            };
+
+            match &mut exposed_type {
+                TypeExpr::List { via, .. } => *via = Some(storage),
+                _ => self.emit_error(SchemaParseError::ExpectedListForVia {
+                    span: storage.table.span,
+                }),
+            }
+        }
 
         match field_spans.iter().find(|(f, _)| f == &name.value) {
             Some((_, previous)) => {
@@ -159,7 +174,7 @@ impl<'src> Parser<'src> {
             match self.expect_ident() {
                 Ok(col) => Ok(ColumnMapping::Single(col)),
                 Err(found) => {
-                    self.emit_error(SchemaParseError::ExpectedAtColumn { span: found.span });
+                    self.emit_error(SchemaParseError::ExpectedColumns { span: found.span });
                     Err(())
                 }
             }
@@ -176,17 +191,17 @@ impl<'src> Parser<'src> {
         }
     }
 
-    fn parse_type_expr(&mut self) -> PResult<TypeExpr> {
+    fn parse_type_expr(&mut self, skip_via: bool) -> PResult<TypeExpr> {
         if self.peek().value == TokenKind::Question {
             self.advance();
-            let inner = self.parse_base_type_expr()?;
+            let inner = self.parse_base_type_expr(skip_via)?;
             Ok(TypeExpr::Optional(Box::new(inner)))
         } else {
-            self.parse_base_type_expr()
+            self.parse_base_type_expr(skip_via)
         }
     }
 
-    fn parse_base_type_expr(&mut self) -> PResult<TypeExpr> {
+    fn parse_base_type_expr(&mut self, skip_via: bool) -> PResult<TypeExpr> {
         match &self.peek().value {
             TokenKind::Int
             | TokenKind::Float
@@ -218,7 +233,7 @@ impl<'src> Parser<'src> {
                     value: s,
                 }))
             }
-            TokenKind::List => self.parse_list_type(),
+            TokenKind::List => self.parse_list_type(skip_via),
             TokenKind::Tuple => self.parse_tuple_type(),
             TokenKind::LParen => self.parse_paren_tuple(),
             _ => {
@@ -229,18 +244,59 @@ impl<'src> Parser<'src> {
         }
     }
 
-    fn parse_list_type(&mut self) -> PResult<TypeExpr> {
+    fn parse_list_type(&mut self, skip_via: bool) -> PResult<TypeExpr> {
         self.advance();
         if let Err(found) = self.expect(TokenKind::LAngle) {
             self.emit_error(SchemaParseError::ExpectedListLAngle { span: found.span });
             return Err(());
         }
-        let element = Box::new(self.parse_type_expr()?);
+        let element = Box::new(self.parse_type_expr(false)?);
         if let Err(found) = self.expect(TokenKind::RAngle) {
             self.emit_error(SchemaParseError::ExpectedListRAngle { span: found.span });
             return Err(());
         }
-        Ok(TypeExpr::List { element, via: None })
+        let via = if !skip_via && self.peek().value == TokenKind::Via {
+            self.advance();
+            Some(self.parse_via_storage()?)
+        } else {
+            None
+        };
+        Ok(TypeExpr::List { element, via })
+    }
+
+    fn parse_via_storage(&mut self) -> PResult<ListStorage> {
+        let table = match self.expect_ident() {
+            Ok(table) => table,
+            Err(found) => {
+                self.emit_error(SchemaParseError::ExpectedListViaTable { span: found.span });
+                return Err(());
+            }
+        };
+        if let Err(found) = self.expect(TokenKind::LBracket) {
+            self.emit_error(SchemaParseError::ExpectedListViaLBracket { span: found.span });
+            return Err(());
+        }
+        let key_col = match self.expect_ident() {
+            Ok(key_col) => key_col,
+            Err(found) => {
+                self.emit_error(SchemaParseError::ExpectedListViaKeyCol { span: found.span });
+                return Err(());
+            }
+        };
+        if let Err(found) = self.expect(TokenKind::Comma) {
+            self.emit_error(SchemaParseError::ExpectedListViaComma { span: found.span });
+            return Err(());
+        }
+        let value = self.parse_column_mapping()?;
+        if let Err(found) = self.expect(TokenKind::RBracket) {
+            self.emit_error(SchemaParseError::ExpectedListViaRBracket { span: found.span });
+            return Err(());
+        }
+        Ok(ListStorage {
+            table,
+            key_col,
+            value,
+        })
     }
 
     fn parse_tuple_type(&mut self) -> PResult<TypeExpr> {
@@ -249,7 +305,7 @@ impl<'src> Parser<'src> {
             self.emit_error(SchemaParseError::ExpectedTupleLAngle { span: found.span });
             return Err(());
         }
-        let mut elements = vec![self.parse_type_expr()?];
+        let mut elements = vec![self.parse_type_expr(false)?];
         loop {
             match self.peek().value {
                 TokenKind::RAngle => {
@@ -268,7 +324,7 @@ impl<'src> Parser<'src> {
                         });
                         return Err(());
                     }
-                    elements.push(self.parse_type_expr()?);
+                    elements.push(self.parse_type_expr(false)?);
                 }
             }
         }
@@ -277,7 +333,7 @@ impl<'src> Parser<'src> {
 
     fn parse_paren_tuple(&mut self) -> PResult<TypeExpr> {
         self.advance();
-        let mut elements = vec![self.parse_type_expr()?];
+        let mut elements = vec![self.parse_type_expr(false)?];
         loop {
             match self.peek().value {
                 TokenKind::RParen => {
@@ -296,7 +352,7 @@ impl<'src> Parser<'src> {
                         });
                         return Err(());
                     }
-                    elements.push(self.parse_type_expr()?);
+                    elements.push(self.parse_type_expr(false)?);
                 }
             }
         }
@@ -474,6 +530,135 @@ mod tests {
     fn multi_column_trailing_comma() {
         let (_, diags) = parse_schema("struct S { rgb: Tuple<Int, Int, Int>@(red, ) }");
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn array_field_with_via() {
+        let (schema, diags) = parse_schema(
+            "struct User { tags: List<String>@id via user_tags[user_key, tag_value] }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let field = schema.unwrap().structs[0].fields[0].clone();
+        match &field.column {
+            Some(ColumnMapping::Single(col)) => assert_eq!(col.value, "id"),
+            _ => panic!("expected Single link column"),
+        }
+        match &field.exposed_type {
+            TypeExpr::List { element, via } => {
+                assert!(matches!(**element, TypeExpr::Primitive(_)));
+                let storage = via.as_ref().expect("expected via storage");
+                assert_eq!(storage.table.value, "user_tags");
+                assert_eq!(storage.key_col.value, "user_key");
+                match &storage.value {
+                    ColumnMapping::Single(col) => assert_eq!(col.value, "tag_value"),
+                    _ => panic!("expected Single value column"),
+                }
+            }
+            _ => panic!("expected List<...> field type"),
+        }
+    }
+
+    #[test]
+    fn array_field_via_multi_columns() {
+        let (schema, diags) = parse_schema(
+            "struct S { tags: List<String>@id via tag_table[user_key, (t_int, t_str)] }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let field = schema.unwrap().structs[0].fields[0].clone();
+        match &field.exposed_type {
+            TypeExpr::List { via, .. } => {
+                let storage = via.as_ref().expect("expected via storage");
+                match &storage.value {
+                    ColumnMapping::Multi(cols) => {
+                        let names: Vec<&str> = cols.iter().map(|c| c.as_str()).collect();
+                        assert_eq!(names, vec!["t_int", "t_str"]);
+                    }
+                    _ => panic!("expected Multi value columns"),
+                }
+            }
+            _ => panic!("expected List<...> field type"),
+        }
+    }
+
+    #[test]
+    fn nested_list_via() {
+        let (schema, diags) = parse_schema(
+            "struct S { tags: List<List<Int> via inner_table[ref, data]>@outer_ref via outer_table[ref, inner_ref] }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let field = schema.unwrap().structs[0].fields[0].clone();
+        match &field.exposed_type {
+            TypeExpr::List {
+                element,
+                via: outer,
+            } => {
+                match &field.column {
+                    Some(ColumnMapping::Single(col)) => assert_eq!(col.value, "outer_ref"),
+                    _ => panic!("expected Single outer link column"),
+                }
+                let outer = outer.as_ref().expect("expected outer via storage");
+                assert_eq!(outer.table.value, "outer_table");
+                match &**element {
+                    TypeExpr::List {
+                        element: inner,
+                        via,
+                    } => {
+                        assert!(matches!(**inner, TypeExpr::Primitive(_)));
+                        let storage = via.as_ref().expect("expected inner via storage");
+                        assert_eq!(storage.table.value, "inner_table");
+                        assert_eq!(storage.key_col.value, "ref");
+                        match &storage.value {
+                            ColumnMapping::Single(col) => assert_eq!(col.value, "data"),
+                            _ => panic!("expected Single inner value column"),
+                        }
+                    }
+                    _ => panic!("expected outer List<inner List>"),
+                }
+            }
+            _ => panic!("expected List<...> field type"),
+        }
+    }
+
+    #[test]
+    fn top_level_list_via_before_at() {
+        let (_, diags) = parse_schema("struct S { tags: List<Int> via t[u, v] @col }");
+        assert_eq!(codes(&diags), vec!["SP0029"]);
+    }
+
+    #[test]
+    fn via_missing_table() {
+        let (_, diags) = parse_schema("struct S { a: List<Int>@id via [u v] }");
+        assert_eq!(codes(&diags), vec!["SP0035"]);
+    }
+
+    #[test]
+    fn via_missing_lbracket() {
+        let (_, diags) = parse_schema("struct S { a: List<Int>@id via t u }");
+        assert_eq!(codes(&diags), vec!["SP0036"]);
+    }
+
+    #[test]
+    fn via_missing_key_col() {
+        let (_, diags) = parse_schema("struct S { a: List<Int>@id via t[, v] }");
+        assert_eq!(codes(&diags), vec!["SP0037"]);
+    }
+
+    #[test]
+    fn via_missing_comma() {
+        let (_, diags) = parse_schema("struct S { a: List<Int>@id via t[u v] }");
+        assert_eq!(codes(&diags), vec!["SP0038"]);
+    }
+
+    #[test]
+    fn via_missing_rbracket() {
+        let (_, diags) = parse_schema("struct S { a: List<Int>@id via t[u, v");
+        assert_eq!(codes(&diags), vec!["SP0039"]);
+    }
+
+    #[test]
+    fn via_on_non_list_type() {
+        let (_, diags) = parse_schema("struct S { a: Int@x via t[u, v] }");
+        assert_eq!(codes(&diags), vec!["SP0040"]);
     }
 
     #[test]
