@@ -1,4 +1,5 @@
 mod config;
+mod rel;
 mod root;
 mod r#struct;
 
@@ -98,6 +99,11 @@ impl<'src> Parser<'src> {
                         }
                     }
                 }
+                TokenKind::Rel => {
+                    if let Ok(relation) = self.parse_rel() {
+                        schema.relations.push(relation);
+                    }
+                }
                 _ => {
                     self.emit_error(SchemaParseError::ExpectedTopLevelStmt { span });
                     self.sync_to_statement_boundary();
@@ -148,6 +154,21 @@ impl<'src> Parser<'src> {
         }
     }
 
+    fn expect_or_sync(
+        &mut self,
+        kind: TokenKind,
+        err: impl FnOnce(Span) -> SchemaParseError,
+    ) -> PResult<Token> {
+        let span = self.peek().span;
+        if self.peek().value == kind {
+            Ok(self.advance())
+        } else {
+            self.emit_error(err(span));
+            self.sync_to_statement_boundary();
+            Err(())
+        }
+    }
+
     fn expect_ident(&mut self) -> Result<Spanned<String>, Token> {
         let token = self.advance();
         match token.value {
@@ -156,6 +177,27 @@ impl<'src> Parser<'src> {
                 value: s,
             }),
             _ => Err(token),
+        }
+    }
+
+    fn expect_ident_or_sync(
+        &mut self,
+        err: impl FnOnce(Span) -> SchemaParseError,
+    ) -> PResult<Spanned<String>> {
+        let span = self.peek().span;
+        match self.peek().value {
+            TokenKind::Ident(_) => {
+                let ident = match self.advance().value {
+                    TokenKind::Ident(s) => s,
+                    _ => unreachable!(),
+                };
+                Ok(Spanned { span, value: ident })
+            }
+            _ => {
+                self.emit_error(err(span));
+                self.sync_to_statement_boundary();
+                Err(())
+            }
         }
     }
 
