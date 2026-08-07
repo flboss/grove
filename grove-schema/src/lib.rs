@@ -3,6 +3,7 @@ pub mod error;
 pub mod lex;
 pub mod parse;
 pub mod token;
+pub mod validated;
 
 use grove_types::Diagnostic;
 

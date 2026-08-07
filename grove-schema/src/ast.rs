@@ -1,5 +1,7 @@
 use grove_types::{Span, Spanned};
 
+pub use crate::validated::{DecArithmetic, IntArithmetic};
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Schema {
     pub roots: Vec<RootCollection>,
@@ -13,44 +15,6 @@ pub struct ConfigBlock {
     pub int_arithmetic: Option<Spanned<IntArithmetic>>,
     pub float_checks: Option<Spanned<bool>>,
     pub dec_arithmetic: Option<Spanned<DecArithmetic>>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IntArithmetic {
-    Checked,
-    Saturating,
-    Wrapping,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DecArithmetic {
-    Checked,
-    Saturating,
-}
-
-impl TryFrom<&str> for IntArithmetic {
-    type Error = ();
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        match value {
-            "checked" => Ok(Self::Checked),
-            "saturating" => Ok(Self::Saturating),
-            "wrapping" => Ok(Self::Wrapping),
-            _ => Err(()),
-        }
-    }
-}
-
-impl TryFrom<&str> for DecArithmetic {
-    type Error = ();
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        match value {
-            "checked" => Ok(Self::Checked),
-            "saturating" => Ok(Self::Saturating),
-            _ => Err(()),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
