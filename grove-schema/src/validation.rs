@@ -106,7 +106,8 @@ impl<'s> Builder<'s> {
             }
         }
 
-        for (name, spans) in unknown_refs {
+        for (name, mut spans) in unknown_refs {
+            spans.sort_unstable();
             self.emit_error(SchemaValidationError::UnknownStructRef {
                 name: name.to_string(),
                 occurrences: spans,
