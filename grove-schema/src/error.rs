@@ -524,7 +524,7 @@ impl From<SchemaParseError> for Diagnostic {
     }
 }
 
-fn error_simple(
+pub(crate) fn error_simple(
     code: &'static str,
     message: impl Into<DiagStr>,
     span: Span,
