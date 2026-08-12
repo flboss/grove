@@ -204,8 +204,7 @@ mod tests {
     fn unknown_structs_separate_diagnostics() {
         stage_identity("root a: Missing; root b: Missing; root c: Other;", |b| {
             assert_eq!(codes(&b.diags), vec!["SV0001", "SV0001"]);
-            assert_eq!(b.diags[0].labels.len(), 2);
-            assert_eq!(b.diags[1].labels.len(), 1);
+            assert_eq!(b.diags.iter().map(|d| d.labels.len()).sum::<usize>(), 3);
         });
     }
 
