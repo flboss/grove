@@ -118,6 +118,15 @@ pub struct ValidatedSchema {
     pub relations: Vec<Relation>,
 }
 
+impl ValidatedSchema {
+    pub fn relation_of_field(&self, field: FieldId) -> Option<RelationId> {
+        self.relations
+            .iter()
+            .position(|r| r.endpoints().contains(&field))
+            .map(RelationId::new)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub int_arithmetic: IntArithmetic,
@@ -166,14 +175,12 @@ pub enum Field {
     },
     Ref {
         name: String,
-        relation: RelationId,
         target: StructId,
         optional: bool,
         is_list: bool,
     },
     BackRef {
         name: String,
-        relation: RelationId,
         target: StructId,
         is_list: bool,
     },
@@ -231,4 +238,22 @@ pub enum Relation {
         b_col: ColumnId,
         b_pk: ColumnId,
     },
+}
+
+impl Relation {
+    pub fn endpoints(&self) -> [FieldId; 2] {
+        match self {
+            Relation::OneToOne {
+                child_ref,
+                parent_ref,
+                ..
+            }
+            | Relation::ManyToOne {
+                child_ref,
+                parent_ref,
+                ..
+            } => [*child_ref, *parent_ref],
+            Relation::ManyToMany { a_ref, b_ref, .. } => [*a_ref, *b_ref],
+        }
+    }
 }
