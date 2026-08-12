@@ -12,6 +12,7 @@ struct Cli {
     command: Command,
 }
 
+#[allow(clippy::enum_variant_names)]
 #[derive(Subcommand)]
 enum Command {
     /// Tokenize a schema file and display the token stream.
@@ -33,6 +34,16 @@ enum Command {
         #[arg(long)]
         raw: bool,
     },
+
+    /// Validate a schema file and display the validated model.
+    SchemaValidate {
+        /// Path to the schema file
+        path: PathBuf,
+
+        /// Display diagnostics as raw Debug output instead of using ariadne
+        #[arg(long)]
+        raw: bool,
+    },
 }
 
 fn main() {
@@ -40,6 +51,7 @@ fn main() {
     match cli.command {
         Command::SchemaLex { path, raw } => schema_lex(&path, raw),
         Command::SchemaParse { path, raw } => schema_parse(&path, raw),
+        Command::SchemaValidate { path, raw } => schema_validate(&path, raw),
     }
 }
 
@@ -96,6 +108,33 @@ fn schema_parse(path: &PathBuf, raw: bool) {
     }
 
     print_diagnostics(&source, path, &diagnostics, raw);
+}
+
+fn schema_validate(path: &PathBuf, raw: bool) {
+    let source = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error reading {}: {e}", path.display());
+            std::process::exit(1);
+        }
+    };
+
+    let (schema, parse_diagnostics) = grove_schema::parse_schema(&source);
+    let Some(schema) = schema else {
+        println!("No validated schema. (parse failed)");
+        print_diagnostics(&source, path, &parse_diagnostics, raw);
+        return;
+    };
+
+    let (validated, validation_diagnostics) = grove_schema::validate(schema);
+
+    println!("=== ValidatedSchema ===");
+    match &validated {
+        Some(schema) => println!("{schema:#?}"),
+        None => println!("No validated schema. (validation failed)"),
+    }
+
+    print_diagnostics(&source, path, &validation_diagnostics, raw);
 }
 
 fn print_diagnostics(source: &str, path: &Path, diagnostics: &[Diagnostic], raw: bool) {
