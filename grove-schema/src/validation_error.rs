@@ -27,6 +27,41 @@ pub enum SchemaValidationError {
         span: Span,
         previous: Span,
     },
+    NestedStructRef {
+        span: Span,
+        struct_name: String,
+        field: String,
+        nested: Span,
+    },
+    ViaOnStructList {
+        span: Span,
+        struct_name: String,
+        field: String,
+    },
+    TupleArityMismatch {
+        span: Span,
+        struct_name: String,
+        field: String,
+        declared: usize,
+        expected: usize,
+    },
+    ViaArityMismatch {
+        span: Span,
+        struct_name: String,
+        field: String,
+        declared: usize,
+        expected: usize,
+    },
+    NoViaScalarList {
+        span: Span,
+        struct_name: String,
+        field: String,
+    },
+    UnmatchedForwardRef {
+        span: Span,
+        struct_name: String,
+        field: String,
+    },
 }
 
 impl From<SchemaValidationError> for Diagnostic {
@@ -106,6 +141,80 @@ impl From<SchemaValidationError> for Diagnostic {
                 message: "first declared here".into(),
                 style: LabelStyle::Secondary,
             }),
+            NestedStructRef {
+                span,
+                struct_name,
+                field,
+                nested,
+            } => error_simple(
+                "SV0007",
+                format!("field `{struct_name}.{field}` nests a struct reference inside a value type"),
+                span,
+                "struct in a value position",
+            )
+            .with_label(Label {
+                span: nested,
+                message: "nested struct reference".into(),
+                style: LabelStyle::Secondary,
+            })
+            .with_help("struct references are only valid as a standalone `S`, `?S`, or `List<S>` field"),
+            ViaOnStructList { span, struct_name, field } => error_simple(
+                "SV0008",
+                format!("field `{struct_name}.{field}` attaches a `via` storage table to a list of structs"),
+                span,
+                "`via` on a struct list",
+            )
+            .with_help("struct collections are defined by `rel` statements, not a `via` clause"),
+            TupleArityMismatch {
+                span,
+                struct_name,
+                field,
+                declared,
+                expected,
+            } => error_simple(
+                "SV0009",
+                format!(
+                    "field `{struct_name}.{field}` maps {declared} column(s) but its type needs {expected}"
+                ),
+                span,
+                "column count does not match the type",
+            ),
+            ViaArityMismatch {
+                span,
+                struct_name,
+                field,
+                declared,
+                expected,
+            } => error_simple(
+                "SV0010",
+                format!(
+                    "field `{struct_name}.{field}` lists {declared} value column(s) in its storage table but the element type needs {expected}"
+                ),
+                span,
+                "value column count does not match the element type",
+            ),
+            NoViaScalarList {
+                span,
+                struct_name,
+                field,
+            } => error_simple(
+                "SV0011",
+                format!("field `{struct_name}.{field}` is a list of values without a `via` storage table"),
+                span,
+                "missing `via` storage",
+            )
+            .with_help("a list of scalar values must be backed by a `via` storage table"),
+            UnmatchedForwardRef {
+                span,
+                struct_name,
+                field,
+            } => error_simple(
+                "SV0012",
+                format!("field `{struct_name}.{field}` is a struct reference that cannot be materialized"),
+                span,
+                "unrepresentable reference",
+            )
+            .with_help("struct references must be matched by a `rel` forward reference"),
         }
     }
 }
