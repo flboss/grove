@@ -63,6 +63,37 @@ pub enum SchemaValidationError {
         struct_name: String,
         field: String,
     },
+    ForwardRefMissing {
+        span: Span,
+        struct_name: String,
+        field: String,
+    },
+    ForwardRefTypeMismatch {
+        span: Span,
+        struct_name: String,
+        field: String,
+    },
+    BackRefInStruct {
+        span: Span,
+        struct_name: String,
+        field: String,
+    },
+    ForwardRefTargetMismatch {
+        span: Span,
+        struct_name: String,
+        field: String,
+        actual: String,
+        expected: String,
+    },
+    ColumnMismatch {
+        span: Span,
+        note: String,
+    },
+    DuplicateBackRefName {
+        span: Span,
+        struct_name: String,
+        field: String,
+    },
 }
 
 impl From<SchemaValidationError> for Diagnostic {
@@ -239,6 +270,83 @@ impl From<SchemaValidationError> for Diagnostic {
                 "unrepresentable reference",
             )
             .with_help("struct references must be matched by a `rel` forward reference"),
+            ForwardRefMissing {
+                span,
+                struct_name,
+                field,
+            } => error_simple(
+                "SV0013",
+                format!(
+                    "relation cannot be built: `{struct_name}.{field}` is not declared as a \
+                     forward reference"
+                ),
+                span,
+                "missing forward reference",
+            )
+            .with_help("declare the forward side of this relation as a field on the owning struct"),
+            ForwardRefTypeMismatch {
+                span,
+                struct_name,
+                field,
+            } => error_simple(
+                "SV0014",
+                format!(
+                    "forward reference `{struct_name}.{field}` has the wrong shape for this \
+                     relation"
+                ),
+                span,
+                "wrong forward-reference shape",
+            )
+            .with_note(
+                "a `<<->` (1:N) relation requires the parent to declare `List<Child>`; a `<->` \
+                 (1:1) relation requires `Child` or `?Child`",
+            ),
+            BackRefInStruct {
+                span,
+                struct_name,
+                field,
+            } => error_simple(
+                "SV0015",
+                format!("back-reference `{struct_name}.{field}` collides with a declared field"),
+                span,
+                "already a declared field",
+            )
+            .with_help("rename the field or change the relation's back-reference name"),
+            ForwardRefTargetMismatch {
+                span,
+                struct_name,
+                field,
+                actual,
+                expected,
+            } => error_simple(
+                "SV0016",
+                format!(
+                    "forward reference `{struct_name}.{field}` points at `{actual}`, but this \
+                     relation expects `{expected}`"
+                ),
+                span,
+                "wrong reference target",
+            ),
+            ColumnMismatch { span, note } => error_simple(
+                "SV0017",
+                "the relation's FK mapping does not match its expected column layout",
+                span,
+                "column mismatch",
+            )
+            .with_note(note),
+            DuplicateBackRefName {
+                span,
+                struct_name,
+                field,
+            } => error_simple(
+                "SV0018",
+                format!(
+                    "back-reference `{struct_name}.{field}` collides with another relation's \
+                     back-reference"
+                ),
+                span,
+                "already a back-reference",
+            ),
         }
     }
 }
