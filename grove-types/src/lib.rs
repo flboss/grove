@@ -16,9 +16,9 @@ impl Span {
     }
 }
 
-impl Into<Span> for Range<usize> {
-    fn into(self) -> Span {
-        Span::new(self.start, self.end)
+impl From<Range<usize>> for Span {
+    fn from(value: Range<usize>) -> Self {
+        Span::new(value.start, value.end)
     }
 }
 
