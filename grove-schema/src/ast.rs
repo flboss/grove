@@ -35,6 +35,7 @@ pub struct Field {
     pub name: Spanned<String>,
     pub exposed_type: TypeExpr,
     pub column: Option<ColumnMapping>,
+    pub non_owning: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

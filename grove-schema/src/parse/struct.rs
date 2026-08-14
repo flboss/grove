@@ -78,6 +78,13 @@ impl<'src> Parser<'src> {
             return self.sync_to_field_or_statement_boundary();
         }
 
+        let non_owning = if self.peek().value == TokenKind::Ampersand {
+            self.advance();
+            true
+        } else {
+            false
+        };
+
         let mut exposed_type = match self.parse_type_expr(true) {
             Ok(ty) => ty,
             Err(()) => return self.sync_to_field_or_statement_boundary(),
@@ -123,6 +130,7 @@ impl<'src> Parser<'src> {
                     name,
                     exposed_type,
                     column,
+                    non_owning,
                 });
             }
         }
@@ -456,6 +464,32 @@ mod tests {
             Some(ColumnMapping::Single(col)) => assert_eq!(col.value, "order_total"),
             _ => panic!("expected Single column mapping"),
         }
+    }
+
+    #[test]
+    fn struct_with_non_owning_references() {
+        let (schema, diags) = parse_schema(
+            "struct S { user: &User, manager: &?User, subs: &List<User>, owned: User }",
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let fields = schema.unwrap().structs[0].fields.clone();
+        assert_eq!(fields.len(), 4);
+        assert!(fields[0].non_owning);
+        assert!(matches!(fields[0].exposed_type, TypeExpr::Struct(_)));
+        assert!(fields[1].non_owning);
+        assert!(matches!(fields[1].exposed_type, TypeExpr::Optional { .. }));
+        assert!(fields[2].non_owning);
+        assert!(matches!(
+            fields[2].exposed_type,
+            TypeExpr::List { via: None, .. }
+        ));
+        assert!(!fields[3].non_owning);
+    }
+
+    #[test]
+    fn ampersand_inside_list_element_error() {
+        let (_, diags) = parse_schema("struct S { a: List<&User> }");
+        assert_eq!(codes(&diags), vec!["SP0022"]);
     }
 
     #[test]

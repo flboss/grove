@@ -40,6 +40,7 @@ pub enum TokenKind {
     Dot,
     At,
     Question,
+    Ampersand,
     Arrow,
 
     // Relation arrows

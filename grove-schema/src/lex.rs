@@ -65,6 +65,7 @@ impl<'src> Lexer<'src> {
                 '.' => self.make_token(start, TokenKind::Dot),
                 '@' => self.make_token(start, TokenKind::At),
                 '?' => self.make_token(start, TokenKind::Question),
+                '&' => self.make_token(start, TokenKind::Ampersand),
                 '>' => self.make_token(start, TokenKind::RAngle),
                 '<' => self.scan_arrow_or_langle(start),
                 '-' => self.scan_arrow_or_minus(start),
@@ -378,7 +379,7 @@ mod tests {
 
     #[test]
     fn punctuation() {
-        let mut lex = Lexer::new("{}[]()<>:;,=.@?");
+        let mut lex = Lexer::new("{}[]()<>:;,=.@?&");
         assert_token!(lex, TokenKind::LBrace);
         assert_token!(lex, TokenKind::RBrace);
         assert_token!(lex, TokenKind::LBracket);
@@ -394,6 +395,7 @@ mod tests {
         assert_token!(lex, TokenKind::Dot);
         assert_token!(lex, TokenKind::At);
         assert_token!(lex, TokenKind::Question);
+        assert_token!(lex, TokenKind::Ampersand);
         assert_eof!(lex);
     }
 
@@ -410,6 +412,22 @@ mod tests {
         assert_token!(lex, TokenKind::List);
         assert_token!(lex, TokenKind::LAngle);
         assert_token!(lex, TokenKind::Int);
+        assert_token!(lex, TokenKind::RAngle);
+        assert_eof!(lex);
+    }
+
+    #[test]
+    fn ampersand_prefix() {
+        let mut lex = Lexer::new("&User &?User &List<User>");
+        assert_token!(lex, TokenKind::Ampersand);
+        assert_ident!(lex, "User");
+        assert_token!(lex, TokenKind::Ampersand);
+        assert_token!(lex, TokenKind::Question);
+        assert_ident!(lex, "User");
+        assert_token!(lex, TokenKind::Ampersand);
+        assert_token!(lex, TokenKind::List);
+        assert_token!(lex, TokenKind::LAngle);
+        assert_ident!(lex, "User");
         assert_token!(lex, TokenKind::RAngle);
         assert_eof!(lex);
     }
