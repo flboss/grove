@@ -497,8 +497,13 @@ impl<'s> Builder<'s> {
                 let declared = value_column_refs(field).len();
                 let expected = value_scalar_leaves(&field.exposed_type).len();
                 if declared != expected {
+                    let columns = field
+                        .column
+                        .as_ref()
+                        .map_or(field.name.span, ColumnMapping::span);
                     self.emit_error(SchemaValidationError::TupleArityMismatch {
                         span: field.exposed_type.span(),
+                        columns,
                         struct_name,
                         field: name,
                         declared,
@@ -530,6 +535,7 @@ impl<'s> Builder<'s> {
                 if declared != expected {
                     self.emit_error(SchemaValidationError::ViaArityMismatch {
                         span: field.exposed_type.span(),
+                        columns: via.value.span(),
                         struct_name,
                         field: name,
                         declared,

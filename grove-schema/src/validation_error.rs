@@ -40,6 +40,7 @@ pub enum SchemaValidationError {
     },
     TupleArityMismatch {
         span: Span,
+        columns: Span,
         struct_name: String,
         field: String,
         declared: usize,
@@ -47,6 +48,7 @@ pub enum SchemaValidationError {
     },
     ViaArityMismatch {
         span: Span,
+        columns: Span,
         struct_name: String,
         field: String,
         declared: usize,
@@ -148,7 +150,9 @@ impl From<SchemaValidationError> for Diagnostic {
                 nested,
             } => error_simple(
                 "SV0007",
-                format!("field `{struct_name}.{field}` nests a struct reference inside a value type"),
+                format!(
+                    "field `{struct_name}.{field}` nests a struct reference inside a value type"
+                ),
                 span,
                 "struct in a value position",
             )
@@ -157,16 +161,26 @@ impl From<SchemaValidationError> for Diagnostic {
                 message: "nested struct reference".into(),
                 style: LabelStyle::Secondary,
             })
-            .with_help("struct references are only valid as a standalone `S`, `?S`, or `List<S>` field"),
-            ViaOnStructList { span, struct_name, field } => error_simple(
+            .with_help(
+                "struct references are only valid as a standalone `S`, `?S`, or `List<S>` field",
+            ),
+            ViaOnStructList {
+                span,
+                struct_name,
+                field,
+            } => error_simple(
                 "SV0008",
-                format!("field `{struct_name}.{field}` attaches a `via` storage table to a list of structs"),
+                format!(
+                    "field `{struct_name}.{field}` attaches a `via` storage table to a list of \
+                     structs"
+                ),
                 span,
                 "`via` on a struct list",
             )
             .with_help("struct collections are defined by `rel` statements, not a `via` clause"),
             TupleArityMismatch {
                 span,
+                columns,
                 struct_name,
                 field,
                 declared,
@@ -174,13 +188,20 @@ impl From<SchemaValidationError> for Diagnostic {
             } => error_simple(
                 "SV0009",
                 format!(
-                    "field `{struct_name}.{field}` maps {declared} column(s) but its type needs {expected}"
+                    "field `{struct_name}.{field}` maps {declared} column(s) but its type needs \
+                     {expected}"
                 ),
                 span,
-                "column count does not match the type",
-            ),
+                format!("type needs {expected} column(s)"),
+            )
+            .with_label(Label {
+                span: columns,
+                message: format!("{declared} column(s) provided").into(),
+                style: LabelStyle::Secondary,
+            }),
             ViaArityMismatch {
                 span,
+                columns,
                 struct_name,
                 field,
                 declared,
@@ -188,18 +209,27 @@ impl From<SchemaValidationError> for Diagnostic {
             } => error_simple(
                 "SV0010",
                 format!(
-                    "field `{struct_name}.{field}` lists {declared} value column(s) in its storage table but the element type needs {expected}"
+                    "field `{struct_name}.{field}` lists {declared} value column(s) in its \
+                     storage table but the element type needs {expected}"
                 ),
                 span,
-                "value column count does not match the element type",
-            ),
+                format!("type needs {expected} column(s)"),
+            )
+            .with_label(Label {
+                span: columns,
+                message: format!("{declared} column(s) provided").into(),
+                style: LabelStyle::Secondary,
+            }),
             NoViaScalarList {
                 span,
                 struct_name,
                 field,
             } => error_simple(
                 "SV0011",
-                format!("field `{struct_name}.{field}` is a list of values without a `via` storage table"),
+                format!(
+                    "field `{struct_name}.{field}` is a list of values without a `via` storage \
+                     table"
+                ),
                 span,
                 "missing `via` storage",
             )
@@ -210,7 +240,10 @@ impl From<SchemaValidationError> for Diagnostic {
                 field,
             } => error_simple(
                 "SV0012",
-                format!("field `{struct_name}.{field}` is a struct reference that cannot be materialized"),
+                format!(
+                    "field `{struct_name}.{field}` is a struct reference that cannot be \
+                     materialized"
+                ),
                 span,
                 "unrepresentable reference",
             )

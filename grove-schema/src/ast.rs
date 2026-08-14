@@ -85,6 +85,22 @@ pub enum ColumnMapping {
     Multi(Vec<Spanned<String>>),
 }
 
+impl ColumnMapping {
+    pub fn span(&self) -> Span {
+        match self {
+            ColumnMapping::Single(col) => col.span,
+            ColumnMapping::Multi(cols) => cols
+                .iter()
+                .map(|col| col.span)
+                .reduce(|mut acc, span| {
+                    acc.end = span.end;
+                    acc
+                })
+                .unwrap_or_default(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ListStorage {
     pub table: Spanned<String>,
