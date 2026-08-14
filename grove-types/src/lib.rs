@@ -1,14 +1,24 @@
 use std::{borrow::Cow, ops::Range};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct Span {
     pub start: usize,
     pub end: usize,
 }
 
 impl Span {
+    pub fn new(start: usize, end: usize) -> Span {
+        Span { start, end }
+    }
+
     pub fn range(&self) -> Range<usize> {
         self.start..self.end
+    }
+}
+
+impl Into<Span> for Range<usize> {
+    fn into(self) -> Span {
+        Span::new(self.start, self.end)
     }
 }
 
