@@ -183,6 +183,7 @@ pub enum Field {
         name: String,
         target: StructId,
         is_list: bool,
+        optional: bool,
     },
 }
 
@@ -229,6 +230,12 @@ pub enum Relation {
         fk: ColumnId,
         pk: ColumnId,
     },
+    OneToMany {
+        a_ref: FieldId,
+        b_ref: FieldId,
+        fk: ColumnId,
+        pk: ColumnId,
+    },
     ManyToMany {
         a_ref: FieldId,
         b_ref: FieldId,
@@ -253,6 +260,7 @@ impl Relation {
                 parent_ref,
                 ..
             } => [*child_ref, *parent_ref],
+            Relation::OneToMany { a_ref, b_ref, .. } => [*a_ref, *b_ref],
             Relation::ManyToMany { a_ref, b_ref, .. } => [*a_ref, *b_ref],
         }
     }

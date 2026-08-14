@@ -9,7 +9,6 @@ pub enum SchemaValidationError {
         name: String,
         occurrences: Vec<Span>,
     },
-    InvalidArrow { span: Span },
     TableMismatch {
         span: Span,
         name: String,
@@ -90,14 +89,6 @@ impl From<SchemaValidationError> for Diagnostic {
                 }
                 diag
             }
-            InvalidArrow { span } => error_simple(
-                "SV0002",
-                "invalid relation arrow `<->>`",
-                span,
-                "invalid arrow",
-            )
-            .with_note("a child holding a single foreign key cannot reference many parents")
-            .with_help("use `<<->` for many children to one parent"),
             TableMismatch { span, name, tables } => error_simple(
                 "SV0003",
                 format!("struct `{name}` maps to multiple tables"),

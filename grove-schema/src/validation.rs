@@ -15,7 +15,6 @@ pub struct Builder<'s> {
     schema: &'s Schema,
     declared_structs: HashSet<&'s str>,
     forward_ref_relations: HashMap<(&'s str, &'s str), usize>,
-    excluded_relations: HashSet<usize>,
     tables: Vec<Table>,
     table_index: HashMap<&'s str, TableId>,
     column_index: HashMap<(TableId, &'s str), ColumnId>,
@@ -43,7 +42,6 @@ impl<'s> Builder<'s> {
             schema,
             declared_structs: HashSet::new(),
             forward_ref_relations: HashMap::new(),
-            excluded_relations: HashSet::new(),
             tables: Vec::new(),
             table_index: HashMap::new(),
             column_index: HashMap::new(),
@@ -88,13 +86,6 @@ impl<'s> Builder<'s> {
             }
 
             match relation.arrow.value {
-                RelationArrow::OneToMany => {
-                    self.excluded_relations.insert(index);
-                    self.emit_error(SchemaValidationError::InvalidArrow {
-                        span: relation.arrow.span,
-                    });
-                }
-                RelationArrow::ManyToMany => {}
                 RelationArrow::OneToOne | RelationArrow::ManyToOne => {
                     let child = relation.child.struct_name.as_str();
                     let parent = relation.parent.struct_name.as_str();
@@ -115,6 +106,7 @@ impl<'s> Builder<'s> {
                         self.forward_ref_relations.insert((owner, field), index);
                     }
                 }
+                RelationArrow::OneToMany | RelationArrow::ManyToMany => {}
             }
         }
 
@@ -197,14 +189,17 @@ impl<'s> Builder<'s> {
                 candidates.insert(root.table.as_ref().unwrap_or(&root.name));
             }
         }
-        for (index, rel) in self.schema.relations.iter().enumerate() {
-            if self.excluded_relations.contains(&index) {
-                continue;
-            }
+        for rel in &self.schema.relations {
+            let is_one_to_many = matches!(rel.arrow.value, RelationArrow::OneToMany);
             if rel.child.struct_name.value == struct_name {
                 match &rel.fk {
-                    FkMapping::Direct { child, .. } => {
-                        candidates.insert(&child.table);
+                    FkMapping::Direct { child, parent } => {
+                        let table = if is_one_to_many {
+                            &parent.table
+                        } else {
+                            &child.table
+                        };
+                        candidates.insert(table);
                     }
                     FkMapping::Indirect { a, .. } => {
                         candidates.insert(&a.target.table);
@@ -213,8 +208,13 @@ impl<'s> Builder<'s> {
             }
             if rel.parent.struct_name.value == struct_name {
                 match &rel.fk {
-                    FkMapping::Direct { parent, .. } => {
-                        candidates.insert(&parent.table);
+                    FkMapping::Direct { child, parent } => {
+                        let table = if is_one_to_many {
+                            &child.table
+                        } else {
+                            &parent.table
+                        };
+                        candidates.insert(table);
                     }
                     FkMapping::Indirect { b, .. } => {
                         candidates.insert(&b.target.table);
@@ -266,10 +266,7 @@ impl<'s> Builder<'s> {
                 self.collect_field_columns(tid, field, first_claims, declared_columns);
             }
         }
-        for (index, rel) in self.schema.relations.iter().enumerate() {
-            if self.excluded_relations.contains(&index) {
-                continue;
-            }
+        for rel in &self.schema.relations {
             let (Some(&child), Some(&parent)) = (
                 self.struct_index.get(rel.child.struct_name.as_str()),
                 self.struct_index.get(rel.parent.struct_name.as_str()),
@@ -377,8 +374,13 @@ impl<'s> Builder<'s> {
         let parent_tid = self.struct_table[parent.index()];
         match &rel.fk {
             FkMapping::Direct { child, parent } => {
-                self.claim_reference(child_tid, &child.col, child.col.span);
-                self.claim_reference(parent_tid, &parent.col, parent.col.span);
+                let (fk_tid, pk_tid) = if matches!(rel.arrow.value, RelationArrow::OneToMany) {
+                    (parent_tid, child_tid)
+                } else {
+                    (child_tid, parent_tid)
+                };
+                self.claim_reference(fk_tid, &child.col, child.col.span);
+                self.claim_reference(pk_tid, &parent.col, parent.col.span);
             }
             FkMapping::Indirect {
                 join_table, a, b, ..
@@ -828,13 +830,13 @@ mod tests {
     }
 
     #[test]
-    fn invalid_arrow_is_excluded() {
+    fn one_to_many_claims_no_forward() {
         stage_identity(
             "struct A {} struct B {} rel A.x <->> B.y (a.a -> b.b);",
             |b| {
-                assert_eq!(codes(&b.diags), vec!["SV0002"]);
-                assert!(b.excluded_relations.contains(&0));
+                assert!(b.diags.is_empty());
                 assert!(!b.forward_ref_relations.contains_key(&("A", "x")));
+                assert!(!b.forward_ref_relations.contains_key(&("B", "y")));
             },
         );
     }
@@ -902,7 +904,6 @@ mod tests {
             |b| {
                 assert!(b.diags.is_empty());
                 assert!(b.forward_ref_relations.is_empty());
-                assert!(b.excluded_relations.is_empty());
             },
         );
     }
@@ -1176,6 +1177,64 @@ mod tests {
                             ty: None,
                         },
                     ]
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn one_to_many_swap_table_roles() {
+        stage_physical(
+            "struct Image {} struct Message {} \
+             rel Image.messages <->> Message.image (messages.image_id -> images.id);",
+            |b| {
+                assert!(b.diags.is_empty());
+                let image = *b.struct_index.get("Image").unwrap();
+                let message = *b.struct_index.get("Message").unwrap();
+                assert_eq!(b.tables[image.index()].name, "images");
+                assert_eq!(b.tables[message.index()].name, "messages");
+                assert_eq!(
+                    b.tables[image.index()].columns,
+                    vec![Column {
+                        name: "id".into(),
+                        ty: None,
+                    }]
+                );
+                assert_eq!(
+                    b.tables[message.index()].columns,
+                    vec![Column {
+                        name: "image_id".into(),
+                        ty: None,
+                    }]
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn one_to_many_pk_reuses_declared_column() {
+        stage_physical(
+            "root images: Image; struct Image { id: Int } struct Message {} \
+             rel Image.messages <->> Message.image (messages.image_id -> images.id);",
+            |b| {
+                assert!(b.diags.is_empty());
+                let image = *b.struct_index.get("Image").unwrap();
+                assert_eq!(
+                    b.tables[image.index()].columns,
+                    vec![Column {
+                        name: "id".into(),
+                        ty: Some(ScalarType::Int),
+                    }]
+                );
+                let id = b.column_index[&(b.struct_table[image.index()], "id")];
+                assert_eq!(id.local(), 0);
+                let message = *b.struct_index.get("Message").unwrap();
+                assert_eq!(
+                    b.tables[message.index()].columns,
+                    vec![Column {
+                        name: "image_id".into(),
+                        ty: None,
+                    }]
                 );
             },
         );
@@ -1462,6 +1521,21 @@ mod tests {
                 assert_eq!(codes(&b.diags), vec!["SV0012"]);
                 assert!(b.structs[0].fields.is_empty());
                 assert_eq!(b.structs[1].fields.len(), 1);
+            },
+        );
+    }
+
+    #[test]
+    fn one_to_many_endpoint_field_unmatched() {
+        stage_structs(
+            "root images: Image; root messages: Message; \
+             struct Image {} struct Message { image: ?Image } \
+             rel Image.messages <->> Message.image (messages.image_id -> images.id);",
+            |b| {
+                assert_eq!(codes(&b.diags), vec!["SV0012"]);
+                assert!(b.structs[0].fields.is_empty());
+                assert!(b.structs[1].fields.is_empty());
+                assert!(!b.field_index.contains_key(&("Message", "image")));
             },
         );
     }
