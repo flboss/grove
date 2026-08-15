@@ -149,7 +149,6 @@ pub struct Table {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Column {
     pub name: String,
-    // TODO: key/link column types
     pub ty: Option<ScalarType>,
 }
 
