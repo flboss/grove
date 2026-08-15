@@ -1,0 +1,11 @@
+[package]
+name = "grove-query"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+grove-types.workspace = true
+
+chrono.workspace = true
+rust_decimal.workspace = true
+
