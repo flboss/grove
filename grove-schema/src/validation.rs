@@ -14,7 +14,7 @@ use grove_types::{Diagnostic, Span};
 pub struct Builder<'s> {
     schema: &'s Schema,
     declared_structs: HashSet<&'s str>,
-    forward_ref_relations: HashMap<(&'s str, &'s str), usize>,
+    relation_endpoint_fields: HashMap<(&'s str, &'s str), usize>,
     tables: Vec<Table>,
     table_index: HashMap<&'s str, TableId>,
     column_index: HashMap<(TableId, &'s str), ColumnId>,
@@ -33,8 +33,9 @@ pub fn validate(schema: Schema) -> (Option<ValidatedSchema>, Vec<Diagnostic>) {
     builder.stage_physical();
     builder.stage_structs();
     builder.stage_relations();
+    builder.stage_ownership();
 
-    // TODO: `ValidatedSchema` assembly
+    // TODO: config defaults; `ValidatedSchema` assembly
     (None, builder.diags)
 }
 
@@ -43,7 +44,7 @@ impl<'s> Builder<'s> {
         Builder {
             schema,
             declared_structs: HashSet::new(),
-            forward_ref_relations: HashMap::new(),
+            relation_endpoint_fields: HashMap::new(),
             tables: Vec::new(),
             table_index: HashMap::new(),
             column_index: HashMap::new(),
@@ -85,31 +86,11 @@ impl<'s> Builder<'s> {
                         .entry(name)
                         .or_default()
                         .push(endpoint.struct_name.span);
+                } else {
+                    self.relation_endpoint_fields
+                        .entry((name, endpoint.field_name.as_str()))
+                        .or_insert(index);
                 }
-            }
-
-            match relation.arrow.value {
-                RelationArrow::OneToOne | RelationArrow::ManyToOne => {
-                    let child = relation.child.struct_name.as_str();
-                    let parent = relation.parent.struct_name.as_str();
-                    if self.declared_structs.contains(child)
-                        && self.declared_structs.contains(parent)
-                    {
-                        let (owner, field) = if child == parent {
-                            (
-                                relation.child.struct_name.as_str(),
-                                relation.child.field_name.as_str(),
-                            )
-                        } else {
-                            (
-                                relation.parent.struct_name.as_str(),
-                                relation.parent.field_name.as_str(),
-                            )
-                        };
-                        self.forward_ref_relations.insert((owner, field), index);
-                    }
-                }
-                RelationArrow::OneToMany | RelationArrow::ManyToMany => {}
             }
         }
 
@@ -454,6 +435,41 @@ impl<'s> Builder<'s> {
         }
     }
 
+    fn stage_ownership(&mut self) {
+        let owned: HashSet<StructId> = self
+            .relations
+            .iter()
+            .filter_map(|r| match r {
+                Relation::OneToOne {
+                    child_ref,
+                    parent_ref,
+                    ..
+                }
+                | Relation::ManyToOne {
+                    child_ref,
+                    parent_ref,
+                    ..
+                } if child_ref.struct_id() != parent_ref.struct_id() => Some(child_ref.struct_id()),
+                _ => None,
+            })
+            .collect();
+
+        for root in &self.schema.roots {
+            let Some(&sid) = self.struct_index.get(root.struct_name.as_str()) else {
+                continue;
+            };
+            if owned.contains(&sid) {
+                self.emit_error(SchemaValidationError::OwnedAsRoot {
+                    span: root.struct_name.span,
+                    root: root.name.value.clone(),
+                    struct_name: root.struct_name.value.clone(),
+                });
+            }
+        }
+
+        self.roots.retain(|root| !owned.contains(&root.struct_id));
+    }
+
     fn stage_structs(&mut self) {
         for def in &self.schema.structs {
             let Some(&sid) = self.struct_index.get(def.name.as_str()) else {
@@ -488,71 +504,185 @@ impl<'s> Builder<'s> {
             };
             let is_self = child == parent;
 
-            let (has_forward, forward_fid) = self.resolve_forward(rel, child, is_self);
-            let needs_forward = matches!(
-                rel.arrow.value,
-                RelationArrow::OneToOne | RelationArrow::ManyToOne
-            );
-            if needs_forward && !has_forward {
+            let child_fid = self
+                .field_index
+                .get(&(
+                    rel.child.struct_name.as_str(),
+                    rel.child.field_name.as_str(),
+                ))
+                .copied();
+            let parent_fid = self
+                .field_index
+                .get(&(
+                    rel.parent.struct_name.as_str(),
+                    rel.parent.field_name.as_str(),
+                ))
+                .copied();
+
+            let (Some(child_fid), Some(parent_fid)) = (child_fid, parent_fid) else {
+                for (fid, endpoint) in [(child_fid, &rel.child), (parent_fid, &rel.parent)] {
+                    if fid.is_none() {
+                        self.emit_error(SchemaValidationError::RelationEndpointMissing {
+                            span: endpoint.field_name.span,
+                            struct_name: endpoint.struct_name.value.clone(),
+                            field: endpoint.field_name.value.clone(),
+                        });
+                    }
+                }
+                continue;
+            };
+
+            if child_fid == parent_fid {
+                self.emit_error(SchemaValidationError::DuplicateEndpoint {
+                    span: rel.child.field_name.span,
+                    struct_name: rel.child.struct_name.value.clone(),
+                    field: rel.child.field_name.value.clone(),
+                });
+                continue;
+            }
+            if self.field_is_relation_endpoint(child_fid) {
+                self.emit_error(SchemaValidationError::DuplicateEndpoint {
+                    span: rel.child.field_name.span,
+                    struct_name: rel.child.struct_name.value.clone(),
+                    field: rel.child.field_name.value.clone(),
+                });
+                continue;
+            }
+            if self.field_is_relation_endpoint(parent_fid) {
+                self.emit_error(SchemaValidationError::DuplicateEndpoint {
+                    span: rel.parent.field_name.span,
+                    struct_name: rel.parent.struct_name.value.clone(),
+                    field: rel.parent.field_name.value.clone(),
+                });
                 continue;
             }
 
-            let backrefs = self.backref_plan(rel, child, parent, is_self);
-            if !self.check_backref_collisions(&backrefs) {
-                continue;
+            let child_field =
+                self.structs[child_fid.struct_id().index()].fields[child_fid.local()].clone();
+            let parent_field =
+                self.structs[parent_fid.struct_id().index()].fields[parent_fid.local()].clone();
+
+            let child_shape = match &child_field {
+                Field::Ref {
+                    owning, is_list, ..
+                } => Some(EndpointShape {
+                    owning: *owning,
+                    is_list: *is_list,
+                }),
+                _ => {
+                    self.emit_error(SchemaValidationError::EndpointShapeMismatch {
+                        span: rel.child.field_name.span,
+                        struct_name: rel.child.struct_name.value.clone(),
+                        field: rel.child.field_name.value.clone(),
+                    });
+                    None
+                }
+            };
+            let parent_shape = match &parent_field {
+                Field::Ref {
+                    owning, is_list, ..
+                } => Some(EndpointShape {
+                    owning: *owning,
+                    is_list: *is_list,
+                }),
+                _ => {
+                    self.emit_error(SchemaValidationError::EndpointShapeMismatch {
+                        span: rel.parent.field_name.span,
+                        struct_name: rel.parent.struct_name.value.clone(),
+                        field: rel.parent.field_name.value.clone(),
+                    });
+                    None
+                }
+            };
+
+            if let (Some(child_shape), Some(parent_shape)) = (child_shape, parent_shape) {
+                let (expect_child, expect_parent) =
+                    expected_endpoint_shapes(rel.arrow.value, is_self);
+                if child_shape != expect_child {
+                    self.emit_error(SchemaValidationError::EndpointShapeMismatch {
+                        span: rel.child.field_name.span,
+                        struct_name: rel.child.struct_name.value.clone(),
+                        field: rel.child.field_name.value.clone(),
+                    });
+                }
+                if parent_shape != expect_parent {
+                    self.emit_error(SchemaValidationError::EndpointShapeMismatch {
+                        span: rel.parent.field_name.span,
+                        struct_name: rel.parent.struct_name.value.clone(),
+                        field: rel.parent.field_name.value.clone(),
+                    });
+                }
+                if matches!(rel.arrow.value, RelationArrow::OneToMany)
+                    && !matches!(&parent_field, Field::Ref { optional: true, .. })
+                {
+                    self.emit_error(SchemaValidationError::EndpointShapeMismatch {
+                        span: rel.parent.field_name.span,
+                        struct_name: rel.parent.struct_name.value.clone(),
+                        field: rel.parent.field_name.value.clone(),
+                    });
+                }
+            }
+
+            if let (
+                Field::Ref {
+                    target: child_target,
+                    ..
+                },
+                Field::Ref {
+                    target: parent_target,
+                    ..
+                },
+            ) = (&child_field, &parent_field)
+            {
+                if *child_target != parent {
+                    self.emit_error(SchemaValidationError::EndpointTargetMismatch {
+                        span: rel.child.field_name.span,
+                        struct_name: rel.child.struct_name.value.clone(),
+                        field: rel.child.field_name.value.clone(),
+                        actual: self.structs[child_target.index()].name.clone(),
+                        expected: self.structs[parent.index()].name.clone(),
+                    });
+                }
+                if *parent_target != child {
+                    self.emit_error(SchemaValidationError::EndpointTargetMismatch {
+                        span: rel.parent.field_name.span,
+                        struct_name: rel.parent.struct_name.value.clone(),
+                        field: rel.parent.field_name.value.clone(),
+                        actual: self.structs[parent_target.index()].name.clone(),
+                        expected: self.structs[child.index()].name.clone(),
+                    });
+                }
             }
 
             let columns = match self.resolve_relation_columns(rel, child, parent) {
                 Ok(columns) => columns,
-                Err(note) => {
-                    self.emit_error(SchemaValidationError::ColumnMismatch {
-                        span: rel.arrow.span,
-                        note,
-                    });
+                Err(err) => {
+                    self.emit_error(err);
                     continue;
                 }
             };
 
-            let fids: Vec<FieldId> = backrefs
-                .iter()
-                .map(|b| {
-                    let fid = FieldId::new(b.sid, self.structs[b.sid.index()].fields.len());
-                    self.structs[b.sid.index()].fields.push(Field::BackRef {
-                        name: b.name.to_string(),
-                        target: if b.sid == child { parent } else { child },
-                        is_list: b.is_list,
-                        optional: b.optional,
-                    });
-                    fid
-                })
-                .collect();
-
             let relation = match rel.arrow.value {
-                RelationArrow::OneToOne | RelationArrow::ManyToOne => {
-                    let forward_fid =
-                        forward_fid.expect("owning relations resolve a forward endpoint");
-                    let (child_ref, parent_ref) = if is_self {
-                        (forward_fid, fids[0])
-                    } else {
-                        (fids[0], forward_fid)
-                    };
+                RelationArrow::OneToOne => {
                     let RelationColumns::Direct { fk, pk } = columns else {
-                        unreachable!("owning relations use direct FK mappings")
+                        unreachable!("OneToOne uses a direct FK mapping")
                     };
-                    if matches!(rel.arrow.value, RelationArrow::ManyToOne) {
-                        Relation::ManyToOne {
-                            child_ref,
-                            parent_ref,
-                            fk,
-                            pk,
-                        }
-                    } else {
-                        Relation::OneToOne {
-                            child_ref,
-                            parent_ref,
-                            fk,
-                            pk,
-                        }
+                    Relation::OneToOne {
+                        child_ref: child_fid,
+                        parent_ref: parent_fid,
+                        fk,
+                        pk,
+                    }
+                }
+                RelationArrow::ManyToOne => {
+                    let RelationColumns::Direct { fk, pk } = columns else {
+                        unreachable!("ManyToOne uses a direct FK mapping")
+                    };
+                    Relation::ManyToOne {
+                        child_ref: child_fid,
+                        parent_ref: parent_fid,
+                        fk,
+                        pk,
                     }
                 }
                 RelationArrow::OneToMany => {
@@ -560,8 +690,8 @@ impl<'s> Builder<'s> {
                         unreachable!("OneToMany uses a direct FK mapping")
                     };
                     Relation::OneToMany {
-                        a_ref: fids[0],
-                        b_ref: fids[1],
+                        a_ref: child_fid,
+                        b_ref: parent_fid,
                         fk,
                         pk,
                     }
@@ -578,8 +708,8 @@ impl<'s> Builder<'s> {
                         unreachable!("ManyToMany uses a join-table mapping")
                     };
                     Relation::ManyToMany {
-                        a_ref: fids[0],
-                        b_ref: fids[1],
+                        a_ref: child_fid,
+                        b_ref: parent_fid,
                         join_table,
                         a_col,
                         a_pk,
@@ -592,176 +722,8 @@ impl<'s> Builder<'s> {
         }
     }
 
-    fn resolve_forward(
-        &mut self,
-        rel: &'s crate::ast::Relation,
-        child: StructId,
-        is_self: bool,
-    ) -> (bool, Option<FieldId>) {
-        if matches!(
-            rel.arrow.value,
-            RelationArrow::OneToMany | RelationArrow::ManyToMany
-        ) {
-            return (true, None);
-        }
-        let (owner, field, span) = if is_self {
-            (
-                rel.child.struct_name.as_str(),
-                rel.child.field_name.as_str(),
-                rel.child.field_name.span,
-            )
-        } else {
-            (
-                rel.parent.struct_name.as_str(),
-                rel.parent.field_name.as_str(),
-                rel.parent.field_name.span,
-            )
-        };
-
-        let Some(&fid) = self.field_index.get(&(owner, field)) else {
-            self.emit_error(SchemaValidationError::ForwardRefMissing {
-                span,
-                struct_name: owner.to_string(),
-                field: field.to_string(),
-            });
-            return (false, None);
-        };
-
-        let model = self.structs[fid.struct_id().index()].fields[fid.local()].clone();
-        match model {
-            Field::Ref {
-                target, is_list, ..
-            } => {
-                let wants_list = matches!(rel.arrow.value, RelationArrow::ManyToOne) && !is_self;
-                if is_list != wants_list {
-                    self.emit_error(SchemaValidationError::ForwardRefTypeMismatch {
-                        span,
-                        struct_name: owner.to_string(),
-                        field: field.to_string(),
-                    });
-                }
-                if target != child {
-                    let actual = self.structs[target.index()].name.clone();
-                    let expected = self.structs[child.index()].name.clone();
-                    self.emit_error(SchemaValidationError::ForwardRefTargetMismatch {
-                        span,
-                        struct_name: owner.to_string(),
-                        field: field.to_string(),
-                        actual,
-                        expected,
-                    });
-                }
-                (true, Some(fid))
-            }
-            _ => {
-                self.emit_error(SchemaValidationError::ForwardRefTypeMismatch {
-                    span,
-                    struct_name: owner.to_string(),
-                    field: field.to_string(),
-                });
-                (true, Some(fid))
-            }
-        }
-    }
-
-    fn backref_plan(
-        &self,
-        rel: &'s crate::ast::Relation,
-        child: StructId,
-        parent: StructId,
-        is_self: bool,
-    ) -> Vec<BackrefPlan<'s>> {
-        match rel.arrow.value {
-            RelationArrow::OneToOne | RelationArrow::ManyToOne => {
-                let (sid, struct_name, name, span) = if is_self {
-                    (
-                        parent,
-                        rel.parent.struct_name.as_str(),
-                        rel.parent.field_name.as_str(),
-                        rel.parent.field_name.span,
-                    )
-                } else {
-                    (
-                        child,
-                        rel.child.struct_name.as_str(),
-                        rel.child.field_name.as_str(),
-                        rel.child.field_name.span,
-                    )
-                };
-                let is_list = matches!(rel.arrow.value, RelationArrow::ManyToOne) && is_self;
-                vec![BackrefPlan {
-                    sid,
-                    struct_name,
-                    name,
-                    span,
-                    is_list,
-                    optional: false,
-                }]
-            }
-            RelationArrow::OneToMany => vec![
-                BackrefPlan {
-                    sid: child,
-                    struct_name: rel.child.struct_name.as_str(),
-                    name: rel.child.field_name.as_str(),
-                    span: rel.child.field_name.span,
-                    is_list: true,
-                    optional: false,
-                },
-                BackrefPlan {
-                    sid: parent,
-                    struct_name: rel.parent.struct_name.as_str(),
-                    name: rel.parent.field_name.as_str(),
-                    span: rel.parent.field_name.span,
-                    is_list: false,
-                    optional: true,
-                },
-            ],
-            RelationArrow::ManyToMany => vec![
-                BackrefPlan {
-                    sid: child,
-                    struct_name: rel.child.struct_name.as_str(),
-                    name: rel.child.field_name.as_str(),
-                    span: rel.child.field_name.span,
-                    is_list: true,
-                    optional: false,
-                },
-                BackrefPlan {
-                    sid: parent,
-                    struct_name: rel.parent.struct_name.as_str(),
-                    name: rel.parent.field_name.as_str(),
-                    span: rel.parent.field_name.span,
-                    is_list: true,
-                    optional: false,
-                },
-            ],
-        }
-    }
-
-    fn check_backref_collisions(&mut self, backrefs: &[BackrefPlan<'s>]) -> bool {
-        let mut conflict = false;
-        for b in backrefs {
-            if self.field_index.contains_key(&(b.struct_name, b.name)) {
-                self.emit_error(SchemaValidationError::BackRefInStruct {
-                    span: b.span,
-                    struct_name: b.struct_name.to_string(),
-                    field: b.name.to_string(),
-                });
-                conflict = true;
-            }
-            let duplicate = self.structs[b.sid.index()]
-                .fields
-                .iter()
-                .any(|f| matches!(f, Field::BackRef { name, .. } if name == b.name));
-            if duplicate {
-                self.emit_error(SchemaValidationError::DuplicateBackRefName {
-                    span: b.span,
-                    struct_name: b.struct_name.to_string(),
-                    field: b.name.to_string(),
-                });
-                conflict = true;
-            }
-        }
-        !conflict
+    fn field_is_relation_endpoint(&self, fid: FieldId) -> bool {
+        self.relations.iter().any(|r| r.endpoints().contains(&fid))
     }
 
     fn resolve_relation_columns(
@@ -769,7 +731,7 @@ impl<'s> Builder<'s> {
         rel: &'s crate::ast::Relation,
         child: StructId,
         parent: StructId,
-    ) -> Result<RelationColumns, String> {
+    ) -> Result<RelationColumns, SchemaValidationError> {
         let child_tid = self.struct_table[child.index()];
         let parent_tid = self.struct_table[parent.index()];
         let is_one_to_many = matches!(rel.arrow.value, RelationArrow::OneToMany);
@@ -777,10 +739,9 @@ impl<'s> Builder<'s> {
         match &rel.fk {
             FkMapping::Direct { child, parent } => {
                 if is_many_to_many {
-                    return Err(
-                        "an N:M relation (`<<->>`) requires a `via` join table mapping, not a direct FK"
-                            .into(),
-                    );
+                    return Err(SchemaValidationError::DirectOnManyToMany {
+                        span: rel.arrow.span,
+                    });
                 }
                 let (fk_tid, pk_tid) = if is_one_to_many {
                     (parent_tid, child_tid)
@@ -790,60 +751,51 @@ impl<'s> Builder<'s> {
                 let fk = self
                     .column_index
                     .get(&(fk_tid, child.col.as_str()))
-                    .copied();
+                    .copied()
+                    .expect("relation FK column claimed in physical stage");
                 let pk = self
                     .column_index
                     .get(&(pk_tid, parent.col.as_str()))
-                    .copied();
-                match (fk, pk) {
-                    (Some(fk), Some(pk)) => Ok(RelationColumns::Direct { fk, pk }),
-                    _ => Err(format!(
-                        "could not resolve FK/PK columns `{}.{}` and `{}.{}`",
-                        child.table.value, child.col.value, parent.table.value, parent.col.value
-                    )),
-                }
+                    .copied()
+                    .expect("relation PK column claimed in physical stage");
+                Ok(RelationColumns::Direct { fk, pk })
             }
             FkMapping::Indirect {
                 join_table, a, b, ..
             } => {
                 if !is_many_to_many {
-                    return Err(
-                        "an owning or OneToMany relation requires a direct `(fk -> pk)` mapping, not `via`"
-                            .into(),
-                    );
+                    return Err(SchemaValidationError::ViaOnOwning {
+                        span: rel.arrow.span,
+                    });
                 }
                 let j_tid = self.table_index[join_table.as_str()];
                 let a_col = self
                     .column_index
                     .get(&(j_tid, a.join_col.as_str()))
-                    .copied();
+                    .copied()
+                    .expect("join column claimed in stage II");
                 let a_pk = self
                     .column_index
                     .get(&(child_tid, a.target.col.as_str()))
-                    .copied();
+                    .copied()
+                    .expect("join target column claimed in stage II");
                 let b_col = self
                     .column_index
                     .get(&(j_tid, b.join_col.as_str()))
-                    .copied();
+                    .copied()
+                    .expect("join column claimed in stage II");
                 let b_pk = self
                     .column_index
                     .get(&(parent_tid, b.target.col.as_str()))
-                    .copied();
-                match (a_col, a_pk, b_col, b_pk) {
-                    (Some(a_col), Some(a_pk), Some(b_col), Some(b_pk)) => {
-                        Ok(RelationColumns::Indirect {
-                            join_table: j_tid,
-                            a_col,
-                            a_pk,
-                            b_col,
-                            b_pk,
-                        })
-                    }
-                    _ => Err(format!(
-                        "could not resolve join-table columns for `{}`",
-                        join_table.value
-                    )),
-                }
+                    .copied()
+                    .expect("join target column claimed in stage II");
+                Ok(RelationColumns::Indirect {
+                    join_table: j_tid,
+                    a_col,
+                    a_pk,
+                    b_col,
+                    b_pk,
+                })
             }
         }
     }
@@ -868,6 +820,16 @@ impl<'s> Builder<'s> {
         }
 
         match field_kind(&field.exposed_type) {
+            FieldKind::Value | FieldKind::Array { .. } | FieldKind::ListNoVia
+                if field.non_owning =>
+            {
+                self.emit_error(SchemaValidationError::NonOwningNonRef {
+                    span: field.exposed_type.span(),
+                    struct_name,
+                    field: name,
+                });
+                None
+            }
             FieldKind::Value => {
                 let declared = value_column_refs(field).len();
                 let expected = value_scalar_leaves(&field.exposed_type).len();
@@ -955,7 +917,7 @@ impl<'s> Builder<'s> {
                     return None;
                 }
                 if !self
-                    .forward_ref_relations
+                    .relation_endpoint_fields
                     .contains_key(&(def.name.as_str(), field.name.as_str()))
                 {
                     self.emit_error(SchemaValidationError::UnmatchedForwardRef {
@@ -984,6 +946,7 @@ impl<'s> Builder<'s> {
                     target,
                     optional,
                     is_list,
+                    owning: !field.non_owning,
                 })
             }
         }
@@ -1026,13 +989,69 @@ impl<'s> Builder<'s> {
     }
 }
 
-struct BackrefPlan<'s> {
-    sid: StructId,
-    struct_name: &'s str,
-    name: &'s str,
-    span: Span,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EndpointShape {
+    owning: bool,
     is_list: bool,
-    optional: bool,
+}
+
+fn expected_endpoint_shapes(arrow: RelationArrow, is_self: bool) -> (EndpointShape, EndpointShape) {
+    match arrow {
+        RelationArrow::OneToOne => (
+            EndpointShape {
+                owning: false,
+                is_list: false,
+            },
+            if is_self {
+                EndpointShape {
+                    owning: false,
+                    is_list: false,
+                }
+            } else {
+                EndpointShape {
+                    owning: true,
+                    is_list: false,
+                }
+            },
+        ),
+        RelationArrow::ManyToOne => (
+            EndpointShape {
+                owning: false,
+                is_list: false,
+            },
+            if is_self {
+                EndpointShape {
+                    owning: false,
+                    is_list: true,
+                }
+            } else {
+                EndpointShape {
+                    owning: true,
+                    is_list: true,
+                }
+            },
+        ),
+        RelationArrow::OneToMany => (
+            EndpointShape {
+                owning: false,
+                is_list: true,
+            },
+            EndpointShape {
+                owning: false,
+                is_list: false,
+            },
+        ),
+        RelationArrow::ManyToMany => (
+            EndpointShape {
+                owning: false,
+                is_list: true,
+            },
+            EndpointShape {
+                owning: false,
+                is_list: true,
+            },
+        ),
+    }
 }
 
 enum RelationColumns {
@@ -1221,18 +1240,19 @@ mod tests {
     fn unknown_relation_endpoint() {
         stage_identity("rel Profile.user <-> User.profile (a.a -> b.b);", |b| {
             assert_eq!(codes(&b.diags), vec!["SV0001", "SV0001"]);
-            assert!(b.forward_ref_relations.is_empty());
+            assert!(b.relation_endpoint_fields.is_empty());
         });
     }
 
     #[test]
-    fn one_to_many_claims_no_forward() {
+    fn one_to_many_claims_both_endpoints() {
         stage_identity(
             "struct A {} struct B {} rel A.x <->> B.y (a.a -> b.b);",
             |b| {
                 assert!(b.diags.is_empty());
-                assert!(!b.forward_ref_relations.contains_key(&("A", "x")));
-                assert!(!b.forward_ref_relations.contains_key(&("B", "y")));
+                assert_eq!(b.relation_endpoint_fields.len(), 2);
+                assert_eq!(b.relation_endpoint_fields.get(&("A", "x")), Some(&0));
+                assert_eq!(b.relation_endpoint_fields.get(&("B", "y")), Some(&0));
             },
         );
     }
@@ -1267,39 +1287,52 @@ mod tests {
     }
 
     #[test]
-    fn forward_endpoint_claims_parent_field() {
+    fn relation_claims_both_endpoints() {
         stage_identity(
             "struct User { orders: List<Order> } struct Order {} \
              rel Order.user <<-> User.orders (a.a -> b.b);",
             |b| {
                 assert!(b.diags.is_empty());
-                assert_eq!(b.forward_ref_relations.len(), 1);
-                assert_eq!(b.forward_ref_relations.get(&("User", "orders")), Some(&0));
+                assert_eq!(b.relation_endpoint_fields.len(), 2);
+                assert_eq!(
+                    b.relation_endpoint_fields.get(&("User", "orders")),
+                    Some(&0)
+                );
+                assert_eq!(b.relation_endpoint_fields.get(&("Order", "user")), Some(&0));
             },
         );
     }
 
     #[test]
-    fn forward_endpoint_self_ref_claims_child_field() {
+    fn self_ref_claims_both_endpoints() {
         stage_identity(
             "struct User { manager: ?User } \
              rel User.manager <<-> User.subordinates (a.a -> b.b);",
             |b| {
                 assert!(b.diags.is_empty());
-                assert_eq!(b.forward_ref_relations.len(), 1);
-                assert_eq!(b.forward_ref_relations.get(&("User", "manager")), Some(&0));
+                assert_eq!(b.relation_endpoint_fields.len(), 2);
+                assert_eq!(
+                    b.relation_endpoint_fields.get(&("User", "manager")),
+                    Some(&0)
+                );
+                assert_eq!(
+                    b.relation_endpoint_fields.get(&("User", "subordinates")),
+                    Some(&0)
+                );
             },
         );
     }
 
     #[test]
-    fn many_to_many_claims_no_forward() {
+    fn many_to_many_claims_both_endpoints() {
         stage_identity(
             "struct User {} struct Role {} \
              rel Role.users <<->> User.roles via jt[role_id -> roles.id, user_id -> users.id];",
             |b| {
                 assert!(b.diags.is_empty());
-                assert!(b.forward_ref_relations.is_empty());
+                assert_eq!(b.relation_endpoint_fields.len(), 2);
+                assert_eq!(b.relation_endpoint_fields.get(&("Role", "users")), Some(&0));
+                assert_eq!(b.relation_endpoint_fields.get(&("User", "roles")), Some(&0));
             },
         );
     }
@@ -1654,9 +1687,9 @@ mod tests {
     fn structs_with_declared_fields() {
         stage_structs(
             "root users: User; \
-             struct User { name: String, manager: ?User, orders: List<Order>, \
-             tags: List<String>@id via user_tags[id, tag_value] } \
-             struct Order { total: Dec@order_total } \
+             struct User { name: String, manager: &?User, subordinates: &List<User>, \
+             orders: List<Order>, tags: List<String>@id via user_tags[id, tag_value] } \
+             struct Order { total: Dec@order_total, user: &User } \
              rel User.manager <<-> User.subordinates (users.manager_id -> users.id); \
              rel Order.user <<-> User.orders (orders.user_id -> users.id);",
             |b| {
@@ -1665,7 +1698,7 @@ mod tests {
                 let user = &b.structs[0];
                 assert_eq!(user.name, "User");
                 assert_eq!(user.table, TableId::new(0));
-                assert_eq!(user.fields.len(), 4);
+                assert_eq!(user.fields.len(), 5);
 
                 let name = b.field_index[&("User", "name")];
                 assert_eq!(name.struct_id(), StructId::new(0));
@@ -1685,23 +1718,37 @@ mod tests {
                         target,
                         optional: true,
                         is_list: false,
+                        owning: false,
+                        ..
+                    } if target == StructId::new(0)
+                ));
+
+                let subordinates = b.field_index[&("User", "subordinates")];
+                assert_eq!(subordinates.local(), 2);
+                assert!(matches!(
+                    user.fields[subordinates.local()],
+                    Field::Ref {
+                        target,
+                        is_list: true,
+                        owning: false,
                         ..
                     } if target == StructId::new(0)
                 ));
 
                 let orders = b.field_index[&("User", "orders")];
-                assert_eq!(orders.local(), 2);
+                assert_eq!(orders.local(), 3);
                 assert!(matches!(
                     user.fields[orders.local()],
                     Field::Ref {
                         target,
                         is_list: true,
+                        owning: true,
                         ..
                     } if target == StructId::new(1)
                 ));
 
                 let tags = b.field_index[&("User", "tags")];
-                assert_eq!(tags.local(), 3);
+                assert_eq!(tags.local(), 4);
                 let Field::Array {
                     element,
                     link,
@@ -1922,16 +1969,18 @@ mod tests {
     }
 
     #[test]
-    fn one_to_many_endpoint_field_unmatched() {
+    fn non_owning_on_value_shape_excluded() {
         stage_structs(
-            "root images: Image; root messages: Message; \
-             struct Image {} struct Message { image: ?Image } \
-             rel Image.messages <->> Message.image (messages.image_id -> images.id);",
+            "root users: User; struct User { \
+             a: &Int, b: &List<Int>, c: &Tuple<Int, Int>, d: &List<String>@id via t[k, v] }",
             |b| {
-                assert_eq!(codes(&b.diags), vec!["SV0012"]);
+                assert_eq!(
+                    codes(&b.diags),
+                    vec!["SV0021", "SV0021", "SV0021", "SV0021"]
+                );
                 assert!(b.structs[0].fields.is_empty());
-                assert!(b.structs[1].fields.is_empty());
-                assert!(!b.field_index.contains_key(&("Message", "image")));
+                assert!(!b.field_index.contains_key(&("User", "a")));
+                assert!(!b.field_index.contains_key(&("User", "d")));
             },
         );
     }
@@ -1955,7 +2004,7 @@ mod tests {
     fn relations_one_to_one() {
         stage_relations(
             "root profiles: Profile; root users: User; \
-             struct Profile { bio: String } struct User { profile: Profile } \
+             struct Profile { bio: String, user: &User } struct User { profile: Profile } \
              rel Profile.user <-> User.profile (profiles.user_id -> users.id);",
             |b| {
                 assert!(b.diags.is_empty());
@@ -1980,11 +2029,12 @@ mod tests {
                 assert_eq!(*pk, b.column_index[&(b.struct_table[user.index()], "id")]);
                 assert!(matches!(
                     b.structs[profile.index()].fields[1],
-                    Field::BackRef {
+                    Field::Ref {
                         name: ref n,
                         target,
                         is_list: false,
                         optional: false,
+                        owning: false,
                     } if n == "user" && target == user
                 ));
             },
@@ -1995,7 +2045,7 @@ mod tests {
     fn relations_many_to_one() {
         stage_relations(
             "root users: User; struct User { orders: List<Order> } \
-             struct Order { total: Dec } \
+             struct Order { total: Dec, user: &User } \
              rel Order.user <<-> User.orders (orders.user_id -> users.id);",
             |b| {
                 assert!(b.diags.is_empty());
@@ -2024,7 +2074,7 @@ mod tests {
     #[test]
     fn relations_self_reference() {
         stage_relations(
-            "root users: User; struct User { manager: ?User } \
+            "root users: User; struct User { manager: &?User, subordinates: &List<User> } \
              rel User.manager <<-> User.subordinates (users.manager_id -> users.id);",
             |b| {
                 assert!(b.diags.is_empty());
@@ -2047,11 +2097,12 @@ mod tests {
                 assert_eq!(*pk, b.column_index[&(b.struct_table[user.index()], "id")]);
                 assert!(matches!(
                     b.structs[user.index()].fields[1],
-                    Field::BackRef {
+                    Field::Ref {
                         name: ref n,
                         target,
                         is_list: true,
                         optional: false,
+                        owning: false,
                     } if n == "subordinates" && target == user
                 ));
             },
@@ -2062,7 +2113,8 @@ mod tests {
     fn relations_one_to_many() {
         stage_relations(
             "root images: Image; root messages: Message; \
-             struct Image { uploaded: Instant } struct Message { text: String } \
+             struct Image { uploaded: Instant, messages: &List<Message> } \
+             struct Message { text: String, image: &?Image } \
              rel Image.messages <->> Message.image (messages.image_id -> images.id);",
             |b| {
                 assert!(b.diags.is_empty());
@@ -2086,20 +2138,22 @@ mod tests {
                 assert_eq!(*pk, b.column_index[&(b.struct_table[image.index()], "id")]);
                 assert!(matches!(
                     b.structs[image.index()].fields[1],
-                    Field::BackRef {
+                    Field::Ref {
                         name: ref n,
                         target,
                         is_list: true,
-                        optional: false,
+                        owning: false,
+                        ..
                     } if n == "messages" && target == message
                 ));
                 assert!(matches!(
                     b.structs[message.index()].fields[1],
-                    Field::BackRef {
+                    Field::Ref {
                         name: ref n,
                         target,
                         is_list: false,
                         optional: true,
+                        owning: false,
                     } if n == "image" && target == image
                 ));
             },
@@ -2109,8 +2163,8 @@ mod tests {
     #[test]
     fn relations_many_to_many() {
         stage_relations(
-            "root roles: Role; root users: User; struct Role { name: String } \
-             struct User { name: String } \
+            "root roles: Role; root users: User; struct Role { name: String, users: &List<User> } \
+             struct User { name: String, roles: &List<Role> } \
              rel Role.users <<->> User.roles via user_roles[role_id -> roles.id, user_id -> users.id];",
             |b| {
                 assert!(b.diags.is_empty());
@@ -2137,17 +2191,19 @@ mod tests {
                 assert_eq!(*b_pk, b.column_index[&(b.struct_table[user.index()], "id")]);
                 assert!(matches!(
                     b.structs[role.index()].fields[1],
-                    Field::BackRef {
+                    Field::Ref {
                         name: ref n,
                         is_list: true,
+                        owning: false,
                         ..
                     } if n == "users"
                 ));
                 assert!(matches!(
                     b.structs[user.index()].fields[1],
-                    Field::BackRef {
+                    Field::Ref {
                         name: ref n,
                         is_list: true,
+                        owning: false,
                         ..
                     } if n == "roles"
                 ));
@@ -2156,23 +2212,21 @@ mod tests {
     }
 
     #[test]
-    fn forward_ref_missing() {
+    fn relation_endpoint_undeclared() {
         stage_relations(
             "root users: User; struct User {} struct Order {} \
              rel Order.user <<-> User.orders (orders.user_id -> users.id);",
             |b| {
-                assert_eq!(codes(&b.diags), vec!["SV0013"]);
+                assert_eq!(codes(&b.diags), vec!["SV0013", "SV0013"]);
                 assert!(b.relations.is_empty());
-                let order = *b.struct_index.get("Order").unwrap();
-                assert!(b.structs[order.index()].fields.is_empty());
             },
         );
     }
 
     #[test]
-    fn forward_ref_type_mismatch() {
+    fn endpoint_shape_mismatch() {
         stage_relations(
-            "root users: User; struct User { orders: Order } struct Order {} \
+            "root users: User; struct User { orders: Order } struct Order { user: &User } \
              rel Order.user <<-> User.orders (orders.user_id -> users.id);",
             |b| {
                 assert_eq!(codes(&b.diags), vec!["SV0014"]);
@@ -2182,45 +2236,53 @@ mod tests {
     }
 
     #[test]
-    fn forward_ref_target_mismatch() {
+    fn endpoint_target_mismatch() {
         stage_relations(
-            "root users: User; root roles: Role; struct User { orders: List<Role> } \
-             struct Order {} struct Role {} \
+            "root users: User; root roles: Role; \
+             struct User { orders: List<Role> } struct Order { user: &Role } struct Role {} \
              rel Order.user <<-> User.orders (orders.user_id -> users.id);",
             |b| {
-                assert_eq!(codes(&b.diags), vec!["SV0016"]);
+                assert_eq!(codes(&b.diags), vec!["SV0016", "SV0016"]);
                 assert_eq!(b.relations.len(), 1);
             },
         );
     }
 
     #[test]
-    fn backref_in_struct() {
+    fn value_endpoint_reported() {
         stage_relations(
             "root profiles: Profile; root users: User; \
              struct Profile { user: String, bio: String } struct User { profile: Profile } \
              rel Profile.user <-> User.profile (profiles.user_id -> users.id);",
             |b| {
-                assert_eq!(codes(&b.diags), vec!["SV0015"]);
-                assert!(b.relations.is_empty());
-                let profile = *b.struct_index.get("Profile").unwrap();
-                assert_eq!(b.structs[profile.index()].fields.len(), 2);
+                assert_eq!(codes(&b.diags), vec!["SV0014"]);
+                assert_eq!(b.relations.len(), 1);
             },
         );
     }
 
     #[test]
-    fn duplicate_backref_name() {
+    fn duplicate_endpoint_excluded() {
         stage_relations(
             "root users: User; root orders: Order; \
-             struct User { a: List<Order>, b: List<Order> } struct Order {} \
+             struct User { a: List<Order>, b: List<Order> } struct Order { user: &User } \
              rel Order.user <<-> User.a (orders.user_id -> users.id); \
              rel Order.user <<-> User.b (orders.user_id2 -> users.id);",
             |b| {
-                assert_eq!(codes(&b.diags), vec!["SV0018"]);
+                assert_eq!(codes(&b.diags), vec!["SV0019"]);
                 assert_eq!(b.relations.len(), 1);
-                let order = *b.struct_index.get("Order").unwrap();
-                assert_eq!(b.structs[order.index()].fields.len(), 1);
+            },
+        );
+    }
+
+    #[test]
+    fn relation_self_endpoint_excluded() {
+        stage_relations(
+            "root users: User; struct User { profile: &User } \
+             rel User.profile <-> User.profile (users.a_id -> users.id);",
+            |b| {
+                assert_eq!(codes(&b.diags), vec!["SV0019"]);
+                assert!(b.relations.is_empty());
             },
         );
     }
@@ -2228,7 +2290,7 @@ mod tests {
     #[test]
     fn column_mismatch_via_on_owning() {
         stage_relations(
-            "root users: User; struct User { orders: List<Order> } struct Order {} \
+            "root users: User; struct User { orders: List<Order> } struct Order { user: &User } \
              rel Order.user <<-> User.orders via user_roles[order_id -> orders.id, user_id -> users.id];",
             |b| {
                 assert_eq!(codes(&b.diags), vec!["SV0017"]);
@@ -2240,11 +2302,81 @@ mod tests {
     #[test]
     fn column_mismatch_n_m_direct() {
         stage_relations(
-            "root users: User; root roles: Role; struct User {} struct Role {} \
+            "root users: User; root roles: Role; \
+             struct User { roles: &List<Role> } struct Role { users: &List<User> } \
              rel Role.users <<->> User.roles (roles.user_id -> users.id);",
             |b| {
-                assert_eq!(codes(&b.diags), vec!["SV0017"]);
+                assert_eq!(codes(&b.diags), vec!["SV0018"]);
                 assert!(b.relations.is_empty());
+            },
+        );
+    }
+
+    fn stage_ownership(source: &str, f: impl FnOnce(&Builder<'_>)) {
+        let (schema, parse_diags) = parse_schema(source);
+        assert!(
+            parse_diags.is_empty(),
+            "expected no parse errors: {parse_diags:?}"
+        );
+        let schema = schema.expect("source should parse");
+        let mut builder = Builder::new(&schema);
+        builder.stage_identity();
+        builder.stage_physical();
+        builder.stage_structs();
+        builder.stage_relations();
+        builder.stage_ownership();
+        f(&builder);
+    }
+
+    #[test]
+    fn one_to_one_child_root_error() {
+        stage_ownership(
+            "root profiles: Profile; root users: User; \
+             struct Profile { user: &User, bio: String } struct User { profile: Profile } \
+             rel Profile.user <-> User.profile (profiles.user_id -> users.id);",
+            |b| {
+                assert_eq!(codes(&b.diags), vec!["SV0020"]);
+                assert_eq!(b.roots.len(), 1);
+                assert_eq!(b.roots[0].name, "users");
+            },
+        );
+    }
+
+    #[test]
+    fn many_to_one_child_root_error() {
+        stage_ownership(
+            "root users: User; root orders: Order; \
+             struct User { orders: List<Order> } struct Order { user: &User } \
+             rel Order.user <<-> User.orders (orders.user_id -> users.id);",
+            |b| {
+                assert_eq!(codes(&b.diags), vec!["SV0020"]);
+                assert_eq!(b.roots.len(), 1);
+                assert_eq!(b.roots[0].name, "users");
+            },
+        );
+    }
+
+    #[test]
+    fn non_owning_sides_may_be_roots() {
+        stage_ownership(
+            "root users: User; root messages: Message; \
+             struct User { messages: &List<Message> } struct Message { user: &?User } \
+             rel User.messages <->> Message.user (messages.user_id -> users.id);",
+            |b| {
+                assert!(b.diags.is_empty());
+                assert_eq!(b.roots.len(), 2);
+            },
+        );
+    }
+
+    #[test]
+    fn self_ref_root_not_owned() {
+        stage_ownership(
+            "root users: User; struct User { manager: &?User, subordinates: &List<User> } \
+             rel User.manager <<-> User.subordinates (users.manager_id -> users.id);",
+            |b| {
+                assert!(b.diags.is_empty());
+                assert_eq!(b.roots.len(), 1);
             },
         );
     }

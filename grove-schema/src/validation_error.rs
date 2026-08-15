@@ -2,7 +2,6 @@ use grove_types::{Diagnostic, Label, LabelStyle, Span};
 
 use crate::error::error_simple;
 
-#[rustfmt::skip] // preserve one-line-per-variant formatting
 #[derive(Debug, Clone)]
 pub enum SchemaValidationError {
     UnknownStructRef {
@@ -14,7 +13,10 @@ pub enum SchemaValidationError {
         name: String,
         tables: Vec<String>,
     },
-    StructNoTable { span: Span, name: String },
+    StructNoTable {
+        span: Span,
+        name: String,
+    },
     DuplicateTable {
         span: Span,
         name: String,
@@ -63,33 +65,40 @@ pub enum SchemaValidationError {
         struct_name: String,
         field: String,
     },
-    ForwardRefMissing {
+    RelationEndpointMissing {
         span: Span,
         struct_name: String,
         field: String,
     },
-    ForwardRefTypeMismatch {
+    EndpointShapeMismatch {
         span: Span,
         struct_name: String,
         field: String,
     },
-    BackRefInStruct {
-        span: Span,
-        struct_name: String,
-        field: String,
-    },
-    ForwardRefTargetMismatch {
+    EndpointTargetMismatch {
         span: Span,
         struct_name: String,
         field: String,
         actual: String,
         expected: String,
     },
-    ColumnMismatch {
+    ViaOnOwning {
         span: Span,
-        note: String,
     },
-    DuplicateBackRefName {
+    DirectOnManyToMany {
+        span: Span,
+    },
+    DuplicateEndpoint {
+        span: Span,
+        struct_name: String,
+        field: String,
+    },
+    OwnedAsRoot {
+        span: Span,
+        root: String,
+        struct_name: String,
+    },
+    NonOwningNonRef {
         span: Span,
         struct_name: String,
         field: String,
@@ -270,49 +279,34 @@ impl From<SchemaValidationError> for Diagnostic {
                 "unrepresentable reference",
             )
             .with_help("struct references must be matched by a `rel` forward reference"),
-            ForwardRefMissing {
+            RelationEndpointMissing {
                 span,
                 struct_name,
                 field,
             } => error_simple(
                 "SV0013",
-                format!(
-                    "relation cannot be built: `{struct_name}.{field}` is not declared as a \
-                     forward reference"
-                ),
+                format!("relation endpoint `{struct_name}.{field}` is not declared as a field"),
                 span,
-                "missing forward reference",
+                "undeclared endpoint",
             )
-            .with_help("declare the forward side of this relation as a field on the owning struct"),
-            ForwardRefTypeMismatch {
+            .with_help("every relation endpoint must be a declared struct field"),
+            EndpointShapeMismatch {
                 span,
                 struct_name,
                 field,
             } => error_simple(
                 "SV0014",
                 format!(
-                    "forward reference `{struct_name}.{field}` has the wrong shape for this \
-                     relation"
+                    "endpoint field `{struct_name}.{field}` doesn't match this relation's shape \
+                     or `&` marker"
                 ),
                 span,
-                "wrong forward-reference shape",
+                "wrong endpoint shape",
             )
             .with_note(
-                "a `<<->` (1:N) relation requires the parent to declare `List<Child>`; a `<->` \
-                 (1:1) relation requires `Child` or `?Child`",
+                "endpoint fields must carry the `&` marker and shape the relation's type requires",
             ),
-            BackRefInStruct {
-                span,
-                struct_name,
-                field,
-            } => error_simple(
-                "SV0015",
-                format!("back-reference `{struct_name}.{field}` collides with a declared field"),
-                span,
-                "already a declared field",
-            )
-            .with_help("rename the field or change the relation's back-reference name"),
-            ForwardRefTargetMismatch {
+            EndpointTargetMismatch {
                 span,
                 struct_name,
                 field,
@@ -321,32 +315,62 @@ impl From<SchemaValidationError> for Diagnostic {
             } => error_simple(
                 "SV0016",
                 format!(
-                    "forward reference `{struct_name}.{field}` points at `{actual}`, but this \
+                    "endpoint field `{struct_name}.{field}` points at `{actual}`, but this \
                      relation expects `{expected}`"
                 ),
                 span,
                 "wrong reference target",
             ),
-            ColumnMismatch { span, note } => error_simple(
+            ViaOnOwning { span } => error_simple(
                 "SV0017",
-                "the relation's FK mapping does not match its expected column layout",
+                "`via` mapping on owning relation",
                 span,
-                "column mismatch",
+                "relation type doesn't support `via`",
             )
-            .with_note(note),
-            DuplicateBackRefName {
+            .with_note("an owning or OneToMany relation requires a direct mapping, not `via`"),
+            DirectOnManyToMany { span } => error_simple(
+                "SV0018",
+                "direct mapping on M:N relation",
+                span,
+                "relation type requires `via`",
+            )
+            .with_note("a ManyToMany relation requires a `via` join table, not a direct mapping"),
+            DuplicateEndpoint {
                 span,
                 struct_name,
                 field,
             } => error_simple(
-                "SV0018",
+                "SV0019",
+                format!("field `{struct_name}.{field}` is already an endpoint of another relation"),
+                span,
+                "already a relation endpoint",
+            ),
+            OwnedAsRoot {
+                span,
+                root,
+                struct_name,
+            } => error_simple(
+                "SV0020",
                 format!(
-                    "back-reference `{struct_name}.{field}` collides with another relation's \
-                     back-reference"
+                    "root `{root}` exposes `{struct_name}`, which is already owned by a relation"
                 ),
                 span,
-                "already a back-reference",
-            ),
+                "owned struct as root",
+            )
+            .with_note("every struct must either be owned by another struct through a relation or be declared as a root"),
+            NonOwningNonRef {
+                span,
+                struct_name,
+                field,
+            } => error_simple(
+                "SV0021",
+                format!(
+                    "field `{struct_name}.{field}` is marked `&` but is not a struct reference"
+                ),
+                span,
+                "`&` on a non-reference",
+            )
+            .with_note("`&` is only valid on a struct reference: `S`, `?S`, or `List<S>`"),
         }
     }
 }

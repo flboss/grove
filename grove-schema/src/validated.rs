@@ -178,12 +178,7 @@ pub enum Field {
         target: StructId,
         optional: bool,
         is_list: bool,
-    },
-    BackRef {
-        name: String,
-        target: StructId,
-        is_list: bool,
-        optional: bool,
+        owning: bool,
     },
 }
 
