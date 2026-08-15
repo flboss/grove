@@ -61,8 +61,7 @@ pub enum TokenKind {
     Percent,
     AmpAmp,
     PipePipe,
-    ColonColon,
+    DoubleColon,
 
     Eof,
 }
-
