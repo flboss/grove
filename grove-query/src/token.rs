@@ -22,8 +22,6 @@ pub enum TokenKind {
     Int,
     Float,
     Dec,
-    Bool,
-    String,
 
     // Literals
     Ident(String),
