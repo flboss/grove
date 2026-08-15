@@ -195,26 +195,24 @@ impl<'src> Lexer<'src> {
     }
 
     fn scan_backtick_ident(&mut self, start: usize) -> Token {
-        let mut content = String::new();
+        let content_start = self.pos;
         loop {
             match self.peek_char() {
                 None | Some('\n') => {
                     self.emit_error(QueryLexError::UnclosedBacktickIdent {
                         span: self.span_from(start),
                     });
-                    break;
+                    let content = self.source[content_start..self.pos].to_string();
+                    return self.make_token(start, TokenKind::Ident(content));
                 }
                 Some('`') => {
+                    let content = self.source[content_start..self.pos].to_string();
                     self.bump();
-                    break;
+                    return self.make_token(start, TokenKind::Ident(content));
                 }
-                Some(ch) => {
-                    self.bump();
-                    content.push(ch);
-                }
+                Some(_) => self.bump(),
             }
         }
-        self.make_token(start, TokenKind::Ident(content))
     }
 
     fn scan_string(&mut self, start: usize) -> Token {
