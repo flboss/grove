@@ -41,6 +41,12 @@ pub enum QueryLexError {
     InstantUnixOverflow { span: Span },
     InstantSuffixInvalid { span: Span },
     FractionRounded { span: Span },
+
+    DurationExpected { span: Span },
+    DurationUnitMissing { span: Span },
+    DurationUnitDuplicate { span: Span, unit: char },
+    DurationFractionOnNonSecond { span: Span },
+    DurationOverflow { span: Span },
 }
 
 impl From<QueryLexError> for Diagnostic {
@@ -170,7 +176,7 @@ impl From<QueryLexError> for Diagnostic {
                 "QL0021",
                 "decimal literal has more than 28 significant digits",
                 span,
-                "precision lost",
+                "precision lost (rounded)",
             ),
             InstantExpected { span } => error_simple(
                 "QL0022",
@@ -249,7 +255,39 @@ impl From<QueryLexError> for Diagnostic {
                 "QL0034",
                 "fractional seconds exceed nanosecond precision",
                 span,
-                "precision lost",
+                "precision lost (rounded)",
+            ),
+            DurationExpected { span } => error_simple(
+                "QL0035",
+                "expected a duration literal after `#`",
+                span,
+                "expected `<digits><unit>`",
+            ),
+            DurationUnitMissing { span } => error_simple(
+                "QL0036",
+                "expected a duration unit after the number",
+                span,
+                "expected duration unit",
+            )
+            .with_help("valid units are: `y`, `w`, `d`, `h`, `m`, and `s`"),
+            DurationUnitDuplicate { span, unit } => error_simple(
+                "QL0037",
+                format!("duration unit `{unit}` appears more than once"),
+                span,
+                "duplicate unit",
+            ),
+            DurationFractionOnNonSecond { span } => error_simple(
+                "QL0038",
+                "fractional not supported by duration component",
+                span,
+                "fractional unit",
+            )
+            .with_note("only the seconds component may be fractional"),
+            DurationOverflow { span } => error_simple(
+                "QL0039",
+                "duration literal is out of range",
+                span,
+                "out of range",
             ),
         }
     }
