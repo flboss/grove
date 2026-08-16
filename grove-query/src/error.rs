@@ -21,6 +21,12 @@ pub enum QueryLexError {
     UnexpectedPipe { span: Span },
     UnexpectedQuestion { span: Span },
     UnexpectedColon { span: Span },
+
+    IncompleteExponent { span: Span },
+    IntLiteralOverflow { span: Span },
+    DecLiteralOverflow { span: Span },
+    UnexpectedDotInNumber { span: Span },
+    DecimalRounded { span: Span },
 }
 
 impl From<QueryLexError> for Diagnostic {
@@ -118,6 +124,40 @@ impl From<QueryLexError> for Diagnostic {
                 error_simple("QL0016", "unexpected `:`", span, "unexpected `:`")
                     .with_help("use `::` for type paths")
             }
+            IncompleteExponent { span } => error_simple(
+                "QL0017",
+                "incomplete exponent in numeric literal",
+                span,
+                "expected digits after `e`/`E`",
+            ),
+            IntLiteralOverflow { span } => error_simple(
+                "QL0018",
+                "integer literal is too large",
+                span,
+                "out of range",
+            )
+            .with_help(
+                "the valid range `Int` values is -9223372036854775808..=9223372036854775807",
+            ),
+            DecLiteralOverflow { span } => error_simple(
+                "QL0019",
+                "decimal literal is out of range",
+                span,
+                "out of range",
+            )
+            .with_help("`Dec` supports up to 28 significant digits"),
+            UnexpectedDotInNumber { span } => error_simple(
+                "QL0020",
+                "unexpected `.` in numeric literal",
+                span,
+                "unexpected `.`",
+            ),
+            DecimalRounded { span } => warning_simple(
+                "QL0021",
+                "decimal literal has more than 28 significant digits",
+                span,
+                "precision lost",
+            ),
         }
     }
 }
@@ -130,6 +170,26 @@ pub fn error_simple(
 ) -> Diagnostic {
     Diagnostic {
         severity: Severity::Error,
+        code: code.into(),
+        message: message.into(),
+        labels: vec![Label {
+            span,
+            message: label.into(),
+            style: LabelStyle::Primary,
+        }],
+        notes: Vec::new(),
+        help: Vec::new(),
+    }
+}
+
+pub fn warning_simple(
+    code: &'static str,
+    message: impl Into<DiagStr>,
+    span: Span,
+    label: impl Into<DiagStr>,
+) -> Diagnostic {
+    Diagnostic {
+        severity: Severity::Warning,
         code: code.into(),
         message: message.into(),
         labels: vec![Label {
