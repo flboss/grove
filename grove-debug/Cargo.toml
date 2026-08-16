@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 grove-schema.workspace = true
+grove-query.workspace = true
 grove-types.workspace = true
 
 ariadne.workspace = true

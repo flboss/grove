@@ -12,7 +12,6 @@ struct Cli {
     command: Command,
 }
 
-#[allow(clippy::enum_variant_names)]
 #[derive(Subcommand)]
 enum Command {
     /// Tokenize a schema file and display the token stream.
@@ -44,6 +43,16 @@ enum Command {
         #[arg(long)]
         raw: bool,
     },
+
+    /// Tokenize a query file and display the token stream.
+    QueryLex {
+        /// Path to the query file
+        path: PathBuf,
+
+        /// Display diagnostics as raw Debug output instead of using ariadne
+        #[arg(long)]
+        raw: bool,
+    },
 }
 
 fn main() {
@@ -52,6 +61,7 @@ fn main() {
         Command::SchemaLex { path, raw } => schema_lex(&path, raw),
         Command::SchemaParse { path, raw } => schema_parse(&path, raw),
         Command::SchemaValidate { path, raw } => schema_validate(&path, raw),
+        Command::QueryLex { path, raw } => query_lex(&path, raw),
     }
 }
 
@@ -69,6 +79,41 @@ fn schema_lex(path: &PathBuf, raw: bool) {
     loop {
         let tok = lexer.next_token();
         let is_eof = matches!(tok.value, grove_schema::token::TokenKind::Eof);
+        tokens.push(tok);
+        if is_eof {
+            break;
+        }
+    }
+    let diagnostics = lexer.finalize();
+
+    println!("=== Tokens ===");
+    for tok in &tokens {
+        let kind = format!("{:?}", tok.value);
+        let span = &tok.span;
+        let text: String = source[span.start..span.end].chars().collect();
+        println!(
+            "  [{:>4}..{:<4}) {:30} {:?}",
+            span.start, span.end, kind, text
+        );
+    }
+
+    print_diagnostics(&source, path, &diagnostics, raw);
+}
+
+fn query_lex(path: &PathBuf, raw: bool) {
+    let source = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error reading {}: {e}", path.display());
+            std::process::exit(1);
+        }
+    };
+
+    let mut lexer = grove_query::lex::Lexer::new(&source);
+    let mut tokens = Vec::new();
+    loop {
+        let tok = lexer.next_token();
+        let is_eof = matches!(tok.value, grove_query::token::TokenKind::Eof);
         tokens.push(tok);
         if is_eof {
             break;

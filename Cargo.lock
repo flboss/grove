@@ -310,6 +310,7 @@ version = "0.1.0"
 dependencies = [
  "ariadne",
  "clap",
+ "grove-query",
  "grove-schema",
  "grove-types",
 ]
