@@ -27,6 +27,20 @@ pub enum QueryLexError {
     DecLiteralOverflow { span: Span },
     UnexpectedDotInNumber { span: Span },
     DecimalRounded { span: Span },
+
+    InstantExpected { span: Span },
+    InstantNameInvalid { span: Span, name: String },
+    InstantYearInvalid { span: Span },
+    InstantMonthInvalid { span: Span },
+    InstantDayInvalid { span: Span },
+    InstantHourInvalid { span: Span },
+    InstantMinuteInvalid { span: Span },
+    InstantSecondInvalid { span: Span },
+    InstantTimeColonExpected { span: Span },
+    InstantUnixSecondsMissing { span: Span },
+    InstantUnixOverflow { span: Span },
+    InstantSuffixInvalid { span: Span },
+    FractionRounded { span: Span },
 }
 
 impl From<QueryLexError> for Diagnostic {
@@ -155,6 +169,85 @@ impl From<QueryLexError> for Diagnostic {
             DecimalRounded { span } => warning_simple(
                 "QL0021",
                 "decimal literal has more than 28 significant digits",
+                span,
+                "precision lost",
+            ),
+            InstantExpected { span } => error_simple(
+                "QL0022",
+                "expected an instant literal after `@`",
+                span,
+                "expected `now`, `today`, `unix`, or a date",
+            ),
+            InstantNameInvalid { span, name } => error_simple(
+                "QL0023",
+                format!("invalid instant name `{name}`"),
+                span,
+                "invalid name",
+            )
+            .with_help("valid names are `now`, `today`, and `unix`"),
+            InstantYearInvalid { span } => error_simple(
+                "QL0024",
+                "invalid year in instant literal",
+                span,
+                "expected at least 4 digits",
+            ),
+            InstantMonthInvalid { span } => error_simple(
+                "QL0025",
+                "invalid month in instant literal",
+                span,
+                "expected 1-12",
+            ),
+            InstantDayInvalid { span } => error_simple(
+                "QL0026",
+                "invalid day in instant literal",
+                span,
+                "invalid day",
+            ),
+            InstantHourInvalid { span } => error_simple(
+                "QL0027",
+                "invalid hour in instant literal",
+                span,
+                "expected 0-23",
+            ),
+            InstantMinuteInvalid { span } => error_simple(
+                "QL0028",
+                "invalid minute in instant literal",
+                span,
+                "expected 0-59",
+            ),
+            InstantSecondInvalid { span } => error_simple(
+                "QL0029",
+                "invalid second in instant literal",
+                span,
+                "expected 0-59",
+            ),
+            InstantTimeColonExpected { span } => error_simple(
+                "QL0030",
+                "expected `:` between hour and minute",
+                span,
+                "expected `:`",
+            ),
+            InstantUnixSecondsMissing { span } => error_simple(
+                "QL0031",
+                "expected seconds after `@unix_`",
+                span,
+                "expected digits",
+            ),
+            InstantUnixOverflow { span } => error_simple(
+                "QL0032",
+                "`@unix_` seconds are out of range",
+                span,
+                "out of range",
+            ),
+            InstantSuffixInvalid { span } => error_simple(
+                "QL0033",
+                "unexpected characters after instant literal",
+                span,
+                "unexpected suffix",
+            ),
+            FractionRounded { span } => warning_simple(
+                "QL0034",
+                "fractional seconds exceed nanosecond precision",
                 span,
                 "precision lost",
             ),
