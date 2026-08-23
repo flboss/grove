@@ -33,8 +33,8 @@ impl<'src> Lexer<'src> {
         self.peeked.as_ref().unwrap()
     }
 
-    pub fn finalize(self) -> Vec<Diagnostic> {
-        self.diagnostics
+    pub fn take_diagnostics(&mut self) -> Vec<Diagnostic> {
+        std::mem::take(&mut self.diagnostics)
     }
 
     fn advance(&mut self) -> Token {
@@ -288,7 +288,7 @@ mod tests {
     fn empty_input() {
         let mut lex = Lexer::new("");
         assert_eof!(lex);
-        assert!(lex.finalize().is_empty());
+        assert!(lex.take_diagnostics().is_empty());
     }
 
     #[test]
@@ -358,7 +358,7 @@ mod tests {
     fn unclosed_backtick() {
         let mut lex = Lexer::new("`root");
         assert_ident!(lex, "root");
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
@@ -374,7 +374,7 @@ mod tests {
         let mut lex = Lexer::new(r#""hello"#);
         let tok = lex.next_token();
         assert_eq!(tok.value, TokenKind::StringLit("hello".into()));
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
@@ -469,14 +469,14 @@ mod tests {
         let mut lex = Lexer::new("<");
         assert_token!(lex, TokenKind::LAngle);
         assert_eof!(lex);
-        assert!(lex.finalize().is_empty());
+        assert!(lex.take_diagnostics().is_empty());
     }
 
     #[test]
     fn lone_minus_is_error() {
         let mut lex = Lexer::new("-");
         assert_eof!(lex);
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
@@ -489,7 +489,7 @@ mod tests {
         assert_token!(lex, TokenKind::At);
         assert_ident!(lex, "bad");
         assert_eof!(lex);
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]

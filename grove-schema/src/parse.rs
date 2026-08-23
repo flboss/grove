@@ -111,7 +111,7 @@ impl<'src> Parser<'src> {
             }
         }
 
-        let mut diagnostics = self.lexer.finalize();
+        let mut diagnostics = self.lexer.take_diagnostics();
         diagnostics.extend(self.diagnostics);
 
         (diagnostics.is_empty().then_some(schema), diagnostics)
