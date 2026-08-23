@@ -332,3 +332,24 @@ pub fn warning_simple(
         help: Vec::new(),
     }
 }
+
+#[rustfmt::skip] // preserve one-line-per-variant formatting
+#[derive(Debug, Clone)]
+pub enum QueryParseError {
+    ExpectedExpr { span: Span },
+}
+
+impl From<QueryParseError> for Diagnostic {
+    fn from(err: QueryParseError) -> Self {
+        use QueryParseError::*;
+
+        match err {
+            ExpectedExpr { span } => error_simple(
+                "QP0001",
+                "expected an expression",
+                span,
+                "expected an expression",
+            ),
+        }
+    }
+}
