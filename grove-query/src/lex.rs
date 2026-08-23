@@ -47,8 +47,8 @@ impl<'src> Lexer<'src> {
         self.peeked2.as_ref().unwrap()
     }
 
-    pub fn finalize(self) -> Vec<Diagnostic> {
-        self.diagnostics
+    pub fn take_diagnostics(&mut self) -> Vec<Diagnostic> {
+        std::mem::take(&mut self.diagnostics)
     }
 
     fn advance(&mut self) -> Token {
@@ -1242,7 +1242,7 @@ mod tests {
     fn empty_input() {
         let mut lex = Lexer::new("");
         assert_eof!(lex);
-        assert!(lex.finalize().is_empty());
+        assert!(lex.take_diagnostics().is_empty());
     }
 
     #[test]
@@ -1278,7 +1278,7 @@ mod tests {
         let mut lex = Lexer::new("/* hi */ users");
         assert_ident!(lex, "users");
         assert_eof!(lex);
-        assert!(lex.finalize().is_empty());
+        assert!(lex.take_diagnostics().is_empty());
     }
 
     #[test]
@@ -1293,7 +1293,7 @@ mod tests {
         let mut lex = Lexer::new("/* a /* b */ c */ users");
         assert_ident!(lex, "users");
         assert_eof!(lex);
-        assert!(lex.finalize().is_empty());
+        assert!(lex.take_diagnostics().is_empty());
     }
 
     #[test]
@@ -1307,7 +1307,7 @@ mod tests {
     fn unclosed_block_comment() {
         let mut lex = Lexer::new("/* never closed");
         assert_eof!(lex);
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
@@ -1377,7 +1377,7 @@ mod tests {
     fn unclosed_backtick() {
         let mut lex = Lexer::new("`prev");
         assert_ident!(lex, "prev");
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
@@ -1393,7 +1393,7 @@ mod tests {
         let mut lex = Lexer::new(r#""a\n\t\r\\\"\0""#);
         let tok = lex.next_token();
         assert_eq!(tok.value, TokenKind::StringLit("a\n\t\r\\\"\0".into()));
-        assert!(lex.finalize().is_empty());
+        assert!(lex.take_diagnostics().is_empty());
     }
 
     #[test]
@@ -1401,7 +1401,7 @@ mod tests {
         let mut lex = Lexer::new(r#""\x41\u{1F600}""#);
         let tok = lex.next_token();
         assert_eq!(tok.value, TokenKind::StringLit("A\u{1F600}".into()));
-        assert!(lex.finalize().is_empty());
+        assert!(lex.take_diagnostics().is_empty());
     }
 
     #[test]
@@ -1409,7 +1409,7 @@ mod tests {
         let mut lex = Lexer::new(r#""hello"#);
         let tok = lex.next_token();
         assert_eq!(tok.value, TokenKind::StringLit("hello".into()));
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
@@ -1417,7 +1417,7 @@ mod tests {
         let mut lex = Lexer::new("\"abc\ndef\"");
         let tok = lex.next_token();
         assert_eq!(tok.value, TokenKind::StringLit("abc".into()));
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
@@ -1425,7 +1425,7 @@ mod tests {
         let mut lex = Lexer::new(r#""\x80""#);
         let tok = lex.next_token();
         assert_eq!(tok.value, TokenKind::StringLit("".into()));
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
@@ -1433,7 +1433,7 @@ mod tests {
         let mut lex = Lexer::new(r#""\xG1""#);
         let tok = lex.next_token();
         assert_eq!(tok.value, TokenKind::StringLit("G1".into()));
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
@@ -1441,7 +1441,7 @@ mod tests {
         let mut lex = Lexer::new(r#""\z""#);
         let tok = lex.next_token();
         assert_eq!(tok.value, TokenKind::StringLit("".into()));
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
@@ -1449,7 +1449,7 @@ mod tests {
         let mut lex = Lexer::new(r#""\u{}""#);
         let tok = lex.next_token();
         assert_eq!(tok.value, TokenKind::StringLit("".into()));
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
@@ -1457,7 +1457,7 @@ mod tests {
         let mut lex = Lexer::new(r#""\u41""#);
         let tok = lex.next_token();
         assert_eq!(tok.value, TokenKind::StringLit("41".into()));
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
@@ -1465,7 +1465,7 @@ mod tests {
         let mut lex = Lexer::new(r#""\u{41x}""#);
         let tok = lex.next_token();
         assert_eq!(tok.value, TokenKind::StringLit("".into()));
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
@@ -1473,7 +1473,7 @@ mod tests {
         let mut lex = Lexer::new(r#""\u{1234567}""#);
         let tok = lex.next_token();
         assert_eq!(tok.value, TokenKind::StringLit("".into()));
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
@@ -1481,7 +1481,7 @@ mod tests {
         let mut lex = Lexer::new(r#""\u{110000}""#);
         let tok = lex.next_token();
         assert_eq!(tok.value, TokenKind::StringLit("".into()));
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
@@ -1489,7 +1489,7 @@ mod tests {
         let mut lex = Lexer::new(r#""\u{D800}""#);
         let tok = lex.next_token();
         assert_eq!(tok.value, TokenKind::StringLit("".into()));
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
@@ -1539,7 +1539,7 @@ mod tests {
         let mut lex = Lexer::new("a & b");
         assert_ident!(lex, "a");
         assert_ident!(lex, "b");
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
@@ -1547,7 +1547,7 @@ mod tests {
         let mut lex = Lexer::new("a | b");
         assert_ident!(lex, "a");
         assert_ident!(lex, "b");
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
@@ -1555,7 +1555,7 @@ mod tests {
         let mut lex = Lexer::new("a ? b");
         assert_ident!(lex, "a");
         assert_ident!(lex, "b");
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
@@ -1563,7 +1563,7 @@ mod tests {
         let mut lex = Lexer::new("a : b");
         assert_ident!(lex, "a");
         assert_ident!(lex, "b");
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
@@ -1571,7 +1571,7 @@ mod tests {
         let mut lex = Lexer::new("a \0 b");
         assert_ident!(lex, "a");
         assert_ident!(lex, "b");
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
@@ -1615,14 +1615,14 @@ mod tests {
         let tok = lex.next_token();
         assert_eq!(tok.value, TokenKind::IntLit(7));
         assert_eof!(lex);
-        assert!(lex.finalize().is_empty());
+        assert!(lex.take_diagnostics().is_empty());
     }
 
     #[test]
     fn int_overflow_is_error() {
         let mut lex = Lexer::new("9223372036854775808");
         assert_eof!(lex);
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
@@ -1633,7 +1633,7 @@ mod tests {
         let tok = lex.next_token();
         assert_eq!(tok.value, TokenKind::DecLit("42.0".parse().unwrap()));
         assert_eof!(lex);
-        assert!(lex.finalize().is_empty());
+        assert!(lex.take_diagnostics().is_empty());
     }
 
     #[test]
@@ -1650,7 +1650,7 @@ mod tests {
         let tok = lex.next_token();
         assert_eq!(tok.value, TokenKind::DecLit("100000".parse().unwrap()));
         assert_eof!(lex);
-        assert!(lex.finalize().is_empty());
+        assert!(lex.take_diagnostics().is_empty());
     }
 
     #[test]
@@ -1665,7 +1665,7 @@ mod tests {
         let tok = lex.next_token();
         assert_eq!(tok.value, TokenKind::FloatLit(0.5));
         assert_eof!(lex);
-        assert!(lex.finalize().is_empty());
+        assert!(lex.take_diagnostics().is_empty());
     }
 
     #[test]
@@ -1674,7 +1674,7 @@ mod tests {
         let tok = lex.next_token();
         assert_eq!(tok.value, TokenKind::FloatLit(f64::INFINITY));
         assert_eof!(lex);
-        assert!(lex.finalize().is_empty());
+        assert!(lex.take_diagnostics().is_empty());
     }
 
     #[test]
@@ -1682,7 +1682,7 @@ mod tests {
         let mut lex = Lexer::new("1e");
         let tok = lex.next_token();
         assert_eq!(tok.value, TokenKind::IntLit(1));
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
@@ -1690,7 +1690,7 @@ mod tests {
         let mut lex = Lexer::new("1.5e+");
         let tok = lex.next_token();
         assert_eq!(tok.value, TokenKind::DecLit("1.5".parse().unwrap()));
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
@@ -1701,7 +1701,7 @@ mod tests {
         assert_token!(lex, TokenKind::Dot);
         let tok = lex.next_token();
         assert_eq!(tok.value, TokenKind::IntLit(3));
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
@@ -1720,7 +1720,7 @@ mod tests {
         assert_token!(lex, TokenKind::LParen);
         assert_token!(lex, TokenKind::RParen);
         assert_eof!(lex);
-        assert!(lex.finalize().is_empty());
+        assert!(lex.take_diagnostics().is_empty());
     }
 
     #[test]
@@ -1731,7 +1731,7 @@ mod tests {
             tok.value,
             TokenKind::DecLit("1.0000000000000000000000000000".parse().unwrap())
         );
-        let diags = lex.finalize();
+        let diags = lex.take_diagnostics();
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].severity, grove_types::Severity::Warning);
     }
@@ -1744,7 +1744,7 @@ mod tests {
             tok.value,
             TokenKind::DecLit("1.0000000000000000000000000002".parse().unwrap())
         );
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
@@ -1755,7 +1755,7 @@ mod tests {
             tok.value,
             TokenKind::DecLit("10.000000000000000000000000000".parse().unwrap())
         );
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
@@ -1766,21 +1766,21 @@ mod tests {
             tok.value,
             TokenKind::DecLit("0.0000000000000000000000000000".parse().unwrap())
         );
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
     fn decimal_overflow_exponent_is_error() {
         let mut lex = Lexer::new("1e29");
         assert_eof!(lex);
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
     fn decimal_overflow_is_error() {
         let mut lex = Lexer::new("99999999999999999999999999999");
         assert_eof!(lex);
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
@@ -1792,14 +1792,14 @@ mod tests {
             TokenKind::DecLit("79228162514264337593543950335".parse().unwrap())
         );
         assert_eof!(lex);
-        assert!(lex.finalize().is_empty());
+        assert!(lex.take_diagnostics().is_empty());
     }
 
     #[test]
     fn decimal_over_max_is_error() {
         let mut lex = Lexer::new("79228162514264337593543950336e0");
         assert_eof!(lex);
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
@@ -1811,7 +1811,7 @@ mod tests {
             TokenKind::DecLit("0.0000000000000000000000000001".parse().unwrap())
         );
         assert_eof!(lex);
-        assert!(lex.finalize().is_empty());
+        assert!(lex.take_diagnostics().is_empty());
     }
 
     #[test]
@@ -1833,7 +1833,7 @@ mod tests {
         assert_eq!(d, "0.0000000000000000000000000001".parse().unwrap());
         assert_eq!(d.scale(), 28);
         assert_eof!(lex);
-        assert!(lex.finalize().is_empty());
+        assert!(lex.take_diagnostics().is_empty());
     }
 
     #[test]
@@ -1844,14 +1844,14 @@ mod tests {
             tok.value,
             TokenKind::DecLit("70000000000000000000000000000".parse().unwrap())
         );
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
     fn decimal_overflow_integer_part_too_large() {
         let mut lex = Lexer::new("99999999999999999999999999999.5");
         assert_eof!(lex);
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     fn utc(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32, ns: u32) -> DateTime<Utc> {
@@ -1865,7 +1865,7 @@ mod tests {
         let tok = lex.next_token();
         assert_eq!(tok.value, TokenKind::InstantLit(expected), "for `{src}`");
         assert_eof!(lex);
-        assert!(lex.finalize().is_empty(), "for `{src}`");
+        assert!(lex.take_diagnostics().is_empty(), "for `{src}`");
     }
 
     fn drain(lex: &mut Lexer) {
@@ -1923,7 +1923,7 @@ mod tests {
         let expect = NaiveTime::from_hms_opt(8, 52, 0).unwrap();
         assert_eq!(tok.value, TokenKind::Today(Some(expect)));
         assert_eof!(lex);
-        assert!(lex.finalize().is_empty());
+        assert!(lex.take_diagnostics().is_empty());
     }
 
     #[test]
@@ -1972,91 +1972,91 @@ mod tests {
         assert_token!(lex, TokenKind::LParen);
         assert_token!(lex, TokenKind::RParen);
         assert_eof!(lex);
-        assert!(lex.finalize().is_empty());
+        assert!(lex.take_diagnostics().is_empty());
     }
 
     #[test]
     fn instant_invalid_month() {
         let mut lex = Lexer::new("@2026-13");
         drain(&mut lex);
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
     fn instant_invalid_day() {
         let mut lex = Lexer::new("@2024-02-30");
         drain(&mut lex);
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
     fn instant_invalid_hour() {
         let mut lex = Lexer::new("@2026-10-20_25:00");
         drain(&mut lex);
-        assert_eq!(lex.finalize().len(), 2);
+        assert_eq!(lex.take_diagnostics().len(), 2);
     }
 
     #[test]
     fn instant_invalid_minute() {
         let mut lex = Lexer::new("@2026-10-20_12:60");
         drain(&mut lex);
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
     fn instant_invalid_second() {
         let mut lex = Lexer::new("@2026-10-20_14:30:60");
         drain(&mut lex);
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
     fn instant_missing_time_colon() {
         let mut lex = Lexer::new("@2026-10-20_1430");
         drain(&mut lex);
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
     fn instant_invalid_name() {
         let mut lex = Lexer::new("@foo");
         drain(&mut lex);
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
     fn instant_name_with_suffix() {
         let mut lex = Lexer::new("@todayx");
         drain(&mut lex);
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
     fn instant_unix_missing_seconds() {
         let mut lex = Lexer::new("@unix_");
         drain(&mut lex);
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
     fn instant_unix_overflow() {
         let mut lex = Lexer::new("@unix_99999999999999999999");
         drain(&mut lex);
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
     fn instant_stray_suffix() {
         let mut lex = Lexer::new("@2024x");
         drain(&mut lex);
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
     fn instant_short_year() {
         let mut lex = Lexer::new("@202 @-1");
         drain(&mut lex);
-        assert_eq!(lex.finalize().len(), 2);
+        assert_eq!(lex.take_diagnostics().len(), 2);
     }
 
     #[test]
@@ -2067,7 +2067,7 @@ mod tests {
             tok.value,
             TokenKind::InstantLit(utc(2026, 10, 16, 14, 30, 1, 0))
         );
-        let diags = lex.finalize();
+        let diags = lex.take_diagnostics();
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].severity, grove_types::Severity::Warning);
     }
@@ -2080,7 +2080,7 @@ mod tests {
             tok.value,
             TokenKind::InstantLit(utc(2026, 10, 17, 0, 0, 0, 0))
         );
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
@@ -2091,7 +2091,7 @@ mod tests {
             tok.value,
             TokenKind::InstantLit(utc(2026, 10, 16, 14, 30, 0, 123456790))
         );
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
@@ -2102,7 +2102,7 @@ mod tests {
             tok.value,
             TokenKind::InstantLit(DateTime::<Utc>::from_timestamp(2, 0).unwrap())
         );
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     fn assert_duration(src: &str, expected: TimeDelta) {
@@ -2110,7 +2110,7 @@ mod tests {
         let tok = lex.next_token();
         assert_eq!(tok.value, TokenKind::DurationLit(expected), "for `{src}`");
         assert_eof!(lex);
-        assert!(lex.finalize().is_empty(), "for `{src}`");
+        assert!(lex.take_diagnostics().is_empty(), "for `{src}`");
     }
 
     #[test]
@@ -2158,7 +2158,7 @@ mod tests {
             tok.value,
             TokenKind::DurationLit(TimeDelta::nanoseconds(123_456_790))
         );
-        let diags = lex.finalize();
+        let diags = lex.take_diagnostics();
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].severity, grove_types::Severity::Warning);
     }
@@ -2168,41 +2168,41 @@ mod tests {
         let mut lex = Lexer::new("#1.9999999995s");
         let tok = lex.next_token();
         assert_eq!(tok.value, TokenKind::DurationLit(TimeDelta::seconds(2)));
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
     fn duration_duplicate_unit() {
         let mut lex = Lexer::new("#1h1h");
         drain(&mut lex);
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
     fn duration_fraction_on_non_second() {
         let mut lex = Lexer::new("#1.5m");
         drain(&mut lex);
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
     fn duration_missing_unit() {
         let mut lex = Lexer::new("#30 #30x");
         drain(&mut lex);
-        assert_eq!(lex.finalize().len(), 2);
+        assert_eq!(lex.take_diagnostics().len(), 2);
     }
 
     #[test]
     fn duration_expected() {
         let mut lex = Lexer::new("# #x");
         drain(&mut lex);
-        assert_eq!(lex.finalize().len(), 2);
+        assert_eq!(lex.take_diagnostics().len(), 2);
     }
 
     #[test]
     fn duration_overflow() {
         let mut lex = Lexer::new("#99999999999999999999y");
         drain(&mut lex);
-        assert_eq!(lex.finalize().len(), 1);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 }

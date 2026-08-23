@@ -119,7 +119,7 @@ fn query_lex(path: &PathBuf, raw: bool) {
             break;
         }
     }
-    let diagnostics = lexer.finalize();
+    let diagnostics = lexer.take_diagnostics();
 
     println!("=== Tokens ===");
     for tok in &tokens {
