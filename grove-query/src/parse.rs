@@ -186,15 +186,11 @@ impl<'src> Parser<'src> {
             }
             elements.push(self.parse_expr()?);
         }
-        let rparen = self.expect(
+        self.expect(
             |k| matches!(k, TokenKind::RParen),
             |span| QueryParseError::TupleCommaOrRParenExpected { span },
         )?;
 
-        if elements.len() < 2 {
-            self.emit_error(QueryParseError::SingleElementTuple { span: rparen.span });
-            return Err(());
-        }
         Ok(Expr::Tuple {
             elements,
             span: self.span_from(lparen.span.start),
@@ -540,9 +536,16 @@ mod tests {
 
     #[test]
     fn single_element_tuple() {
-        let (file, diags) = parse_query("(1,)");
-        assert!(file.is_none());
-        assert_eq!(codes(&diags), vec!["QP0004"]);
+        match parse_ok("(1,)") {
+            Expr::Tuple { elements, .. } => {
+                assert_eq!(elements.len(), 1);
+                let Expr::Literal(lit) = &elements[0] else {
+                    panic!("expected literal");
+                };
+                assert_eq!(lit.value, Literal::Int(1));
+            }
+            other => panic!("expected tuple, got {other:?}"),
+        }
     }
 
     #[test]

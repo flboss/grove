@@ -340,7 +340,6 @@ pub enum QueryParseError {
     TrailingInput { span: Span },
 
     TupleCommaOrRParenExpected { span: Span },
-    SingleElementTuple { span: Span },
     ArrayCommaOrRBracketExpected { span: Span },
 
     SomeLParenExpected { span: Span },
@@ -379,13 +378,6 @@ impl From<QueryParseError> for Diagnostic {
             TupleCommaOrRParenExpected { span } => {
                 error_simple("QP0003", "unclosed tuple", span, "expected `,` or `)`")
             }
-            SingleElementTuple { span } => error_simple(
-                "QP0004",
-                "tuples require at least two elements",
-                span,
-                "single-element tuple",
-            )
-            .with_help("wrap a single value in parentheses for grouping instead"),
             ArrayCommaOrRBracketExpected { span } => {
                 error_simple("QP0005", "unclosed array", span, "expected `,` or `]`")
             }
