@@ -337,6 +337,26 @@ pub fn warning_simple(
 #[derive(Debug, Clone)]
 pub enum QueryParseError {
     ExpectedExpr { span: Span },
+    TrailingInput { span: Span },
+
+    TupleCommaOrRParenExpected { span: Span },
+    SingleElementTuple { span: Span },
+    ArrayCommaOrRBracketExpected { span: Span },
+
+    SomeLParenExpected { span: Span },
+    SomeRParenExpected { span: Span },
+
+    TypeConstColonExpected { span: Span },
+    TypeConstNameExpected { span: Span },
+
+    IfLBraceExpected { span: Span },
+    IfRBraceExpected { span: Span },
+    MissingElse { span: Span },
+    ElseLBraceExpected { span: Span },
+
+    StructFieldNameExpected { span: Span },
+    StructEqualsExpected { span: Span, field: String },
+    StructCommaOrRBraceExpected { span: Span },
 }
 
 impl From<QueryParseError> for Diagnostic {
@@ -349,6 +369,78 @@ impl From<QueryParseError> for Diagnostic {
                 "expected an expression",
                 span,
                 "expected an expression",
+            ),
+            TrailingInput { span } => error_simple(
+                "QP0002",
+                "unexpected input after the result expression",
+                span,
+                "unexpected input",
+            ),
+            TupleCommaOrRParenExpected { span } => {
+                error_simple("QP0003", "unclosed tuple", span, "expected `,` or `)`")
+            }
+            SingleElementTuple { span } => error_simple(
+                "QP0004",
+                "tuples require at least two elements",
+                span,
+                "single-element tuple",
+            )
+            .with_help("wrap a single value in parentheses for grouping instead"),
+            ArrayCommaOrRBracketExpected { span } => {
+                error_simple("QP0005", "unclosed array", span, "expected `,` or `]`")
+            }
+            SomeLParenExpected { span } => {
+                error_simple("QP0006", "expected `(` after `some`", span, "expected `(`")
+            }
+            SomeRParenExpected { span } => {
+                error_simple("QP0007", "unclosed `some(...)`", span, "expected `)`")
+            }
+            TypeConstColonExpected { span } => {
+                error_simple("QP0008", "incomplete type constant", span, "expected `::`")
+                    .with_note("numeric types support the constants `MIN` and `MAX`")
+            }
+            TypeConstNameExpected { span } => error_simple(
+                "QP0009",
+                "expected a valid type constant",
+                span,
+                "expected an identifier",
+            )
+            .with_help("numeric types support the constants `MIN` and `MAX`"),
+            IfLBraceExpected { span } => error_simple(
+                "QP0010",
+                "expected `{` after `if` condition",
+                span,
+                "expected `{`",
+            ),
+            IfRBraceExpected { span } => {
+                error_simple("QP0011", "unclosed `if` block", span, "expected `}`")
+            }
+            MissingElse { span } => error_simple(
+                "QP0012",
+                "`if` expression requires an `else` branch",
+                span,
+                "missing `else`",
+            ),
+            ElseLBraceExpected { span } => {
+                error_simple("QP0013", "expected `{` after `else`", span, "expected `{`")
+            }
+            StructFieldNameExpected { span } => error_simple(
+                "QP0014",
+                "expected a field name in struct literal",
+                span,
+                "expected an identifier",
+            ),
+            StructEqualsExpected { span, field } => error_simple(
+                "QP0015",
+                format!("expected `=` after struct field `{field}`"),
+                span,
+                "expected `=`",
+            ),
+            StructCommaOrRBraceExpected { span } => error_simple(
+                "QP0016",
+                "unclosed struct literal",
+                span,
+                "expected `,` or `}`",
             ),
         }
     }
