@@ -66,13 +66,6 @@ impl<'src> Parser<'src> {
         }
     }
 
-    fn literal_expr(&self, value: Literal) -> Expr {
-        Expr::Literal(Spanned {
-            span: self.current.span,
-            value,
-        })
-    }
-
     fn parse_file(&mut self) -> Result<QueryFile, ()> {
         let result = self.parse_expr()?;
         if !self.at(|k| matches!(k, TokenKind::Eof)) {
@@ -98,55 +91,86 @@ impl<'src> Parser<'src> {
         match kind {
             TokenKind::IntLit(i) => {
                 self.bump();
-                Ok(self.literal_expr(Literal::Int(i)))
+                Ok(Expr::Literal(Spanned {
+                    span,
+                    value: Literal::Int(i),
+                }))
             }
             TokenKind::FloatLit(f) => {
                 self.bump();
-                Ok(self.literal_expr(Literal::Float(f)))
+                Ok(Expr::Literal(Spanned {
+                    span,
+                    value: Literal::Float(f),
+                }))
             }
             TokenKind::DecLit(d) => {
                 self.bump();
-                Ok(self.literal_expr(Literal::Dec(d)))
+                Ok(Expr::Literal(Spanned {
+                    span,
+                    value: Literal::Dec(d),
+                }))
             }
             TokenKind::StringLit(s) => {
                 self.bump();
-                Ok(self.literal_expr(Literal::String(s)))
+                Ok(Expr::Literal(Spanned {
+                    span,
+                    value: Literal::String(s),
+                }))
             }
             TokenKind::True => {
                 self.bump();
-                Ok(self.literal_expr(Literal::Bool(true)))
+                Ok(Expr::Literal(Spanned {
+                    span,
+                    value: Literal::Bool(true),
+                }))
             }
             TokenKind::False => {
                 self.bump();
-                Ok(self.literal_expr(Literal::Bool(false)))
+                Ok(Expr::Literal(Spanned {
+                    span,
+                    value: Literal::Bool(false),
+                }))
             }
             TokenKind::None => {
                 self.bump();
-                Ok(self.literal_expr(Literal::None))
+                Ok(Expr::Literal(Spanned {
+                    span,
+                    value: Literal::None,
+                }))
             }
             TokenKind::InstantLit(dt) => {
                 self.bump();
-                Ok(self.literal_expr(Literal::Instant(dt)))
+                Ok(Expr::Literal(Spanned {
+                    span,
+                    value: Literal::Instant(dt),
+                }))
             }
             TokenKind::Now => {
                 self.bump();
-                Ok(self.literal_expr(Literal::Now))
+                Ok(Expr::Literal(Spanned {
+                    span,
+                    value: Literal::Now,
+                }))
             }
             TokenKind::Today(t) => {
                 self.bump();
-                Ok(self.literal_expr(Literal::Today(t)))
+                Ok(Expr::Literal(Spanned {
+                    span,
+                    value: Literal::Today(t),
+                }))
             }
-            TokenKind::DurationLit(td) => {
+            TokenKind::DurationLit(d) => {
                 self.bump();
-                Ok(self.literal_expr(Literal::Duration(td)))
+                Ok(Expr::Literal(Spanned {
+                    span,
+                    value: Literal::Duration(d),
+                }))
             }
             TokenKind::Ident(name) => {
                 self.bump();
                 Ok(Expr::Ident(Spanned { span, value: name }))
             }
             TokenKind::Prev => {
-                // `prev` is contextual; the type checker restricts where it is
-                // valid, so it parses as a plain identifier.
                 self.bump();
                 Ok(Expr::Ident(Spanned {
                     span,
