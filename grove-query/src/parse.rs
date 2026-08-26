@@ -41,10 +41,6 @@ impl<'src> Parser<'src> {
         tok
     }
 
-    fn at(&self, pred: impl Fn(&TokenKind) -> bool) -> bool {
-        pred(&self.current.value)
-    }
-
     fn expect(
         &mut self,
         pred: impl Fn(&TokenKind) -> bool,
@@ -68,7 +64,7 @@ impl<'src> Parser<'src> {
 
     fn parse_file(&mut self) -> Result<QueryFile, ()> {
         let result = self.parse_expr(true)?;
-        if !self.at(|k| matches!(k, TokenKind::Eof)) {
+        if !matches!(self.current.value, TokenKind::Eof) {
             self.emit_error(QueryParseError::TrailingInput {
                 span: self.current.span,
             });
@@ -98,7 +94,7 @@ impl<'src> Parser<'src> {
                         });
                         return Err(());
                     };
-                    if self.at(|k| matches!(k, TokenKind::LParen)) {
+                    if matches!(self.current.value, TokenKind::LParen) {
                         let args = self.parse_method_args()?;
                         let span = self.span_from(expr.span().start);
                         expr = Expr::Method {
@@ -190,7 +186,7 @@ impl<'src> Parser<'src> {
         self.bump();
         let mut args = Vec::new();
 
-        while !self.at(|k| matches!(k, TokenKind::RParen)) {
+        while !matches!(self.current.value, TokenKind::RParen) {
             let direction = match self.current.value {
                 TokenKind::Asc => {
                     let span = self.bump().span;
@@ -212,7 +208,7 @@ impl<'src> Parser<'src> {
             let expr = self.parse_expr(true)?;
             args.push(Arg { direction, expr });
 
-            if !self.at(|k| matches!(k, TokenKind::Comma)) {
+            if !matches!(self.current.value, TokenKind::Comma) {
                 break;
             }
             self.bump();
@@ -227,9 +223,9 @@ impl<'src> Parser<'src> {
 
     fn parse_projection_body(&mut self) -> Result<Vec<ProjectionItem>, ()> {
         let mut items = Vec::new();
-        while !self.at(|k| matches!(k, TokenKind::RBrace)) {
+        while !matches!(self.current.value, TokenKind::RBrace) {
             items.push(self.parse_projection_item()?);
-            if !self.at(|k| matches!(k, TokenKind::Comma)) {
+            if !matches!(self.current.value, TokenKind::Comma) {
                 break;
             }
             self.bump();
@@ -252,12 +248,10 @@ impl<'src> Parser<'src> {
 
         let path = self.parse_pure_path()?;
 
-        if self.at(|k| {
-            matches!(
-                k,
-                TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace
-            )
-        }) {
+        if matches!(
+            self.current.value,
+            TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace
+        ) {
             self.emit_error(QueryParseError::ProjectionItemAliasRequired {
                 span: self.current.span,
             });
@@ -279,7 +273,7 @@ impl<'src> Parser<'src> {
         };
         let mut expr = Expr::Ident(first);
 
-        while self.at(|k| matches!(k, TokenKind::Dot | TokenKind::QuestionDot)) {
+        while matches!(self.current.value, TokenKind::Dot | TokenKind::QuestionDot) {
             let optional = matches!(self.current.value, TokenKind::QuestionDot);
             self.bump();
             let span = self.span_from(expr.span().start);
@@ -411,7 +405,7 @@ impl<'src> Parser<'src> {
         let lparen = self.bump();
         let first = self.parse_expr(true)?;
 
-        if !self.at(|k| matches!(k, TokenKind::Comma)) {
+        if !matches!(self.current.value, TokenKind::Comma) {
             self.expect(
                 |k| matches!(k, TokenKind::RParen),
                 |span| QueryParseError::TupleCommaOrRParenExpected { span },
@@ -420,9 +414,9 @@ impl<'src> Parser<'src> {
         }
 
         let mut elements = vec![first];
-        while self.at(|k| matches!(k, TokenKind::Comma)) {
+        while matches!(self.current.value, TokenKind::Comma) {
             self.bump();
-            if self.at(|k| matches!(k, TokenKind::RParen)) {
+            if matches!(self.current.value, TokenKind::RParen) {
                 break;
             }
             elements.push(self.parse_expr(true)?);
@@ -442,10 +436,10 @@ impl<'src> Parser<'src> {
         let lbracket = self.bump();
         let mut elements = Vec::new();
 
-        if !self.at(|k| matches!(k, TokenKind::RBracket)) {
-            while !self.at(|k| matches!(k, TokenKind::RBracket)) {
+        if !matches!(self.current.value, TokenKind::RBracket) {
+            while !matches!(self.current.value, TokenKind::RBracket) {
                 elements.push(self.parse_expr(true)?);
-                if !self.at(|k| matches!(k, TokenKind::Comma)) {
+                if !matches!(self.current.value, TokenKind::Comma) {
                     break;
                 }
                 self.bump();
@@ -487,7 +481,7 @@ impl<'src> Parser<'src> {
             .parse_type_name()
             .expect("only type keywords dispatch here");
 
-        if !self.at(|k| matches!(k, TokenKind::DoubleColon)) {
+        if !matches!(self.current.value, TokenKind::DoubleColon) {
             self.emit_error(QueryParseError::TypeConstColonExpected { span: ty.span });
             return Err(());
         }
@@ -521,7 +515,7 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_if_condition(&mut self) -> Result<Expr, ()> {
-        if self.at(|k| matches!(k, TokenKind::LParen)) {
+        if matches!(self.current.value, TokenKind::LParen) {
             self.bump();
             let cond = self.parse_expr(true)?;
             self.expect(
@@ -553,9 +547,9 @@ impl<'src> Parser<'src> {
         let mut end = rbrace.span.end;
         let mut default: Option<Box<Expr>> = None;
 
-        while self.at(|k| matches!(k, TokenKind::Else)) {
+        while matches!(self.current.value, TokenKind::Else) {
             self.bump();
-            if self.at(|k| matches!(k, TokenKind::If)) {
+            if matches!(self.current.value, TokenKind::If) {
                 self.bump();
                 let cond = self.parse_if_condition()?;
                 self.expect(
@@ -627,9 +621,9 @@ impl<'src> Parser<'src> {
             let field_value = self.parse_expr(true)?;
             fields.push((name, field_value));
 
-            if self.at(|k| matches!(k, TokenKind::Comma)) {
+            if matches!(self.current.value, TokenKind::Comma) {
                 self.bump();
-                if self.at(|k| matches!(k, TokenKind::RBrace)) {
+                if matches!(self.current.value, TokenKind::RBrace) {
                     break;
                 }
                 continue;
@@ -651,7 +645,7 @@ impl<'src> Parser<'src> {
     }
 
     fn expect_ident(&mut self) -> Result<Spanned<String>, ()> {
-        if self.at(|k| matches!(k, TokenKind::Ident(_))) {
+        if matches!(self.current.value, TokenKind::Ident(_)) {
             Ok(self.bump().map(|t| match t {
                 TokenKind::Ident(s) => s,
                 _ => unreachable!(),
