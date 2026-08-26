@@ -85,33 +85,34 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_primary(&mut self) -> Result<Expr, ()> {
-        let kind = self.current.value.clone();
         let span = self.current.span;
 
-        match kind {
-            TokenKind::IntLit(i) => {
+        match &self.current.value {
+            &TokenKind::IntLit(i) => {
                 self.bump();
                 Ok(Expr::Literal(Spanned {
                     span,
                     value: Literal::Int(i),
                 }))
             }
-            TokenKind::FloatLit(f) => {
+            &TokenKind::FloatLit(f) => {
                 self.bump();
                 Ok(Expr::Literal(Spanned {
                     span,
                     value: Literal::Float(f),
                 }))
             }
-            TokenKind::DecLit(d) => {
+            &TokenKind::DecLit(d) => {
                 self.bump();
                 Ok(Expr::Literal(Spanned {
                     span,
                     value: Literal::Dec(d),
                 }))
             }
-            TokenKind::StringLit(s) => {
-                self.bump();
+            TokenKind::StringLit(_) => {
+                let TokenKind::StringLit(s) = self.bump().value else {
+                    unreachable!()
+                };
                 Ok(Expr::Literal(Spanned {
                     span,
                     value: Literal::String(s),
@@ -138,7 +139,7 @@ impl<'src> Parser<'src> {
                     value: Literal::None,
                 }))
             }
-            TokenKind::InstantLit(dt) => {
+            &TokenKind::InstantLit(dt) => {
                 self.bump();
                 Ok(Expr::Literal(Spanned {
                     span,
@@ -152,23 +153,23 @@ impl<'src> Parser<'src> {
                     value: Literal::Now,
                 }))
             }
-            TokenKind::Today(t) => {
+            &TokenKind::Today(t) => {
                 self.bump();
                 Ok(Expr::Literal(Spanned {
                     span,
                     value: Literal::Today(t),
                 }))
             }
-            TokenKind::DurationLit(d) => {
+            &TokenKind::DurationLit(d) => {
                 self.bump();
                 Ok(Expr::Literal(Spanned {
                     span,
                     value: Literal::Duration(d),
                 }))
             }
-            TokenKind::Ident(name) => {
-                self.bump();
-                Ok(Expr::Ident(Spanned { span, value: name }))
+            TokenKind::Ident(_) => {
+                let name = self.expect_ident()?;
+                Ok(Expr::Ident(name))
             }
             TokenKind::Prev => {
                 self.bump();
