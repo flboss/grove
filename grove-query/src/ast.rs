@@ -83,6 +83,7 @@ pub enum Expr {
         base: Box<Expr>,
         name: Spanned<String>,
         args: Vec<Arg>,
+        optional: bool,
         span: Span,
     },
     Projection {

@@ -356,6 +356,13 @@ pub enum QueryParseError {
     StructFieldNameExpected { span: Span },
     StructEqualsExpected { span: Span, field: String },
     StructCommaOrRBraceExpected { span: Span },
+
+    ExpectedIdentAfterDot { span: Span },
+    UnclosedMethodArgs { span: Span },
+    ExpectedFilterRBracket { span: Span },
+    ExpectedProjectionRBrace { span: Span },
+    ExpectedCastTypeName { span: Span },
+    ProjectionItemAliasRequired { span: Span },
 }
 
 impl From<QueryParseError> for Diagnostic {
@@ -434,6 +441,35 @@ impl From<QueryParseError> for Diagnostic {
                 span,
                 "expected `,` or `}`",
             ),
+            ExpectedIdentAfterDot { span } => error_simple(
+                "QP0017",
+                "expected an identifier after `.` or `?.`",
+                span,
+                "expected a method or field name",
+            ),
+            UnclosedMethodArgs { span } => {
+                error_simple("QP0018", "unclosed method arguments", span, "expected `)`")
+            }
+            ExpectedFilterRBracket { span } => {
+                error_simple("QP0019", "unclosed filter", span, "expected `]`")
+            }
+            ExpectedProjectionRBrace { span } => {
+                error_simple("QP0020", "unclosed projection", span, "expected `}`")
+            }
+            ExpectedCastTypeName { span } => error_simple(
+                "QP0021",
+                "expected a type name after `as`",
+                span,
+                "expected a type name",
+            )
+            .with_help("valid cast targets are `Int`, `Float`, and `Dec`"),
+            ProjectionItemAliasRequired { span } => error_simple(
+                "QP0022",
+                "expected explicit alias for complex projection item",
+                span,
+                "expected a plain field path or an explicit alias",
+            )
+            .with_help("add an alias to name the projection item: `alias = ...`"),
         }
     }
 }
