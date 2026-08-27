@@ -1,4 +1,7 @@
-use crate::ast::{Arg, ConstantName, Expr, Literal, ProjectionItem, QueryFile, SortDir, TypeName};
+use crate::ast::{
+    Arg, BinaryOp, ConstantName, Expr, Literal, ProjectionItem, QueryFile, SortDir, TypeName,
+    UnaryOp,
+};
 use crate::error::QueryParseError;
 use crate::lex::Lexer;
 use crate::token::{Token, TokenKind};
@@ -77,7 +80,60 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_expr(&mut self, allow_projection_braces: bool) -> Result<Expr, ()> {
-        self.parse_postfix(allow_projection_braces)
+        self.parse_binary(0, allow_projection_braces)
+    }
+
+    fn parse_binary(&mut self, min_prec: u8, allow_projection_braces: bool) -> Result<Expr, ()> {
+        let mut lhs = self.parse_unary(allow_projection_braces)?;
+        while let Some((op, prec)) = binary_op(&self.current.value)
+            && prec >= min_prec
+        {
+            let op_tok = self.bump();
+            let rhs = self.parse_binary(prec + 1, allow_projection_braces)?;
+            let span = self.span_from(lhs.span().start);
+            lhs = Expr::Binary {
+                op: Spanned {
+                    span: op_tok.span,
+                    value: op,
+                },
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+                span,
+            };
+        }
+        Ok(lhs)
+    }
+
+    fn parse_unary(&mut self, allow_projection_braces: bool) -> Result<Expr, ()> {
+        match self.current.value {
+            TokenKind::Minus => {
+                let op_tok = self.bump();
+                let expr = self.parse_unary(allow_projection_braces)?;
+                let span = self.span_from(op_tok.span.start);
+                Ok(Expr::Unary {
+                    op: Spanned {
+                        span: op_tok.span,
+                        value: UnaryOp::Neg,
+                    },
+                    expr: Box::new(expr),
+                    span,
+                })
+            }
+            TokenKind::Bang => {
+                let op_tok = self.bump();
+                let expr = self.parse_unary(allow_projection_braces)?;
+                let span = self.span_from(op_tok.span.start);
+                Ok(Expr::Unary {
+                    op: Spanned {
+                        span: op_tok.span,
+                        value: UnaryOp::Not,
+                    },
+                    expr: Box::new(expr),
+                    span,
+                })
+            }
+            _ => self.parse_postfix(allow_projection_braces),
+        }
     }
 
     fn parse_postfix(&mut self, allow_projection_braces: bool) -> Result<Expr, ()> {
@@ -676,6 +732,27 @@ impl<'src> Parser<'src> {
     }
 }
 
+fn binary_op(kind: &TokenKind) -> Option<(BinaryOp, u8)> {
+    match kind {
+        TokenKind::Star => Some((BinaryOp::Mul, 6)),
+        TokenKind::Slash => Some((BinaryOp::Div, 6)),
+        TokenKind::Percent => Some((BinaryOp::Rem, 6)),
+        TokenKind::Mod => Some((BinaryOp::Mod, 6)),
+        TokenKind::Plus => Some((BinaryOp::Add, 5)),
+        TokenKind::Minus => Some((BinaryOp::Sub, 5)),
+        TokenKind::Less => Some((BinaryOp::Lt, 4)),
+        TokenKind::Greater => Some((BinaryOp::Gt, 4)),
+        TokenKind::LessEquals => Some((BinaryOp::Le, 4)),
+        TokenKind::GreaterEquals => Some((BinaryOp::Ge, 4)),
+        TokenKind::EqualsEquals => Some((BinaryOp::Eq, 3)),
+        TokenKind::BangEquals => Some((BinaryOp::Ne, 3)),
+        TokenKind::In => Some((BinaryOp::In, 3)),
+        TokenKind::AmpAmp => Some((BinaryOp::And, 2)),
+        TokenKind::PipePipe => Some((BinaryOp::Or, 1)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1144,5 +1221,356 @@ mod tests {
         assert_eq!(name.value, "filter");
         assert!(matches!(args.first().unwrap().expr, Expr::Ident(_)));
         assert!(matches!(*base, Expr::Ident(_)));
+    }
+
+    #[test]
+    fn unary_neg() {
+        match parse_ok("-1") {
+            Expr::Unary { op, expr, .. } => {
+                assert_eq!(op.value, UnaryOp::Neg);
+                assert!(matches!(*expr, Expr::Literal(lit)
+                    if lit.value == Literal::Int(1)
+                ));
+            }
+            other => panic!("expected unary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unary_not() {
+        match parse_ok("!true") {
+            Expr::Unary { op, expr, .. } => {
+                assert_eq!(op.value, UnaryOp::Not);
+                assert!(matches!(*expr, Expr::Literal(lit)
+                    if lit.value == Literal::Bool(true)
+                ));
+            }
+            other => panic!("expected unary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn double_unary_neg() {
+        match parse_ok("--1") {
+            Expr::Unary { op, expr, .. } => {
+                assert_eq!(op.value, UnaryOp::Neg);
+                match *expr {
+                    Expr::Unary { op, expr, .. } => {
+                        assert_eq!(op.value, UnaryOp::Neg);
+                        assert!(matches!(*expr, Expr::Literal(lit)
+                            if lit.value == Literal::Int(1)
+                        ));
+                    }
+                    other => panic!("expected inner unary, got {other:?}"),
+                }
+            }
+            other => panic!("expected unary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_add() {
+        match parse_ok("1 + 2") {
+            Expr::Binary { op, lhs, rhs, .. } => {
+                assert_eq!(op.value, BinaryOp::Add);
+                assert!(matches!(*lhs, Expr::Literal(lit) if lit.value == Literal::Int(1)));
+                assert!(matches!(*rhs, Expr::Literal(lit) if lit.value == Literal::Int(2)));
+            }
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_sub() {
+        match parse_ok("1 - 2") {
+            Expr::Binary { op, .. } => assert_eq!(op.value, BinaryOp::Sub),
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_mul() {
+        match parse_ok("1 * 2") {
+            Expr::Binary { op, .. } => assert_eq!(op.value, BinaryOp::Mul),
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_div() {
+        match parse_ok("1 / 2") {
+            Expr::Binary { op, .. } => assert_eq!(op.value, BinaryOp::Div),
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_rem() {
+        match parse_ok("1 % 2") {
+            Expr::Binary { op, .. } => assert_eq!(op.value, BinaryOp::Rem),
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_mod() {
+        match parse_ok("1 mod 2") {
+            Expr::Binary { op, .. } => assert_eq!(op.value, BinaryOp::Mod),
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_eq() {
+        match parse_ok("a == b") {
+            Expr::Binary { op, .. } => assert_eq!(op.value, BinaryOp::Eq),
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_ne() {
+        match parse_ok("a != b") {
+            Expr::Binary { op, .. } => assert_eq!(op.value, BinaryOp::Ne),
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_lt() {
+        match parse_ok("a < b") {
+            Expr::Binary { op, .. } => assert_eq!(op.value, BinaryOp::Lt),
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_gt() {
+        match parse_ok("a > b") {
+            Expr::Binary { op, .. } => assert_eq!(op.value, BinaryOp::Gt),
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_le() {
+        match parse_ok("a <= b") {
+            Expr::Binary { op, .. } => assert_eq!(op.value, BinaryOp::Le),
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_ge() {
+        match parse_ok("a >= b") {
+            Expr::Binary { op, .. } => assert_eq!(op.value, BinaryOp::Ge),
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_and() {
+        match parse_ok("a && b") {
+            Expr::Binary { op, .. } => assert_eq!(op.value, BinaryOp::And),
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_or() {
+        match parse_ok("a || b") {
+            Expr::Binary { op, .. } => assert_eq!(op.value, BinaryOp::Or),
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_in() {
+        match parse_ok("a in (1, 2)") {
+            Expr::Binary { op, lhs, rhs, .. } => {
+                assert_eq!(op.value, BinaryOp::In);
+                assert!(matches!(*lhs, Expr::Ident(_)));
+                assert!(matches!(*rhs, Expr::Tuple { .. }));
+            }
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mul_add_precedence() {
+        match parse_ok("1 + 2 * 3") {
+            Expr::Binary { op, lhs, rhs, .. } => {
+                assert_eq!(op.value, BinaryOp::Add);
+                assert!(matches!(*lhs, Expr::Literal(lit) if lit.value == Literal::Int(1)));
+                match *rhs {
+                    Expr::Binary { op, lhs, rhs, .. } => {
+                        assert_eq!(op.value, BinaryOp::Mul);
+                        assert!(matches!(*lhs, Expr::Literal(lit) if lit.value == Literal::Int(2)));
+                        assert!(matches!(*rhs, Expr::Literal(lit) if lit.value == Literal::Int(3)));
+                    }
+                    other => panic!("expected mul, got {other:?}"),
+                }
+            }
+            other => panic!("expected add, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn left_associativity() {
+        match parse_ok("1 - 2 + 3") {
+            Expr::Binary { op, lhs, .. } => {
+                assert_eq!(op.value, BinaryOp::Add);
+                match *lhs {
+                    Expr::Binary { op, lhs, rhs, .. } => {
+                        assert_eq!(op.value, BinaryOp::Sub);
+                        assert!(matches!(*lhs, Expr::Literal(lit) if lit.value == Literal::Int(1)));
+                        assert!(matches!(*rhs, Expr::Literal(lit) if lit.value == Literal::Int(2)));
+                    }
+                    other => panic!("expected sub, got {other:?}"),
+                }
+            }
+            other => panic!("expected add, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parens_override_precedence() {
+        match parse_ok("(1 + 2) * 3") {
+            Expr::Binary { op, lhs, rhs, .. } => {
+                assert_eq!(op.value, BinaryOp::Mul);
+                match *lhs {
+                    Expr::Binary { op, .. } => {
+                        assert_eq!(op.value, BinaryOp::Add);
+                    }
+                    other => panic!("expected add, got {other:?}"),
+                }
+                assert!(matches!(*rhs, Expr::Literal(lit) if lit.value == Literal::Int(3)));
+            }
+            other => panic!("expected mul, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cast_binary_precedence() {
+        match parse_ok("1 + 2 as Int") {
+            Expr::Binary { op, lhs, rhs, .. } => {
+                assert_eq!(op.value, BinaryOp::Add);
+                assert!(matches!(*lhs, Expr::Literal(lit) if lit.value == Literal::Int(1)));
+                assert!(matches!(*rhs, Expr::Cast { .. }));
+            }
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unary_in_binary_rhs() {
+        match parse_ok("1 + -2") {
+            Expr::Binary { op, rhs, .. } => {
+                assert_eq!(op.value, BinaryOp::Add);
+                assert!(matches!(*rhs, Expr::Unary { op, .. } if op.value == UnaryOp::Neg));
+            }
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mixed_precedence() {
+        match parse_ok("1 + 2 * 3 <= 4.0 as Int - 5 / 6 % 7") {
+            Expr::Binary { op, lhs, rhs, .. } => {
+                assert_eq!(op.value, BinaryOp::Le);
+                match *lhs {
+                    Expr::Binary { op, lhs, rhs, .. } => {
+                        assert_eq!(op.value, BinaryOp::Add);
+                        assert!(matches!(*lhs, Expr::Literal(lit) if lit.value == Literal::Int(1)));
+                        match *rhs {
+                            Expr::Binary { op, .. } => assert_eq!(op.value, BinaryOp::Mul),
+                            other => panic!("expected mul, got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected add, got {other:?}"),
+                }
+                match *rhs {
+                    Expr::Binary { op, lhs, rhs, .. } => {
+                        assert_eq!(op.value, BinaryOp::Sub);
+                        match *lhs {
+                            Expr::Cast { ty, .. } => assert_eq!(ty.value, TypeName::Int),
+                            other => panic!("expected cast, got {other:?}"),
+                        }
+                        match *rhs {
+                            Expr::Binary { op, lhs, rhs, .. } => {
+                                assert_eq!(op.value, BinaryOp::Rem);
+                                match *lhs {
+                                    Expr::Binary { op, lhs, rhs, .. } => {
+                                        assert_eq!(op.value, BinaryOp::Div);
+                                        assert!(
+                                            matches!(*lhs, Expr::Literal(lit) if lit.value == Literal::Int(5))
+                                        );
+                                        assert!(
+                                            matches!(*rhs, Expr::Literal(lit) if lit.value == Literal::Int(6))
+                                        );
+                                    }
+                                    other => panic!("expected cast, got {other:?}"),
+                                }
+                                assert!(
+                                    matches!(*rhs, Expr::Literal(lit) if lit.value == Literal::Int(7))
+                                );
+                            }
+                            other => panic!("expected mul, got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected sub, got {other:?}"),
+                }
+            }
+            other => panic!("expected le, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_missing_rhs() {
+        let (file, diags) = parse_query("1 +");
+        assert!(file.is_none());
+        assert_eq!(codes(&diags), vec!["QP0001"]);
+    }
+
+    #[test]
+    fn binary_missing_lhs() {
+        let (file, diags) = parse_query("+ 1");
+        assert!(file.is_none());
+        assert_eq!(codes(&diags), vec!["QP0001"]);
+    }
+
+    #[test]
+    fn unary_neg_binary_sub() {
+        match parse_ok("a - -b") {
+            Expr::Binary { op, rhs, .. } => {
+                assert_eq!(op.value, BinaryOp::Sub);
+                assert!(matches!(*rhs, Expr::Unary { op, .. } if op.value == UnaryOp::Neg));
+            }
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn comparison_precedence() {
+        let expr = parse_ok("a < b && c >= d");
+        assert!(matches!(expr, Expr::Binary { op, .. } if op.value == BinaryOp::And));
+        match parse_ok("a < b && c >= d") {
+            Expr::Binary { op, lhs, rhs, .. } => {
+                assert_eq!(op.value, BinaryOp::And);
+                assert!(matches!(*lhs, Expr::Binary { op, .. } if op.value == BinaryOp::Lt));
+                assert!(matches!(*rhs, Expr::Binary { op, .. } if op.value == BinaryOp::Ge));
+            }
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn if_condition_expr() {
+        match parse_ok("if x == 0 { 1 } else { 2 }") {
+            Expr::If { arms, .. } => {
+                assert!(matches!(&arms[0].0, Expr::Binary { op, .. } if op.value == BinaryOp::Eq));
+            }
+            other => panic!("expected if, got {other:?}"),
+        }
     }
 }
