@@ -98,6 +98,9 @@ impl<'src> Parser<'src> {
                 while !matches!(self.current.value, TokenKind::Semicolon | TokenKind::Eof) {
                     self.bump();
                 }
+                if matches!(self.current.value, TokenKind::Semicolon) {
+                    self.bump();
+                }
                 continue;
             };
 
