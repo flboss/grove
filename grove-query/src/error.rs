@@ -481,6 +481,10 @@ impl From<QueryParseError> for Diagnostic {
                 "discarded query has no effect",
                 span,
                 "query result is discarded",
+            )
+            .with_help(
+                "remove the semicolon and all following content \
+                    to return the result of this expression",
             ),
             MutationAsResult { span } => error_simple(
                 "QP0025",
