@@ -383,7 +383,7 @@ impl<'src> Parser<'src> {
             TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace
         ) {
             self.emit_error(QueryParseError::ProjectionItemAliasRequired {
-                span: self.current.span,
+                span: self.span_from(path.span().start),
             });
             return Err(());
         }
