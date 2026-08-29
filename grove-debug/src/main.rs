@@ -53,6 +53,16 @@ enum Command {
         #[arg(long)]
         raw: bool,
     },
+
+    /// Parse a query file and display the AST.
+    QueryParse {
+        /// Path to the query file
+        path: PathBuf,
+
+        /// Display diagnostics as raw Debug output instead of using ariadne
+        #[arg(long)]
+        raw: bool,
+    },
 }
 
 fn main() {
@@ -62,6 +72,7 @@ fn main() {
         Command::SchemaParse { path, raw } => schema_parse(&path, raw),
         Command::SchemaValidate { path, raw } => schema_validate(&path, raw),
         Command::QueryLex { path, raw } => query_lex(&path, raw),
+        Command::QueryParse { path, raw } => query_parse(&path, raw),
     }
 }
 
@@ -130,6 +141,26 @@ fn query_lex(path: &PathBuf, raw: bool) {
             "  [{:>4}..{:<4}) {:30} {:?}",
             span.start, span.end, kind, text
         );
+    }
+
+    print_diagnostics(&source, path, &diagnostics, raw);
+}
+
+fn query_parse(path: &PathBuf, raw: bool) {
+    let source = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error reading {}: {e}", path.display());
+            std::process::exit(1);
+        }
+    };
+
+    let (file, diagnostics) = grove_query::parse_query(&source);
+
+    println!("=== AST ===");
+    match &file {
+        Some(file) => println!("{file:#?}"),
+        None => println!("No AST. (parse failed)"),
     }
 
     print_diagnostics(&source, path, &diagnostics, raw);
