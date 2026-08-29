@@ -65,6 +65,14 @@ impl<'src> Parser<'src> {
         }
     }
 
+    fn sync_to(&mut self, targets: &[TokenKind]) {
+        while !targets.contains(&self.current.value)
+            && !matches!(self.current.value, TokenKind::Semicolon | TokenKind::Eof)
+        {
+            self.bump();
+        }
+    }
+
     fn parse_file(&mut self) -> Result<QueryFile, ()> {
         let mut statements = Vec::new();
 
@@ -287,7 +295,7 @@ impl<'src> Parser<'src> {
         self.bump();
         let mut args = Vec::new();
 
-        while !matches!(self.current.value, TokenKind::RParen) {
+        while !matches!(self.current.value, TokenKind::RParen | TokenKind::Eof) {
             let direction = match self.current.value {
                 TokenKind::Asc => {
                     let span = self.bump().span;
@@ -306,8 +314,18 @@ impl<'src> Parser<'src> {
                 _ => None,
             };
 
-            let expr = self.parse_expr(true)?;
-            args.push(Arg { direction, expr });
+            match self.parse_expr(true) {
+                Ok(expr) => {
+                    args.push(Arg { direction, expr });
+                }
+                Err(()) => {
+                    self.sync_to(&[TokenKind::Comma, TokenKind::RParen]);
+                    if matches!(self.current.value, TokenKind::Comma) {
+                        self.bump();
+                    }
+                    continue;
+                }
+            }
 
             if !matches!(self.current.value, TokenKind::Comma) {
                 break;
@@ -324,8 +342,19 @@ impl<'src> Parser<'src> {
 
     fn parse_projection_body(&mut self) -> Result<Vec<ProjectionItem>, ()> {
         let mut items = Vec::new();
-        while !matches!(self.current.value, TokenKind::RBrace) {
-            items.push(self.parse_projection_item()?);
+        while !matches!(self.current.value, TokenKind::RBrace | TokenKind::Eof) {
+            match self.parse_projection_item() {
+                Ok(item) => {
+                    items.push(item);
+                }
+                Err(()) => {
+                    self.sync_to(&[TokenKind::Comma, TokenKind::RBrace]);
+                    if matches!(self.current.value, TokenKind::Comma) {
+                        self.bump();
+                    }
+                    continue;
+                }
+            }
             if !matches!(self.current.value, TokenKind::Comma) {
                 break;
             }
@@ -504,23 +533,37 @@ impl<'src> Parser<'src> {
 
     fn parse_tuple_or_group(&mut self) -> Result<Expr, ()> {
         let lparen = self.bump();
-        let first = self.parse_expr(true)?;
+
+        let first = self.parse_expr(true);
+
+        if first.is_err() {
+            self.sync_to(&[TokenKind::Comma, TokenKind::RParen]);
+        }
 
         if !matches!(self.current.value, TokenKind::Comma) {
             self.expect(
                 |k| matches!(k, TokenKind::RParen),
                 |span| QueryParseError::TupleCommaOrRParenExpected { span },
             )?;
-            return Ok(first);
+            return first;
         }
 
-        let mut elements = vec![first];
+        let mut elements: Vec<Expr> = first.into_iter().collect();
         while matches!(self.current.value, TokenKind::Comma) {
             self.bump();
             if matches!(self.current.value, TokenKind::RParen) {
                 break;
             }
-            elements.push(self.parse_expr(true)?);
+            match self.parse_expr(true) {
+                Ok(expr) => elements.push(expr),
+                Err(()) => {
+                    self.sync_to(&[TokenKind::Comma, TokenKind::RParen]);
+                    if matches!(self.current.value, TokenKind::Comma) {
+                        self.bump();
+                    }
+                    continue;
+                }
+            }
         }
         self.expect(
             |k| matches!(k, TokenKind::RParen),
@@ -537,14 +580,21 @@ impl<'src> Parser<'src> {
         let lbracket = self.bump();
         let mut elements = Vec::new();
 
-        if !matches!(self.current.value, TokenKind::RBracket) {
-            while !matches!(self.current.value, TokenKind::RBracket) {
-                elements.push(self.parse_expr(true)?);
-                if !matches!(self.current.value, TokenKind::Comma) {
-                    break;
+        while !matches!(self.current.value, TokenKind::RBracket | TokenKind::Eof) {
+            match self.parse_expr(true) {
+                Ok(expr) => elements.push(expr),
+                Err(()) => {
+                    self.sync_to(&[TokenKind::Comma, TokenKind::RBracket]);
+                    if matches!(self.current.value, TokenKind::Comma) {
+                        self.bump();
+                    }
+                    continue;
                 }
-                self.bump();
             }
+            if !matches!(self.current.value, TokenKind::Comma) {
+                break;
+            }
+            self.bump();
         }
 
         self.expect(
@@ -1119,7 +1169,7 @@ mod tests {
     fn unclosed_explicit_if_condition_parens() {
         let (file, diags) = parse_query("if (true { 1 } else { 2 }");
         assert!(file.is_none());
-        assert_eq!(codes(&diags), vec!["QP0022"]);
+        assert_eq!(codes(&diags), vec!["QP0022", "QP0003"]);
     }
 
     #[test]
@@ -1264,7 +1314,7 @@ mod tests {
     fn projection_nested_missing_alias() {
         let (file, diags) = parse_query("users { orders { total } }");
         assert!(file.is_none());
-        assert_eq!(codes(&diags), vec!["QP0022"]);
+        assert_eq!(codes(&diags), vec!["QP0022", "QP0002"]);
     }
 
     #[test]
@@ -1757,5 +1807,51 @@ mod tests {
         let (file, diags) = parse_query("users.insert({name = \"Alice\"})");
         assert!(file.is_none());
         assert!(diags.iter().any(|d| d.code.as_ref() == "QP0025"));
+    }
+
+    #[test]
+    fn multi_error_projection_items() {
+        let (file, diags) = parse_query("users { orders { total }, 42 }");
+        assert!(file.is_none());
+        assert_eq!(codes(&diags), vec!["QP0022", "QP0002"]);
+    }
+
+    #[test]
+    fn multi_error_method_args() {
+        let (_, diags) = parse_query("users.sort(asc , asc )");
+        assert_eq!(codes(&diags), vec!["QP0001", "QP0001"]);
+    }
+
+    #[test]
+    fn multi_error_array_elements() {
+        let (file, diags) = parse_query("[,]");
+        assert!(file.is_some());
+        assert_eq!(codes(&diags), vec!["QP0001"]);
+    }
+
+    #[test]
+    fn recovery_skips_to_comma_in_args() {
+        let (_, diags) = parse_query("users.sort(name, , age)");
+        assert_eq!(codes(&diags), vec!["QP0001"]);
+    }
+
+    #[test]
+    fn recovery_skips_to_comma_in_projection() {
+        let (file, diags) = parse_query("users { , name }");
+        assert!(file.is_some());
+        assert_eq!(codes(&diags), vec!["QP0022"]);
+    }
+
+    #[test]
+    fn sync_to_stops_at_semicolon() {
+        let src = "users.sort(bad; 42";
+        let (file, diags) = parse_query(src);
+        let file = file.expect("should parse");
+        assert!(matches!(file.result, Expr::Literal(lit) if lit.value == Literal::Int(42)));
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == grove_types::Severity::Error)
+            .collect();
+        assert!(!errors.is_empty());
     }
 }
