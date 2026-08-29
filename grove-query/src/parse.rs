@@ -112,6 +112,11 @@ impl<'src> Parser<'src> {
                 return Err(());
             }
 
+            if is_mutation(&expr) {
+                self.emit_error(QueryParseError::MutationAsResult { span: expr.span() });
+                return Err(());
+            }
+
             return Ok(QueryFile {
                 statements,
                 result: expr,
@@ -1745,5 +1750,12 @@ mod tests {
         let (file, diags) = parse_query("users.insert({name = \"Alice\"});");
         assert!(file.is_none());
         assert!(diags.iter().any(|d| d.code.as_ref() == "QP0001"));
+    }
+
+    #[test]
+    fn mutation_as_result_error() {
+        let (file, diags) = parse_query("users.insert({name = \"Alice\"})");
+        assert!(file.is_none());
+        assert!(diags.iter().any(|d| d.code.as_ref() == "QP0025"));
     }
 }

@@ -365,6 +365,7 @@ pub enum QueryParseError {
     ProjectionItemAliasRequired { span: Span },
     EmptyStatement { span: Span },
     DiscardedQuery {span:Span},
+    MutationAsResult { span: Span },
 }
 
 impl From<QueryParseError> for Diagnostic {
@@ -481,6 +482,13 @@ impl From<QueryParseError> for Diagnostic {
                 span,
                 "query result is discarded",
             ),
+            MutationAsResult { span } => error_simple(
+                "QP0025",
+                "mutation cannot be used as a result expression",
+                span,
+                "produces no value",
+            )
+            .with_help("add a semicolon to make this a statement, and provide a result expression"),
         }
     }
 }
