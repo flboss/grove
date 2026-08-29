@@ -363,6 +363,8 @@ pub enum QueryParseError {
     ExpectedProjectionRBrace { span: Span },
     ExpectedCastTypeName { span: Span },
     ProjectionItemAliasRequired { span: Span },
+    EmptyStatement { span: Span },
+    DiscardedQuery {span:Span},
 }
 
 impl From<QueryParseError> for Diagnostic {
@@ -470,6 +472,15 @@ impl From<QueryParseError> for Diagnostic {
                 "expected a plain field path or an explicit alias",
             )
             .with_help("add an alias to name the projection item: `alias = ...`"),
+            EmptyStatement { span } => {
+                error_simple("QP0023", "empty statement", span, "expected an expression")
+            }
+            DiscardedQuery { span } => warning_simple(
+                "QP0024",
+                "discarded query has no effect",
+                span,
+                "query result is discarded",
+            ),
         }
     }
 }

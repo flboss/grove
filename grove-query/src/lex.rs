@@ -73,6 +73,7 @@ impl<'src> Lexer<'src> {
                 '(' => self.make_token(start, TokenKind::LParen),
                 ')' => self.make_token(start, TokenKind::RParen),
                 ',' => self.make_token(start, TokenKind::Comma),
+                ';' => self.make_token(start, TokenKind::Semicolon),
                 '.' => self.make_token(start, TokenKind::Dot),
                 '+' => self.make_token(start, TokenKind::Plus),
                 '-' => self.make_token(start, TokenKind::Minus),
@@ -1494,7 +1495,7 @@ mod tests {
 
     #[test]
     fn punctuation() {
-        let mut lex = Lexer::new("{}[](),.+*%-");
+        let mut lex = Lexer::new("{}[](),;.+*%-");
         assert_token!(lex, TokenKind::LBrace);
         assert_token!(lex, TokenKind::RBrace);
         assert_token!(lex, TokenKind::LBracket);
@@ -1502,6 +1503,7 @@ mod tests {
         assert_token!(lex, TokenKind::LParen);
         assert_token!(lex, TokenKind::RParen);
         assert_token!(lex, TokenKind::Comma);
+        assert_token!(lex, TokenKind::Semicolon);
         assert_token!(lex, TokenKind::Dot);
         assert_token!(lex, TokenKind::Plus);
         assert_token!(lex, TokenKind::Star);

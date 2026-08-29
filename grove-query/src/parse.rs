@@ -1,6 +1,6 @@
 use crate::ast::{
-    Arg, BinaryOp, ConstantName, Expr, Literal, ProjectionItem, QueryFile, SortDir, TypeName,
-    UnaryOp,
+    Arg, BinaryOp, ConstantName, Expr, Literal, MutationKind, MutationStmt, ProjectionItem,
+    QueryFile, SortDir, Statement, TypeName, UnaryOp,
 };
 use crate::error::QueryParseError;
 use crate::lex::Lexer;
@@ -66,17 +66,57 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_file(&mut self) -> Result<QueryFile, ()> {
-        let result = self.parse_expr(true)?;
-        if !matches!(self.current.value, TokenKind::Eof) {
-            self.emit_error(QueryParseError::TrailingInput {
-                span: self.current.span,
+        let mut statements = Vec::new();
+
+        loop {
+            if matches!(self.current.value, TokenKind::Eof) {
+                if self.diagnostics.is_empty() {
+                    self.emit_error(QueryParseError::ExpectedExpr {
+                        span: self.current.span,
+                    });
+                }
+                return Err(());
+            }
+
+            if matches!(self.current.value, TokenKind::Semicolon) {
+                self.emit_error(QueryParseError::EmptyStatement {
+                    span: self.current.span,
+                });
+                self.bump();
+                continue;
+            }
+
+            let Ok(expr) = self.parse_expr(true) else {
+                while !matches!(self.current.value, TokenKind::Semicolon | TokenKind::Eof) {
+                    self.bump();
+                }
+                continue;
+            };
+
+            if matches!(self.current.value, TokenKind::Semicolon) {
+                self.bump();
+
+                if is_mutation(&expr) {
+                    statements.push(Statement::Mutation(reclassify_mutation(expr)));
+                } else {
+                    self.emit_warning(QueryParseError::DiscardedQuery { span: expr.span() });
+                    statements.push(Statement::Expr(expr));
+                }
+                continue;
+            }
+
+            if !matches!(self.current.value, TokenKind::Eof) {
+                self.emit_error(QueryParseError::TrailingInput {
+                    span: self.current.span,
+                });
+                return Err(());
+            }
+
+            return Ok(QueryFile {
+                statements,
+                result: expr,
             });
-            return Err(());
         }
-        Ok(QueryFile {
-            statements: Vec::new(),
-            result,
-        })
     }
 
     fn parse_expr(&mut self, allow_projection_braces: bool) -> Result<Expr, ()> {
@@ -730,6 +770,10 @@ impl<'src> Parser<'src> {
     fn emit_error(&mut self, err: QueryParseError) {
         self.diagnostics.push(err.into());
     }
+
+    fn emit_warning(&mut self, err: QueryParseError) {
+        self.diagnostics.push(err.into());
+    }
 }
 
 fn binary_op(kind: &TokenKind) -> Option<(BinaryOp, u8)> {
@@ -750,6 +794,47 @@ fn binary_op(kind: &TokenKind) -> Option<(BinaryOp, u8)> {
         TokenKind::AmpAmp => Some((BinaryOp::And, 2)),
         TokenKind::PipePipe => Some((BinaryOp::Or, 1)),
         _ => None,
+    }
+}
+
+fn is_mutation(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Method {
+            name,
+            ..
+        } if matches!(name.value.as_str(), "insert" | "update" | "delete")
+    )
+}
+
+fn reclassify_mutation(expr: Expr) -> MutationStmt {
+    let Expr::Method {
+        base, name, args, ..
+    } = expr
+    else {
+        unreachable!()
+    };
+
+    let kind = match name.value.as_str() {
+        "insert" => MutationKind::Insert,
+        "update" => MutationKind::Update,
+        "delete" => MutationKind::Delete,
+        _ => unreachable!(),
+    };
+
+    let arg = if args.is_empty() {
+        None
+    } else {
+        Some(Box::new(args.into_iter().next().unwrap().expr))
+    };
+
+    MutationStmt {
+        kind: Spanned {
+            span: name.span,
+            value: kind,
+        },
+        base: *base,
+        arg,
     }
 }
 
@@ -1572,5 +1657,93 @@ mod tests {
             }
             other => panic!("expected if, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn mutation_insert_statement() {
+        let src = "users.insert({name = \"Alice\"}); 0";
+        let (file, diags) = parse_query(src);
+        let file = file.expect("should parse");
+        assert_eq!(file.statements.len(), 1);
+        assert!(
+            matches!(&file.statements[0], Statement::Mutation(m) if m.kind.value == MutationKind::Insert)
+        );
+        assert!(matches!(file.result, Expr::Literal(lit) if lit.value == Literal::Int(0)));
+        assert!(
+            diags
+                .iter()
+                .all(|d| d.severity != grove_types::Severity::Warning)
+        );
+    }
+
+    #[test]
+    fn mutation_delete_statement() {
+        let src = "users[!active].delete(); 0";
+        let file = parse_query(src).0.expect("should parse");
+        assert_eq!(file.statements.len(), 1);
+        assert!(
+            matches!(&file.statements[0], Statement::Mutation(m) if m.kind.value == MutationKind::Delete)
+        );
+    }
+
+    #[test]
+    fn mutation_update_statement() {
+        let src = "users.update({name = \"Bob\"}); 0";
+        let file = parse_query(src).0.expect("should parse");
+        assert_eq!(file.statements.len(), 1);
+        assert!(
+            matches!(&file.statements[0], Statement::Mutation(m) if m.kind.value == MutationKind::Update)
+        );
+    }
+
+    #[test]
+    fn discarded_query_warning() {
+        let src = "users { name }; 0";
+        let (file, diags) = parse_query(src);
+        let file = file.expect("should parse");
+        assert_eq!(file.statements.len(), 1);
+        assert!(matches!(&file.statements[0], Statement::Expr(_)));
+        let warnings: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == grove_types::Severity::Warning)
+            .collect();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code.as_ref(), "QP0024");
+    }
+
+    #[test]
+    fn empty_statement_error() {
+        let (file, diags) = parse_query(";");
+        assert!(file.is_none());
+        assert!(diags.iter().any(|d| d.code.as_ref() == "QP0023"));
+    }
+
+    #[test]
+    fn multiple_statements() {
+        let src = "users.insert({name = \"Alice\"}); users.insert({name = \"Bob\"}); 42";
+        let file = parse_query(src).0.expect("should parse");
+        assert_eq!(file.statements.len(), 2);
+        assert!(
+            file.statements
+                .iter()
+                .all(|s| matches!(s, Statement::Mutation(_)))
+        );
+        assert!(matches!(file.result, Expr::Literal(lit) if lit.value == Literal::Int(42)));
+    }
+
+    #[test]
+    fn statement_and_discarded() {
+        let src = "users.insert({name = \"Alice\"}); users { name }; 42";
+        let file = parse_query(src).0.expect("should parse");
+        assert_eq!(file.statements.len(), 2);
+        assert!(matches!(&file.statements[0], Statement::Mutation(_)));
+        assert!(matches!(&file.statements[1], Statement::Expr(_)));
+    }
+
+    #[test]
+    fn missing_result() {
+        let (file, diags) = parse_query("users.insert({name = \"Alice\"});");
+        assert!(file.is_none());
+        assert!(diags.iter().any(|d| d.code.as_ref() == "QP0001"));
     }
 }

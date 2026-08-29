@@ -42,6 +42,7 @@ pub enum TokenKind {
     LParen,
     RParen,
     Comma,
+    Semicolon,
     Dot,
     QuestionDot,
     Equals,
