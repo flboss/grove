@@ -127,6 +127,15 @@ impl ValidatedSchema {
             .position(|r| r.endpoints().contains(&field))
             .map(RelationId::new)
     }
+
+    pub fn struct_field(&self, struct_id: StructId, name: &str) -> Option<&Field> {
+        let s = &self.structs[struct_id.index()];
+        s.fields.iter().find(|f| match f {
+            Field::Value { name: n, .. }
+            | Field::Array { name: n, .. }
+            | Field::Ref { name: n, .. } => n == name,
+        })
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
