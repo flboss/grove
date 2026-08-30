@@ -364,7 +364,7 @@ pub enum QueryParseError {
     ExpectedCastTypeName { span: Span },
     ProjectionItemAliasRequired { span: Span },
     EmptyStatement { span: Span },
-    DiscardedQuery {span:Span},
+    DiscardedQuery { span: Span },
     MutationAsResult { span: Span },
 }
 
