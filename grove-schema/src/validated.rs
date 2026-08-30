@@ -1,5 +1,6 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IntArithmetic {
+    #[default]
     Checked,
     Saturating,
     Wrapping,
@@ -18,8 +19,9 @@ impl TryFrom<&str> for IntArithmetic {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DecArithmetic {
+    #[default]
     Checked,
     Saturating,
 }
@@ -109,7 +111,7 @@ impl FieldId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct ValidatedSchema {
     pub config: Config,
     pub roots: Vec<Root>,
@@ -127,7 +129,7 @@ impl ValidatedSchema {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct Config {
     pub int_arithmetic: IntArithmetic,
     pub float_checks: bool,

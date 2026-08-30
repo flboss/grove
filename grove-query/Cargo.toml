@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 grove-types.workspace = true
+grove-schema.workspace = true
 
 chrono.workspace = true
 rust_decimal.workspace = true

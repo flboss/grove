@@ -1,0 +1,179 @@
+use std::fmt;
+
+use crate::ast::{BinaryOp, ConstantName, Literal, MutationKind, TypeName, UnaryOp};
+use grove_schema::validated::{ScalarType, StructId};
+use grove_types::{Span, Spanned};
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedQueryFile {
+    pub statements: Vec<TypedStatement>,
+    pub result: TypedExpr,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TypedStatement {
+    Mutation(TypedMutationStmt),
+    Expr(TypedExpr),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedMutationStmt {
+    pub kind: Spanned<MutationKind>,
+    pub base: TypedExpr,
+    pub arg: Option<TypedExpr>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedExpr {
+    pub kind: TypedExprKind,
+    pub ty: QueryType,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TypedExprKind {
+    Literal(Spanned<Literal>),
+    Ident(Spanned<String>),
+    Field {
+        base: Box<TypedExpr>,
+        name: Spanned<String>,
+        optional: bool,
+    },
+    Method {
+        base: Box<TypedExpr>,
+        name: Spanned<String>,
+        args: Vec<TypedExpr>,
+        optional: bool,
+    },
+    Binary {
+        op: Spanned<BinaryOp>,
+        lhs: Box<TypedExpr>,
+        rhs: Box<TypedExpr>,
+    },
+    Unary {
+        op: Spanned<UnaryOp>,
+        expr: Box<TypedExpr>,
+    },
+    Cast {
+        expr: Box<TypedExpr>,
+        ty: Spanned<TypeName>,
+    },
+    If {
+        arms: Vec<(TypedExpr, TypedExpr)>,
+        default: Box<TypedExpr>,
+    },
+    Some {
+        value: Box<TypedExpr>,
+    },
+    Tuple {
+        elements: Vec<TypedExpr>,
+    },
+    Array {
+        elements: Vec<TypedExpr>,
+    },
+    Struct {
+        fields: Vec<(Spanned<String>, TypedExpr)>,
+    },
+    Projection {
+        base: Box<TypedExpr>,
+        items: Vec<TypedProjectionItem>,
+    },
+    TypeConstant {
+        ty: Spanned<TypeName>,
+        name: Spanned<ConstantName>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedProjectionItem {
+    pub alias: Option<Spanned<String>>,
+    pub value: TypedExpr,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectionField {
+    pub name: String,
+    pub ty: QueryType,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum QueryType {
+    Scalar(ScalarType),
+    Optional(Box<QueryType>),
+    List(Box<QueryType>),
+    Tuple(Vec<QueryType>),
+    Record {
+        struct_id: Option<StructId>,
+        fields: Vec<ProjectionField>,
+    },
+    Void,
+    Unknown,
+}
+
+impl QueryType {
+    pub fn is_numeric(&self) -> bool {
+        matches!(
+            self,
+            QueryType::Scalar(ScalarType::Int | ScalarType::Float | ScalarType::Dec)
+        )
+    }
+
+    pub fn is_bool(&self) -> bool {
+        matches!(self, QueryType::Scalar(ScalarType::Bool))
+    }
+
+    pub fn unwrap_optional(&self) -> &QueryType {
+        match self {
+            QueryType::Optional(inner) => inner,
+            other => other,
+        }
+    }
+
+    pub fn into_optional(self) -> QueryType {
+        QueryType::Optional(Box::new(self))
+    }
+}
+
+impl fmt::Display for QueryType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            QueryType::Scalar(s) => match s {
+                ScalarType::Int => write!(f, "Int"),
+                ScalarType::Float => write!(f, "Float"),
+                ScalarType::Dec => write!(f, "Dec"),
+                ScalarType::String => write!(f, "String"),
+                ScalarType::Bool => write!(f, "Bool"),
+                ScalarType::Instant => write!(f, "Instant"),
+                ScalarType::Duration => write!(f, "Duration"),
+            },
+            QueryType::Optional(inner) => write!(f, "?{inner}"),
+            QueryType::List(inner) => write!(f, "List<{inner}>"),
+            QueryType::Tuple(elems) => {
+                write!(f, "(")?;
+                for (i, elem) in elems.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{elem}")?;
+                }
+                write!(f, ")")
+            }
+            QueryType::Record { struct_id, fields } => {
+                if let Some(id) = struct_id {
+                    write!(f, "Record#{}", id.index())
+                } else {
+                    write!(f, "{{ ")?;
+                    for (i, field) in fields.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{}", field.name)?;
+                    }
+                    write!(f, " }}")
+                }
+            }
+            QueryType::Void => write!(f, "Void"),
+            QueryType::Unknown => write!(f, "_"),
+        }
+    }
+}
