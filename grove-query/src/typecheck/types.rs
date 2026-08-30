@@ -97,15 +97,18 @@ pub struct ProjectionField {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum RecordSource {
+    Schema(StructId),
+    Projection(Vec<ProjectionField>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum QueryType {
     Scalar(ScalarType),
     Optional(Box<QueryType>),
     List(Box<QueryType>),
     Tuple(Vec<QueryType>),
-    Record {
-        struct_id: Option<StructId>,
-        fields: Vec<ProjectionField>,
-    },
+    Record(RecordSource),
     Void,
     Unknown,
 }
@@ -158,19 +161,18 @@ impl fmt::Display for QueryType {
                 }
                 write!(f, ")")
             }
-            QueryType::Record { struct_id, fields } => {
-                if let Some(id) = struct_id {
-                    write!(f, "Record#{}", id.index())
-                } else {
-                    write!(f, "{{ ")?;
-                    for (i, field) in fields.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{}", field.name)?;
+            QueryType::Record(RecordSource::Projection(fields)) => {
+                write!(f, "{{ ")?;
+                for (i, field) in fields.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
                     }
-                    write!(f, " }}")
+                    write!(f, "{}", field.name)?;
                 }
+                write!(f, " }}")
+            }
+            QueryType::Record(RecordSource::Schema(struct_id)) => {
+                write!(f, "Record#{}", struct_id.index())
             }
             QueryType::Void => write!(f, "Void"),
             QueryType::Unknown => write!(f, "_"),
