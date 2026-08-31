@@ -330,16 +330,29 @@ fn infer_method(
     let mut typed_args = Vec::new();
     for (i, arg) in args.iter().enumerate() {
         let typed = infer(&arg.expr, env)?;
-        if let ArgCheck::Fixed(expected) = &signature.args
-            && let Some(exp_ty) = expected.get(i)
-            && !types_compatible(&typed.ty, exp_ty)
-        {
-            return Err(TypeError::ArgTypeMismatch {
-                method: name.value.clone(),
-                expected: exp_ty.to_string(),
-                got: typed.ty.to_string(),
-                span: arg.expr.span(),
-            });
+        match &signature.args {
+            ArgCheck::Fixed(expected) => {
+                if let Some(exp_ty) = expected.get(i)
+                    && !types_compatible(&typed.ty, exp_ty)
+                {
+                    return Err(TypeError::ArgTypeMismatch {
+                        method: name.value.clone(),
+                        expected: exp_ty.to_string(),
+                        got: typed.ty.to_string(),
+                        span: arg.expr.span(),
+                    });
+                }
+            }
+            ArgCheck::Scoped { constraint, .. } => {
+                if !constraint(&typed.ty) {
+                    return Err(TypeError::ArgTypeMismatch {
+                        method: name.value.clone(),
+                        expected: "valid argument type".into(),
+                        got: typed.ty.to_string(),
+                        span: arg.expr.span(),
+                    });
+                }
+            }
         }
         typed_args.push(typed);
     }
@@ -845,6 +858,24 @@ mod tests {
         let schema = test_schema();
         let mut env = TypeEnv::new(&schema);
         let (file, _diags) = crate::parse_query("users.age.contains(1)");
+        let result = infer(&file.unwrap().result, &mut env);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn method_arg_constraint_valid() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _diags) = crate::parse_query("users.sum_by(age)");
+        let result = infer(&file.unwrap().result, &mut env);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn method_arg_constraint_invalid() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _diags) = crate::parse_query("users.sort_asc(profile)");
         let result = infer(&file.unwrap().result, &mut env);
         assert!(result.is_err());
     }
