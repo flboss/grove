@@ -496,7 +496,7 @@ fn method_signature(base: &QueryType, method: &str) -> Option<MethodSig> {
                 1,
                 QueryType::has_defined_order,
             )),
-            "sum_by" | "avg_by" if matches!(inner.as_ref(), QueryType::Record(_)) => {
+            "sum_over" | "avg_over" if matches!(inner.as_ref(), QueryType::Record(_)) => {
                 Some(MethodSig::scoped_fixed(
                     QueryType::Unknown.wrap_optional(),
                     1,
@@ -858,7 +858,7 @@ mod tests {
     fn method_arg_constraint_valid() {
         let schema = test_schema();
         let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("users.sum_by(age)");
+        let (file, _diags) = crate::parse_query("users.sum_over(age)");
         let result = infer(&file.unwrap().result, &mut env);
         assert!(result.is_ok());
     }
