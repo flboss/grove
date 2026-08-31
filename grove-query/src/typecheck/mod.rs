@@ -282,7 +282,7 @@ fn infer_method(
         base.ty.clone()
     };
 
-    let signature =
+    let mut signature =
         method_signature(&resolve_ty, &name.value).ok_or_else(|| TypeError::UnknownMethod {
             method: name.value.clone(),
             base_ty: base.ty.to_string(),
@@ -329,11 +329,11 @@ fn infer_method(
 
     let mut typed_args = Vec::new();
     for (i, arg) in args.iter().enumerate() {
-        let typed = infer(&arg.expr, env)?;
-        match &signature.args {
+        let mut typed = infer(&arg.expr, env)?;
+        match &mut signature.args {
             ArgCheck::Fixed(expected) => {
-                if let Some(exp_ty) = expected.get(i)
-                    && !types_compatible(&typed.ty, exp_ty, env.schema())
+                if let Some(exp_ty) = expected.get_mut(i)
+                    && !types_compatible(&mut typed.ty, exp_ty, env.schema())
                 {
                     return Err(TypeError::ArgTypeMismatch {
                         method: name.value.clone(),
@@ -361,10 +361,15 @@ fn infer_method(
         env.pop_scope();
     }
 
+    let return_ty = match signature.return_type {
+        QueryType::Unknown if !typed_args.is_empty() => typed_args[0].ty.clone().wrap_optional(),
+        _ => signature.return_type,
+    };
+
     let return_ty = if optional {
-        signature.return_type.wrap_optional()
+        return_ty.wrap_optional()
     } else {
-        signature.return_type
+        return_ty
     };
 
     let span = Span::new(base.span.start, name.span.end);
@@ -380,20 +385,28 @@ fn infer_method(
     })
 }
 
-fn types_compatible(a: &QueryType, b: &QueryType, schema: &ValidatedSchema) -> bool {
+fn types_compatible(a: &mut QueryType, b: &mut QueryType, schema: &ValidatedSchema) -> bool {
     match (a, b) {
-        (QueryType::Unknown, _) | (_, QueryType::Unknown) => true,
+        (QueryType::Unknown, QueryType::Unknown) => true,
+        (a @ QueryType::Unknown, b) => {
+            *a = b.clone();
+            true
+        }
+        (a, b @ QueryType::Unknown) => {
+            *b = a.clone();
+            true
+        }
         (QueryType::Optional(a), QueryType::Optional(b)) => types_compatible(a, b, schema),
         (QueryType::List(a), QueryType::List(b)) => types_compatible(a, b, schema),
         (QueryType::Scalar(a), QueryType::Scalar(b)) => a == b,
         (QueryType::Tuple(a), QueryType::Tuple(b)) => {
             a.len() == b.len()
-                && a.iter()
-                    .zip(b.iter())
+                && a.iter_mut()
+                    .zip(b.iter_mut())
                     .all(|(a, b)| types_compatible(a, b, schema))
         }
         (QueryType::Record(a), QueryType::Record(b)) => record_fields_match(a, b, schema),
-        _ => a == b,
+        (a, b) => a == b,
     }
 }
 
@@ -439,11 +452,12 @@ fn record_fields_match(a: &RecordSource, b: &RecordSource, schema: &ValidatedSch
         let a_ty = record_source_field_type(a, name, schema);
         let b_ty = record_source_field_type(b, name, schema);
         match (a_ty, b_ty) {
-            (Some(a_ty), Some(b_ty)) => types_compatible(&a_ty, &b_ty, schema),
+            (Some(mut a_ty), Some(mut b_ty)) => types_compatible(&mut a_ty, &mut b_ty, schema),
             _ => false,
         }
     })
 }
+
 #[derive(Debug, Clone, Copy)]
 enum ArgCount {
     Exact(usize),
