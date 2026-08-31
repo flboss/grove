@@ -8,7 +8,6 @@ pub enum TypeError {
     UnknownField { field: String, base_ty: String, span: Span },
     UnknownMethod { method: String, base_ty: String, span: Span },
     WrongArgCount { method: String, expected: usize, got: usize, span: Span },
-    // TODO: enum instead of String?
     ArgTypeMismatch { method: String, expected: String, got: String, span: Span },
     AmbiguousType { span: Span },
 }

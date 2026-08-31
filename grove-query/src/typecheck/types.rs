@@ -137,6 +137,10 @@ impl QueryType {
         self.is_numeric() || matches!(self, QueryType::Scalar(ScalarType::Duration))
     }
 
+    pub fn is_optional(&self) -> bool {
+        matches!(self, QueryType::Optional(_))
+    }
+
     pub fn unwrap_optional(&self) -> &QueryType {
         match self {
             QueryType::Optional(inner) => inner,
@@ -145,7 +149,13 @@ impl QueryType {
     }
 
     pub fn wrap_optional(self) -> QueryType {
-        QueryType::Optional(Box::new(self))
+        match self {
+            QueryType::Optional(_) => self,
+            QueryType::Tuple(elems) => {
+                QueryType::Tuple(elems.into_iter().map(QueryType::wrap_optional).collect())
+            }
+            other => QueryType::Optional(Box::new(other)),
+        }
     }
 }
 
@@ -156,9 +166,7 @@ impl From<&ValueType> for QueryType {
             ValueType::Tuple(types) => {
                 QueryType::Tuple(types.iter().map(QueryType::from).collect())
             }
-            ValueType::Optional(inner) => {
-                QueryType::Optional(Box::new(QueryType::from(inner.as_ref())))
-            }
+            ValueType::Optional(inner) => QueryType::from(inner.as_ref()).wrap_optional(),
             ValueType::Array { element, .. } => {
                 QueryType::List(Box::new(QueryType::from(element.as_ref())))
             }

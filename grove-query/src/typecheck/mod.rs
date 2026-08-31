@@ -93,7 +93,7 @@ impl<'s> TypeEnv<'s> {
                     let ty = if *is_list {
                         QueryType::List(Box::new(inner))
                     } else if *optional {
-                        QueryType::Optional(Box::new(inner))
+                        inner.wrap_optional()
                     } else {
                         inner
                     };
@@ -119,7 +119,7 @@ fn field_query_type(field: &Field) -> QueryType {
             if *is_list {
                 QueryType::List(Box::new(inner))
             } else if *optional {
-                QueryType::Optional(Box::new(inner))
+                inner.wrap_optional()
             } else {
                 inner
             }
@@ -154,7 +154,7 @@ fn infer_literal(literal: &Literal) -> QueryType {
             QueryType::Scalar(ScalarType::Instant)
         }
         Literal::Duration(_) => QueryType::Scalar(ScalarType::Duration),
-        Literal::None => QueryType::Optional(Box::new(QueryType::Unknown)),
+        Literal::None => QueryType::Unknown.wrap_optional(),
     }
 }
 
@@ -244,7 +244,7 @@ fn infer_field(
         field_ty = QueryType::List(Box::new(field_ty));
     }
     if optional {
-        field_ty = QueryType::Optional(Box::new(field_ty));
+        field_ty = field_ty.wrap_optional();
     }
 
     let span = Span::new(base.span.start, name.span.end);
@@ -573,10 +573,7 @@ fn check(expr: &Expr, expected: &QueryType, env: &mut TypeEnv) -> Result<TypedEx
             value: Literal::None,
             span,
         }) => {
-            let ty = match expected {
-                QueryType::Optional(inner) => QueryType::Optional(inner.clone()),
-                other => QueryType::Optional(Box::new(other.clone())),
-            };
+            let ty = expected.clone().wrap_optional();
             Ok(TypedExpr {
                 kind: TypedExprKind::Literal(Spanned {
                     span: *span,
@@ -728,7 +725,7 @@ mod tests {
     fn none_inferred_type() {
         let schema = test_schema();
         let mut env = TypeEnv::new(&schema);
-        let expected = QueryType::Optional(Box::new(QueryType::Scalar(ScalarType::Int)));
+        let expected = QueryType::Scalar(ScalarType::Int).wrap_optional();
         let (file, _diags) = crate::parse_query("none");
         let result = check(&file.unwrap().result, &expected, &mut env).unwrap();
         assert_eq!(result.ty, expected);
@@ -740,7 +737,7 @@ mod tests {
         let mut env = TypeEnv::new(&schema);
         let (file, _diags) = crate::parse_query("none");
         let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Optional(Box::new(QueryType::Unknown)));
+        assert_eq!(result.ty, QueryType::Unknown.wrap_optional());
     }
 
     #[test]
