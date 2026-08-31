@@ -384,9 +384,11 @@ fn types_compatible(actual: &QueryType, expected: &QueryType) -> bool {
     match (actual, expected) {
         (QueryType::Unknown, _) | (_, QueryType::Unknown) => true,
         (QueryType::Optional(a), QueryType::Optional(b)) => types_compatible(a, b),
-        (a, QueryType::Optional(b)) => types_compatible(a, b),
         (QueryType::List(a), QueryType::List(b)) => types_compatible(a, b),
         (QueryType::Scalar(a), QueryType::Scalar(b)) => a == b,
+        (QueryType::Tuple(a), QueryType::Tuple(b)) => {
+            a.len() == b.len() && a.iter().zip(b.iter()).all(|(a, b)| types_compatible(a, b))
+        }
         (
             QueryType::Record(RecordSource::Schema(a)),
             QueryType::Record(RecordSource::Schema(b)),
