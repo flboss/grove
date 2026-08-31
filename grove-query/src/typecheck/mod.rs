@@ -478,6 +478,10 @@ fn method_signature(base: &QueryType, method: &str) -> Option<MethodSig> {
                 inner.as_ref().clone().wrap_optional(),
                 QueryType::Scalar(Int),
             )),
+            "contains" => Some(MethodSig::one_arg(
+                QueryType::Scalar(Bool),
+                inner.as_ref().clone(),
+            )),
             "sum" if inner.is_summable() => {
                 Some(MethodSig::no_args(inner.as_ref().clone().wrap_optional()))
             }
@@ -849,15 +853,6 @@ mod tests {
         let schema = test_schema();
         let mut env = TypeEnv::new(&schema);
         let (file, _diags) = crate::parse_query("users.name.contains(\"a\", \"b\")");
-        let result = infer(&file.unwrap().result, &mut env);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn method_on_non_method_type() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("users.age.contains(1)");
         let result = infer(&file.unwrap().result, &mut env);
         assert!(result.is_err());
     }
