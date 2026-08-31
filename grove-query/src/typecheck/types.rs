@@ -1,7 +1,7 @@
 use std::fmt;
 
 use crate::ast::{BinaryOp, ConstantName, Literal, MutationKind, TypeName, UnaryOp};
-use grove_schema::validated::{ScalarType, StructId};
+use grove_schema::validated::{ScalarType, StructId, ValueType};
 use grove_types::{Span, Spanned};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -125,6 +125,18 @@ impl QueryType {
         matches!(self, QueryType::Scalar(ScalarType::Bool))
     }
 
+    pub fn has_defined_order(&self) -> bool {
+        match self {
+            QueryType::Scalar(_) => true,
+            QueryType::Tuple(elems) => elems.iter().all(Self::has_defined_order),
+            _ => false,
+        }
+    }
+
+    pub fn is_summable(&self) -> bool {
+        self.is_numeric() || matches!(self, QueryType::Scalar(ScalarType::Duration))
+    }
+
     pub fn unwrap_optional(&self) -> &QueryType {
         match self {
             QueryType::Optional(inner) => inner,
@@ -132,8 +144,25 @@ impl QueryType {
         }
     }
 
-    pub fn into_optional(self) -> QueryType {
+    pub fn wrap_optional(self) -> QueryType {
         QueryType::Optional(Box::new(self))
+    }
+}
+
+impl From<&ValueType> for QueryType {
+    fn from(value: &ValueType) -> Self {
+        match value {
+            ValueType::Scalar(s) => QueryType::Scalar(*s),
+            ValueType::Tuple(types) => {
+                QueryType::Tuple(types.iter().map(QueryType::from).collect())
+            }
+            ValueType::Optional(inner) => {
+                QueryType::Optional(Box::new(QueryType::from(inner.as_ref())))
+            }
+            ValueType::Array { element, .. } => {
+                QueryType::List(Box::new(QueryType::from(element.as_ref())))
+            }
+        }
     }
 }
 
