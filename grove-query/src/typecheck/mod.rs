@@ -333,7 +333,7 @@ fn infer_method(
         match &signature.args {
             ArgCheck::Fixed(expected) => {
                 if let Some(exp_ty) = expected.get(i)
-                    && !types_compatible(&typed.ty, exp_ty)
+                    && !types_compatible(&typed.ty, exp_ty, env.schema())
                 {
                     return Err(TypeError::ArgTypeMismatch {
                         method: name.value.clone(),
@@ -380,23 +380,70 @@ fn infer_method(
     })
 }
 
-fn types_compatible(actual: &QueryType, expected: &QueryType) -> bool {
-    match (actual, expected) {
+fn types_compatible(a: &QueryType, b: &QueryType, schema: &ValidatedSchema) -> bool {
+    match (a, b) {
         (QueryType::Unknown, _) | (_, QueryType::Unknown) => true,
-        (QueryType::Optional(a), QueryType::Optional(b)) => types_compatible(a, b),
-        (QueryType::List(a), QueryType::List(b)) => types_compatible(a, b),
+        (QueryType::Optional(a), QueryType::Optional(b)) => types_compatible(a, b, schema),
+        (QueryType::List(a), QueryType::List(b)) => types_compatible(a, b, schema),
         (QueryType::Scalar(a), QueryType::Scalar(b)) => a == b,
         (QueryType::Tuple(a), QueryType::Tuple(b)) => {
-            a.len() == b.len() && a.iter().zip(b.iter()).all(|(a, b)| types_compatible(a, b))
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b.iter())
+                    .all(|(a, b)| types_compatible(a, b, schema))
         }
-        (
-            QueryType::Record(RecordSource::Schema(a)),
-            QueryType::Record(RecordSource::Schema(b)),
-        ) => a == b,
-        _ => actual == expected,
+        (QueryType::Record(a), QueryType::Record(b)) => record_fields_match(a, b, schema),
+        _ => a == b,
     }
 }
 
+fn record_source_field_count(source: &RecordSource, schema: &ValidatedSchema) -> usize {
+    match source {
+        RecordSource::Schema(id) => schema.structs[id.index()].fields.len(),
+        RecordSource::Projection(fields) => fields.len(),
+    }
+}
+
+fn record_source_field_type<'a>(
+    source: &'a RecordSource,
+    name: &str,
+    schema: &'a ValidatedSchema,
+) -> Option<QueryType> {
+    match source {
+        RecordSource::Schema(id) => schema.struct_field(*id, name).map(field_query_type),
+        RecordSource::Projection(fields) => {
+            fields.iter().find(|f| f.name == name).map(|f| f.ty.clone())
+        }
+    }
+}
+
+fn record_fields_match(a: &RecordSource, b: &RecordSource, schema: &ValidatedSchema) -> bool {
+    if record_source_field_count(a, schema) != record_source_field_count(b, schema) {
+        return false;
+    }
+
+    let a_names: Vec<&str> = match a {
+        RecordSource::Schema(id) => schema.structs[id.index()]
+            .fields
+            .iter()
+            .map(|f| match f {
+                Field::Value { name, .. } | Field::Array { name, .. } | Field::Ref { name, .. } => {
+                    name.as_str()
+                }
+            })
+            .collect(),
+        RecordSource::Projection(fields) => fields.iter().map(|f| f.name.as_str()).collect(),
+    };
+
+    a_names.iter().all(|name| {
+        let a_ty = record_source_field_type(a, name, schema);
+        let b_ty = record_source_field_type(b, name, schema);
+        match (a_ty, b_ty) {
+            (Some(a_ty), Some(b_ty)) => types_compatible(&a_ty, &b_ty, schema),
+            _ => false,
+        }
+    })
+}
 #[derive(Debug, Clone, Copy)]
 enum ArgCount {
     Exact(usize),
