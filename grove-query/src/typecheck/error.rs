@@ -1,5 +1,5 @@
 use crate::error::error_simple;
-use grove_types::{Diagnostic, Span};
+use grove_types::{Diagnostic, Label, LabelStyle, Span};
 
 #[rustfmt::skip]
 #[derive(Debug, Clone)]
@@ -17,6 +17,10 @@ pub enum TypeError {
     IfBranchTypeMismatch { expected: String, got: String, span: Span },
     InvalidCast { from: String, to: String, span: Span },
     ArrayElementTypeMismatch { expected: String, got: String, span: Span },
+    DuplicateProjectionField { name: String, span: Span, previous: Span},
+    UnnamedComputedField { span: Span },
+    ProjectionBaseNotRecord { found: String, span: Span },
+    EmptyProjection { span: Span },
 }
 
 impl From<TypeError> for Diagnostic {
@@ -131,6 +135,40 @@ impl From<TypeError> for Diagnostic {
                 span,
                 "type mismatch",
             ),
+            TypeError::DuplicateProjectionField {
+                name,
+                span,
+                previous,
+            } => error_simple(
+                "QT0015",
+                format!("duplicate projection field name `{name}`"),
+                span,
+                "duplicate field",
+            )
+            .with_label(Label {
+                span: previous,
+                message: "first defined here".into(),
+                style: LabelStyle::Secondary,
+            }),
+            TypeError::UnnamedComputedField { span } => error_simple(
+                "QT0016",
+                "computed projection field requires an explicit alias",
+                span,
+                "missing alias",
+            ),
+            TypeError::ProjectionBaseNotRecord { found, span } => error_simple(
+                "QT0017",
+                format!("projection requires a Record or List<Record>, got `{found}`"),
+                span,
+                "expected record",
+            ),
+            TypeError::EmptyProjection { span } => error_simple(
+                "QT0018",
+                "empty projection `{}` is not allowed",
+                span,
+                "empty projection",
+            )
+            .with_help("omit the projection to select all fields"),
         }
     }
 }

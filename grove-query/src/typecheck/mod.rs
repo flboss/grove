@@ -1,9 +1,11 @@
 pub mod error;
 pub mod types;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use crate::ast::{Arg, BinaryOp, Expr, Literal, QueryFile, Statement, TypeName, UnaryOp};
+use crate::ast::{
+    Arg, BinaryOp, Expr, Literal, ProjectionItem, QueryFile, Statement, TypeName, UnaryOp,
+};
 use crate::typecheck::error::TypeError;
 use crate::typecheck::types::*;
 use grove_schema::validated::{Field, ScalarType, StructId, ValidatedSchema};
@@ -235,6 +237,7 @@ fn infer(expr: &Expr, env: &mut TypeEnv) -> Result<TypedExpr, TypeError> {
             span,
         } => infer_if(arms, default, *span, env),
         Expr::Cast { expr, ty, .. } => infer_cast(expr, ty, env),
+        Expr::Projection { base, items, span } => infer_projection(base, items, *span, env),
         _ => Err(TypeError::AmbiguousType { span: expr.span() }),
     }
 }
@@ -354,6 +357,97 @@ fn cast_allowed(from: &QueryType, to: &QueryType) -> bool {
             (from, to),
             (QueryType::Scalar(Bool), QueryType::Scalar(Int))
         )
+}
+
+fn infer_projection(
+    base: &Expr,
+    items: &[ProjectionItem],
+    span: Span,
+    env: &mut TypeEnv,
+) -> Result<TypedExpr, TypeError> {
+    if items.is_empty() {
+        return Err(TypeError::EmptyProjection { span });
+    }
+
+    let typed_base = infer(base, env)?;
+
+    match &typed_base.ty {
+        QueryType::Record(_) => {}
+        QueryType::List(inner) if matches!(**inner, QueryType::Record(_)) => {}
+        _ => {
+            return Err(TypeError::ProjectionBaseNotRecord {
+                found: typed_base.ty.to_string(),
+                span: typed_base.span,
+            });
+        }
+    }
+
+    let pushed_scope = env.push_record_fields(&typed_base.ty);
+
+    let mut typed_items = Vec::with_capacity(items.len());
+    let mut seen_names: HashSet<&Spanned<String>> = HashSet::new();
+
+    for item in items {
+        let (name, typed_value) = match (&item.alias, &item.value) {
+            (Some(name), value)
+            | (None, value @ Expr::Ident(name))
+            | (None, value @ Expr::Field { name, .. }) => {
+                let typed_value = infer(value, env)?;
+                (name, typed_value)
+            }
+            (None, _) => {
+                return Err(TypeError::UnnamedComputedField {
+                    span: item.value.span(),
+                });
+            }
+        };
+
+        if let Some(previous) = seen_names.get(name) {
+            return Err(TypeError::DuplicateProjectionField {
+                name: name.value.to_string(),
+                span: item.value.span(),
+                previous: previous.span,
+            });
+        }
+        seen_names.insert(name);
+
+        typed_items.push(TypedProjectionItem {
+            alias: Some(Spanned {
+                value: name.to_string(),
+                span: item.value.span(),
+            }),
+            value: typed_value,
+        });
+    }
+
+    let is_list = matches!(&typed_base.ty, QueryType::List(_));
+    let proj_source = RecordSource::Projection(
+        typed_items
+            .iter()
+            .map(|t| ProjectionField {
+                name: t.alias.as_deref().cloned().unwrap_or_default(),
+                ty: t.value.ty.clone(),
+            })
+            .collect(),
+    );
+    let result_ty = if is_list {
+        QueryType::List(Box::new(QueryType::Record(proj_source)))
+    } else {
+        QueryType::Record(proj_source)
+    };
+
+    if pushed_scope {
+        env.pop_scope();
+    }
+
+    Ok(TypedExpr {
+        kind: TypedExprKind::Projection {
+            base: Box::new(typed_base),
+            items: typed_items,
+        },
+        ty: result_ty,
+        span,
+    })
 }
 
 fn infer_field(
@@ -2045,5 +2139,124 @@ mod tests {
         let (file, _) = crate::parse_query(r#"1 in (1, 2, 3)"#);
         let result = infer(&file.unwrap().result, &mut env).unwrap();
         assert_eq!(result.ty, QueryType::Scalar(ScalarType::Bool));
+    }
+
+    #[test]
+    fn projection_basic() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("users { name, age }");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert!(matches!(
+            result.ty,
+            QueryType::List(inner)
+            if matches!(
+                *inner,
+                QueryType::Record(RecordSource::Projection(ref fields))
+                if fields.len() == 2
+            )
+        ));
+    }
+
+    #[test]
+    fn projection_single_field() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("users { name }");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        match &result.ty {
+            QueryType::List(inner) => match inner.as_ref() {
+                QueryType::Record(RecordSource::Projection(fields)) => {
+                    assert_eq!(fields.len(), 1);
+                    assert_eq!(fields[0].name, "name");
+                    assert_eq!(fields[0].ty, QueryType::Scalar(ScalarType::String));
+                }
+                other => panic!("expected Record, got {other:?}"),
+            },
+            other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn projection_computed_field() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) =
+            crate::parse_query("users { name, adult = users.first().unwrap().age > 18 }");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        match &result.ty {
+            QueryType::List(inner) => match inner.as_ref() {
+                QueryType::Record(RecordSource::Projection(fields)) => {
+                    assert_eq!(fields.len(), 2);
+                    assert_eq!(fields[0].name, "name");
+                    assert_eq!(fields[1].name, "adult");
+                    assert_eq!(fields[1].ty, QueryType::Scalar(ScalarType::Bool));
+                }
+                other => panic!("expected Record, got {other:?}"),
+            },
+            other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn projection_empty_error() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("users { }");
+        let result = infer(&file.unwrap().result, &mut env);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn projection_duplicate_field_error() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("users { name, name }");
+        let result = infer(&file.unwrap().result, &mut env);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn projection_on_non_record_error() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("42 { name }");
+        let result = infer(&file.unwrap().result, &mut env);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn projection_derived_alias() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("users { name, profile?.username }");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        match &result.ty {
+            QueryType::List(inner) => match inner.as_ref() {
+                QueryType::Record(RecordSource::Projection(fields)) => {
+                    assert_eq!(fields.len(), 2);
+                    assert_eq!(fields[0].name, "name");
+                    assert_eq!(fields[1].name, "username");
+                    assert_eq!(
+                        fields[1].ty,
+                        QueryType::Optional(Box::new(QueryType::Scalar(ScalarType::String)))
+                    );
+                }
+                other => panic!("expected Record, got {other:?}"),
+            },
+            other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn projection_single_record_base() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("users.first().unwrap() { name, age }");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert!(matches!(
+            result.ty,
+            QueryType::Record(RecordSource::Projection(_))
+        ));
     }
 }
