@@ -3,7 +3,7 @@ pub mod types;
 
 use std::collections::HashMap;
 
-use crate::ast::{Arg, BinaryOp, Expr, Literal, QueryFile, Statement, UnaryOp};
+use crate::ast::{Arg, BinaryOp, Expr, Literal, QueryFile, Statement, TypeName, UnaryOp};
 use crate::typecheck::error::TypeError;
 use crate::typecheck::types::*;
 use grove_schema::validated::{Field, ScalarType, StructId, ValidatedSchema};
@@ -217,8 +217,136 @@ fn infer(expr: &Expr, env: &mut TypeEnv) -> Result<TypedExpr, TypeError> {
                 span: expr.span(),
             })
         }
+        Expr::Array { elements, span } => infer_array(elements, *span, env),
+        Expr::Some { value, .. } => {
+            let typed_value = infer(value, env)?;
+            let ty = typed_value.ty.clone().wrap_optional();
+            Ok(TypedExpr {
+                kind: TypedExprKind::Some {
+                    value: Box::new(typed_value),
+                },
+                ty,
+                span: expr.span(),
+            })
+        }
+        Expr::If {
+            arms,
+            default,
+            span,
+        } => infer_if(arms, default, *span, env),
+        Expr::Cast { expr, ty, .. } => infer_cast(expr, ty, env),
         _ => Err(TypeError::AmbiguousType { span: expr.span() }),
     }
+}
+
+fn infer_array(elements: &[Expr], span: Span, env: &mut TypeEnv) -> Result<TypedExpr, TypeError> {
+    let mut typed_elems = Vec::with_capacity(elements.len());
+    for elem in elements {
+        typed_elems.push(infer(elem, env)?);
+    }
+
+    let mut ty = QueryType::Unknown;
+    for elem in &mut typed_elems {
+        if !types_compatible(&mut ty, &mut elem.ty, env.schema()) {
+            return Err(TypeError::ArrayElementTypeMismatch {
+                expected: ty.to_string(),
+                got: elem.ty.to_string(),
+                span: elem.span,
+            });
+        }
+    }
+
+    let ty = QueryType::List(Box::new(ty));
+
+    Ok(TypedExpr {
+        kind: TypedExprKind::Array {
+            elements: typed_elems,
+        },
+        ty,
+        span,
+    })
+}
+
+fn infer_if(
+    arms: &[(Expr, Expr)],
+    default: &Expr,
+    span: Span,
+    env: &mut TypeEnv,
+) -> Result<TypedExpr, TypeError> {
+    let mut typed_arms = Vec::with_capacity(arms.len());
+    let mut typed_default = infer(default, env)?;
+
+    for (cond, body) in arms {
+        let typed_cond = infer(cond, env)?;
+        if !typed_cond.ty.is_bool() {
+            return Err(TypeError::IfConditionNotBool {
+                span: typed_cond.span,
+            });
+        }
+        let typed_body = infer(body, env)?;
+        typed_arms.push((typed_cond, typed_body));
+    }
+
+    let mut ty = QueryType::Unknown;
+    for body in typed_arms
+        .iter_mut()
+        .map(|(_, b)| b)
+        .chain(std::iter::once(&mut typed_default))
+    {
+        if !types_compatible(&mut ty, &mut body.ty, env.schema()) {
+            return Err(TypeError::IfBranchTypeMismatch {
+                expected: ty.to_string(),
+                got: body.ty.to_string(),
+                span: body.span,
+            });
+        }
+    }
+
+    Ok(TypedExpr {
+        kind: TypedExprKind::If {
+            arms: typed_arms,
+            default: Box::new(typed_default),
+        },
+        ty,
+        span,
+    })
+}
+
+fn infer_cast(
+    expr: &Expr,
+    target: &Spanned<TypeName>,
+    env: &mut TypeEnv,
+) -> Result<TypedExpr, TypeError> {
+    let typed_expr = infer(expr, env)?;
+    let span = Span::new(typed_expr.span.start, target.span.end);
+
+    let target_ty = target.value.into();
+
+    if !cast_allowed(&typed_expr.ty, &target_ty) {
+        return Err(TypeError::InvalidCast {
+            from: typed_expr.ty.to_string(),
+            to: target_ty.to_string(),
+            span,
+        });
+    }
+
+    Ok(TypedExpr {
+        kind: TypedExprKind::Cast {
+            expr: Box::new(typed_expr),
+            ty: target.clone(),
+        },
+        ty: target_ty,
+        span,
+    })
+}
+
+fn cast_allowed(from: &QueryType, to: &QueryType) -> bool {
+    use ScalarType::*;
+    from.is_numeric() && to.is_numeric()
+        || matches!(
+            (from, to),
+            (QueryType::Scalar(Bool), QueryType::Scalar(Int))
+        )
 }
 
 fn infer_field(
@@ -642,11 +770,11 @@ fn infer_unary(
 fn types_compatible(a: &mut QueryType, b: &mut QueryType, schema: &ValidatedSchema) -> bool {
     match (a, b) {
         (QueryType::Unknown, QueryType::Unknown) => true,
-        (a @ QueryType::Unknown, b @ QueryType::Scalar(_)) => {
+        (a @ QueryType::Unknown, b) => {
             *a = b.clone();
             true
         }
-        (a @ QueryType::Scalar(_), b @ QueryType::Unknown) => {
+        (a, b @ QueryType::Unknown) => {
             *b = a.clone();
             true
         }
@@ -1650,5 +1778,265 @@ mod tests {
         let (file, _) = crate::parse_query("#30d + #24h - #7d + #7.8s");
         let result = infer(&file.unwrap().result, &mut env).unwrap();
         assert_eq!(result.ty, QueryType::Scalar(ScalarType::Duration));
+    }
+
+    #[test]
+    fn if_else_basic() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query(r#"if true { 1 } else { 2 }"#);
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Int));
+    }
+
+    #[test]
+    fn if_else_bool_result() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query(r#"if true { false } else { true }"#);
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Bool));
+    }
+
+    #[test]
+    fn if_else_condition_type_mismatch() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query(r#"if 42 { 1 } else { 2 }"#);
+        let result = infer(&file.unwrap().result, &mut env);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn if_else_branch_type_mismatch() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query(r#"if true { 1 } else { "two" }"#);
+        let result = infer(&file.unwrap().result, &mut env);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn if_else_if_chain() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query(r#"if true { "A" } else if false { "B" } else { "C" }"#);
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::String));
+    }
+
+    #[test]
+    fn if_else_with_comparison_condition() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query(
+            r#"if users.first().unwrap().age > 18 { "adult" } else { "minor" }"#,
+        );
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::String));
+    }
+
+    #[test]
+    fn cast_int_to_float() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("42 as Float");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Float));
+    }
+
+    #[test]
+    fn cast_int_to_dec() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("42 as Dec");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Dec));
+    }
+
+    #[test]
+    fn cast_float_to_int() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("1.0f as Int");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Int));
+    }
+
+    #[test]
+    fn cast_float_to_dec() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("1.0f as Dec");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Dec));
+    }
+
+    #[test]
+    fn cast_dec_to_int() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("1.0 as Int");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Int));
+    }
+
+    #[test]
+    fn cast_dec_to_float() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("1.0 as Float");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Float));
+    }
+
+    #[test]
+    fn cast_bool_to_int() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("true as Int");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Int));
+    }
+
+    #[test]
+    fn cast_disallowed_type() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query(r#""hello" as Int"#);
+        let result = infer(&file.unwrap().result, &mut env);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cast_complex_expr() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("users.first().unwrap().age as Float + 1.0f");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Float));
+    }
+
+    #[test]
+    fn some_basic() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query(r#"some("hello")"#);
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(
+            result.ty,
+            QueryType::Scalar(ScalarType::String).wrap_optional()
+        );
+    }
+
+    #[test]
+    fn some_complex_expr() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("some(users.first().unwrap().age)");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(
+            result.ty,
+            QueryType::Scalar(ScalarType::Int).wrap_optional()
+        );
+    }
+
+    #[test]
+    fn some_none() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("none");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Unknown.wrap_optional());
+    }
+
+    #[test]
+    fn array_int() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("[1, 2, 3]");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(
+            result.ty,
+            QueryType::List(Box::new(QueryType::Scalar(ScalarType::Int)))
+        );
+    }
+
+    #[test]
+    fn array_string() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query(r#"["a", "b", "c"]"#);
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(
+            result.ty,
+            QueryType::List(Box::new(QueryType::Scalar(ScalarType::String)))
+        );
+    }
+
+    #[test]
+    fn array_type_mismatch() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query(r#"[1, "two", 3]"#);
+        let result = infer(&file.unwrap().result, &mut env);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn array_types_inferred() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("[none, some(1), none]");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(
+            result.ty,
+            QueryType::List(Box::new(QueryType::Scalar(ScalarType::Int).wrap_optional()))
+        );
+        match result.kind {
+            TypedExprKind::Array { elements } => {
+                assert_eq!(
+                    elements.into_iter().map(|e| e.ty).collect::<Vec<_>>(),
+                    vec![QueryType::Optional(Box::new(QueryType::Scalar(ScalarType::Int))); 3]
+                )
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn array_empty() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("[]");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::List(Box::new(QueryType::Unknown)));
+    }
+
+    #[test]
+    fn tuple_mixed_types() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query(r#"(1, "hello", false, @now, 1.7e-5)"#);
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(
+            result.ty,
+            QueryType::Tuple(vec![
+                QueryType::Scalar(ScalarType::Int),
+                QueryType::Scalar(ScalarType::String),
+                QueryType::Scalar(ScalarType::Bool),
+                QueryType::Scalar(ScalarType::Instant),
+                QueryType::Scalar(ScalarType::Dec),
+            ])
+        );
+    }
+
+    #[test]
+    fn tuple_in_membership() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query(r#"1 in (1, 2, 3)"#);
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Bool));
     }
 }

@@ -174,6 +174,16 @@ impl From<&ValueType> for QueryType {
     }
 }
 
+impl From<TypeName> for QueryType {
+    fn from(value: TypeName) -> Self {
+        match value {
+            TypeName::Int => QueryType::Scalar(ScalarType::Int),
+            TypeName::Float => QueryType::Scalar(ScalarType::Float),
+            TypeName::Dec => QueryType::Scalar(ScalarType::Dec),
+        }
+    }
+}
+
 impl fmt::Display for QueryType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

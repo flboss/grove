@@ -13,6 +13,10 @@ pub enum TypeError {
     BinaryOpTypeMismatch { left: String, op: String, right: String, span: Span },
     UnaryOpTypeMismatch { op: String, operand: String, span: Span },
     InRequiresTuple { span: Span },
+    IfConditionNotBool { span: Span },
+    IfBranchTypeMismatch { expected: String, got: String, span: Span },
+    InvalidCast { from: String, to: String, span: Span },
+    ArrayElementTypeMismatch { expected: String, got: String, span: Span },
 }
 
 impl From<TypeError> for Diagnostic {
@@ -94,6 +98,38 @@ impl From<TypeError> for Diagnostic {
                 "`in` requires a tuple on the right-hand side",
                 span,
                 "expected tuple",
+            ),
+            TypeError::IfConditionNotBool { span } => error_simple(
+                "QT0011",
+                "`if` condition must be `Bool`",
+                span,
+                "expected Bool",
+            ),
+            TypeError::IfBranchTypeMismatch {
+                expected,
+                got,
+                span,
+            } => error_simple(
+                "QT0012",
+                format!("if branch type mismatch: expected `{expected}`, got `{got}`"),
+                span,
+                "type mismatch",
+            ),
+            TypeError::InvalidCast { from, to, span } => error_simple(
+                "QT0013",
+                format!("invalid cast: `{from}` cannot be cast to `{to}`"),
+                span,
+                "invalid cast",
+            ),
+            TypeError::ArrayElementTypeMismatch {
+                expected,
+                got,
+                span,
+            } => error_simple(
+                "QT0014",
+                format!("array element type mismatch: expected `{expected}`, got `{got}`"),
+                span,
+                "type mismatch",
             ),
         }
     }
