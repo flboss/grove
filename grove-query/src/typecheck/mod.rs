@@ -1,7 +1,7 @@
 pub mod error;
 pub mod types;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::ast::{
     Arg, BinaryOp, Expr, Literal, ProjectionItem, QueryFile, Statement, TypeName, UnaryOp,
@@ -385,7 +385,7 @@ fn infer_projection(
     let pushed_scope = env.push_record_fields(&typed_base.ty);
 
     let mut typed_items = Vec::with_capacity(items.len());
-    let mut seen_names: HashSet<&Spanned<String>> = HashSet::new();
+    let mut seen_names: HashMap<&str, Span> = HashMap::new();
 
     for item in items {
         let (name, typed_value) = match (&item.alias, &item.value) {
@@ -402,14 +402,14 @@ fn infer_projection(
             }
         };
 
-        if let Some(previous) = seen_names.get(name) {
+        if let Some(&previous) = seen_names.get(name.as_str()) {
             return Err(TypeError::DuplicateProjectionField {
-                name: name.value.to_string(),
+                name: name.to_string(),
                 span: item.value.span(),
-                previous: previous.span,
+                previous,
             });
         }
-        seen_names.insert(name);
+        seen_names.insert(name.as_str(), name.span);
 
         typed_items.push(TypedProjectionItem {
             alias: Some(Spanned {

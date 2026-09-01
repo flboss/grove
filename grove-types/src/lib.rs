@@ -1,6 +1,6 @@
 use std::{borrow::Cow, ops::Range};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct Span {
     pub start: usize,
     pub end: usize,
@@ -22,7 +22,7 @@ impl From<Range<usize>> for Span {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Spanned<T> {
     pub span: Span,
     pub value: T,
