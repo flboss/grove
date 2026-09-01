@@ -5,7 +5,7 @@ use crate::ast::{
 use crate::error::QueryParseError;
 use crate::lex::Lexer;
 use crate::token::{Token, TokenKind};
-use grove_types::{Diagnostic, Span, Spanned};
+use grove_types::{Diagnostic, Severity, Span, Spanned};
 
 pub struct Parser<'src> {
     lexer: Lexer<'src>,
@@ -27,10 +27,13 @@ impl<'src> Parser<'src> {
     }
 
     pub fn parse_query(mut self) -> (Option<QueryFile>, Vec<Diagnostic>) {
-        let result = self.parse_file().ok();
+        let mut result = self.parse_file().ok();
         self.drain_lexer_diagnostics();
         let mut diagnostics = self.diagnostics;
         diagnostics.extend(self.lexer.take_diagnostics());
+        if diagnostics.iter().any(|d| d.severity == Severity::Error) {
+            result.take();
+        }
         (result, diagnostics)
     }
 
@@ -1828,7 +1831,7 @@ mod tests {
     #[test]
     fn multi_error_array_elements() {
         let (file, diags) = parse_query("[,]");
-        assert!(file.is_some());
+        assert!(file.is_none());
         assert_eq!(codes(&diags), vec!["QP0001"]);
     }
 
@@ -1841,7 +1844,7 @@ mod tests {
     #[test]
     fn recovery_skips_to_comma_in_projection() {
         let (file, diags) = parse_query("users { , name }");
-        assert!(file.is_some());
+        assert!(file.is_none());
         assert_eq!(codes(&diags), vec!["QP0022"]);
     }
 
@@ -1849,8 +1852,7 @@ mod tests {
     fn sync_to_stops_at_semicolon() {
         let src = "users.sort(bad; 42";
         let (file, diags) = parse_query(src);
-        let file = file.expect("should parse");
-        assert!(matches!(file.result, Expr::Literal(lit) if lit.value == Literal::Int(42)));
+        assert!(file.is_none());
         let errors: Vec<_> = diags
             .iter()
             .filter(|d| d.severity == grove_types::Severity::Error)
