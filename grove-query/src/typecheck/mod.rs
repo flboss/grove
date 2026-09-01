@@ -256,6 +256,12 @@ fn infer_array(elements: &[Expr], span: Span, env: &mut TypeEnv) -> Result<Typed
         }
     }
 
+    if !matches!(ty, QueryType::Unknown) {
+        for elem in &mut typed_elems {
+            types_compatible(&mut ty, &mut elem.ty, env.schema());
+        }
+    }
+
     let ty = QueryType::List(Box::new(ty));
 
     Ok(TypedExpr {
@@ -287,20 +293,21 @@ fn infer_if(
         typed_arms.push((typed_cond, typed_body));
     }
 
-    let mut ty = QueryType::Unknown;
-    for body in typed_arms
-        .iter_mut()
-        .map(|(_, b)| b)
-        .chain(std::iter::once(&mut typed_default))
-    {
-        if !types_compatible(&mut ty, &mut body.ty, env.schema()) {
+    for (_, body) in &mut typed_arms {
+        if !types_compatible(&mut typed_default.ty, &mut body.ty, env.schema()) {
             return Err(TypeError::IfBranchTypeMismatch {
-                expected: ty.to_string(),
+                expected: typed_default.ty.to_string(),
                 got: body.ty.to_string(),
                 span: body.span,
             });
         }
     }
+
+    for (_, body) in &mut typed_arms {
+        types_compatible(&mut typed_default.ty, &mut body.ty, env.schema());
+    }
+
+    let ty = typed_default.ty.clone();
 
     Ok(TypedExpr {
         kind: TypedExprKind::If {
