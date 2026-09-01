@@ -3,7 +3,7 @@ pub mod types;
 
 use std::collections::HashMap;
 
-use crate::ast::{Arg, Expr, Literal, QueryFile, Statement};
+use crate::ast::{Arg, BinaryOp, Expr, Literal, QueryFile, Statement, UnaryOp};
 use crate::typecheck::error::TypeError;
 use crate::typecheck::types::*;
 use grove_schema::validated::{Field, ScalarType, StructId, ValidatedSchema};
@@ -201,6 +201,22 @@ fn infer(expr: &Expr, env: &mut TypeEnv) -> Result<TypedExpr, TypeError> {
             let typed_base = infer(base, env)?;
             infer_method(typed_base, name, args, *optional, env)
         }
+        Expr::Binary { op, lhs, rhs, .. } => infer_binary(op, lhs, rhs, env),
+        Expr::Unary { op, expr, .. } => infer_unary(op, expr, env),
+        Expr::Tuple { elements, .. } => {
+            let mut typed_elems = Vec::new();
+            for elem in elements {
+                typed_elems.push(infer(elem, env)?);
+            }
+            let ty = QueryType::Tuple(typed_elems.iter().map(|e| e.ty.clone()).collect());
+            Ok(TypedExpr {
+                kind: TypedExprKind::Tuple {
+                    elements: typed_elems,
+                },
+                ty,
+                span: expr.span(),
+            })
+        }
         _ => Err(TypeError::AmbiguousType { span: expr.span() }),
     }
 }
@@ -385,14 +401,252 @@ fn infer_method(
     })
 }
 
+fn infer_binary(
+    op: &Spanned<BinaryOp>,
+    lhs: &Expr,
+    rhs: &Expr,
+    env: &mut TypeEnv,
+) -> Result<TypedExpr, TypeError> {
+    let mut typed_lhs = infer(lhs, env)?;
+    let mut typed_rhs = infer(rhs, env)?;
+    let span = Span::new(typed_lhs.span.start, typed_rhs.span.end);
+
+    let result_ty = match op.value {
+        BinaryOp::In => infer_binary_in(&mut typed_lhs.ty, &mut typed_rhs.ty, span, env.schema())?,
+        BinaryOp::And | BinaryOp::Or => {
+            if !typed_lhs.ty.is_bool() || !typed_rhs.ty.is_bool() {
+                return Err(TypeError::BinaryOpTypeMismatch {
+                    left: typed_lhs.ty.to_string(),
+                    op: op.value.to_string(),
+                    right: typed_rhs.ty.to_string(),
+                    span,
+                });
+            }
+            QueryType::Scalar(ScalarType::Bool)
+        }
+        BinaryOp::Eq | BinaryOp::Ne => infer_equality_op(
+            &mut typed_lhs.ty,
+            &op.value,
+            &mut typed_rhs.ty,
+            span,
+            env.schema(),
+        )?,
+        BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Ge => infer_comparison_op(
+            &mut typed_lhs.ty,
+            &op.value,
+            &mut typed_rhs.ty,
+            span,
+            env.schema(),
+        )?,
+        _ => infer_arithmetic_op(&mut typed_lhs.ty, &op.value, &mut typed_rhs.ty, span)?,
+    };
+
+    Ok(TypedExpr {
+        kind: TypedExprKind::Binary {
+            op: op.clone(),
+            lhs: Box::new(typed_lhs),
+            rhs: Box::new(typed_rhs),
+        },
+        ty: result_ty,
+        span,
+    })
+}
+
+fn infer_binary_in(
+    lhs: &mut QueryType,
+    rhs: &mut QueryType,
+    span: Span,
+    schema: &ValidatedSchema,
+) -> Result<QueryType, TypeError> {
+    let rhs_inner = match rhs {
+        QueryType::Tuple(elems) if !elems.is_empty() => elems,
+        _ => return Err(TypeError::InRequiresTuple { span }),
+    };
+    for elem in rhs_inner {
+        if !types_compatible(lhs, elem, schema) {
+            return Err(TypeError::BinaryOpTypeMismatch {
+                left: lhs.to_string(),
+                op: "in".into(),
+                right: rhs.to_string(),
+                span,
+            });
+        }
+    }
+    Ok(QueryType::Scalar(ScalarType::Bool))
+}
+
+fn infer_equality_op(
+    lhs: &mut QueryType,
+    op: &BinaryOp,
+    rhs: &mut QueryType,
+    span: Span,
+    schema: &ValidatedSchema,
+) -> Result<QueryType, TypeError> {
+    if !types_compatible(lhs, rhs, schema) {
+        return Err(TypeError::BinaryOpTypeMismatch {
+            left: lhs.to_string(),
+            op: op.to_string(),
+            right: rhs.to_string(),
+            span,
+        });
+    }
+    Ok(QueryType::Scalar(ScalarType::Bool))
+}
+
+fn infer_comparison_op(
+    lhs: &mut QueryType,
+    op: &BinaryOp,
+    rhs: &mut QueryType,
+    span: Span,
+    schema: &ValidatedSchema,
+) -> Result<QueryType, TypeError> {
+    if !types_compatible(lhs, rhs, schema) || !lhs.has_defined_order() {
+        return Err(TypeError::BinaryOpTypeMismatch {
+            left: lhs.to_string(),
+            op: op.to_string(),
+            right: rhs.to_string(),
+            span,
+        });
+    }
+    Ok(QueryType::Scalar(ScalarType::Bool))
+}
+
+fn infer_arithmetic_op(
+    lhs: &mut QueryType,
+    op: &BinaryOp,
+    rhs: &mut QueryType,
+    span: Span,
+) -> Result<QueryType, TypeError> {
+    use ScalarType::*;
+
+    match (lhs, rhs) {
+        (QueryType::Scalar(Int), QueryType::Scalar(Int)) => Ok(QueryType::Scalar(Int)),
+        (QueryType::Scalar(Float), QueryType::Scalar(Float)) => Ok(QueryType::Scalar(Float)),
+        (QueryType::Scalar(Dec), QueryType::Scalar(Dec)) => Ok(QueryType::Scalar(Dec)),
+        (lhs @ QueryType::Scalar(Instant), rhs @ QueryType::Scalar(Duration)) => {
+            if matches!(op, BinaryOp::Add | BinaryOp::Sub) {
+                Ok(QueryType::Scalar(Instant))
+            } else {
+                Err(TypeError::BinaryOpTypeMismatch {
+                    left: lhs.to_string(),
+                    op: op.to_string(),
+                    right: rhs.to_string(),
+                    span,
+                })
+            }
+        }
+        (lhs @ QueryType::Scalar(Instant), rhs @ QueryType::Scalar(Instant)) => {
+            if matches!(op, BinaryOp::Sub) {
+                Ok(QueryType::Scalar(Duration))
+            } else {
+                Err(TypeError::BinaryOpTypeMismatch {
+                    left: lhs.to_string(),
+                    op: op.to_string(),
+                    right: rhs.to_string(),
+                    span,
+                })
+            }
+        }
+        (lhs @ QueryType::Scalar(Duration), rhs @ QueryType::Scalar(Duration)) => {
+            if matches!(op, BinaryOp::Add | BinaryOp::Sub) {
+                Ok(QueryType::Scalar(Duration))
+            } else {
+                Err(TypeError::BinaryOpTypeMismatch {
+                    left: lhs.to_string(),
+                    op: op.to_string(),
+                    right: rhs.to_string(),
+                    span,
+                })
+            }
+        }
+        (lhs, rhs @ QueryType::Scalar(Duration)) if lhs.is_numeric() => {
+            if matches!(op, BinaryOp::Mul) {
+                Ok(QueryType::Scalar(Duration))
+            } else {
+                Err(TypeError::BinaryOpTypeMismatch {
+                    left: lhs.to_string(),
+                    op: op.to_string(),
+                    right: rhs.to_string(),
+                    span,
+                })
+            }
+        }
+        (lhs @ QueryType::Scalar(Duration), rhs) if rhs.is_numeric() => {
+            if matches!(
+                op,
+                BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem | BinaryOp::Mod
+            ) {
+                Ok(QueryType::Scalar(Duration))
+            } else {
+                Err(TypeError::BinaryOpTypeMismatch {
+                    left: lhs.to_string(),
+                    op: op.to_string(),
+                    right: rhs.to_string(),
+                    span,
+                })
+            }
+        }
+        (lhs, rhs) => Err(TypeError::BinaryOpTypeMismatch {
+            left: lhs.to_string(),
+            op: op.to_string(),
+            right: rhs.to_string(),
+            span,
+        }),
+    }
+}
+
+fn infer_unary(
+    op: &Spanned<UnaryOp>,
+    expr: &Expr,
+    env: &mut TypeEnv,
+) -> Result<TypedExpr, TypeError> {
+    let typed_expr = infer(expr, env)?;
+    let span = Span::new(op.span.start, typed_expr.span.end);
+
+    let result_ty = match op.value {
+        UnaryOp::Neg => match &typed_expr.ty {
+            QueryType::Scalar(ScalarType::Int) => QueryType::Scalar(ScalarType::Int),
+            QueryType::Scalar(ScalarType::Float) => QueryType::Scalar(ScalarType::Float),
+            QueryType::Scalar(ScalarType::Dec) => QueryType::Scalar(ScalarType::Dec),
+            QueryType::Scalar(ScalarType::Duration) => QueryType::Scalar(ScalarType::Duration),
+            _ => {
+                return Err(TypeError::UnaryOpTypeMismatch {
+                    op: op.to_string(),
+                    operand: typed_expr.ty.to_string(),
+                    span,
+                });
+            }
+        },
+        UnaryOp::Not => {
+            if !typed_expr.ty.is_bool() {
+                return Err(TypeError::UnaryOpTypeMismatch {
+                    op: op.to_string(),
+                    operand: typed_expr.ty.to_string(),
+                    span,
+                });
+            }
+            QueryType::Scalar(ScalarType::Bool)
+        }
+    };
+
+    Ok(TypedExpr {
+        kind: TypedExprKind::Unary {
+            op: op.clone(),
+            expr: Box::new(typed_expr),
+        },
+        ty: result_ty,
+        span,
+    })
+}
+
 fn types_compatible(a: &mut QueryType, b: &mut QueryType, schema: &ValidatedSchema) -> bool {
     match (a, b) {
         (QueryType::Unknown, QueryType::Unknown) => true,
-        (a @ QueryType::Unknown, b) => {
+        (a @ QueryType::Unknown, b @ QueryType::Scalar(_)) => {
             *a = b.clone();
             true
         }
-        (a, b @ QueryType::Unknown) => {
+        (a @ QueryType::Scalar(_), b @ QueryType::Unknown) => {
             *b = a.clone();
             true
         }
@@ -431,6 +685,9 @@ fn record_source_field_type<'a>(
 }
 
 fn record_fields_match(a: &RecordSource, b: &RecordSource, schema: &ValidatedSchema) -> bool {
+    if a == b {
+        return true;
+    }
     if record_source_field_count(a, schema) != record_source_field_count(b, schema) {
         return false;
     }
@@ -933,5 +1190,465 @@ mod tests {
         let (file, _diags) = crate::parse_query("users.sort_asc(profile)");
         let result = infer(&file.unwrap().result, &mut env);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn binary_int_add() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("1 + 2");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Int));
+    }
+
+    #[test]
+    fn binary_int_sub() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("5 - 3");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Int));
+    }
+
+    #[test]
+    fn binary_int_mul() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("4 * 3");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Int));
+    }
+
+    #[test]
+    fn binary_int_div() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("10 / 2");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Int));
+    }
+
+    #[test]
+    fn binary_int_rem() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("10 % 3");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Int));
+    }
+
+    #[test]
+    fn binary_int_mod() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("10 mod 3");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Int));
+    }
+
+    #[test]
+    fn binary_float_add() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("1.0f + 2.0f");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Float));
+    }
+
+    #[test]
+    fn binary_dec_add() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("1.0 + 2.0");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Dec));
+    }
+
+    #[test]
+    fn binary_int_float_mismatch() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("1 + 2.0f");
+        let result = infer(&file.unwrap().result, &mut env);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn binary_float_dec_mismatch() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("1.0f + 2.0");
+        let result = infer(&file.unwrap().result, &mut env);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn binary_duration_add() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("#30d + #5h");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Duration));
+    }
+
+    #[test]
+    fn binary_duration_sub() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("#30d - #5h");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Duration));
+    }
+
+    #[test]
+    fn binary_duration_mul_int() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("#30d * 3");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Duration));
+    }
+
+    #[test]
+    fn binary_int_mul_duration() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("3 * #30d");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Duration));
+    }
+
+    #[test]
+    fn binary_duration_mul_float() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("#30d * 1.5f");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Duration));
+    }
+
+    #[test]
+    fn binary_duration_mul_dec() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("#30d * 1.5");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Duration));
+    }
+
+    #[test]
+    fn binary_duration_div_int() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("#30d / 2");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Duration));
+    }
+
+    #[test]
+    fn binary_duration_rem_int() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("#30d % 7");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Duration));
+    }
+
+    #[test]
+    fn binary_duration_add_error() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("#30d + 3");
+        let result = infer(&file.unwrap().result, &mut env);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn binary_duration_mul_duration_error() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("#30d * #5h");
+        let result = infer(&file.unwrap().result, &mut env);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn binary_comparison_eq() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("1 == 2");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Bool));
+    }
+
+    #[test]
+    fn binary_comparison_ne() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("1.0f != 2e5f");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Bool));
+    }
+
+    #[test]
+    fn binary_comparison_lt() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("1 < 2");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Bool));
+    }
+
+    #[test]
+    fn binary_comparison_gt() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("10.5 > 11.0");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Bool));
+    }
+
+    #[test]
+    fn binary_comparison_le() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("20 <= 40");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Bool));
+    }
+
+    #[test]
+    fn binary_comparison_ge() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("1001 >= 1000");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Bool));
+    }
+
+    #[test]
+    fn binary_string_eq() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query(r#""a" == "b""#);
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Bool));
+    }
+
+    #[test]
+    fn binary_string_lt() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query(r#""x" < "y""#);
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Bool));
+    }
+
+    #[test]
+    fn binary_comparison_type_mismatch() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query(r#"1 == "a""#);
+        let result = infer(&file.unwrap().result, &mut env);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn binary_logical_and() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("true && false");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Bool));
+    }
+
+    #[test]
+    fn binary_logical_or() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("false || true");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Bool));
+    }
+
+    #[test]
+    fn binary_logical_and_non_bool_error() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("1 && 2");
+        let result = infer(&file.unwrap().result, &mut env);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn binary_in_string_tuple() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query(r#""a" in ("a", "b", "c")"#);
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Bool));
+    }
+
+    #[test]
+    fn binary_in_non_tuple_error() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("1 in 2");
+        let result = infer(&file.unwrap().result, &mut env);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn binary_in_type_mismatch() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query(r#"1 in ("a", "b")"#);
+        let result = infer(&file.unwrap().result, &mut env);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn optional_eq_optional() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) =
+            crate::parse_query("users.first().unwrap().profile == users.first().unwrap().profile");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Bool));
+    }
+
+    #[test]
+    fn optional_eq_non_optional_error() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("none != 1");
+        let result = infer(&file.unwrap().result, &mut env);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn optional_ordering_error() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("none < none");
+        let result = infer(&file.unwrap().result, &mut env);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn unary_neg_int() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("-1");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Int));
+    }
+
+    #[test]
+    fn unary_neg_float() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("-3e6f");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Float));
+    }
+
+    #[test]
+    fn unary_neg_dec() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("-12.5");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Dec));
+    }
+
+    #[test]
+    fn unary_neg_duration() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("-#30d");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Duration));
+    }
+
+    #[test]
+    fn unary_neg_instant_error() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("-@now");
+        let result = infer(&file.unwrap().result, &mut env);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn unary_neg_string_error() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query(r#"-"hello""#);
+        let result = infer(&file.unwrap().result, &mut env);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn unary_not_bool() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("!true");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Bool));
+    }
+
+    #[test]
+    fn unary_not_type_mismatch() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("!1");
+        let result = infer(&file.unwrap().result, &mut env);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn binary_complex_arithmetic() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("1 + 2 * (3 / 2) % (7 - 2)");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Int));
+    }
+
+    #[test]
+    fn binary_arithmetic_comparison() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("(1 + 2 - 3) >= 3");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Bool));
+    }
+
+    #[test]
+    fn binary_field_arithmetic() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("users.first().unwrap().age + 1");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Int));
+    }
+
+    #[test]
+    fn binary_field_comparison() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("users.first().unwrap().age < 18");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Bool));
+    }
+
+    #[test]
+    fn binary_duration_arithmetic() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("#30d + #24h - #7d + #7.8s");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Duration));
     }
 }

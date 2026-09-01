@@ -10,6 +10,9 @@ pub enum TypeError {
     WrongArgCount { method: String, expected: usize, got: usize, span: Span },
     ArgTypeMismatch { method: String, expected: String, got: String, span: Span },
     AmbiguousType { span: Span },
+    BinaryOpTypeMismatch { left: String, op: String, right: String, span: Span },
+    UnaryOpTypeMismatch { op: String, operand: String, span: Span },
+    InRequiresTuple { span: Span },
 }
 
 impl From<TypeError> for Diagnostic {
@@ -68,6 +71,29 @@ impl From<TypeError> for Diagnostic {
                 "ambiguous type: cannot infer type without context",
                 span,
                 "type is ambiguous",
+            ),
+            TypeError::BinaryOpTypeMismatch {
+                left,
+                op,
+                right,
+                span,
+            } => error_simple(
+                "QT0007",
+                format!("invalid binary operation: cannot apply `{op}` to `{left}` and `{right}`"),
+                span,
+                "type mismatch",
+            ),
+            TypeError::UnaryOpTypeMismatch { op, operand, span } => error_simple(
+                "QT0008",
+                format!("invalid unary operation: cannot apply `{op}` to `{operand}`"),
+                span,
+                "type mismatch",
+            ),
+            TypeError::InRequiresTuple { span } => error_simple(
+                "QT0009",
+                "`in` requires a tuple on the right-hand side",
+                span,
+                "expected tuple",
             ),
         }
     }
