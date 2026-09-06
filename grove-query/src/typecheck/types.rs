@@ -225,7 +225,7 @@ impl fmt::Display for QueryType {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{}", field.name)?;
+                    write!(f, "{}: {}", field.name, field.ty)?;
                 }
                 write!(f, " }}")
             }
