@@ -19,8 +19,34 @@ pub enum TypeError {
     ArrayElementTypeMismatch { expected: String, got: String, span: Span },
     DuplicateProjectionField { name: String, span: Span, previous: Span},
     UnnamedComputedField { span: Span },
-    ProjectionBaseNotRecord { found: String, span: Span },
+    ProjectionBaseNotRecord { got: String, span: Span },
     EmptyProjection { span: Span },
+    MutationOnProjection { span: Span },
+    MutationOnNonList { got: String, span: Span },
+    InsertOnNonRoot { got: String, span: Span },
+    StructFieldNotInSchema {
+        field: String,
+        struct_name: String,
+        span: Span,
+    },
+    InsertMissingRequiredField {
+        field: String,
+        struct_name: String,
+        span: Span,
+    },
+    StructFieldTypeMismatch {
+        field: String,
+        struct_name: String,
+        expected: String,
+        got: String,
+        span: Span,
+    },
+    DuplicateStructField { name: String, span: Span },
+    RefFieldInMutation {
+        field: String,
+        struct_name: String,
+        span: Span,
+    },
 }
 
 impl From<TypeError> for Diagnostic {
@@ -156,9 +182,9 @@ impl From<TypeError> for Diagnostic {
                 span,
                 "missing alias",
             ),
-            TypeError::ProjectionBaseNotRecord { found, span } => error_simple(
+            TypeError::ProjectionBaseNotRecord { got, span } => error_simple(
                 "QT0017",
-                format!("projection requires a Record or List<Record>, got `{found}`"),
+                format!("projection requires a Record or List<Record>, got `{got}`"),
                 span,
                 "expected record",
             ),
@@ -168,7 +194,77 @@ impl From<TypeError> for Diagnostic {
                 span,
                 "empty projection",
             )
-            .with_help("omit the projection to select all fields"),
+            .with_help("omit the projection to keep all fields"),
+            TypeError::MutationOnProjection { span } => error_simple(
+                "QT0019",
+                "cannot mutate a projection",
+                span,
+                "mutation on projection",
+            )
+            .with_note("only materialized collections can be mutated"),
+            TypeError::MutationOnNonList { got, span } => error_simple(
+                "QT0020",
+                format!("mutation base type incompatible, got `{got}`"),
+                span,
+                "expected list of records",
+            ),
+            TypeError::InsertOnNonRoot { got, span } => error_simple(
+                "QT0021",
+                format!("insert base must be a root collection, got `{got}`"),
+                span,
+                "expected root collection",
+            ),
+            TypeError::StructFieldNotInSchema {
+                field,
+                struct_name,
+                span,
+            } => error_simple(
+                "QT0022",
+                format!("field `{field}` does not exist in struct `{struct_name}`"),
+                span,
+                "unknown field",
+            ),
+            TypeError::InsertMissingRequiredField {
+                field,
+                struct_name,
+                span,
+            } => error_simple(
+                "QT0023",
+                format!("missing required field `{field}` in struct `{struct_name}`"),
+                span,
+                "missing required field",
+            ),
+            TypeError::StructFieldTypeMismatch {
+                field,
+                struct_name,
+                expected,
+                got,
+                span,
+            } => error_simple(
+                "QT0024",
+                format!("type mismatch for field `{field}` in struct `{struct_name}`"),
+                span,
+                format!("expected `{expected}`, got `{got}`"),
+            ),
+            TypeError::DuplicateStructField { name, span } => error_simple(
+                "QT0025",
+                format!("duplicate field name `{name}` in struct literal"),
+                span,
+                "duplicate field",
+            ),
+            TypeError::RefFieldInMutation {
+                field,
+                struct_name,
+                span,
+            } => error_simple(
+                "QT0026",
+                format!("field `{field}` in struct `{struct_name}` not supported in mutation"),
+                span,
+                "ref field not allowed",
+            )
+            .with_note(format!(
+                "`{field}` is a non-owning reference and cannot be provided in a mutation"
+            )),
         }
     }
 }

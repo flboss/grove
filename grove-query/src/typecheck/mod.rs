@@ -1,14 +1,15 @@
 pub mod error;
 pub mod types;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
-    Arg, BinaryOp, Expr, Literal, ProjectionItem, QueryFile, Statement, TypeName, UnaryOp,
+    Arg, BinaryOp, Expr, Literal, MutationKind, MutationStmt, ProjectionItem, QueryFile, Statement,
+    TypeName, UnaryOp,
 };
 use crate::typecheck::error::TypeError;
 use crate::typecheck::types::*;
-use grove_schema::validated::{Field, ScalarType, StructId, ValidatedSchema};
+use grove_schema::validated::{Field, ScalarType, StructId, ValidatedSchema, ValueType};
 use grove_types::{Diagnostic, Span, Spanned};
 
 struct TypeEnv<'s> {
@@ -238,7 +239,8 @@ fn infer(expr: &Expr, env: &mut TypeEnv) -> Result<TypedExpr, TypeError> {
         } => infer_if(arms, default, *span, env),
         Expr::Cast { expr, ty, .. } => infer_cast(expr, ty, env),
         Expr::Projection { base, items, span } => infer_projection(base, items, *span, env),
-        _ => Err(TypeError::AmbiguousType { span: expr.span() }),
+        Expr::TypeConstant { ty, name } => infer_type_constant(ty, name),
+        Expr::Struct { fields, span } => infer_struct_literal(fields, *span, env),
     }
 }
 
@@ -359,6 +361,63 @@ fn cast_allowed(from: &QueryType, to: &QueryType) -> bool {
         )
 }
 
+fn infer_type_constant(
+    type_name: &Spanned<TypeName>,
+    name: &Spanned<crate::ast::ConstantName>,
+) -> Result<TypedExpr, TypeError> {
+    let scalar_ty = match type_name.value {
+        TypeName::Int => ScalarType::Int,
+        TypeName::Float => ScalarType::Float,
+        TypeName::Dec => ScalarType::Dec,
+    };
+
+    let result_ty = QueryType::Scalar(scalar_ty);
+    let span = Span::new(type_name.span.start, name.span.end);
+
+    Ok(TypedExpr {
+        kind: TypedExprKind::TypeConstant {
+            ty: type_name.clone(),
+            name: name.clone(),
+        },
+        ty: result_ty,
+        span,
+    })
+}
+
+fn infer_struct_literal(
+    fields: &[(Spanned<String>, Expr)],
+    span: Span,
+    env: &mut TypeEnv,
+) -> Result<TypedExpr, TypeError> {
+    let mut typed_fields = Vec::new();
+    let mut proj_fields = Vec::new();
+    let mut seen_names = HashSet::new();
+
+    for (name, value) in fields {
+        if !seen_names.insert(name.as_str()) {
+            return Err(TypeError::DuplicateStructField {
+                name: name.value.clone(),
+                span: name.span,
+            });
+        }
+        let typed_value = infer(value, env)?;
+        proj_fields.push(ProjectionField {
+            name: name.value.clone(),
+            ty: typed_value.ty.clone(),
+        });
+        typed_fields.push((name.clone(), typed_value));
+    }
+
+    let result_ty = QueryType::Record(RecordSource::Projection(proj_fields));
+    Ok(TypedExpr {
+        kind: TypedExprKind::Struct {
+            fields: typed_fields,
+        },
+        ty: result_ty,
+        span,
+    })
+}
+
 fn infer_projection(
     base: &Expr,
     items: &[ProjectionItem],
@@ -376,7 +435,7 @@ fn infer_projection(
         QueryType::List(inner) if matches!(**inner, QueryType::Record(_)) => {}
         _ => {
             return Err(TypeError::ProjectionBaseNotRecord {
-                found: typed_base.ty.to_string(),
+                got: typed_base.ty.to_string(),
                 span: typed_base.span,
             });
         }
@@ -893,55 +952,47 @@ fn types_compatible(a: &mut QueryType, b: &mut QueryType, schema: &ValidatedSche
     }
 }
 
-fn record_source_field_count(source: &RecordSource, schema: &ValidatedSchema) -> usize {
-    match source {
-        RecordSource::Schema(id) => schema.structs[id.index()].fields.len(),
-        RecordSource::Projection(fields) => fields.len(),
-    }
-}
-
-fn record_source_field_type<'a>(
-    source: &'a RecordSource,
-    name: &str,
-    schema: &'a ValidatedSchema,
-) -> Option<QueryType> {
-    match source {
-        RecordSource::Schema(id) => schema.struct_field(*id, name).map(field_query_type),
-        RecordSource::Projection(fields) => {
-            fields.iter().find(|f| f.name == name).map(|f| f.ty.clone())
+fn record_fields_match(
+    a: &mut RecordSource,
+    b: &mut RecordSource,
+    schema: &ValidatedSchema,
+) -> bool {
+    match (a, b) {
+        (RecordSource::Schema(a_id), RecordSource::Schema(b_id)) => a_id == b_id,
+        (RecordSource::Schema(sid), RecordSource::Projection(proj))
+        | (RecordSource::Projection(proj), RecordSource::Schema(sid)) => {
+            record_schema_matches_projection(*sid, proj, schema)
         }
-    }
-}
-
-fn record_fields_match(a: &RecordSource, b: &RecordSource, schema: &ValidatedSchema) -> bool {
-    if a == b {
-        return true;
-    }
-    if record_source_field_count(a, schema) != record_source_field_count(b, schema) {
-        return false;
-    }
-
-    let a_names: Vec<&str> = match a {
-        RecordSource::Schema(id) => schema.structs[id.index()]
-            .fields
-            .iter()
-            .map(|f| match f {
-                Field::Value { name, .. } | Field::Array { name, .. } | Field::Ref { name, .. } => {
-                    name.as_str()
-                }
+        (RecordSource::Projection(a_proj), RecordSource::Projection(b_proj)) => {
+            if a_proj.len() != b_proj.len() {
+                return false;
+            }
+            a_proj.iter_mut().all(|a_field| {
+                b_proj.iter_mut().any(|b_field| {
+                    b_field.name == a_field.name
+                        && types_compatible(&mut a_field.ty, &mut b_field.ty, schema)
+                })
             })
-            .collect(),
-        RecordSource::Projection(fields) => fields.iter().map(|f| f.name.as_str()).collect(),
-    };
-
-    a_names.iter().all(|name| {
-        let a_ty = record_source_field_type(a, name, schema);
-        let b_ty = record_source_field_type(b, name, schema);
-        match (a_ty, b_ty) {
-            (Some(mut a_ty), Some(mut b_ty)) => types_compatible(&mut a_ty, &mut b_ty, schema),
-            _ => false,
         }
-    })
+    }
+}
+
+fn record_schema_matches_projection(
+    sid: StructId,
+    proj: &mut Vec<ProjectionField>,
+    schema: &ValidatedSchema,
+) -> bool {
+    let struct_ = &schema.structs[sid.index()];
+    for proj_field in proj {
+        let Some(schema_field) = struct_.fields.iter().find(|f| f.name() == proj_field.name) else {
+            return false;
+        };
+        let mut schema_ty = field_query_type(schema_field);
+        if !types_compatible(&mut schema_ty, &mut proj_field.ty, schema) {
+            return false;
+        }
+    }
+    true
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1031,6 +1082,9 @@ fn method_signature(base: &QueryType, method: &str) -> Option<MethodSig> {
                 QueryType::Scalar(Bool),
                 inner.as_ref().clone(),
             )),
+            "filter" if matches!(inner.as_ref(), QueryType::Record(_)) => Some(
+                MethodSig::scoped_fixed(QueryType::List(inner.clone()), 1, QueryType::is_bool),
+            ),
             "sum" if inner.is_summable() => {
                 Some(MethodSig::no_args(inner.as_ref().clone().wrap_optional()))
             }
@@ -1142,8 +1196,297 @@ fn typecheck_stmt(stmt: &Statement, env: &mut TypeEnv) -> Result<TypedStatement,
             let typed = infer(expr, env)?;
             Ok(TypedStatement::Expr(typed))
         }
-        Statement::Mutation(_) => todo!(),
+        Statement::Mutation(mutation) => typecheck_mutation(mutation, env),
     }
+}
+
+fn typecheck_mutation(
+    mutation: &MutationStmt,
+    env: &mut TypeEnv,
+) -> Result<TypedStatement, TypeError> {
+    let kind = mutation.kind.value;
+
+    if kind == MutationKind::Delete && mutation.arg.is_some() {
+        return Err(TypeError::WrongArgCount {
+            method: kind.to_string(),
+            expected: 0,
+            got: 1,
+            span: mutation.kind.span,
+        });
+    }
+
+    if matches!(kind, MutationKind::Insert | MutationKind::Update) && mutation.arg.is_none() {
+        return Err(TypeError::WrongArgCount {
+            method: kind.to_string(),
+            expected: 1,
+            got: 0,
+            span: mutation.kind.span,
+        });
+    }
+
+    match kind {
+        MutationKind::Delete => {
+            let typed_base = infer(&mutation.base, env)?;
+            check_mutation_base(&typed_base.ty, typed_base.span)?;
+            Ok(TypedStatement::Mutation(TypedMutationStmt::Delete {
+                span: mutation.kind.span,
+                base: typed_base,
+            }))
+        }
+        MutationKind::Insert => {
+            let (typed_base, struct_id) = check_insert_base(&mutation.base, env)?;
+            let mut typed_arg = infer(mutation.arg.as_ref().expect("checked above"), env)?;
+            validate_insert(struct_id, &mut typed_arg, env.schema())?;
+            Ok(TypedStatement::Mutation(TypedMutationStmt::Insert {
+                span: mutation.kind.span,
+                base: typed_base,
+                arg: typed_arg,
+            }))
+        }
+        MutationKind::Update => {
+            let typed_base = infer(&mutation.base, env)?;
+            let struct_id = check_mutation_base(&typed_base.ty, typed_base.span)?;
+            env.push_scope();
+            env.define(
+                "prev".to_string(),
+                QueryType::Record(RecordSource::Schema(struct_id)),
+            );
+            let mut typed_arg = infer(mutation.arg.as_ref().expect("checked above"), env)?;
+            env.pop_scope();
+            validate_update(struct_id, &mut typed_arg, env.schema())?;
+            Ok(TypedStatement::Mutation(TypedMutationStmt::Update {
+                span: mutation.kind.span,
+                base: typed_base,
+                arg: typed_arg,
+            }))
+        }
+    }
+}
+
+fn check_mutation_base(ty: &QueryType, span: Span) -> Result<StructId, TypeError> {
+    match ty {
+        QueryType::List(inner) => match inner.as_ref() {
+            QueryType::Record(RecordSource::Schema(id)) => Ok(*id),
+            QueryType::Record(RecordSource::Projection(_)) => {
+                Err(TypeError::MutationOnProjection { span })
+            }
+            _ => Err(TypeError::MutationOnNonList {
+                got: ty.to_string(),
+                span,
+            }),
+        },
+        _ => Err(TypeError::MutationOnNonList {
+            got: ty.to_string(),
+            span,
+        }),
+    }
+}
+
+fn check_insert_base(base: &Expr, env: &mut TypeEnv) -> Result<(TypedExpr, StructId), TypeError> {
+    let base_ident = match base {
+        Expr::Ident(name) => name,
+        _ => {
+            return Err(TypeError::InsertOnNonRoot {
+                got: "expression".into(),
+                span: base.span(),
+            });
+        }
+    };
+    if !env
+        .schema()
+        .roots
+        .iter()
+        .any(|r| r.name == base_ident.value)
+    {
+        return Err(TypeError::InsertOnNonRoot {
+            got: base_ident.value.clone(),
+            span: base_ident.span,
+        });
+    };
+    let ty = env
+        .resolve(&base_ident.value)
+        .ok_or_else(|| TypeError::UnknownIdentifier {
+            name: base_ident.value.clone(),
+            span: base_ident.span,
+        })?;
+    let struct_id = match ty {
+        QueryType::List(inner)
+            if let QueryType::Record(RecordSource::Schema(id)) = inner.as_ref() =>
+        {
+            *id
+        }
+        _ => {
+            return Err(TypeError::InsertOnNonRoot {
+                got: base_ident.value.clone(),
+                span: base_ident.span,
+            });
+        }
+    };
+    let span = base.span();
+    let typed_base = TypedExpr {
+        kind: TypedExprKind::Ident(base_ident.clone()),
+        ty: ty.clone(),
+        span,
+    };
+    Ok((typed_base, struct_id))
+}
+
+fn expect_struct_literal(
+    ty: &mut QueryType,
+    span: Span,
+    mutation_kind: MutationKind,
+) -> Result<&mut Vec<ProjectionField>, TypeError> {
+    match ty {
+        QueryType::Record(RecordSource::Projection(p)) => Ok(p),
+        ty => Err(TypeError::ArgTypeMismatch {
+            method: mutation_kind.to_string(),
+            expected: "struct literal".into(),
+            got: ty.to_string(),
+            span,
+        }),
+    }
+}
+
+fn validate_insert(
+    sid: StructId,
+    typed_arg: &mut TypedExpr,
+    schema: &ValidatedSchema,
+) -> Result<(), TypeError> {
+    let struct_ = &schema.structs[sid.index()];
+    let proj_fields =
+        expect_struct_literal(&mut typed_arg.ty, typed_arg.span, MutationKind::Insert)?;
+
+    let TypedExprKind::Struct {
+        fields: struct_fields,
+    } = &mut typed_arg.kind
+    else {
+        unreachable!()
+    };
+
+    for schema_field in &struct_.fields {
+        let (expected_name, is_optional) = match schema_field {
+            Field::Value {
+                name,
+                ty: ValueType::Optional(_),
+                ..
+            } => (name, true),
+            Field::Value { name, .. } | Field::Array { name, .. } => (name, false),
+            Field::Ref { name, .. } => {
+                if proj_fields.iter().any(|f| &f.name == name) {
+                    return Err(TypeError::RefFieldInMutation {
+                        field: name.clone(),
+                        struct_name: struct_.name.clone(),
+                        span: typed_arg.span,
+                    });
+                }
+                continue;
+            }
+        };
+
+        if proj_fields.iter().any(|f| &f.name == expected_name) {
+            continue;
+        }
+
+        if is_optional {
+            let schema_ty = field_query_type(schema_field);
+            let none_span = typed_arg.span;
+            let none_expr = TypedExpr {
+                kind: TypedExprKind::Literal(Spanned {
+                    span: none_span,
+                    value: Literal::None,
+                }),
+                ty: schema_ty.clone(),
+                span: none_span,
+            };
+            struct_fields.push((
+                Spanned {
+                    value: expected_name.clone(),
+                    span: none_span,
+                },
+                none_expr,
+            ));
+            proj_fields.push(ProjectionField {
+                name: expected_name.clone(),
+                ty: schema_ty,
+            });
+        } else {
+            return Err(TypeError::InsertMissingRequiredField {
+                field: expected_name.clone(),
+                struct_name: struct_.name.clone(),
+                span: typed_arg.span,
+            });
+        }
+    }
+
+    for proj_field in proj_fields {
+        let schema_field = struct_.fields.iter().find(|f| match f {
+            Field::Value { name, .. } | Field::Array { name, .. } | Field::Ref { name, .. } => {
+                name == &proj_field.name
+            }
+        });
+        let Some(mut schema_ty) = schema_field.map(field_query_type) else {
+            return Err(TypeError::StructFieldNotInSchema {
+                field: proj_field.name.clone(),
+                struct_name: struct_.name.clone(),
+                span: typed_arg.span,
+            });
+        };
+
+        if !types_compatible(&mut schema_ty, &mut proj_field.ty, schema) {
+            return Err(TypeError::StructFieldTypeMismatch {
+                field: proj_field.name.clone(),
+                struct_name: struct_.name.clone(),
+                expected: schema_ty.to_string(),
+                got: proj_field.ty.to_string(),
+                span: typed_arg.span,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_update(
+    sid: StructId,
+    typed_arg: &mut TypedExpr,
+    schema: &ValidatedSchema,
+) -> Result<(), TypeError> {
+    let struct_ = &schema.structs[sid.index()];
+    let proj_fields =
+        expect_struct_literal(&mut typed_arg.ty, typed_arg.span, MutationKind::Update)?;
+
+    for proj_field in proj_fields {
+        let Some(schema_field) = struct_.fields.iter().find(|f| match f {
+            Field::Value { name, .. } | Field::Array { name, .. } | Field::Ref { name, .. } => {
+                name == &proj_field.name
+            }
+        }) else {
+            return Err(TypeError::StructFieldNotInSchema {
+                field: proj_field.name.clone(),
+                struct_name: struct_.name.clone(),
+                span: typed_arg.span,
+            });
+        };
+        if let Field::Ref { .. } = schema_field {
+            return Err(TypeError::RefFieldInMutation {
+                field: proj_field.name.clone(),
+                struct_name: struct_.name.clone(),
+                span: typed_arg.span,
+            });
+        }
+        let mut schema_ty = field_query_type(schema_field);
+
+        if !types_compatible(&mut schema_ty, &mut proj_field.ty, schema) {
+            return Err(TypeError::StructFieldTypeMismatch {
+                field: proj_field.name.clone(),
+                struct_name: struct_.name.clone(),
+                expected: schema_ty.to_string(),
+                got: proj_field.ty.to_string(),
+                span: typed_arg.span,
+            });
+        }
+    }
+    Ok(())
 }
 
 pub fn typecheck(
@@ -2258,5 +2601,192 @@ mod tests {
             result.ty,
             QueryType::Record(RecordSource::Projection(_))
         ));
+    }
+
+    #[test]
+    fn mutation_insert() {
+        let schema = test_schema();
+        let (file, _diags) = crate::parse_query(
+            r#"users.insert({ name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, created = @now }); 0"#,
+        );
+        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        assert!(diags.is_empty(), "expected no errors, got {diags:?}");
+    }
+
+    #[test]
+    fn mutation_update() {
+        let schema = test_schema();
+        let (file, _diags) = crate::parse_query(r#"users[age == 30].update({ age = 31 }); 0"#);
+        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        assert!(diags.is_empty(), "expected no errors, got {diags:?}");
+    }
+
+    #[test]
+    fn mutation_update_with_prev() {
+        let schema = test_schema();
+        let (file, _diags) =
+            crate::parse_query(r#"users[age == 30].update({ age = prev.age + 1 }); 0"#);
+        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        assert!(diags.is_empty(), "expected no errors, got {diags:?}");
+    }
+
+    #[test]
+    fn mutation_delete() {
+        let schema = test_schema();
+        let (file, _diags) = crate::parse_query(r#"users[!active].delete(); 0"#);
+        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        assert!(diags.is_empty(), "expected no errors, got {diags:?}");
+    }
+
+    #[test]
+    fn mutation_on_projection_error() {
+        let schema = test_schema();
+        let (file, _diags) = crate::parse_query(r#"users { name }.insert({ name = "Alice" }); 0"#);
+        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn mutation_on_scalar_error() {
+        let schema = test_schema();
+        let (file, _diags) = crate::parse_query(r#"42.insert({ name = "Alice" }); 0"#);
+        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn mutation_delete_arg_error() {
+        let schema = test_schema();
+        let (file, _diags) = crate::parse_query(r#"users[!active].delete("abc"); 0"#);
+        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn type_constant_int() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("Int::MAX");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Int));
+    }
+
+    #[test]
+    fn type_constant_float() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("Float::MIN");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Float));
+    }
+
+    #[test]
+    fn type_constant_dec() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("Dec::MAX");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Dec));
+    }
+
+    #[test]
+    fn mutation_insert_missing_required() {
+        let schema = test_schema();
+        let (file, _diags) = crate::parse_query(r#"users.insert({ name = "Alice" }); 0"#);
+        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn mutation_insert_unknown_field() {
+        let schema = test_schema();
+        let (file, _diags) = crate::parse_query(
+            r#"users.insert({ name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, created = @now, bogus = 1 }); 0"#,
+        );
+        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn mutation_insert_wrong_type() {
+        let schema = test_schema();
+        let (file, _diags) = crate::parse_query(
+            r#"users.insert({ name = 42, age = 30, score = 1.0f, balance = 0.0, active = true, created = @now }); 0"#,
+        );
+        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn mutation_update_unknown_field() {
+        let schema = test_schema();
+        let (file, _diags) = crate::parse_query(r#"users[name == "Bob"].update({ bogus = 2 }); 0"#);
+        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn mutation_update_subset() {
+        let schema = test_schema();
+        let (file, _diags) =
+            crate::parse_query(r#"users[name == "Bob"].update({ age = 30, score = 2.5f }); 0"#);
+        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        assert!(diags.is_empty(), "expected no errors, got {diags:?}");
+    }
+
+    #[test]
+    fn mutation_duplicate_field() {
+        let schema = test_schema();
+        let (file, _diags) = crate::parse_query(
+            r#"users.insert({ name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, name = "Bob", created = @now }); 0"#,
+        );
+        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn mutation_insert_on_non_root() {
+        let schema = test_schema();
+        let (file, _diags) = crate::parse_query(
+            r#"users[age == 30].insert({ name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, created = @now }); 0"#,
+        );
+        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn mutation_insert_optional_field_omitted() {
+        let schema = test_schema();
+        let (file, _diags) = crate::parse_query(
+            r#"users.insert({ name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, created = @now }); 0"#,
+        );
+        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        assert!(diags.is_empty(), "expected no errors, got {diags:?}");
+    }
+
+    #[test]
+    fn mutation_insert_with_ref_field_error() {
+        let schema = test_schema();
+        let (file, _diags) = crate::parse_query(
+            r#"users.insert({ name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, created = @now, profile = none }); 0"#,
+        );
+        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn file_with_mutations_result_expr() {
+        let schema = test_schema();
+        let (file, _diags) = crate::parse_query(
+            r#"
+            users.insert({ name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, created = @now });
+            users.insert({ name = "Bob", age = 25, score = 2.0f, balance = 0.0, active = true, created = @now });
+            users[!(name in ("Bob", "Alice"))].delete();
+            users[name == "Bob"].update({ score = prev.score + 0.4f });
+            users { name, age }
+            "#,
+        );
+        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        assert!(diags.is_empty(), "expected no errors, got {diags:?}");
     }
 }
