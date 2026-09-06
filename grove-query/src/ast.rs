@@ -30,6 +30,16 @@ pub enum MutationKind {
     Delete,
 }
 
+impl fmt::Display for MutationKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MutationKind::Insert => write!(f, "insert"),
+            MutationKind::Update => write!(f, "update"),
+            MutationKind::Delete => write!(f, "delete"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Literal(Spanned<Literal>),

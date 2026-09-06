@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::ast::{BinaryOp, ConstantName, Literal, MutationKind, TypeName, UnaryOp};
+use crate::ast::{BinaryOp, ConstantName, Literal, TypeName, UnaryOp};
 use grove_schema::validated::{ScalarType, StructId, ValueType};
 use grove_types::{Span, Spanned};
 
@@ -17,10 +17,21 @@ pub enum TypedStatement {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct TypedMutationStmt {
-    pub kind: Spanned<MutationKind>,
-    pub base: TypedExpr,
-    pub arg: Option<TypedExpr>,
+pub enum TypedMutationStmt {
+    Insert {
+        base: TypedExpr,
+        arg: TypedExpr,
+        span: Span,
+    },
+    Update {
+        base: TypedExpr,
+        arg: TypedExpr,
+        span: Span,
+    },
+    Delete {
+        base: TypedExpr,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
