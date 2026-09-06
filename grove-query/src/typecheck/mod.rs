@@ -1353,8 +1353,11 @@ fn validate_insert(
     schema: &ValidatedSchema,
 ) -> Result<(), TypeError> {
     let struct_ = &schema.structs[sid.index()];
-    let proj_fields =
-        expect_constructed_record(&mut typed_arg.ty, typed_arg.span, MutationKind::Insert)?;
+    let (record_ty, is_list) = match &mut typed_arg.ty {
+        QueryType::List(inner) => (inner.as_mut(), true),
+        ty => (ty, false),
+    };
+    let proj_fields = expect_constructed_record(record_ty, typed_arg.span, MutationKind::Insert)?;
 
     for schema_field in &struct_.fields {
         let (expected_name, is_optional) = match schema_field {
@@ -1395,7 +1398,10 @@ fn validate_insert(
                 ty: schema_ty.clone(),
                 span: typed_arg.span,
             };
-            let cloned_ty = QueryType::Record(RecordSource::Projection(proj_fields.clone()));
+            let mut cloned_ty = QueryType::Record(RecordSource::Projection(proj_fields.clone()));
+            if is_list {
+                cloned_ty = QueryType::List(Box::new(cloned_ty));
+            }
             let prev_arg_kind = std::mem::replace(&mut typed_arg.kind, none_expr.kind.clone());
             let _ = std::mem::replace(
                 &mut typed_arg.kind,
@@ -2797,5 +2803,57 @@ mod tests {
         );
         let (_typed, diags) = typecheck(file.unwrap(), &schema);
         assert!(diags.is_empty(), "expected no errors, got {diags:?}");
+    }
+
+    #[test]
+    fn batch_insert() {
+        let schema = test_schema();
+        let (file, _diags) = crate::parse_query(
+            r#"users.insert([
+                { name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, created = @now },
+                { name = "Bob", age = 25, score = 2.0f, balance = 2.0, active = false, created = @today },
+            ]); 0"#,
+        );
+        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        assert!(diags.is_empty(), "expected no errors, got {diags:?}");
+    }
+
+    #[test]
+    fn batch_insert_element_missing_required() {
+        let schema = test_schema();
+        let (file, _diags) = crate::parse_query(
+            r#"users.insert([
+                { name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, created = @now },
+                { name = "Bob", score = 2.0f, balance = 0.0, active = true, created = @now },
+            ]); 0"#,
+        );
+        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn batch_insert_element_mismatched_type() {
+        let schema = test_schema();
+        let (file, _diags) = crate::parse_query(
+            r#"users.insert([
+                { name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, created = @now },
+                { name = 42, age = 25, score = 2.0f, balance = 0.0, active = true, created = @now },
+            ]); 0"#,
+        );
+        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn batch_insert_element_unknown_field() {
+        let schema = test_schema();
+        let (file, _diags) = crate::parse_query(
+            r#"users.insert([
+                { name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, created = @now },
+                { name = "Bob", age = 25, score = 2.0f, balance = 0.0, active = true, created = @now, foo = 1 },
+            ]); 0"#,
+        );
+        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        assert!(!diags.is_empty());
     }
 }
