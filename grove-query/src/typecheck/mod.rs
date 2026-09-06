@@ -1371,7 +1371,11 @@ fn validate_insert(
                 ..
             } => (name, true),
             Field::Value { name, .. } | Field::Array { name, .. } => (name, false),
-            Field::Ref { name, .. } => {
+            Field::Ref {
+                name,
+                owning: false,
+                ..
+            } => {
                 if proj_fields.iter().any(|f| &f.name == name) {
                     return Err(TypeError::RefFieldInMutation {
                         field: name.clone(),
@@ -1381,6 +1385,7 @@ fn validate_insert(
                 }
                 continue;
             }
+            Field::Ref { name, optional, .. } => (name, *optional),
         };
 
         if proj_fields.iter().any(|f| &f.name == expected_name) {
@@ -1467,7 +1472,7 @@ fn validate_update(
                 span: typed_arg.span,
             });
         };
-        if let Field::Ref { .. } = schema_field {
+        if let Field::Ref { owning: false, .. } = schema_field {
             return Err(TypeError::RefFieldInMutation {
                 field: proj_field.name.clone(),
                 struct_name: struct_.name.clone(),
@@ -2765,13 +2770,13 @@ mod tests {
     }
 
     #[test]
-    fn mutation_insert_with_ref_field_error() {
+    fn mutation_insert_with_ref_field() {
         let schema = test_schema();
         let (file, _diags) = crate::parse_query(
             r#"users.insert({ name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, created = @now, profile = none }); 0"#,
         );
         let (_typed, diags) = typecheck(file.unwrap(), &schema);
-        assert!(!diags.is_empty());
+        assert!(diags.is_empty());
     }
 
     #[test]
