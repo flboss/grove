@@ -192,6 +192,14 @@ pub enum Field {
     },
 }
 
+impl Field {
+    pub fn name(&self) -> &str {
+        match self {
+            Field::Value { name, .. } | Field::Array { name, .. } | Field::Ref { name, .. } => name,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValueType {
     Scalar(ScalarType),
