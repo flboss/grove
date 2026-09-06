@@ -389,9 +389,9 @@ fn infer_struct_literal(
     span: Span,
     env: &mut TypeEnv,
 ) -> Result<TypedExpr, TypeError> {
-    let mut typed_fields = Vec::new();
-    let mut proj_fields = Vec::new();
-    let mut seen_names = HashSet::new();
+    let mut typed_fields = Vec::with_capacity(fields.len());
+    let mut proj_fields = Vec::with_capacity(fields.len());
+    let mut seen_names = HashSet::with_capacity(fields.len());
 
     for (name, value) in fields {
         if !seen_names.insert(name.as_str()) {
