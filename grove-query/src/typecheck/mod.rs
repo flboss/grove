@@ -932,11 +932,11 @@ fn types_compatible(a: &mut QueryType, b: &mut QueryType, schema: &ValidatedSche
         (QueryType::Unknown, QueryType::Unknown) => true,
         (a @ QueryType::Unknown, b) => {
             *a = b.clone();
-            true
+            types_compatible(a, b, schema)
         }
         (a, b @ QueryType::Unknown) => {
             *b = a.clone();
-            true
+            types_compatible(a, b, schema)
         }
         (QueryType::Optional(a), QueryType::Optional(b)) => types_compatible(a, b, schema),
         (QueryType::List(a), QueryType::List(b)) => types_compatible(a, b, schema),
