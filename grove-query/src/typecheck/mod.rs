@@ -1225,8 +1225,7 @@ fn check(
             arms.iter_mut()
                 .map(|(_, b)| b)
                 .chain(std::iter::once(default.as_mut()))
-                .map(|b| check(b, expected, env))
-                .collect::<Result<(), _>>()?;
+                .try_for_each(|b| check(b, expected, env))?;
         }
         TypedExprKind::Some { value } => {
             let QueryType::Optional(inner) = &mut expr.ty else {
@@ -1241,47 +1240,37 @@ fn check(
             elements
                 .iter_mut()
                 .zip(inners.iter_mut())
-                .map(|(elem, ty)| check(elem, ty, env))
-                .collect::<Result<(), _>>()?;
+                .try_for_each(|(elem, ty)| check(elem, ty, env))?;
         }
         TypedExprKind::Array { elements } => {
             let QueryType::List(inner) = &mut expr.ty else {
                 return type_mismatch("List<T>".into(), expr.ty.to_string());
             };
-            elements
-                .iter_mut()
-                .map(|e| check(e, inner, env))
-                .collect::<Result<(), _>>()?;
+            elements.iter_mut().try_for_each(|e| check(e, inner, env))?;
         }
         TypedExprKind::Struct { fields } => {
             let QueryType::Record(RecordSource::Projection(proj_fields)) = &mut expr.ty else {
                 return type_mismatch("Record".into(), expr.ty.to_string());
             };
-            fields
-                .iter_mut()
-                .map(|(name, expr)| {
-                    let Some(field) = proj_fields
-                        .iter_mut()
-                        .find(|field| field.name == name.as_str())
-                    else {
-                        return type_mismatch(
-                            format!("Record with field `{}`", name.as_str()),
-                            expr.ty.to_string(),
-                        );
-                    };
-                    check(expr, &mut field.ty, env)
-                })
-                .collect::<Result<(), _>>()?;
+            fields.iter_mut().try_for_each(|(name, expr)| {
+                let Some(field) = proj_fields
+                    .iter_mut()
+                    .find(|field| field.name == name.as_str())
+                else {
+                    return type_mismatch(
+                        format!("Record with field `{}`", name.as_str()),
+                        expr.ty.to_string(),
+                    );
+                };
+                check(expr, &mut field.ty, env)
+            })?;
         }
         // no propagation
         TypedExprKind::Projection { base, items } => {
-            items
-                .iter_mut()
-                .map(|item| {
-                    let mut item_ty = item.value.ty.clone();
-                    check(&mut item.value, &mut item_ty, env)
-                })
-                .collect::<Result<(), _>>()?;
+            items.iter_mut().try_for_each(|item| {
+                let mut item_ty = item.value.ty.clone();
+                check(&mut item.value, &mut item_ty, env)
+            })?;
             let mut base_ty = base.ty.clone();
             check(base, &mut base_ty, env)?;
         }
