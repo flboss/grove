@@ -29,6 +29,7 @@ pub enum TypeError {
     StructFieldTypeMismatch { field: String, struct_name: String, expected: String, got: String, span: Span },
     DuplicateStructField { name: String, span: Span },
     RefFieldInMutation { field: String, struct_name: String, span: Span },
+    UnexpectedType { expected: String, got: String, span: Span },
 }
 
 impl From<TypeError> for Diagnostic {
@@ -247,6 +248,16 @@ impl From<TypeError> for Diagnostic {
             .with_note(format!(
                 "`{field}` is a non-owning reference and cannot be provided in a mutation"
             )),
+            TypeError::UnexpectedType {
+                expected,
+                got,
+                span,
+            } => error_simple(
+                "QT0027",
+                format!("type mismatch: expected {expected}, found {got}"),
+                span,
+                format!("expected {expected}"),
+            ),
         }
     }
 }

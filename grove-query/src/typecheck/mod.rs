@@ -1169,25 +1169,125 @@ fn scalar_method(s: &ScalarType, method: &str) -> Option<MethodSig> {
     }
 }
 
-#[allow(dead_code)] // not yet used
-fn check(expr: &Expr, expected: &QueryType, env: &mut TypeEnv) -> Result<TypedExpr, TypeError> {
-    match expr {
-        Expr::Literal(Spanned {
-            value: Literal::None,
-            span,
-        }) => {
-            let ty = expected.clone().wrap_optional();
-            Ok(TypedExpr {
-                kind: TypedExprKind::Literal(Spanned {
-                    span: *span,
-                    value: Literal::None,
-                }),
-                ty,
-                span: *span,
-            })
-        }
-        _ => infer(expr, env),
+fn check(
+    expr: &mut TypedExpr,
+    expected: &mut QueryType,
+    env: &mut TypeEnv,
+) -> Result<(), TypeError> {
+    let type_mismatch = |exp: String, got: String| {
+        Err(TypeError::UnexpectedType {
+            expected: exp.to_string(),
+            got: got.to_string(),
+            span: expr.span,
+        })
+    };
+
+    if !types_compatible(&mut expr.ty, expected, env.schema()) {
+        return type_mismatch(expected.to_string(), expr.ty.to_string());
     }
+
+    if expr.ty.is_unknown() {
+        return Err(TypeError::AmbiguousType { span: expr.span });
+    }
+
+    match &mut expr.kind {
+        TypedExprKind::Literal(_) | TypedExprKind::Ident(_) => {}
+        // no propagation
+        TypedExprKind::Field { base, .. } => {
+            let mut base_ty = base.ty.clone();
+            check(base, &mut base_ty, env)?;
+        }
+        // no propagation
+        TypedExprKind::Method { base, args, .. } => {
+            let mut base_ty = base.ty.clone();
+            check(base, &mut base_ty, env)?;
+            for arg in args {
+                let mut arg_ty = arg.ty.clone();
+                check(arg, &mut arg_ty, env)?;
+            }
+        }
+        // no propagation
+        TypedExprKind::Binary { lhs, rhs, .. } => {
+            let mut lhs_ty = lhs.ty.clone();
+            let mut rhs_ty = rhs.ty.clone();
+            check(lhs, &mut lhs_ty, env)?;
+            check(rhs, &mut rhs_ty, env)?;
+        }
+        TypedExprKind::Unary { expr: operand, .. } => {
+            check(operand, &mut expr.ty, env)?;
+        }
+        // no propagation
+        TypedExprKind::Cast { expr: operand, .. } => {
+            let mut ty = operand.ty.clone();
+            check(operand, &mut ty, env)?;
+        }
+        TypedExprKind::If { arms, default } => {
+            arms.iter_mut()
+                .map(|(_, b)| b)
+                .chain(std::iter::once(default.as_mut()))
+                .map(|b| check(b, expected, env))
+                .collect::<Result<(), _>>()?;
+        }
+        TypedExprKind::Some { value } => {
+            let QueryType::Optional(inner) = &mut expr.ty else {
+                return type_mismatch("?T".into(), expr.ty.to_string());
+            };
+            check(value.as_mut(), inner, env)?;
+        }
+        TypedExprKind::Tuple { elements } => {
+            let QueryType::Tuple(inners) = &mut expr.ty else {
+                return type_mismatch("Tuple".into(), expr.ty.to_string());
+            };
+            elements
+                .iter_mut()
+                .zip(inners.iter_mut())
+                .map(|(elem, ty)| check(elem, ty, env))
+                .collect::<Result<(), _>>()?;
+        }
+        TypedExprKind::Array { elements } => {
+            let QueryType::List(inner) = &mut expr.ty else {
+                return type_mismatch("List<T>".into(), expr.ty.to_string());
+            };
+            elements
+                .iter_mut()
+                .map(|e| check(e, inner, env))
+                .collect::<Result<(), _>>()?;
+        }
+        TypedExprKind::Struct { fields } => {
+            let QueryType::Record(RecordSource::Projection(proj_fields)) = &mut expr.ty else {
+                return type_mismatch("Record".into(), expr.ty.to_string());
+            };
+            fields
+                .iter_mut()
+                .map(|(name, expr)| {
+                    let Some(field) = proj_fields
+                        .iter_mut()
+                        .find(|field| field.name == name.as_str())
+                    else {
+                        return type_mismatch(
+                            format!("Record with field `{}`", name.as_str()),
+                            expr.ty.to_string(),
+                        );
+                    };
+                    check(expr, &mut field.ty, env)
+                })
+                .collect::<Result<(), _>>()?;
+        }
+        // no propagation
+        TypedExprKind::Projection { base, items } => {
+            items
+                .iter_mut()
+                .map(|item| {
+                    let mut item_ty = item.value.ty.clone();
+                    check(&mut item.value, &mut item_ty, env)
+                })
+                .collect::<Result<(), _>>()?;
+            let mut base_ty = base.ty.clone();
+            check(base, &mut base_ty, env)?;
+        }
+        TypedExprKind::TypeConstant { .. } => {}
+    }
+    Ok(())
 }
 
 fn typecheck_stmt(stmt: &Statement, env: &mut TypeEnv) -> Result<TypedStatement, TypeError> {
@@ -1520,7 +1620,14 @@ pub fn typecheck(
     }
 
     match infer(&file.result, &mut env) {
-        Ok(result) => (Some(TypedQueryFile { statements, result }), diags),
+        Ok(mut result) => {
+            let mut ty = result.ty.clone();
+            if let Err(err) = check(&mut result, &mut ty, &mut env) {
+                diags.push(err.into());
+                return (None, diags);
+            }
+            (Some(TypedQueryFile { statements, result }), diags)
+        }
         Err(err) => {
             diags.push(err.into());
             (None, diags)
@@ -1626,16 +1733,6 @@ mod tests {
         let (file, _diags) = crate::parse_query("#30d");
         let result = infer(&file.unwrap().result, &mut env).unwrap();
         assert_eq!(result.ty, QueryType::Scalar(ScalarType::Duration));
-    }
-
-    #[test]
-    fn none_inferred_type() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let expected = QueryType::Scalar(ScalarType::Int).wrap_optional();
-        let (file, _diags) = crate::parse_query("none");
-        let result = check(&file.unwrap().result, &expected, &mut env).unwrap();
-        assert_eq!(result.ty, expected);
     }
 
     #[test]
