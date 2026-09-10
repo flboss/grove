@@ -2856,4 +2856,140 @@ mod tests {
         let (_typed, diags) = typecheck(file.unwrap(), &schema);
         assert!(!diags.is_empty());
     }
+
+    #[test]
+    fn typecheck_if_else_optional_list() {
+        let schema = test_schema();
+        let (file, _diags) = crate::parse_query(
+            "
+            if true { none }
+            else {
+                if false { some([]) }
+                else { some([1, 2, 3]) }
+            }
+            ",
+        );
+        let (typed, _diags) = typecheck(file.unwrap(), &schema);
+        assert_eq!(
+            typed.unwrap().result.ty,
+            QueryType::List(Box::new(QueryType::Scalar(ScalarType::Int))).wrap_optional()
+        );
+    }
+
+    #[test]
+    fn typecheck_if_else_ambiguous() {
+        let schema = test_schema();
+        let (file, _) = crate::parse_query("if true { none } else { none }");
+        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn typecheck_array_optional() {
+        let schema = test_schema();
+        let (file, _) = crate::parse_query("[none, some(3), none]");
+        let (typed, _diags) = typecheck(file.unwrap(), &schema);
+        assert_eq!(
+            typed.unwrap().result.ty,
+            QueryType::List(Box::new(QueryType::Scalar(ScalarType::Int).wrap_optional()))
+        );
+    }
+
+    #[test]
+    fn typecheck_array_empty() {
+        let schema = test_schema();
+        let (file, _) = crate::parse_query("[]");
+        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn typecheck_array_mismatched_types() {
+        let schema = test_schema();
+        let (file, _) = crate::parse_query(r#"[1, "two", 3]"#);
+        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn typecheck_some_none_if_else() {
+        let schema = test_schema();
+        let (file, _) = crate::parse_query("if true { some(42) } else { none }");
+        let (typed, _diags) = typecheck(file.unwrap(), &schema);
+        assert_eq!(
+            typed.unwrap().result.ty,
+            QueryType::Scalar(ScalarType::Int).wrap_optional()
+        );
+    }
+
+    #[test]
+    fn typecheck_method_chain() {
+        let schema = test_schema();
+        let (file, _) = crate::parse_query("users.first().unwrap().profile?.username");
+        let (typed, _diags) = typecheck(file.unwrap(), &schema);
+        assert_eq!(
+            typed.unwrap().result.ty,
+            QueryType::Scalar(ScalarType::String).wrap_optional()
+        );
+    }
+
+    #[test]
+    fn typecheck_filter_project() {
+        let schema = test_schema();
+        let (file, _) = crate::parse_query("users[age > 18] { name, profile?.username }");
+        let (typed, _diags) = typecheck(file.unwrap(), &schema);
+        assert!(matches!(
+            typed.unwrap().result.ty,
+            QueryType::List(inner) if matches!(*inner, QueryType::Record(RecordSource::Projection(_)))
+        ));
+    }
+
+    #[test]
+    fn typecheck_optional_comparison_error() {
+        let schema = test_schema();
+        let (file, _) = crate::parse_query("none == 1");
+        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn typecheck_optional_ambiguous() {
+        let schema = test_schema();
+        let (file, _) = crate::parse_query("none == none");
+        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn typecheck_filter_method_optional() {
+        let schema = test_schema();
+        let (file, _) = crate::parse_query("users[age > 18].first()?.age");
+        let (typed, _diags) = typecheck(file.unwrap(), &schema);
+        assert_eq!(
+            typed.unwrap().result.ty,
+            QueryType::Scalar(ScalarType::Int).wrap_optional()
+        );
+    }
+
+    #[test]
+    fn typecheck_tuple() {
+        let schema = test_schema();
+        let (file, _) = crate::parse_query("if true { (1, 2) } else { (3, 4) }");
+        let (typed, _diags) = typecheck(file.unwrap(), &schema);
+        assert_eq!(
+            typed.unwrap().result.ty,
+            QueryType::Tuple(vec![
+                QueryType::Scalar(ScalarType::Int),
+                QueryType::Scalar(ScalarType::Int),
+            ])
+        );
+    }
+
+    #[test]
+    fn typecheck_tuple_mismatch() {
+        let schema = test_schema();
+        let (file, _) = crate::parse_query(r#"if true { (1, 2, 4) } else { (4, "abc") }"#);
+        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        assert!(!diags.is_empty());
+    }
 }
