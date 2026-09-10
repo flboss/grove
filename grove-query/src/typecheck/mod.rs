@@ -1095,7 +1095,7 @@ fn method_signature(base: &QueryType, method: &str) -> Option<MethodSig> {
                 Some(MethodSig::no_args(inner.as_ref().clone().wrap_optional()))
             }
             "sort" | "sort_asc" | "sort_desc" => Some(MethodSig::scoped_at_least(
-                inner.as_ref().clone(),
+                QueryType::List(inner.clone()),
                 1,
                 QueryType::has_defined_order,
             )),
