@@ -471,10 +471,10 @@ fn infer_projection(
         seen_names.insert(name.as_str(), name.span);
 
         typed_items.push(TypedProjectionItem {
-            alias: Some(Spanned {
+            alias: Spanned {
                 value: name.to_string(),
                 span: item.value.span(),
-            }),
+            },
             value: typed_value,
         });
     }
@@ -484,7 +484,7 @@ fn infer_projection(
         typed_items
             .iter()
             .map(|t| ProjectionField {
-                name: t.alias.as_deref().cloned().unwrap_or_default(),
+                name: t.alias.to_string(),
                 ty: t.value.ty.clone(),
             })
             .collect(),
@@ -1412,10 +1412,10 @@ fn validate_insert(
                         span: typed_arg.span,
                     }),
                     items: vec![TypedProjectionItem {
-                        alias: Some(Spanned {
+                        alias: Spanned {
                             value: expected_name.clone(),
                             span: typed_arg.span,
-                        }),
+                        },
                         value: none_expr,
                     }],
                 },

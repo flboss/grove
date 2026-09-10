@@ -97,7 +97,7 @@ pub enum TypedExprKind {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypedProjectionItem {
-    pub alias: Option<Spanned<String>>,
+    pub alias: Spanned<String>,
     pub value: TypedExpr,
 }
 
@@ -166,6 +166,19 @@ impl QueryType {
                 QueryType::Tuple(elems.into_iter().map(QueryType::wrap_optional).collect())
             }
             other => QueryType::Optional(Box::new(other)),
+        }
+    }
+
+    pub fn is_unknown(&self) -> bool {
+        match self {
+            QueryType::Scalar(_) | QueryType::Void => false,
+            QueryType::Optional(inner) | QueryType::List(inner) => inner.is_unknown(),
+            QueryType::Tuple(elements) => elements.iter().any(QueryType::is_unknown),
+            QueryType::Record(source) => match source {
+                RecordSource::Schema(_) => false,
+                RecordSource::Projection(fields) => fields.iter().any(|f| f.ty.is_unknown()),
+            },
+            QueryType::Unknown => true,
         }
     }
 }
