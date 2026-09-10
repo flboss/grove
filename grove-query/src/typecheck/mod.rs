@@ -10,7 +10,7 @@ use crate::ast::{
 use crate::typecheck::error::TypeError;
 use crate::typecheck::types::*;
 use grove_schema::validated::{Field, ScalarType, StructId, ValidatedSchema, ValueType};
-use grove_types::{Diagnostic, Span, Spanned};
+use grove_types::{Diagnostic, Severity, Span, Spanned};
 
 struct TypeEnv<'s> {
     scopes: Vec<HashMap<String, QueryType>>,
@@ -1613,15 +1613,16 @@ pub fn typecheck(
             let mut ty = result.ty.clone();
             if let Err(err) = check(&mut result, &mut ty, &mut env) {
                 diags.push(err.into());
-                return (None, diags);
             }
-            (Some(TypedQueryFile { statements, result }), diags)
+            if !diags.iter().any(|d| d.severity == Severity::Error) {
+                return (Some(TypedQueryFile { statements, result }), diags);
+            }
         }
         Err(err) => {
             diags.push(err.into());
-            (None, diags)
         }
     }
+    (None, diags)
 }
 
 #[cfg(test)]
