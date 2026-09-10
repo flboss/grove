@@ -1073,9 +1073,9 @@ fn method_signature(base: &QueryType, method: &str) -> Option<MethodSig> {
         },
         QueryType::List(inner) => match method {
             "len" => Some(MethodSig::no_args(QueryType::Scalar(Int))),
-            "first" => Some(MethodSig::no_args(inner.as_ref().clone().wrap_optional())),
+            "first" => Some(MethodSig::no_args(inner.clone().wrap_optional())),
             "nth" => Some(MethodSig::one_arg(
-                inner.as_ref().clone().wrap_optional(),
+                inner.clone().wrap_optional(),
                 QueryType::Scalar(Int),
             )),
             "contains" => Some(MethodSig::one_arg(
@@ -1085,19 +1085,19 @@ fn method_signature(base: &QueryType, method: &str) -> Option<MethodSig> {
             "filter" if matches!(inner.as_ref(), QueryType::Record(_)) => Some(
                 MethodSig::scoped_fixed(QueryType::List(inner.clone()), 1, QueryType::is_bool),
             ),
-            "sum" if inner.is_summable() => {
-                Some(MethodSig::no_args(inner.as_ref().clone().wrap_optional()))
-            }
-            "avg" if inner.is_summable() => {
-                Some(MethodSig::no_args(inner.as_ref().clone().wrap_optional()))
-            }
+            "sum" if inner.is_summable() => Some(MethodSig::no_args(inner.clone().wrap_optional())),
+            "avg" if inner.is_summable() => Some(MethodSig::no_args(inner.clone().wrap_optional())),
             "max" | "min" if inner.has_defined_order() => {
-                Some(MethodSig::no_args(inner.as_ref().clone().wrap_optional()))
+                Some(MethodSig::no_args(inner.clone().wrap_optional()))
             }
             "sort" | "sort_asc" | "sort_desc" => Some(MethodSig::scoped_at_least(
                 QueryType::List(inner.clone()),
                 1,
                 QueryType::has_defined_order,
+            )),
+            "take" | "skip" => Some(MethodSig::one_arg(
+                QueryType::List(inner.clone()),
+                QueryType::Scalar(Int),
             )),
             "sum_over" | "avg_over" if matches!(inner.as_ref(), QueryType::Record(_)) => {
                 Some(MethodSig::scoped_fixed(
@@ -1108,7 +1108,7 @@ fn method_signature(base: &QueryType, method: &str) -> Option<MethodSig> {
             }
             "max_by" | "min_by" if matches!(inner.as_ref(), QueryType::Record(_)) => {
                 Some(MethodSig::scoped_fixed(
-                    inner.as_ref().clone().wrap_optional(),
+                    inner.clone().wrap_optional(),
                     1,
                     QueryType::has_defined_order,
                 ))
