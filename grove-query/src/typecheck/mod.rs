@@ -9,11 +9,17 @@ use crate::ast::{
 };
 use crate::typecheck::error::TypeError;
 use crate::typecheck::types::*;
-use grove_schema::validated::{Field, ScalarType, StructId, ValidatedSchema, ValueType};
+use grove_schema::validated::{Field, FieldId, ScalarType, StructId, ValidatedSchema, ValueType};
 use grove_types::{Diagnostic, Severity, Span, Spanned};
 
+#[derive(Debug, Clone, PartialEq)]
+struct ScopeEntry {
+    ty: QueryType,
+    binding: IdentBinding,
+}
+
 struct TypeEnv<'s> {
-    scopes: Vec<HashMap<String, QueryType>>,
+    scopes: Vec<HashMap<String, ScopeEntry>>,
     schema: &'s ValidatedSchema,
 }
 
@@ -24,10 +30,10 @@ impl<'s> TypeEnv<'s> {
             schema,
         };
 
-        for root in &schema.roots {
+        for (root_idx, root) in schema.roots.iter().enumerate() {
             let record_ty = QueryType::Record(RecordSource::Schema(root.struct_id));
             let list_ty = QueryType::List(Box::new(record_ty));
-            env.define(root.name.clone(), list_ty);
+            env.define(root.name.clone(), list_ty, IdentBinding::Root { root_idx });
         }
 
         env
@@ -41,14 +47,17 @@ impl<'s> TypeEnv<'s> {
         self.scopes.pop();
     }
 
-    fn define(&mut self, name: String, ty: QueryType) {
-        self.scopes.last_mut().unwrap().insert(name, ty);
+    fn define(&mut self, name: String, ty: QueryType, binding: IdentBinding) {
+        self.scopes
+            .last_mut()
+            .unwrap()
+            .insert(name, ScopeEntry { ty, binding });
     }
 
-    fn resolve(&self, name: &str) -> Option<&QueryType> {
+    fn resolve(&self, name: &str) -> Option<&ScopeEntry> {
         for scope in self.scopes.iter().rev() {
-            if let Some(ty) = scope.get(name) {
-                return Some(ty);
+            if let Some(entry) = scope.get(name) {
+                return Some(entry);
             }
         }
         None
@@ -68,7 +77,13 @@ impl<'s> TypeEnv<'s> {
             QueryType::Record(RecordSource::Projection(fields)) => {
                 self.push_scope();
                 for field in fields {
-                    self.define(field.name.clone(), field.ty.clone());
+                    self.define(
+                        field.name.clone(),
+                        field.ty.clone(),
+                        IdentBinding::ProjectedField {
+                            name: field.name.clone(),
+                        },
+                    );
                 }
                 true
             }
@@ -79,7 +94,8 @@ impl<'s> TypeEnv<'s> {
 
     fn push_schema_struct_fields(&mut self, struct_id: StructId) {
         let struct_ = &self.schema.structs[struct_id.index()];
-        for field in &struct_.fields {
+        for (local_idx, field) in struct_.fields.iter().enumerate() {
+            let binding = IdentBinding::Field(FieldId::new(struct_id, local_idx));
             let (name, ty) = match field {
                 Field::Value { name, ty, .. } => (name.clone(), ty.into()),
                 Field::Array { name, element, .. } => {
@@ -103,7 +119,7 @@ impl<'s> TypeEnv<'s> {
                     (name.clone(), ty)
                 }
             };
-            self.define(name, ty);
+            self.define(name, ty, binding);
         }
     }
 }
@@ -172,16 +188,18 @@ fn infer(expr: &Expr, env: &mut TypeEnv) -> Result<TypedExpr, TypeError> {
             })
         }
         Expr::Ident(name) => {
-            let ty =
-                env.resolve(&name.value)
-                    .cloned()
-                    .ok_or_else(|| TypeError::UnknownIdentifier {
-                        name: name.value.clone(),
-                        span: name.span,
-                    })?;
+            let entry = env
+                .resolve(&name.value)
+                .ok_or_else(|| TypeError::UnknownIdentifier {
+                    name: name.to_string(),
+                    span: name.span,
+                })?;
             Ok(TypedExpr {
-                kind: TypedExprKind::Ident(name.clone()),
-                ty,
+                kind: TypedExprKind::Ident {
+                    name: name.clone(),
+                    binding: entry.binding.clone(),
+                },
+                ty: entry.ty.clone(),
                 span: name.span,
             })
         }
@@ -1191,7 +1209,7 @@ fn check(
     }
 
     match &mut expr.kind {
-        TypedExprKind::Literal(_) | TypedExprKind::Ident(_) => {}
+        TypedExprKind::Literal(_) | TypedExprKind::Ident { .. } => {}
         // no propagation
         TypedExprKind::Field { base, .. } => {
             let mut base_ty = base.ty.clone();
@@ -1339,6 +1357,7 @@ fn typecheck_mutation(
             env.define(
                 "prev".to_string(),
                 QueryType::Record(RecordSource::Schema(struct_id)),
+                IdentBinding::Prev { struct_id },
             );
             let mut typed_arg = infer(mutation.arg.as_ref().expect("checked above"), env)?;
             env.pop_scope();
@@ -1381,24 +1400,24 @@ fn check_insert_base(base: &Expr, env: &mut TypeEnv) -> Result<(TypedExpr, Struc
             });
         }
     };
-    if !env
+    let Some(root_idx) = env
         .schema()
         .roots
         .iter()
-        .any(|r| r.name == base_ident.value)
-    {
+        .position(|r| r.name == base_ident.value)
+    else {
         return Err(TypeError::InsertOnNonRoot {
             got: base_ident.value.clone(),
             span: base_ident.span,
         });
     };
-    let ty = env
+    let entry = env
         .resolve(&base_ident.value)
         .ok_or_else(|| TypeError::UnknownIdentifier {
-            name: base_ident.value.clone(),
+            name: base_ident.to_string(),
             span: base_ident.span,
         })?;
-    let struct_id = match ty {
+    let struct_id = match &entry.ty {
         QueryType::List(inner)
             if let QueryType::Record(RecordSource::Schema(id)) = inner.as_ref() =>
         {
@@ -1413,8 +1432,11 @@ fn check_insert_base(base: &Expr, env: &mut TypeEnv) -> Result<(TypedExpr, Struc
     };
     let span = base.span();
     let typed_base = TypedExpr {
-        kind: TypedExprKind::Ident(base_ident.clone()),
-        ty: ty.clone(),
+        kind: TypedExprKind::Ident {
+            name: base_ident.clone(),
+            binding: IdentBinding::Root { root_idx },
+        },
+        ty: entry.ty.clone(),
         span,
     };
     Ok((typed_base, struct_id))
@@ -1738,8 +1760,140 @@ mod tests {
     fn root_lookup() {
         let schema = test_schema();
         let env = TypeEnv::new(&schema);
-        let ty = env.resolve("users").unwrap();
-        assert!(matches!(ty, QueryType::List(_)));
+        let entry = env.resolve("users").unwrap();
+        assert!(matches!(entry.ty, QueryType::List(_)));
+    }
+
+    fn field_binding(schema: &ValidatedSchema, struct_id: StructId, field: &str) -> IdentBinding {
+        let local = schema.structs[struct_id.index()]
+            .fields
+            .iter()
+            .position(|f| f.name() == field)
+            .unwrap();
+        IdentBinding::Field(FieldId::new(struct_id, local))
+    }
+
+    #[test]
+    fn ident_binding_root() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("users");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        let TypedExprKind::Ident { name, binding } = &result.kind else {
+            panic!("expected ident, got {:?}", result.kind);
+        };
+        assert_eq!(name.value, "users");
+        assert_eq!(*binding, IdentBinding::Root { root_idx: 0 });
+    }
+
+    #[test]
+    fn ident_binding_scoped_field() {
+        let schema = test_schema();
+        let user = schema.roots[0].struct_id;
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("users[active]");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        let TypedExprKind::Method { args, .. } = &result.kind else {
+            panic!("expected method, got {:?}", result.kind);
+        };
+        let TypedExprKind::Ident { name, binding } = &args[0].kind else {
+            panic!("expected ident, got {:?}", args[0].kind);
+        };
+        assert_eq!(name.value, "active");
+        assert_eq!(*binding, field_binding(&schema, user, "active"));
+    }
+
+    #[test]
+    fn ident_binding_scoped_ref_field() {
+        let schema = test_schema();
+        let user = schema.roots[0].struct_id;
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("users[profile.is_some()]");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        let TypedExprKind::Method { args, .. } = &result.kind else {
+            panic!("expected method, got {:?}", result.kind);
+        };
+        let TypedExprKind::Method { base, .. } = &args[0].kind else {
+            panic!("expected method, got {:?}", args[0].kind);
+        };
+        let TypedExprKind::Ident { name, binding } = &base.kind else {
+            panic!("expected ident, got {:?}", base.kind);
+        };
+        assert_eq!(name.value, "profile");
+        assert_eq!(*binding, field_binding(&schema, user, "profile"));
+    }
+
+    #[test]
+    fn ident_binding_projected_field() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("users { name } { name }");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        let TypedExprKind::Projection { items, .. } = &result.kind else {
+            panic!("expected projection, got {:?}", result.kind);
+        };
+        let TypedExprKind::Ident { name, binding } = &items[0].value.kind else {
+            panic!("expected ident, got {:?}", items[0].value.kind);
+        };
+        assert_eq!(name.value, "name");
+        assert_eq!(
+            *binding,
+            IdentBinding::ProjectedField {
+                name: "name".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn ident_binding_projected_scoped_field() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query(r#"users { name }[name == "Alice"]"#);
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        let TypedExprKind::Method { args, .. } = &result.kind else {
+            panic!("expected method, got {:?}", result.kind);
+        };
+        let TypedExprKind::Binary { lhs, .. } = &args[0].kind else {
+            panic!("expected binary, got {:?}", args[0].kind);
+        };
+        let TypedExprKind::Ident { name, binding } = &lhs.kind else {
+            panic!("expected ident, got {:?}", lhs.kind);
+        };
+        assert_eq!(name.value, "name");
+        assert_eq!(
+            *binding,
+            IdentBinding::ProjectedField {
+                name: "name".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn ident_binding_prev() {
+        let schema = test_schema();
+        let user = schema.roots[0].struct_id;
+        let (file, _) = crate::parse_query(r#"users[age == 30].update({ age = prev.age + 1 }); 0"#);
+        let (typed, diags) = typecheck(file.unwrap(), &schema);
+        assert!(diags.is_empty(), "expected no errors, got {diags:?}");
+        let TypedStatement::Mutation(TypedMutationStmt::Update { arg, .. }) =
+            &typed.unwrap().statements[0]
+        else {
+            panic!("expected update statement");
+        };
+        let TypedExprKind::Struct { fields, .. } = &arg.kind else {
+            panic!("expected struct, got {:?}", arg.kind);
+        };
+        let TypedExprKind::Binary { lhs, .. } = &fields[0].1.kind else {
+            panic!("expected binary, got {:?}", fields[0].1.kind);
+        };
+        let TypedExprKind::Field { base, .. } = &lhs.kind else {
+            panic!("expected field, got {:?}", lhs.kind);
+        };
+        let TypedExprKind::Ident { name, binding } = &base.kind else {
+            panic!("expected ident, got {:?}", base.kind);
+        };
+        assert_eq!(name.value, "prev");
+        assert_eq!(*binding, IdentBinding::Prev { struct_id: user });
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use std::fmt;
 
 use crate::ast::{BinaryOp, ConstantName, Literal, TypeName, UnaryOp};
-use grove_schema::validated::{ScalarType, StructId, ValueType};
+use grove_schema::validated::{FieldId, ScalarType, StructId, ValueType};
 use grove_types::{Span, Spanned};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -44,7 +44,10 @@ pub struct TypedExpr {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypedExprKind {
     Literal(Spanned<Literal>),
-    Ident(Spanned<String>),
+    Ident {
+        name: Spanned<String>,
+        binding: IdentBinding,
+    },
     Field {
         base: Box<TypedExpr>,
         name: Spanned<String>,
@@ -99,6 +102,14 @@ pub enum TypedExprKind {
 pub struct TypedProjectionItem {
     pub alias: Spanned<String>,
     pub value: TypedExpr,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum IdentBinding {
+    Root { root_idx: usize },
+    Field(FieldId),
+    ProjectedField { name: String },
+    Prev { struct_id: StructId },
 }
 
 #[derive(Debug, Clone, PartialEq)]
