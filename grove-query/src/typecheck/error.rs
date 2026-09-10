@@ -24,29 +24,11 @@ pub enum TypeError {
     MutationOnProjection { span: Span },
     MutationOnNonList { got: String, span: Span },
     InsertOnNonRoot { got: String, span: Span },
-    StructFieldNotInSchema {
-        field: String,
-        struct_name: String,
-        span: Span,
-    },
-    InsertMissingRequiredField {
-        field: String,
-        struct_name: String,
-        span: Span,
-    },
-    StructFieldTypeMismatch {
-        field: String,
-        struct_name: String,
-        expected: String,
-        got: String,
-        span: Span,
-    },
+    StructFieldNotInSchema { field: String, struct_name: String, span: Span },
+    InsertMissingRequiredField { field: String, struct_name: String, span: Span },
+    StructFieldTypeMismatch { field: String, struct_name: String, expected: String, got: String, span: Span },
     DuplicateStructField { name: String, span: Span },
-    RefFieldInMutation {
-        field: String,
-        struct_name: String,
-        span: Span,
-    },
+    RefFieldInMutation { field: String, struct_name: String, span: Span },
 }
 
 impl From<TypeError> for Diagnostic {
