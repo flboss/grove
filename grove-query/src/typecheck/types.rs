@@ -47,6 +47,7 @@ pub enum TypedExprKind {
     Ident {
         name: Spanned<String>,
         binding: IdentBinding,
+        depth: usize,
     },
     Field {
         base: Box<TypedExpr>,

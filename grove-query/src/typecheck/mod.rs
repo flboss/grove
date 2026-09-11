@@ -54,10 +54,10 @@ impl<'s> TypeEnv<'s> {
             .insert(name, ScopeEntry { ty, binding });
     }
 
-    fn resolve(&self, name: &str) -> Option<&ScopeEntry> {
-        for scope in self.scopes.iter().rev() {
+    fn resolve(&self, name: &str) -> Option<(&ScopeEntry, usize)> {
+        for (skipped, scope) in self.scopes.iter().rev().enumerate() {
             if let Some(entry) = scope.get(name) {
-                return Some(entry);
+                return Some((entry, skipped));
             }
         }
         None
@@ -188,16 +188,17 @@ fn infer(expr: &Expr, env: &mut TypeEnv) -> Result<TypedExpr, TypeError> {
             })
         }
         Expr::Ident(name) => {
-            let entry = env
-                .resolve(&name.value)
-                .ok_or_else(|| TypeError::UnknownIdentifier {
-                    name: name.to_string(),
-                    span: name.span,
-                })?;
+            let (entry, depth) =
+                env.resolve(&name.value)
+                    .ok_or_else(|| TypeError::UnknownIdentifier {
+                        name: name.to_string(),
+                        span: name.span,
+                    })?;
             Ok(TypedExpr {
                 kind: TypedExprKind::Ident {
                     name: name.clone(),
                     binding: entry.binding.clone(),
+                    depth,
                 },
                 ty: entry.ty.clone(),
                 span: name.span,
@@ -1416,12 +1417,12 @@ fn check_insert_base(base: &Expr, env: &mut TypeEnv) -> Result<(TypedExpr, Struc
             span: base_ident.span,
         });
     };
-    let entry = env
-        .resolve(&base_ident.value)
-        .ok_or_else(|| TypeError::UnknownIdentifier {
-            name: base_ident.to_string(),
-            span: base_ident.span,
-        })?;
+    let (entry, depth) =
+        env.resolve(&base_ident.value)
+            .ok_or_else(|| TypeError::UnknownIdentifier {
+                name: base_ident.to_string(),
+                span: base_ident.span,
+            })?;
     let struct_id = match &entry.ty {
         QueryType::List(inner)
             if let QueryType::Record(RecordSource::Schema(id)) = inner.as_ref() =>
@@ -1440,6 +1441,7 @@ fn check_insert_base(base: &Expr, env: &mut TypeEnv) -> Result<(TypedExpr, Struc
         kind: TypedExprKind::Ident {
             name: base_ident.clone(),
             binding: IdentBinding::Root { root_idx },
+            depth,
         },
         ty: entry.ty.clone(),
         span,
@@ -1765,8 +1767,26 @@ mod tests {
     fn root_lookup() {
         let schema = test_schema();
         let env = TypeEnv::new(&schema);
-        let entry = env.resolve("users").unwrap();
+        let (entry, depth) = env.resolve("users").unwrap();
         assert!(matches!(entry.ty, QueryType::List(_)));
+        assert_eq!(depth, 0);
+    }
+
+    #[test]
+    fn resolve_returns_depth() {
+        let schema = test_schema();
+        let user = schema.roots[0].struct_id;
+        let mut env = TypeEnv::new(&schema);
+        assert_eq!(env.resolve("users").unwrap().1, 0);
+        env.push_scope();
+        env.define(
+            "name".to_string(),
+            QueryType::Scalar(ScalarType::String),
+            field_binding(&schema, user, "name"),
+        );
+        assert_eq!(env.resolve("name").unwrap().1, 0);
+        assert_eq!(env.resolve("users").unwrap().1, 1);
+        assert!(env.resolve("missing").is_none());
     }
 
     fn field_binding(schema: &ValidatedSchema, struct_id: StructId, field: &str) -> IdentBinding {
@@ -1784,11 +1804,17 @@ mod tests {
         let mut env = TypeEnv::new(&schema);
         let (file, _) = crate::parse_query("users");
         let result = infer(&file.unwrap().result, &mut env).unwrap();
-        let TypedExprKind::Ident { name, binding } = &result.kind else {
+        let TypedExprKind::Ident {
+            name,
+            binding,
+            depth,
+        } = &result.kind
+        else {
             panic!("expected ident, got {:?}", result.kind);
         };
         assert_eq!(name.value, "users");
         assert_eq!(*binding, IdentBinding::Root { root_idx: 0 });
+        assert_eq!(*depth, 0);
     }
 
     #[test]
@@ -1801,11 +1827,17 @@ mod tests {
         let TypedExprKind::Method { args, .. } = &result.kind else {
             panic!("expected method, got {:?}", result.kind);
         };
-        let TypedExprKind::Ident { name, binding } = &args[0].expr.kind else {
+        let TypedExprKind::Ident {
+            name,
+            binding,
+            depth,
+        } = &args[0].expr.kind
+        else {
             panic!("expected ident, got {:?}", args[0].expr.kind);
         };
         assert_eq!(name.value, "active");
         assert_eq!(*binding, field_binding(&schema, user, "active"));
+        assert_eq!(*depth, 0);
     }
 
     #[test]
@@ -1821,11 +1853,17 @@ mod tests {
         let TypedExprKind::Method { base, .. } = &args[0].expr.kind else {
             panic!("expected method, got {:?}", args[0].expr.kind);
         };
-        let TypedExprKind::Ident { name, binding } = &base.kind else {
+        let TypedExprKind::Ident {
+            name,
+            binding,
+            depth,
+        } = &base.kind
+        else {
             panic!("expected ident, got {:?}", base.kind);
         };
         assert_eq!(name.value, "profile");
         assert_eq!(*binding, field_binding(&schema, user, "profile"));
+        assert_eq!(*depth, 0);
     }
 
     #[test]
@@ -1837,7 +1875,12 @@ mod tests {
         let TypedExprKind::Projection { items, .. } = &result.kind else {
             panic!("expected projection, got {:?}", result.kind);
         };
-        let TypedExprKind::Ident { name, binding } = &items[0].value.kind else {
+        let TypedExprKind::Ident {
+            name,
+            binding,
+            depth,
+        } = &items[0].value.kind
+        else {
             panic!("expected ident, got {:?}", items[0].value.kind);
         };
         assert_eq!(name.value, "name");
@@ -1847,6 +1890,7 @@ mod tests {
                 name: "name".to_string()
             }
         );
+        assert_eq!(*depth, 0);
     }
 
     #[test]
@@ -1861,7 +1905,12 @@ mod tests {
         let TypedExprKind::Binary { lhs, .. } = &args[0].expr.kind else {
             panic!("expected binary, got {:?}", args[0].expr.kind);
         };
-        let TypedExprKind::Ident { name, binding } = &lhs.kind else {
+        let TypedExprKind::Ident {
+            name,
+            binding,
+            depth,
+        } = &lhs.kind
+        else {
             panic!("expected ident, got {:?}", lhs.kind);
         };
         assert_eq!(name.value, "name");
@@ -1871,6 +1920,7 @@ mod tests {
                 name: "name".to_string()
             }
         );
+        assert_eq!(*depth, 0);
     }
 
     #[test]
@@ -1894,11 +1944,17 @@ mod tests {
         let TypedExprKind::Field { base, .. } = &lhs.kind else {
             panic!("expected field, got {:?}", lhs.kind);
         };
-        let TypedExprKind::Ident { name, binding } = &base.kind else {
+        let TypedExprKind::Ident {
+            name,
+            binding,
+            depth,
+        } = &base.kind
+        else {
             panic!("expected ident, got {:?}", base.kind);
         };
         assert_eq!(name.value, "prev");
         assert_eq!(*binding, IdentBinding::Prev { struct_id: user });
+        assert_eq!(*depth, 0);
     }
 
     #[test]
