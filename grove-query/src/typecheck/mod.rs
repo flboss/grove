@@ -676,7 +676,10 @@ fn infer_method(
                 }
             }
         }
-        typed_args.push(typed);
+        typed_args.push(TypedMethodArg {
+            direction: arg.direction.clone(),
+            expr: typed,
+        });
     }
 
     if pushed_scope {
@@ -684,7 +687,9 @@ fn infer_method(
     }
 
     let return_ty = match signature.return_type {
-        QueryType::Unknown if !typed_args.is_empty() => typed_args[0].ty.clone().wrap_optional(),
+        QueryType::Unknown if !typed_args.is_empty() => {
+            typed_args[0].expr.ty.clone().wrap_optional()
+        }
         _ => signature.return_type,
     };
 
@@ -1220,8 +1225,8 @@ fn check(
             let mut base_ty = base.ty.clone();
             check(base, &mut base_ty, env)?;
             for arg in args {
-                let mut arg_ty = arg.ty.clone();
-                check(arg, &mut arg_ty, env)?;
+                let mut arg_ty = arg.expr.ty.clone();
+                check(&mut arg.expr, &mut arg_ty, env)?;
             }
         }
         // no propagation
@@ -1796,8 +1801,8 @@ mod tests {
         let TypedExprKind::Method { args, .. } = &result.kind else {
             panic!("expected method, got {:?}", result.kind);
         };
-        let TypedExprKind::Ident { name, binding } = &args[0].kind else {
-            panic!("expected ident, got {:?}", args[0].kind);
+        let TypedExprKind::Ident { name, binding } = &args[0].expr.kind else {
+            panic!("expected ident, got {:?}", args[0].expr.kind);
         };
         assert_eq!(name.value, "active");
         assert_eq!(*binding, field_binding(&schema, user, "active"));
@@ -1813,8 +1818,8 @@ mod tests {
         let TypedExprKind::Method { args, .. } = &result.kind else {
             panic!("expected method, got {:?}", result.kind);
         };
-        let TypedExprKind::Method { base, .. } = &args[0].kind else {
-            panic!("expected method, got {:?}", args[0].kind);
+        let TypedExprKind::Method { base, .. } = &args[0].expr.kind else {
+            panic!("expected method, got {:?}", args[0].expr.kind);
         };
         let TypedExprKind::Ident { name, binding } = &base.kind else {
             panic!("expected ident, got {:?}", base.kind);
@@ -1853,8 +1858,8 @@ mod tests {
         let TypedExprKind::Method { args, .. } = &result.kind else {
             panic!("expected method, got {:?}", result.kind);
         };
-        let TypedExprKind::Binary { lhs, .. } = &args[0].kind else {
-            panic!("expected binary, got {:?}", args[0].kind);
+        let TypedExprKind::Binary { lhs, .. } = &args[0].expr.kind else {
+            panic!("expected binary, got {:?}", args[0].expr.kind);
         };
         let TypedExprKind::Ident { name, binding } = &lhs.kind else {
             panic!("expected ident, got {:?}", lhs.kind);

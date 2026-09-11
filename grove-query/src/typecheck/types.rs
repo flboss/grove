@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::ast::{BinaryOp, ConstantName, Literal, TypeName, UnaryOp};
+use crate::ast::{BinaryOp, ConstantName, Literal, SortDir, TypeName, UnaryOp};
 use grove_schema::validated::{FieldId, ScalarType, StructId, ValueType};
 use grove_types::{Span, Spanned};
 
@@ -56,7 +56,7 @@ pub enum TypedExprKind {
     Method {
         base: Box<TypedExpr>,
         name: Spanned<String>,
-        args: Vec<TypedExpr>,
+        args: Vec<TypedMethodArg>,
         optional: bool,
     },
     Binary {
@@ -102,6 +102,12 @@ pub enum TypedExprKind {
 pub struct TypedProjectionItem {
     pub alias: Spanned<String>,
     pub value: TypedExpr,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedMethodArg {
+    pub direction: Option<Spanned<SortDir>>,
+    pub expr: TypedExpr,
 }
 
 #[derive(Debug, Clone, PartialEq)]
