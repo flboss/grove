@@ -526,7 +526,7 @@ mod tests {
         let (sql, params) = sql("users { name, age }");
         assert_eq!(
             sql,
-            r#"SELECT "$$users0"."name" AS "name", "$$users0"."age" AS "age" FROM "users" AS "$$users0""#
+            r#"SELECT "$$users0"."name", "$$users0"."age" FROM "users" AS "$$users0""#
         );
         assert!(params.is_empty());
     }
@@ -546,7 +546,7 @@ mod tests {
         let (sql, params) = sql("users[active][age >= 18] { name }");
         assert_eq!(
             sql,
-            r#"SELECT "$$users0"."name" AS "name" FROM "users" AS "$$users0" WHERE ("$$users0"."age" >= ?) AND "$$users0"."active""#
+            r#"SELECT "$$users0"."name" FROM "users" AS "$$users0" WHERE ("$$users0"."age" >= ?) AND "$$users0"."active""#
         );
         assert_eq!(params, vec![int_param(18)]);
     }
@@ -556,7 +556,7 @@ mod tests {
         let (sql, params) = sql("users[age == 18] { name }");
         assert_eq!(
             sql,
-            r#"SELECT "$$users0"."name" AS "name" FROM "users" AS "$$users0" WHERE ("$$users0"."age" = ?)"#
+            r#"SELECT "$$users0"."name" FROM "users" AS "$$users0" WHERE ("$$users0"."age" = ?)"#
         );
         assert_eq!(params, vec![int_param(18)]);
     }
@@ -566,14 +566,14 @@ mod tests {
         let (sql_eq, params) = sql("users[nickname == none] { name }");
         assert_eq!(
             sql_eq,
-            r#"SELECT "$$users0"."name" AS "name" FROM "users" AS "$$users0" WHERE ("$$users0"."nickname" IS ?)"#
+            r#"SELECT "$$users0"."name" FROM "users" AS "$$users0" WHERE ("$$users0"."nickname" IS ?)"#
         );
         assert_eq!(params, vec![Param::Value(ParamValue::Null)]);
 
         let (sql_ne, _) = sql("users[nickname != nickname] { name }");
         assert_eq!(
             sql_ne,
-            r#"SELECT "$$users0"."name" AS "name" FROM "users" AS "$$users0" WHERE ("$$users0"."nickname" IS NOT "$$users0"."nickname")"#
+            r#"SELECT "$$users0"."name" FROM "users" AS "$$users0" WHERE ("$$users0"."nickname" IS NOT "$$users0"."nickname")"#
         );
     }
 
@@ -582,7 +582,7 @@ mod tests {
         let (sql, params) = sql("users[!active || age < 30] { name }");
         assert_eq!(
             sql,
-            r#"SELECT "$$users0"."name" AS "name" FROM "users" AS "$$users0" WHERE (NOT "$$users0"."active" OR ("$$users0"."age" < ?))"#
+            r#"SELECT "$$users0"."name" FROM "users" AS "$$users0" WHERE (NOT "$$users0"."active" OR ("$$users0"."age" < ?))"#
         );
         assert_eq!(params, vec![int_param(30)]);
     }
@@ -594,7 +594,7 @@ mod tests {
         assert_eq!(
             sql,
             format!(
-                r#"SELECT "$$users0"."name" AS "name" FROM "users" AS "$$users0" ORDER BY "$$users0"."age" DESC LIMIT ({limit_sql})"#
+                r#"SELECT "$$users0"."name" FROM "users" AS "$$users0" ORDER BY "$$users0"."age" DESC LIMIT ({limit_sql})"#
             )
         );
         assert_eq!(params, limit_params);
@@ -605,7 +605,7 @@ mod tests {
         let (sql, params) = sql("users.sort_desc(age, asc name) { name }");
         assert_eq!(
             sql,
-            r#"SELECT "$$users0"."name" AS "name" FROM "users" AS "$$users0" ORDER BY "$$users0"."age" DESC, "$$users0"."name" ASC"#
+            r#"SELECT "$$users0"."name" FROM "users" AS "$$users0" ORDER BY "$$users0"."age" DESC, "$$users0"."name" ASC"#
         );
         assert!(params.is_empty());
     }
@@ -615,7 +615,7 @@ mod tests {
         let (sql, params) = sql("users.sort_asc(pos) { name }");
         assert_eq!(
             sql,
-            r#"SELECT "$$users0"."name" AS "name" FROM "users" AS "$$users0" ORDER BY "$$users0"."lat" ASC, "$$users0"."lng" ASC"#
+            r#"SELECT "$$users0"."name" FROM "users" AS "$$users0" ORDER BY "$$users0"."lat" ASC, "$$users0"."lng" ASC"#
         );
         assert!(params.is_empty());
     }
@@ -629,7 +629,7 @@ mod tests {
         assert_eq!(
             sql,
             format!(
-                r#"SELECT "$$users0"."name" AS "name" FROM "users" AS "$$users0" LIMIT ({take_sql}) OFFSET ({skip_sql})"#
+                r#"SELECT "$$users0"."name" FROM "users" AS "$$users0" LIMIT ({take_sql}) OFFSET ({skip_sql})"#
             )
         );
         assert_eq!(params, expected);
@@ -646,7 +646,7 @@ mod tests {
         assert_eq!(
             sql,
             format!(
-                r#"SELECT "$$users0"."name" AS "name" FROM "users" AS "$$users0" LIMIT "max"("$$sub"({take_sql}, {skip_sql}), ?) OFFSET ({skip_sql})"#
+                r#"SELECT "$$users0"."name" FROM "users" AS "$$users0" LIMIT "max"("$$sub"({take_sql}, {skip_sql}), ?) OFFSET ({skip_sql})"#
             )
         );
         assert_eq!(params, expected);
@@ -700,7 +700,7 @@ mod tests {
         assert_eq!(
             sql,
             format!(
-                r#"SELECT "$$users0"."name" AS "name" FROM "users" AS "$$users0" LIMIT "max"("$$sub"({take_sql}, {skip_sql}), ?) OFFSET ({skip_sql})"#
+                r#"SELECT "$$users0"."name" FROM "users" AS "$$users0" LIMIT "max"("$$sub"({take_sql}, {skip_sql}), ?) OFFSET ({skip_sql})"#
             )
         );
         assert_eq!(params, expected);
@@ -715,7 +715,7 @@ mod tests {
         assert_eq!(
             sql,
             format!(
-                r#"SELECT "$$users0"."name" AS "name" FROM "users" AS "$$users0" LIMIT "min"({first}, {second})"#
+                r#"SELECT "$$users0"."name" FROM "users" AS "$$users0" LIMIT "min"({first}, {second})"#
             )
         );
         assert_eq!(params, expected);
@@ -730,7 +730,7 @@ mod tests {
         assert_eq!(
             sql,
             format!(
-                r#"SELECT "$$users0"."name" AS "name" FROM "users" AS "$$users0" LIMIT -1 OFFSET "$$add"({first}, {second})"#
+                r#"SELECT "$$users0"."name" FROM "users" AS "$$users0" LIMIT -1 OFFSET "$$add"({first}, {second})"#
             )
         );
         assert_eq!(params, expected);
@@ -768,7 +768,7 @@ mod tests {
         let (sql, params) = sql(r#"users { name }[name == "x"]"#);
         assert_eq!(
             sql,
-            r#"SELECT "$$sub0".* FROM (SELECT "$$users1"."name" AS "name" FROM "users" AS "$$users1") AS "$$sub0" WHERE ("$$sub0"."name" = ?)"#
+            r#"SELECT "$$sub0".* FROM (SELECT "$$users1"."name" FROM "users" AS "$$users1") AS "$$sub0" WHERE ("$$sub0"."name" = ?)"#
         );
         assert_eq!(
             params,
@@ -781,7 +781,7 @@ mod tests {
         let (sql, params) = sql("users { name } { name }");
         assert_eq!(
             sql,
-            r#"SELECT "$$sub0"."name" AS "name" FROM (SELECT "$$users1"."name" AS "name" FROM "users" AS "$$users1") AS "$$sub0""#
+            r#"SELECT "$$sub0"."name" FROM (SELECT "$$users1"."name" FROM "users" AS "$$users1") AS "$$sub0""#
         );
         assert!(params.is_empty());
     }

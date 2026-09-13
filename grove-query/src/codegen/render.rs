@@ -31,8 +31,10 @@ pub fn render_select(
                 sql.push_str(&quote(resolve(stack, *depth)));
                 sql.push('.');
                 sql.push_str(&quote(column));
-                sql.push_str(" AS ");
-                sql.push_str(&quote(output));
+                if output != column {
+                    sql.push_str(" AS ");
+                    sql.push_str(&quote(output));
+                }
             }
             SelectItem::Expr { expr, output } => {
                 render_expr(expr, stack, true, sql, params);
@@ -239,7 +241,7 @@ mod tests {
         render_select(&simple_builder(), &mut test_stack(), &mut sql, &mut params);
         assert_eq!(
             sql,
-            r#"SELECT "$$users0"."name" AS "name" FROM "users" AS "$$users0" WHERE ("$$users0"."age" > ?) ORDER BY "$$users0"."name" ASC LIMIT ?"#
+            r#"SELECT "$$users0"."name" FROM "users" AS "$$users0" WHERE ("$$users0"."age" > ?) ORDER BY "$$users0"."name" ASC LIMIT ?"#
         );
         assert_eq!(
             params,
