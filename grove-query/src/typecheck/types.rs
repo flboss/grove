@@ -199,6 +199,14 @@ impl QueryType {
             QueryType::Unknown => true,
         }
     }
+
+    pub fn is_scalar(&self) -> bool {
+        match self {
+            QueryType::Scalar(_) => true,
+            QueryType::Optional(inner) => matches!(inner.as_ref(), QueryType::Scalar(_)),
+            _ => false,
+        }
+    }
 }
 
 impl From<&ValueType> for QueryType {
