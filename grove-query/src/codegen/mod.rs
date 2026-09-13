@@ -1,7 +1,11 @@
 pub mod builder;
 mod lower;
 pub mod model;
-use model::CompiledQuery;
+pub mod render;
+
+use model::{
+    ColumnRole, CompiledQuery, OutputColumn, PlannedStatement, ResultShape, StatementShape,
+};
 
 use grove_schema::validated::ValidatedSchema;
 
@@ -16,6 +20,22 @@ pub fn codegen(file: &TypedQueryFile, schema: &ValidatedSchema) -> CompiledQuery
             todo!("mutation statements");
         }
     }
-    let (_builder, _columns) = lower::lower_query(&mut ctx, &file.result);
-    todo!()
+    let (builder, columns) = lower::lower_query(&mut ctx, &file.result);
+    let mut sql = String::new();
+    let mut params = Vec::new();
+    let mut stack = Vec::new();
+    render::render_select(&builder, &mut stack, &mut sql, &mut params);
+    let shape = StatementShape {
+        columns: columns
+            .iter()
+            .map(|name| OutputColumn {
+                name: name.clone(),
+                role: ColumnRole::Value,
+            })
+            .collect(),
+    };
+    CompiledQuery {
+        statements: vec![PlannedStatement { sql, params, shape }],
+        result: ResultShape::Rows { columns },
+    }
 }
