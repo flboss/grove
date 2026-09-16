@@ -135,7 +135,7 @@ impl AliasGen {
     }
 
     pub fn subquery(&mut self) -> String {
-        self.generate("sub")
+        self.generate("subq")
     }
 }
 
@@ -147,7 +147,7 @@ mod tests {
     fn alias_shared_counter() {
         let mut aliases = AliasGen::default();
         assert_eq!(aliases.table("users"), "$$users0");
-        assert_eq!(aliases.subquery(), "$$sub1");
+        assert_eq!(aliases.subquery(), "$$subq1");
         assert_eq!(aliases.table("users"), "$$users2");
         assert_eq!(aliases.generic(), "$$val3");
     }

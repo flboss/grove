@@ -918,7 +918,7 @@ mod tests {
         assert_eq!(
             sql,
             format!(
-                r#"SELECT "$$sub0".* FROM (SELECT "$$users1".* FROM "users" AS "$$users1" ORDER BY "$$users1"."age" DESC LIMIT ({inner_limit})) AS "$$sub0" ORDER BY "$$sub0"."name" ASC LIMIT ({outer_limit})"#
+                r#"SELECT "$$subq0".* FROM (SELECT "$$users1".* FROM "users" AS "$$users1" ORDER BY "$$users1"."age" DESC LIMIT ({inner_limit})) AS "$$subq0" ORDER BY "$$subq0"."name" ASC LIMIT ({outer_limit})"#
             )
         );
         assert_eq!(params, expected);
@@ -929,7 +929,7 @@ mod tests {
         let (sql, params) = sql(r#"users { name }[name == "x"]"#);
         assert_eq!(
             sql,
-            r#"SELECT "$$sub0".* FROM (SELECT "$$users1"."name" FROM "users" AS "$$users1") AS "$$sub0" WHERE ("$$sub0"."name" = ?)"#
+            r#"SELECT "$$subq0".* FROM (SELECT "$$users1"."name" FROM "users" AS "$$users1") AS "$$subq0" WHERE ("$$subq0"."name" = ?)"#
         );
         assert_eq!(
             params,
@@ -942,7 +942,7 @@ mod tests {
         let (sql, params) = sql("users { name } { name }");
         assert_eq!(
             sql,
-            r#"SELECT "$$sub0"."name" FROM (SELECT "$$users1"."name" FROM "users" AS "$$users1") AS "$$sub0""#
+            r#"SELECT "$$subq0"."name" FROM (SELECT "$$users1"."name" FROM "users" AS "$$users1") AS "$$subq0""#
         );
         assert!(params.is_empty());
     }
