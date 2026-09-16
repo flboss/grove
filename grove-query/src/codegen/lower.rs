@@ -2,7 +2,7 @@ use super::builder::{
     AliasGen, FromClause, OrderDir, OrderItem, SelectBuilder, SelectItem, SqlBinOp, SqlExpr,
 };
 use super::model::ParamValue;
-use crate::ast::{BinaryOp, Literal, SortDir, UnaryOp};
+use crate::ast::{BinaryOp, Literal, SortDir, TypeName, UnaryOp};
 use crate::typecheck::types::{
     IdentBinding, QueryType, TypedExpr, TypedExprKind, TypedMethodArg, TypedProjectionItem,
 };
@@ -372,8 +372,30 @@ fn lower_value(ctx: &mut Context, expr: &TypedExpr) -> SqlExpr {
             lower_scalar_method(ctx, base, &name.value, args)
         }
         TypedExprKind::Ident { binding, depth, .. } => bound_column(ctx.schema, *depth, binding),
-        TypedExprKind::Literal(lit) => SqlExpr::Param(literal_param(&lit.value)),
+        TypedExprKind::Literal(lit) => lower_literal(&lit.value),
+        TypedExprKind::Cast { expr: operand, ty } => {
+            if matches!(operand.ty, QueryType::Scalar(ScalarType::Bool))
+                && matches!(ty.value, TypeName::Int)
+            {
+                return lower_value(ctx, operand);
+            }
+            SqlExpr::Func {
+                name: "$$cast".to_string(),
+                args: vec![
+                    lower_value(ctx, operand),
+                    SqlExpr::Param(ParamValue::String(cast_target_name(ty.value).to_string())),
+                ],
+            }
+        }
         _ => todo!("{}", kind_noun(expr)),
+    }
+}
+
+fn cast_target_name(ty: TypeName) -> &'static str {
+    match ty {
+        TypeName::Int => "int",
+        TypeName::Float => "float",
+        TypeName::Dec => "dec",
     }
 }
 
@@ -400,6 +422,29 @@ fn lower_scalar_method(
     }
     match &base.ty {
         QueryType::Scalar(ScalarType::String) => lower_string_method(ctx, base, name, args),
+        QueryType::Scalar(ScalarType::Instant)
+            if matches!(
+                name,
+                "year" | "month" | "day" | "hour" | "minute" | "second" | "weekday" | "epoch"
+            ) =>
+        {
+            SqlExpr::Func {
+                name: format!("$$instant_{name}"),
+                args: vec![lower_value(ctx, base)],
+            }
+        }
+        QueryType::Scalar(ScalarType::Duration)
+            if matches!(name, "as_seconds" | "as_minutes" | "as_hours" | "as_days") =>
+        {
+            SqlExpr::Func {
+                name: format!("$$duration_{name}"),
+                args: vec![lower_value(ctx, base)],
+            }
+        }
+        QueryType::Scalar(ScalarType::Dec) if name == "round_dp" => SqlExpr::Func {
+            name: "$$dec_round_dp".to_string(),
+            args: vec![lower_value(ctx, base), lower_value(ctx, &args[0].expr)],
+        },
         QueryType::List(_) if name == "contains" => {
             todo!("`.contains` on lists")
         }
@@ -553,17 +598,29 @@ fn lower_neg(ctx: &mut Context, operand: &TypedExpr) -> SqlExpr {
     }
 }
 
-fn literal_param(lit: &Literal) -> ParamValue {
+fn lower_literal(lit: &Literal) -> SqlExpr {
     match lit {
-        Literal::Int(n) => ParamValue::Int(*n),
-        Literal::Float(x) => ParamValue::Float(*x),
-        Literal::Dec(d) => ParamValue::Dec(*d),
-        Literal::String(s) => ParamValue::String(s.clone()),
-        Literal::Bool(b) => ParamValue::Bool(*b),
-        Literal::Instant(dt) => ParamValue::Instant(*dt),
-        Literal::Duration(td) => ParamValue::Duration(*td),
-        Literal::None => ParamValue::Null,
-        Literal::Now | Literal::Today(_) => todo!("wall-clock instant"),
+        Literal::Int(n) => SqlExpr::Param(ParamValue::Int(*n)),
+        Literal::Float(x) => SqlExpr::Param(ParamValue::Float(*x)),
+        Literal::Dec(d) => SqlExpr::Param(ParamValue::Dec(*d)),
+        Literal::String(s) => SqlExpr::Param(ParamValue::String(s.clone())),
+        Literal::Bool(b) => SqlExpr::Param(ParamValue::Bool(*b)),
+        Literal::Instant(dt) => SqlExpr::Param(ParamValue::Instant(*dt)),
+        Literal::Duration(td) => SqlExpr::Param(ParamValue::Duration(*td)),
+        Literal::None => SqlExpr::Param(ParamValue::Null),
+        Literal::Now => SqlExpr::Func {
+            name: "$$now".to_string(),
+            args: Vec::new(),
+        },
+        Literal::Today(time) => SqlExpr::Func {
+            name: "$$today".to_string(),
+            args: vec![match time {
+                Some(t) => SqlExpr::Param(ParamValue::Duration(
+                    t.signed_duration_since(chrono::NaiveTime::MIN),
+                )),
+                None => SqlExpr::Param(ParamValue::Null),
+            }],
+        },
     }
 }
 
@@ -1013,6 +1070,141 @@ mod tests {
     fn arithmetic_duration_neg() {
         let (sql, _) = sql("users[ttl > -ttl] { name }");
         assert!(sql.contains(r#""$$neg"("$$users0"."ttl", ?)"#));
+    }
+
+    #[test]
+    fn cast_numeric() {
+        let (sql_if, params_if) = sql("users[(age as Float) > 1.5f] { name }");
+        assert_eq!(
+            sql_if,
+            r#"SELECT "$$users0"."name" FROM "users" AS "$$users0" WHERE ("$$cast"("$$users0"."age", ?) > ?)"#
+        );
+        assert_eq!(
+            params_if,
+            vec![
+                Param::Value(ParamValue::String("float".to_string())),
+                Param::Value(ParamValue::Float(1.5)),
+            ]
+        );
+
+        let (sql_id, params_id) = sql("users[(age as Dec) > 0.0] { name }");
+        assert!(sql_id.contains(r#""$$cast"("$$users0"."age", ?)"#));
+        assert_eq!(
+            params_id,
+            vec![
+                Param::Value(ParamValue::String("dec".to_string())),
+                Param::Value(ParamValue::Dec(rust_decimal::Decimal::new(0, 0))),
+            ]
+        );
+
+        let (sql_fi, params_fi) = sql("users[(score as Int) > 1] { name }");
+        assert!(sql_fi.contains(r#""$$cast"("$$users0"."score", ?)"#));
+        assert_eq!(
+            params_fi,
+            vec![
+                Param::Value(ParamValue::String("int".to_string())),
+                int_param(1),
+            ]
+        );
+
+        let (sql_fd, params_fd) = sql("users[(score as Dec) > 0.0] { name }");
+        assert!(sql_fd.contains(r#""$$cast"("$$users0"."score", ?)"#));
+        assert_eq!(
+            params_fd[0],
+            Param::Value(ParamValue::String("dec".to_string()))
+        );
+
+        let (sql_di, params_di) = sql("users[(balance as Int) > 0] { name }");
+        assert!(sql_di.contains(r#""$$cast"("$$users0"."balance", ?)"#));
+        assert_eq!(
+            params_di[0],
+            Param::Value(ParamValue::String("int".to_string()))
+        );
+
+        let (sql_df, params_df) = sql("users[(balance as Float) > 1.0f] { name }");
+        assert!(sql_df.contains(r#""$$cast"("$$users0"."balance", ?)"#));
+        assert_eq!(
+            params_df[0],
+            Param::Value(ParamValue::String("float".to_string()))
+        );
+    }
+
+    #[test]
+    fn cast_bool_int_noop() {
+        let (sql, params) = sql("users[(active as Int) == 1] { name }");
+        assert_eq!(
+            sql,
+            r#"SELECT "$$users0"."name" FROM "users" AS "$$users0" WHERE ("$$users0"."active" = ?)"#
+        );
+        assert_eq!(params, vec![int_param(1)]);
+    }
+
+    #[test]
+    fn instant_duration_methods() {
+        let (sql_y, params_y) = sql("users[created.year() == 2026] { name }");
+        assert_eq!(
+            sql_y,
+            r#"SELECT "$$users0"."name" FROM "users" AS "$$users0" WHERE ("$$instant_year"("$$users0"."created") = ?)"#
+        );
+        assert_eq!(params_y, vec![int_param(2026)]);
+
+        let (sql_dur, params_dur) = sql("users[ttl.as_hours() > 1.0] { name }");
+        assert_eq!(
+            sql_dur,
+            r#"SELECT "$$users0"."name" FROM "users" AS "$$users0" WHERE ("$$duration_as_hours"("$$users0"."ttl") > ?)"#
+        );
+        assert_eq!(
+            params_dur,
+            vec![Param::Value(ParamValue::Dec(rust_decimal::Decimal::ONE))],
+        );
+
+        let (sql_ep, _) = sql("users[created.epoch() > 0.0] { name }");
+        assert!(sql_ep.contains(r#""$$instant_epoch"("$$users0"."created")"#));
+    }
+
+    #[test]
+    fn dec_round_dp() {
+        let (sql, params) = sql("users[balance.round_dp(2) > 0.0] { name }");
+        assert_eq!(
+            sql,
+            r#"SELECT "$$users0"."name" FROM "users" AS "$$users0" WHERE ("$$dec_round_dp"("$$users0"."balance", ?) > ?)"#
+        );
+        assert_eq!(
+            params,
+            vec![
+                int_param(2),
+                Param::Value(ParamValue::Dec(rust_decimal::Decimal::new(0, 0))),
+            ]
+        );
+    }
+
+    #[test]
+    fn wall_clock_constructors() {
+        let (sql_now, params_now) = sql("users[created > @now] { name }");
+        assert_eq!(
+            sql_now,
+            r#"SELECT "$$users0"."name" FROM "users" AS "$$users0" WHERE ("$$users0"."created" > "$$now"())"#
+        );
+        assert!(params_now.is_empty());
+
+        let (sql_today, params_today) = sql("users[created > @today] { name }");
+        assert_eq!(
+            sql_today,
+            r#"SELECT "$$users0"."name" FROM "users" AS "$$users0" WHERE ("$$users0"."created" > "$$today"(?))"#
+        );
+        assert_eq!(params_today, vec![Param::Value(ParamValue::Null)]);
+
+        let (sql_time, params_time) = sql("users[created > @today_14:30] { name }");
+        assert_eq!(
+            sql_time,
+            r#"SELECT "$$users0"."name" FROM "users" AS "$$users0" WHERE ("$$users0"."created" > "$$today"(?))"#
+        );
+        assert_eq!(
+            params_time,
+            vec![Param::Value(ParamValue::Duration(
+                chrono::TimeDelta::try_minutes(870).unwrap()
+            ))]
+        );
     }
 
     #[test]
