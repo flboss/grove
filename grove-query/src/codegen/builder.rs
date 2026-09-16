@@ -86,6 +86,14 @@ pub enum SqlExpr {
         arms: Vec<(SqlExpr, SqlExpr)>,
         else_: Box<SqlExpr>,
     },
+    In {
+        expr: Box<SqlExpr>,
+        items: Vec<SqlExpr>,
+    },
+    Cast {
+        expr: Box<SqlExpr>,
+        target: &'static str,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -305,54 +305,177 @@ fn lower_order_key(ctx: &mut Context, expr: &TypedExpr, dir: OrderDir) -> Vec<Or
 
 fn lower_value(ctx: &mut Context, expr: &TypedExpr) -> SqlExpr {
     match &expr.kind {
-        TypedExprKind::Binary { op, lhs, rhs } => {
-            let lhs_sql = lower_value(ctx, lhs);
-            let rhs_sql = lower_value(ctx, rhs);
-            match op.value {
-                BinaryOp::Eq | BinaryOp::Ne => {
-                    if lhs.ty.is_optional() || rhs.ty.is_optional() {
-                        return SqlExpr::Binary {
-                            op: if op.value == BinaryOp::Eq {
-                                SqlBinOp::Is
-                            } else {
-                                SqlBinOp::IsNot
-                            },
-                            lhs: Box::new(lhs_sql),
-                            rhs: Box::new(rhs_sql),
-                        };
-                    }
-                    SqlExpr::Binary {
-                        op: bin_op(op.value),
-                        lhs: Box::new(lhs_sql),
-                        rhs: Box::new(rhs_sql),
-                    }
+        TypedExprKind::Binary { op, lhs, rhs } => match op.value {
+            BinaryOp::Eq | BinaryOp::Ne if lhs.ty.is_optional() || rhs.ty.is_optional() => {
+                SqlExpr::Binary {
+                    op: if op.value == BinaryOp::Eq {
+                        SqlBinOp::Is
+                    } else {
+                        SqlBinOp::IsNot
+                    },
+                    lhs: Box::new(lower_value(ctx, lhs)),
+                    rhs: Box::new(lower_value(ctx, rhs)),
                 }
-                BinaryOp::Lt
-                | BinaryOp::Gt
-                | BinaryOp::Le
-                | BinaryOp::Ge
-                | BinaryOp::And
-                | BinaryOp::Or => SqlExpr::Binary {
-                    op: bin_op(op.value),
-                    lhs: Box::new(lhs_sql),
-                    rhs: Box::new(rhs_sql),
-                },
-                BinaryOp::In => todo!("`in` membership test"),
-                BinaryOp::Add
-                | BinaryOp::Sub
-                | BinaryOp::Mul
-                | BinaryOp::Div
-                | BinaryOp::Rem
-                | BinaryOp::Mod => lower_arithmetic(ctx, op.value, lhs, rhs),
             }
-        }
+            BinaryOp::Eq
+            | BinaryOp::Ne
+            | BinaryOp::Lt
+            | BinaryOp::Gt
+            | BinaryOp::Le
+            | BinaryOp::Ge
+            | BinaryOp::And
+            | BinaryOp::Or => SqlExpr::Binary {
+                op: bin_op(op.value),
+                lhs: Box::new(lower_value(ctx, lhs)),
+                rhs: Box::new(lower_value(ctx, rhs)),
+            },
+            BinaryOp::In => {
+                let items = match &rhs.kind {
+                    TypedExprKind::Tuple { elements, .. } => elements,
+                    _ => todo!("non-tuple `in` rhs"),
+                };
+                if items.is_empty() {
+                    return SqlExpr::Param(ParamValue::Bool(false));
+                }
+                SqlExpr::In {
+                    expr: Box::new(lower_value(ctx, lhs)),
+                    items: items.iter().map(|e| lower_value(ctx, e)).collect(),
+                }
+            }
+            BinaryOp::Add
+            | BinaryOp::Sub
+            | BinaryOp::Mul
+            | BinaryOp::Div
+            | BinaryOp::Rem
+            | BinaryOp::Mod => lower_arithmetic(ctx, op.value, lhs, rhs),
+        },
         TypedExprKind::Unary { op, expr: operand } => match op.value {
             UnaryOp::Not => SqlExpr::Not(Box::new(lower_value(ctx, operand))),
             UnaryOp::Neg => lower_neg(ctx, operand),
         },
+        TypedExprKind::If { arms, default, .. } => SqlExpr::Case {
+            arms: arms
+                .iter()
+                .map(|(cond, value)| (lower_value(ctx, cond), lower_value(ctx, value)))
+                .collect(),
+            else_: Box::new(lower_value(ctx, default)),
+        },
+        TypedExprKind::Method {
+            base,
+            name,
+            args,
+            optional,
+        } => {
+            if *optional {
+                todo!("optional-chained method");
+            }
+            lower_scalar_method(ctx, base, &name.value, args)
+        }
         TypedExprKind::Ident { binding, depth, .. } => bound_column(ctx.schema, *depth, binding),
         TypedExprKind::Literal(lit) => SqlExpr::Param(literal_param(&lit.value)),
         _ => todo!("{}", kind_noun(expr)),
+    }
+}
+
+fn lower_scalar_method(
+    ctx: &mut Context,
+    base: &TypedExpr,
+    name: &str,
+    args: &[TypedMethodArg],
+) -> SqlExpr {
+    if name == "to_string" {
+        return match &base.ty {
+            QueryType::Scalar(ScalarType::Int | ScalarType::Float | ScalarType::Bool) => {
+                SqlExpr::Cast {
+                    expr: Box::new(lower_value(ctx, base)),
+                    target: "TEXT",
+                }
+            }
+            QueryType::Scalar(ScalarType::Dec) => SqlExpr::Func {
+                name: "$$dec_to_string".to_string(),
+                args: vec![lower_value(ctx, base)],
+            },
+            _ => todo!("method `to_string`"),
+        };
+    }
+    match &base.ty {
+        QueryType::Scalar(ScalarType::String) => lower_string_method(ctx, base, name, args),
+        QueryType::List(_) if name == "contains" => {
+            todo!("`.contains` on lists")
+        }
+        _ => todo!("method `{name}` in scalar position"),
+    }
+}
+
+fn instr_sql(haystack: SqlExpr, needle: SqlExpr) -> SqlExpr {
+    SqlExpr::Func {
+        name: "instr".to_string(),
+        args: vec![haystack, needle],
+    }
+}
+
+fn str_len_sql(value: SqlExpr) -> SqlExpr {
+    SqlExpr::Func {
+        name: "length".to_string(),
+        args: vec![value],
+    }
+}
+
+fn lower_string_method(
+    ctx: &mut Context,
+    base: &TypedExpr,
+    name: &str,
+    args: &[TypedMethodArg],
+) -> SqlExpr {
+    match name {
+        "contains" => {
+            let needle = lower_value(ctx, &args[0].expr);
+            SqlExpr::Binary {
+                op: SqlBinOp::Gt,
+                lhs: Box::new(instr_sql(lower_value(ctx, base), needle)),
+                rhs: Box::new(SqlExpr::Param(ParamValue::Int(0))),
+            }
+        }
+        "starts_with" => {
+            let needle = lower_value(ctx, &args[0].expr);
+            SqlExpr::Binary {
+                op: SqlBinOp::Eq,
+                lhs: Box::new(instr_sql(lower_value(ctx, base), needle)),
+                rhs: Box::new(SqlExpr::Param(ParamValue::Int(1))),
+            }
+        }
+        "ends_with" => {
+            let needle = lower_value(ctx, &args[0].expr);
+            let base = lower_value(ctx, base);
+            let start = SqlExpr::Func {
+                name: "$$add".to_string(),
+                args: vec![
+                    SqlExpr::Func {
+                        name: "$$sub".to_string(),
+                        args: vec![str_len_sql(base.clone()), str_len_sql(needle.clone())],
+                    },
+                    SqlExpr::Param(ParamValue::Int(1)),
+                ],
+            };
+            SqlExpr::Binary {
+                op: SqlBinOp::Eq,
+                lhs: Box::new(SqlExpr::Func {
+                    name: "substr".to_string(),
+                    args: vec![base, start],
+                }),
+                rhs: Box::new(needle),
+            }
+        }
+        "to_upper" => SqlExpr::Func {
+            name: "$$upper".to_string(),
+            args: vec![lower_value(ctx, base)],
+        },
+        "to_lower" => SqlExpr::Func {
+            name: "$$lower".to_string(),
+            args: vec![lower_value(ctx, base)],
+        },
+        "len" => str_len_sql(lower_value(ctx, base)),
+        _ => todo!("string method `{name}`"),
     }
 }
 
@@ -643,6 +766,150 @@ mod tests {
             r#"SELECT "$$users0"."name" FROM "users" AS "$$users0" WHERE (NOT "$$users0"."active" OR ("$$users0"."age" < ?))"#
         );
         assert_eq!(params, vec![int_param(30)]);
+    }
+
+    #[test]
+    fn conditional_if_else() {
+        let (sql, params) = sql("users[if active { age } else { 0 } > 18] { name }");
+        assert_eq!(
+            sql,
+            r#"SELECT "$$users0"."name" FROM "users" AS "$$users0" WHERE ((CASE WHEN "$$users0"."active" THEN "$$users0"."age" ELSE ? END) > ?)"#
+        );
+        assert_eq!(params, vec![int_param(0), int_param(18)]);
+    }
+
+    #[test]
+    fn conditional_else_if_chain() {
+        let (sql, params) = sql(
+            r#"users[if age > 30 { "a" } else if age > 20 { "b" } else { "c" } == "a"] { name }"#,
+        );
+        assert_eq!(
+            sql,
+            r#"SELECT "$$users0"."name" FROM "users" AS "$$users0" WHERE ((CASE WHEN "$$users0"."age" > ? THEN ? WHEN "$$users0"."age" > ? THEN ? ELSE ? END) = ?)"#
+        );
+        assert_eq!(
+            params,
+            vec![
+                int_param(30),
+                Param::Value(ParamValue::String("a".to_string())),
+                int_param(20),
+                Param::Value(ParamValue::String("b".to_string())),
+                Param::Value(ParamValue::String("c".to_string())),
+                Param::Value(ParamValue::String("a".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn membership_in_tuple() {
+        let (sql_int, params_int) = sql("users[age in (18, 21)] { name }");
+        assert_eq!(
+            sql_int,
+            r#"SELECT "$$users0"."name" FROM "users" AS "$$users0" WHERE ("$$users0"."age" IN (?, ?))"#
+        );
+        assert_eq!(params_int, vec![int_param(18), int_param(21)]);
+
+        let (sql_str, params_str) = sql(r#"users[name in ("a", "b")] { name }"#);
+        assert_eq!(
+            sql_str,
+            r#"SELECT "$$users0"."name" FROM "users" AS "$$users0" WHERE ("$$users0"."name" IN (?, ?))"#
+        );
+        assert_eq!(
+            params_str,
+            vec![
+                Param::Value(ParamValue::String("a".to_string())),
+                Param::Value(ParamValue::String("b".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn string_contains() {
+        let (sql, params) = sql(r#"users[name.contains("ob")] { name }"#);
+        assert_eq!(
+            sql,
+            r#"SELECT "$$users0"."name" FROM "users" AS "$$users0" WHERE ("instr"("$$users0"."name", ?) > ?)"#
+        );
+        assert_eq!(
+            params,
+            vec![
+                Param::Value(ParamValue::String("ob".to_string())),
+                int_param(0),
+            ]
+        );
+    }
+
+    #[test]
+    fn string_starts_ends_with() {
+        let (sql_sw, params_sw) = sql(r#"users[email.starts_with("a@")] { name }"#);
+        assert_eq!(
+            sql_sw,
+            r#"SELECT "$$users0"."name" FROM "users" AS "$$users0" WHERE ("instr"("$$users0"."address", ?) = ?)"#
+        );
+        assert_eq!(
+            params_sw,
+            vec![
+                Param::Value(ParamValue::String("a@".to_string())),
+                int_param(1),
+            ]
+        );
+
+        let (sql2, params2) = sql(r#"users[email.ends_with(".com")] { name }"#);
+        assert_eq!(
+            sql2,
+            r#"SELECT "$$users0"."name" FROM "users" AS "$$users0" WHERE ("substr"("$$users0"."address", "$$add"("$$sub"("length"("$$users0"."address"), "length"(?)), ?)) = ?)"#
+        );
+        assert_eq!(
+            params2,
+            vec![
+                Param::Value(ParamValue::String(".com".to_string())),
+                int_param(1),
+                Param::Value(ParamValue::String(".com".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn string_case_len_to_string() {
+        let (sql_up, params_up) = sql(r#"users[name.to_upper() == "X"] { name }"#);
+        assert_eq!(
+            sql_up,
+            r#"SELECT "$$users0"."name" FROM "users" AS "$$users0" WHERE ("$$upper"("$$users0"."name") = ?)"#
+        );
+        assert_eq!(
+            params_up,
+            vec![Param::Value(ParamValue::String("X".to_string()))]
+        );
+
+        let (sql_lower, _) = sql(r#"users[name.to_lower() == "x"] { name }"#);
+        assert!(sql_lower.contains(r#""$$lower"("$$users0"."name")"#));
+
+        let (sql_len, params_len) = sql("users[name.len() > 2] { name }");
+        assert_eq!(
+            sql_len,
+            r#"SELECT "$$users0"."name" FROM "users" AS "$$users0" WHERE ("length"("$$users0"."name") > ?)"#
+        );
+        assert_eq!(params_len, vec![int_param(2)]);
+
+        let (sql_str, params_str) = sql(r#"users[age.to_string() == "30"] { name }"#);
+        assert_eq!(
+            sql_str,
+            r#"SELECT "$$users0"."name" FROM "users" AS "$$users0" WHERE (CAST("$$users0"."age" AS TEXT) = ?)"#
+        );
+        assert_eq!(
+            params_str,
+            vec![Param::Value(ParamValue::String("30".to_string()))]
+        );
+
+        let (sql_dec, params_dec) = sql(r#"users[balance.to_string() == "0.5"] { name }"#);
+        assert_eq!(
+            sql_dec,
+            r#"SELECT "$$users0"."name" FROM "users" AS "$$users0" WHERE ("$$dec_to_string"("$$users0"."balance") = ?)"#
+        );
+        assert_eq!(
+            params_dec,
+            vec![Param::Value(ParamValue::String("0.5".to_string()))]
+        );
     }
 
     #[test]

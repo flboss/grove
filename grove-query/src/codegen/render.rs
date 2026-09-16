@@ -186,6 +186,30 @@ fn render_expr(
                 sql.push(')');
             }
         }
+        SqlExpr::In { expr, items } => {
+            if nested {
+                sql.push('(');
+            }
+            render_expr(expr, stack, true, sql, params);
+            sql.push_str(" IN (");
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(", ");
+                }
+                render_expr(item, stack, false, sql, params);
+            }
+            sql.push(')');
+            if nested {
+                sql.push(')');
+            }
+        }
+        SqlExpr::Cast { expr, target } => {
+            sql.push_str("CAST(");
+            render_expr(expr, stack, false, sql, params);
+            sql.push_str(" AS ");
+            sql.push_str(target);
+            sql.push(')');
+        }
     }
 }
 
