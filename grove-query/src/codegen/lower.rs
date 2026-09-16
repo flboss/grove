@@ -4,9 +4,9 @@ use super::builder::{
 use super::model::ParamValue;
 use crate::ast::{BinaryOp, Literal, SortDir, UnaryOp};
 use crate::typecheck::types::{
-    IdentBinding, TypedExpr, TypedExprKind, TypedMethodArg, TypedProjectionItem,
+    IdentBinding, QueryType, TypedExpr, TypedExprKind, TypedMethodArg, TypedProjectionItem,
 };
-use grove_schema::validated::{Field, ValidatedSchema};
+use grove_schema::validated::{Field, ScalarType, ValidatedSchema};
 
 pub struct Context<'s> {
     pub schema: &'s ValidatedSchema,
@@ -343,12 +343,12 @@ fn lower_value(ctx: &mut Context, expr: &TypedExpr) -> SqlExpr {
                 | BinaryOp::Mul
                 | BinaryOp::Div
                 | BinaryOp::Rem
-                | BinaryOp::Mod => todo!("arithmetic"),
+                | BinaryOp::Mod => lower_arithmetic(ctx, op.value, lhs, rhs),
             }
         }
         TypedExprKind::Unary { op, expr: operand } => match op.value {
             UnaryOp::Not => SqlExpr::Not(Box::new(lower_value(ctx, operand))),
-            UnaryOp::Neg => todo!("negation"),
+            UnaryOp::Neg => lower_neg(ctx, operand),
         },
         TypedExprKind::Ident { binding, depth, .. } => bound_column(ctx.schema, *depth, binding),
         TypedExprKind::Literal(lit) => SqlExpr::Param(literal_param(&lit.value)),
@@ -373,6 +373,60 @@ fn bin_op(op: BinaryOp) -> SqlBinOp {
         | BinaryOp::Div
         | BinaryOp::Rem
         | BinaryOp::Mod => unreachable!(),
+    }
+}
+
+fn lower_arithmetic(ctx: &mut Context, op: BinaryOp, lhs: &TypedExpr, rhs: &TypedExpr) -> SqlExpr {
+    let lhs_sql = lower_value(ctx, lhs);
+    let rhs_sql = lower_value(ctx, rhs);
+    let mut args = vec![lhs_sql, rhs_sql];
+    let left = type_disambiguation_descriptor(&lhs.ty);
+    let right = type_disambiguation_descriptor(&rhs.ty);
+    if left.is_some() || right.is_some() {
+        args.push(type_descriptor_param(left));
+        args.push(type_descriptor_param(right));
+    }
+
+    let fn_name = match op {
+        BinaryOp::Add => "$$add",
+        BinaryOp::Sub => "$$sub",
+        BinaryOp::Mul => "$$mul",
+        BinaryOp::Div => "$$div",
+        BinaryOp::Rem => "$$rem",
+        BinaryOp::Mod => "$$mod",
+        _ => unreachable!("non-arithmetic operator"),
+    };
+
+    SqlExpr::Func {
+        name: fn_name.to_string(),
+        args,
+    }
+}
+
+fn type_disambiguation_descriptor(ty: &QueryType) -> Option<&'static str> {
+    match ty {
+        QueryType::Scalar(ScalarType::Instant) => Some("instant"),
+        QueryType::Scalar(ScalarType::Duration) => Some("duration"),
+        _ => None,
+    }
+}
+
+fn type_descriptor_param(descriptor: Option<&'static str>) -> SqlExpr {
+    match descriptor {
+        Some(name) => SqlExpr::Param(ParamValue::String(name.to_string())),
+        None => SqlExpr::Param(ParamValue::Null),
+    }
+}
+
+fn lower_neg(ctx: &mut Context, operand: &TypedExpr) -> SqlExpr {
+    let value = lower_value(ctx, operand);
+    let mut args = vec![value];
+    if let Some(descriptor) = type_disambiguation_descriptor(&operand.ty) {
+        args.push(type_descriptor_param(Some(descriptor)));
+    }
+    SqlExpr::Func {
+        name: "$$neg".to_string(),
+        args,
     }
 }
 
@@ -470,9 +524,13 @@ mod tests {
             name: String,
             email: String@address,
             age: Int,
+            score: Float,
+            balance: Dec,
             active: Bool,
             nickname: ?String,
             pos: Tuple<Float, Float>@(lat, lng),
+            created: Instant,
+            ttl: Duration,
         }
     "#;
 
@@ -585,6 +643,109 @@ mod tests {
             r#"SELECT "$$users0"."name" FROM "users" AS "$$users0" WHERE (NOT "$$users0"."active" OR ("$$users0"."age" < ?))"#
         );
         assert_eq!(params, vec![int_param(30)]);
+    }
+
+    #[test]
+    fn arithmetic_int_add() {
+        let (sql, params) = sql("users[age + 1 > 18] { name }");
+        assert_eq!(
+            sql,
+            r#"SELECT "$$users0"."name" FROM "users" AS "$$users0" WHERE ("$$add"("$$users0"."age", ?) > ?)"#
+        );
+        assert_eq!(params, vec![int_param(1), int_param(18)]);
+    }
+
+    #[test]
+    fn arithmetic_float_mul() {
+        let (sql, params) = sql("users[score * 2.0f > 1.0f] { name }");
+        assert_eq!(
+            sql,
+            r#"SELECT "$$users0"."name" FROM "users" AS "$$users0" WHERE ("$$mul"("$$users0"."score", ?) > ?)"#
+        );
+        assert_eq!(
+            params,
+            vec![
+                Param::Value(ParamValue::Float(2.0)),
+                Param::Value(ParamValue::Float(1.0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn arithmetic_dec_sub() {
+        let (sql, params) = sql("users[balance - 0.5 > 0.0] { name }");
+        assert_eq!(
+            sql,
+            r#"SELECT "$$users0"."name" FROM "users" AS "$$users0" WHERE ("$$sub"("$$users0"."balance", ?) > ?)"#
+        );
+        assert_eq!(
+            params,
+            vec![
+                Param::Value(ParamValue::Dec(rust_decimal::Decimal::new(5, 1))),
+                Param::Value(ParamValue::Dec(rust_decimal::Decimal::new(0, 0))),
+            ]
+        );
+    }
+
+    #[test]
+    fn arithmetic_int_div_rem_mod() {
+        let (sql_div, _) = sql("users[age / 2 > 1] { name }");
+        assert!(sql_div.contains(r#""$$div"("$$users0"."age", ?)"#));
+        let (sql_mod, _) = sql("users[age % 2 == 0] { name }");
+        assert!(sql_mod.contains(r#""$$rem"("$$users0"."age", ?)"#));
+        let (sql_mod, _) = sql("users[age mod 2 == 0] { name }");
+        assert!(sql_mod.contains(r#""$$mod"("$$users0"."age", ?)"#));
+    }
+
+    #[test]
+    fn arithmetic_duration_scalar() {
+        let (sql, params) = sql("users[ttl * 2 > #1d] { name }");
+        assert_eq!(
+            sql,
+            r#"SELECT "$$users0"."name" FROM "users" AS "$$users0" WHERE ("$$mul"("$$users0"."ttl", ?, ?, ?) > ?)"#
+        );
+        assert_eq!(
+            params,
+            vec![
+                int_param(2),
+                Param::Value(ParamValue::String("duration".to_string())),
+                Param::Value(ParamValue::Null),
+                Param::Value(ParamValue::Duration(
+                    chrono::TimeDelta::try_days(1).unwrap()
+                )),
+            ]
+        );
+    }
+
+    #[test]
+    fn arithmetic_instant_duration() {
+        let (sql, params) = sql("users[created + ttl > @2026-01-02] { name }");
+        assert_eq!(
+            sql,
+            r#"SELECT "$$users0"."name" FROM "users" AS "$$users0" WHERE ("$$add"("$$users0"."created", "$$users0"."ttl", ?, ?) > ?)"#
+        );
+        assert_eq!(
+            params,
+            vec![
+                Param::Value(ParamValue::String("instant".to_string())),
+                Param::Value(ParamValue::String("duration".to_string())),
+                Param::Value(ParamValue::Instant(
+                    chrono::DateTime::from_timestamp(1767312000, 0).unwrap()
+                )),
+            ]
+        );
+    }
+
+    #[test]
+    fn arithmetic_instant_instant() {
+        let (sql, _) = sql("users[created - @2026 > #0s] { name }");
+        assert!(sql.contains(r#""$$sub"("$$users0"."created", ?, ?, ?)"#));
+    }
+
+    #[test]
+    fn arithmetic_duration_neg() {
+        let (sql, _) = sql("users[ttl > -ttl] { name }");
+        assert!(sql.contains(r#""$$neg"("$$users0"."ttl", ?)"#));
     }
 
     #[test]
