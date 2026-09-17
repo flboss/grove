@@ -90,6 +90,13 @@ pub enum SqlExpr {
         expr: Box<SqlExpr>,
         items: Vec<SqlExpr>,
     },
+    InSubquery {
+        expr: Box<SqlExpr>,
+        query: Box<SelectBuilder>,
+    },
+    Subquery {
+        query: Box<SelectBuilder>,
+    },
     Cast {
         expr: Box<SqlExpr>,
         target: &'static str,

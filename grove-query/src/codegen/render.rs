@@ -203,6 +203,23 @@ fn render_expr(
                 sql.push(')');
             }
         }
+        SqlExpr::InSubquery { expr, query } => {
+            if nested {
+                sql.push('(');
+            }
+            render_expr(expr, stack, true, sql, params);
+            sql.push_str(" IN (");
+            render_select(query, stack, sql, params);
+            sql.push(')');
+            if nested {
+                sql.push(')');
+            }
+        }
+        SqlExpr::Subquery { query } => {
+            sql.push('(');
+            render_select(query, stack, sql, params);
+            sql.push(')');
+        }
         SqlExpr::Cast { expr, target } => {
             sql.push_str("CAST(");
             render_expr(expr, stack, false, sql, params);
@@ -327,6 +344,82 @@ mod tests {
         let mut params = Vec::new();
         render_expr(&expr, &mut Vec::new(), false, &mut sql, &mut params);
         assert_eq!(sql, "CASE WHEN ? THEN ? WHEN ? THEN ? ELSE ? END");
+    }
+
+    #[test]
+    fn correlated_scalar_subquery() {
+        let inner = SelectBuilder {
+            from: Some(FromClause::Table {
+                table: "users".to_string(),
+                alias: "$$users1".to_string(),
+            }),
+            select: vec![SelectItem::Column {
+                depth: 0,
+                column: "name".to_string(),
+                output: "$$val0".to_string(),
+            }],
+            where_: vec![SqlExpr::Binary {
+                op: SqlBinOp::Eq,
+                lhs: Box::new(SqlExpr::Column {
+                    depth: 0,
+                    column: "id".to_string(),
+                }),
+                rhs: Box::new(SqlExpr::Column {
+                    depth: 1,
+                    column: "manager_id".to_string(),
+                }),
+            }],
+            order_by: vec![],
+            limit: None,
+            offset: None,
+        };
+        let expr = SqlExpr::Subquery {
+            query: Box::new(inner),
+        };
+        let mut stack = vec!["$$users0".to_string()];
+        let mut sql = String::new();
+        let mut params = Vec::new();
+        render_expr(&expr, &mut stack, true, &mut sql, &mut params);
+        assert_eq!(
+            sql,
+            r#"(SELECT "$$users1"."name" AS "$$val0" FROM "users" AS "$$users1" WHERE ("$$users1"."id" = "$$users0"."manager_id"))"#
+        );
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn in_subquery() {
+        let inner = SelectBuilder {
+            from: Some(FromClause::Table {
+                table: "users".to_string(),
+                alias: "$$users1".to_string(),
+            }),
+            select: vec![SelectItem::Column {
+                depth: 0,
+                column: "id".to_string(),
+                output: "id".to_string(),
+            }],
+            where_: vec![],
+            order_by: vec![],
+            limit: None,
+            offset: None,
+        };
+        let expr = SqlExpr::InSubquery {
+            expr: Box::new(SqlExpr::Column {
+                depth: 0,
+                column: "user_id".to_string(),
+            }),
+            query: Box::new(inner),
+        };
+        let mut stack = vec!["$$orders0".to_string()];
+        let mut sql = String::new();
+        let mut params = Vec::new();
+        render_expr(&expr, &mut stack, true, &mut sql, &mut params);
+        assert_eq!(
+            sql,
+            r#"("$$orders0"."user_id" IN (SELECT "$$users1"."id" FROM "users" AS "$$users1"))"#
+        );
+        assert!(params.is_empty());
     }
 
     #[test]
