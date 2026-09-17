@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use ariadne::{Color, Label, Report, ReportKind, Source};
+use ariadne::{Color, Config, IndexType, Label, Report, ReportKind, Source};
 use clap::{Parser, Subcommand};
 
 use grove_query::typecheck::typecheck;
@@ -431,6 +431,7 @@ fn print_diagnostics(
             },
             (path_str.as_ref(), location),
         )
+        .with_config(Config::default().with_index_type(IndexType::Byte))
         .with_code(diag.code.as_ref())
         .with_message(diag.message.as_ref());
 
