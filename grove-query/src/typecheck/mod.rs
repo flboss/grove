@@ -1102,6 +1102,9 @@ fn method_signature(base: &QueryType, method: &str) -> Option<MethodSig> {
                 inner.clone().wrap_optional(),
                 QueryType::Scalar(Int),
             )),
+            "flatten" if matches!(inner.as_ref(), QueryType::List(_)) => {
+                Some(MethodSig::no_args(inner.as_ref().clone()))
+            }
             "contains" => Some(MethodSig::one_arg(
                 QueryType::Scalar(Bool),
                 inner.as_ref().clone(),
@@ -2050,6 +2053,109 @@ mod tests {
         let schema = test_schema();
         let mut env = TypeEnv::new(&schema);
         let (file, _diags) = crate::parse_query("users.name.nonexistent()");
+        let result = infer(&file.unwrap().result, &mut env);
+        assert!(result.is_err());
+    }
+
+    const NESTED_SCHEMA_SRC: &str = r#"
+        root users: User;
+        struct User {
+            name: String,
+            active: Bool,
+            manager: &User,
+            subordinates: &List<User>,
+            orders: List<Order>,
+        }
+        struct Order {
+            total: Dec,
+            user: &User,
+            items: List<Item>,
+        }
+        struct Item {
+            sku: String,
+            order: &Order,
+        }
+        rel User.manager <<-> User.subordinates (users.manager_id -> users.id);
+        rel Order.user <<-> User.orders (orders.user_id -> users.id);
+        rel Item.order <<-> Order.items (items.order_id -> orders.id);
+    "#;
+
+    fn nested_schema() -> ValidatedSchema {
+        grove_schema::validate(
+            grove_schema::parse_schema(NESTED_SCHEMA_SRC)
+                .0
+                .expect("invalid test schema"),
+        )
+        .0
+        .expect("invalid test schema")
+    }
+
+    fn nested_struct(schema: &ValidatedSchema, name: &str) -> StructId {
+        StructId::new(
+            schema
+                .structs
+                .iter()
+                .position(|s| s.name == name)
+                .unwrap_or_else(|| panic!("missing struct {name}")),
+        )
+    }
+
+    #[test]
+    fn flatten_nested_collection() {
+        let schema = nested_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _diags) = crate::parse_query("users.orders.flatten()");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(
+            result.ty,
+            QueryType::List(Box::new(QueryType::Record(RecordSource::Schema(
+                nested_struct(&schema, "Order")
+            ))))
+        );
+    }
+
+    #[test]
+    fn flatten_compose_first() {
+        let schema = nested_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _diags) = crate::parse_query("users.orders.flatten().first()");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(
+            result.ty,
+            QueryType::Record(RecordSource::Schema(nested_struct(&schema, "Order")))
+                .wrap_optional()
+        );
+    }
+
+    #[test]
+    fn flatten_compose_optional() {
+        let schema = nested_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _diags) = crate::parse_query("users.orders.first()?.items?.flatten()");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(
+            result.ty,
+            QueryType::List(Box::new(QueryType::Record(RecordSource::Schema(
+                nested_struct(&schema, "Item")
+            ))))
+            .wrap_optional()
+        );
+    }
+
+    #[test]
+    fn flatten_flat_rejected() {
+        let schema = nested_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _diags) = crate::parse_query("users.name.flatten()");
+        let result = infer(&file.unwrap().result, &mut env);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn flatten_scalar_rejected() {
+        let schema = nested_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _diags) = crate::parse_query("1.flatten()");
         let result = infer(&file.unwrap().result, &mut env);
         assert!(result.is_err());
     }
