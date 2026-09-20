@@ -128,13 +128,18 @@ impl ValidatedSchema {
             .map(RelationId::new)
     }
 
-    pub fn struct_field(&self, struct_id: StructId, name: &str) -> Option<&Field> {
-        let s = &self.structs[struct_id.index()];
-        s.fields.iter().find(|f| match f {
+    pub fn struct_field(&self, struct_id: StructId, name: &str) -> Option<(FieldId, &Field)> {
+        let struct_ = &self.structs[struct_id.index()];
+        let local = struct_.fields.iter().position(|f| match f {
             Field::Value { name: n, .. }
             | Field::Array { name: n, .. }
             | Field::Ref { name: n, .. } => n == name,
-        })
+        });
+        local.map(|local| (FieldId::new(struct_id, local), &struct_.fields[local]))
+    }
+
+    pub fn column_name(&self, column_id: ColumnId) -> &str {
+        &self.tables[column_id.table_id().index()].columns[column_id.local()].name
     }
 }
 

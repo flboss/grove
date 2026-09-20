@@ -4,9 +4,11 @@ use super::builder::{
 use super::model::ParamValue;
 use crate::ast::{BinaryOp, Literal, SortDir, TypeName, UnaryOp};
 use crate::typecheck::types::{
-    IdentBinding, QueryType, TypedExpr, TypedExprKind, TypedMethodArg, TypedProjectionItem,
+    IdentBinding, QueryType, RecordSource, TypedExpr, TypedExprKind, TypedMethodArg,
+    TypedProjectionItem,
 };
-use grove_schema::validated::{Field, ScalarType, ValidatedSchema};
+use grove_schema::validated::{Field, FieldId, Relation, ScalarType, StructId, ValidatedSchema};
+use grove_types::Spanned;
 
 pub struct Context<'s> {
     pub schema: &'s ValidatedSchema,
@@ -111,6 +113,41 @@ fn lower_expr(ctx: &mut Context, expr: &TypedExpr, builder: &mut SelectBuilder) 
                         lower_expr(ctx, base, builder);
                     }
                 }
+                "flatten" => {
+                    if *optional {
+                        todo!("optional flatten");
+                    }
+                    let TypedExprKind::Field {
+                        base,
+                        name: collection,
+                        optional: nav_optional,
+                    } = &base.kind
+                    else {
+                        todo!("flatten over {}", kind_noun(base))
+                    };
+                    if *nav_optional {
+                        todo!("optional field navigation");
+                    }
+                    let elem_struct = match &base.ty {
+                        QueryType::List(element) => match element.as_ref() {
+                            QueryType::Record(RecordSource::Schema(id)) => *id,
+                            QueryType::Record(RecordSource::Projection(_)) => {
+                                todo!("flatten over projected rows")
+                            }
+                            QueryType::List(_) => {
+                                unreachable!("flatten pipe is never nested")
+                            }
+                            _ => unreachable!("flatten field not resolved on scalar rows"),
+                        },
+                        QueryType::Record(RecordSource::Projection(_)) => {
+                            todo!("flatten over projected rows")
+                        }
+                        _ => unreachable!("flatten field not resolved on non-list rows"),
+                    };
+                    let field_id =
+                        flatten_collection_fid(ctx.schema, elem_struct, &collection.value);
+                    flatten_navigate(ctx, builder, base, field_id)
+                }
                 _ => todo!("method `{}`", name.value),
             }
         }
@@ -129,8 +166,106 @@ fn lower_expr(ctx: &mut Context, expr: &TypedExpr, builder: &mut SelectBuilder) 
             }
             _ => todo!("bare non-root identifier as query"),
         },
+        TypedExprKind::Field {
+            base,
+            name,
+            optional,
+        } => {
+            if *optional {
+                todo!("optional field navigation");
+            }
+            match &expr.ty {
+                QueryType::List(inner) if matches!(inner.as_ref(), QueryType::List(_)) => {
+                    todo!("nested collection result")
+                }
+                QueryType::List(inner) if matches!(inner.as_ref(), QueryType::Record(_)) => {
+                    if matches!(
+                        inner.as_ref(),
+                        QueryType::Record(RecordSource::Projection(_))
+                    ) {
+                        todo!("collection over projected rows");
+                    }
+                    let elem_struct = match &base.ty {
+                        QueryType::List(element) => match element.as_ref() {
+                            QueryType::Record(RecordSource::Schema(id)) => *id,
+                            QueryType::Record(RecordSource::Projection(_)) => {
+                                todo!("collection over projected rows")
+                            }
+                            _ => unreachable!("collection field not resolved on schema rows"),
+                        },
+                        QueryType::Record(_) => todo!("collection over single row"),
+                        _ => unreachable!("collection field without list base"),
+                    };
+                    let (field_id, field) = ctx
+                        .schema
+                        .struct_field(elem_struct, &name.value)
+                        .unwrap_or_else(|| {
+                            panic!("typechecked field `{}` missing from struct", name.value)
+                        });
+                    match field {
+                        Field::Ref { .. } => flatten_navigate(ctx, builder, base, field_id),
+                        Field::Array { .. } => {
+                            unreachable!("array field as single-record collection")
+                        }
+                        Field::Value { .. } => {
+                            unreachable!("value field as single-record collection")
+                        }
+                    }
+                }
+                _ if expr.ty.is_scalar() => {
+                    let column = scalar_field_column(ctx.schema, base, name);
+                    lower_expr(ctx, base, builder);
+                    builder.select.push(SelectItem::Column {
+                        depth: 0,
+                        column: column.clone(),
+                        output: name.value.clone(),
+                    });
+                }
+                QueryType::List(_) => {
+                    let column = scalar_field_column(ctx.schema, base, name);
+                    lower_expr(ctx, base, builder);
+                    builder.select.push(SelectItem::Column {
+                        depth: 0,
+                        column: column.clone(),
+                        output: name.value.clone(),
+                    });
+                }
+                _ => unreachable!("{} as query", kind_noun(expr)),
+            }
+        }
         _ => todo!("{} as query", kind_noun(expr)),
     }
+}
+
+fn scalar_field_column(
+    schema: &ValidatedSchema,
+    base: &TypedExpr,
+    name: &Spanned<String>,
+) -> String {
+    let elem_struct = match &base.ty {
+        QueryType::List(element) => match element.as_ref() {
+            QueryType::Record(RecordSource::Schema(id)) => *id,
+            QueryType::Record(RecordSource::Projection(_)) => {
+                todo!("field over projected rows")
+            }
+            _ => unreachable!("field lookup on non-record rows"),
+        },
+        QueryType::Record(RecordSource::Schema(id)) => *id,
+        QueryType::Record(RecordSource::Projection(_)) => {
+            todo!("field over projected rows")
+        }
+        _ => unreachable!("field lookup on non-record rows"),
+    };
+    let (_, field) = schema
+        .struct_field(elem_struct, &name.value)
+        .unwrap_or_else(|| panic!("typechecked field `{}` missing from struct", name.value));
+    let Field::Value { columns, .. } = field else {
+        unreachable!("non-scalar field with scalar result")
+    };
+    let [column] = columns.as_slice() else {
+        todo!("multi-column field")
+    };
+    schema.column_name(*column).to_string()
 }
 
 fn default_select(builder: &mut SelectBuilder) {
@@ -145,6 +280,49 @@ fn attach_child(builder: &mut SelectBuilder, child: SelectBuilder, sub: String) 
         query: Box::new(child),
         alias: sub,
     });
+}
+
+fn flatten_navigate(
+    ctx: &mut Context,
+    builder: &mut SelectBuilder,
+    base: &TypedExpr,
+    field_id: FieldId,
+) {
+    let schema = ctx.schema;
+    let (target_table, target_col, outer_col) = nav_link(schema, field_id);
+    let mut inner = SelectBuilder::new();
+    lower_expr(ctx, base, &mut inner);
+    debug_assert!(inner.select.is_empty());
+    inner.select = vec![SelectItem::Column {
+        depth: 0,
+        column: outer_col.clone(),
+        output: outer_col,
+    }];
+    let alias = ctx.aliases.table(&target_table);
+    debug_assert!(builder.from.is_none());
+    builder.from = Some(FromClause::Table {
+        table: target_table,
+        alias,
+    });
+    builder.where_.push(SqlExpr::InSubquery {
+        expr: Box::new(SqlExpr::Column {
+            depth: 0,
+            column: target_col,
+        }),
+        query: Box::new(inner),
+    });
+}
+
+fn flatten_collection_fid(schema: &ValidatedSchema, struct_id: StructId, name: &str) -> FieldId {
+    let (field_id, field) = schema
+        .struct_field(struct_id, name)
+        .unwrap_or_else(|| panic!("typechecked field `{name}` missing from struct"));
+    match field {
+        Field::Ref { is_list: true, .. } => field_id,
+        Field::Ref { .. } => unreachable!("flatten over single navigation"),
+        Field::Array { .. } => todo!("flatten over array"),
+        Field::Value { .. } => unreachable!("flatten over value field"),
+    }
 }
 
 fn builder_outputs(builder: &SelectBuilder, schema: &ValidatedSchema) -> Vec<String> {
@@ -372,6 +550,50 @@ fn lower_value(ctx: &mut Context, expr: &TypedExpr) -> SqlExpr {
             lower_scalar_method(ctx, base, &name.value, args)
         }
         TypedExprKind::Ident { binding, depth, .. } => bound_column(ctx.schema, *depth, binding),
+        TypedExprKind::Field {
+            base,
+            name,
+            optional,
+        } => {
+            if *optional {
+                todo!("optional field navigation");
+            }
+            if !expr.ty.is_scalar() {
+                todo!("collection field in scalar position");
+            }
+            let struct_id = match &base.ty {
+                QueryType::Record(RecordSource::Schema(id)) => *id,
+                QueryType::Record(RecordSource::Projection(_)) => {
+                    todo!("field over projected rows")
+                }
+                _ => unreachable!("field base is not a single record"),
+            };
+            let (_, field) = ctx
+                .schema
+                .struct_field(struct_id, &name.value)
+                .unwrap_or_else(|| {
+                    panic!("typechecked field `{}` missing from struct", name.value)
+                });
+            let Field::Value { columns, .. } = field else {
+                unreachable!("non-scalar field with scalar type")
+            };
+            let [column] = columns.as_slice() else {
+                unreachable!("multi-column field with scalar type")
+            };
+            let column = ctx.schema.column_name(*column).to_string();
+            let nav = provide_rows(ctx, base);
+            let filled = fill_hole(
+                nav,
+                SelectItem::Column {
+                    depth: 0,
+                    column: column.clone(),
+                    output: column,
+                },
+            );
+            SqlExpr::Subquery {
+                query: Box::new(filled),
+            }
+        }
         TypedExprKind::Literal(lit) => lower_literal(&lit.value),
         TypedExprKind::Cast { expr: operand, ty } => {
             if matches!(operand.ty, QueryType::Scalar(ScalarType::Bool))
@@ -658,19 +880,198 @@ fn bound_column(schema: &ValidatedSchema, depth: usize, binding: &IdentBinding) 
     }
 }
 
+fn provide_rows(ctx: &mut Context, base: &TypedExpr) -> SelectBuilder {
+    match &base.kind {
+        TypedExprKind::Ident { binding, .. } => match binding {
+            IdentBinding::Field(field_id) => match field_of(ctx.schema, *field_id) {
+                Field::Ref { .. } => navigate_ref(ctx, *field_id),
+                _ => unreachable!("value as navigation base"),
+            },
+            IdentBinding::ProjectedField { .. } => {
+                unreachable!("projected record as navigation base")
+            }
+            IdentBinding::Prev { .. } => todo!("navigation through prev"),
+            IdentBinding::Root { .. } => unreachable!("root as navigation base"),
+        },
+        TypedExprKind::Field {
+            base: inner,
+            name,
+            optional,
+        } => {
+            if *optional {
+                todo!("optional field navigation");
+            }
+            let struct_id = match &inner.ty {
+                QueryType::Record(RecordSource::Schema(id)) => *id,
+                _ => unreachable!("navigation base is not a single record"),
+            };
+            let (field_id, field) = ctx
+                .schema
+                .struct_field(struct_id, &name.value)
+                .unwrap_or_else(|| {
+                    panic!("typechecked field `{}` missing from struct", name.value)
+                });
+            match field {
+                Field::Ref { .. } => {}
+                _ => unreachable!("non-reference field as navigation base"),
+            }
+            let outer = provide_rows(ctx, inner);
+            let nav = navigate_ref(ctx, field_id);
+            let output = ctx.aliases.generic();
+            fill_hole(
+                outer,
+                SelectItem::Expr {
+                    expr: SqlExpr::Subquery {
+                        query: Box::new(nav),
+                    },
+                    output,
+                },
+            )
+        }
+        TypedExprKind::Method { .. } => todo!("navigation through method result"),
+        _ => todo!("{} as navigation base", kind_noun(base)),
+    }
+}
+
+fn fill_hole(nav: SelectBuilder, item: SelectItem) -> SelectBuilder {
+    let mut nav = nav;
+    match nav.select.len() {
+        0 => {
+            nav.select = vec![item];
+            nav
+        }
+        1 => {
+            let first = nav.select.pop().expect("single select item");
+            match first {
+                SelectItem::Expr {
+                    expr: SqlExpr::Subquery { query },
+                    output,
+                } => {
+                    let filled = fill_hole(*query, item);
+                    nav.select = vec![SelectItem::Expr {
+                        expr: SqlExpr::Subquery {
+                            query: Box::new(filled),
+                        },
+                        output,
+                    }];
+                    nav
+                }
+                _ => unreachable!("navigation hole already filled"),
+            }
+        }
+        _ => unreachable!("navigation hole missing"),
+    }
+}
+
+fn navigate_ref(ctx: &mut Context, field_id: FieldId) -> SelectBuilder {
+    let schema = ctx.schema;
+    let (target_table, target_col, outer_col) = nav_link(schema, field_id);
+    let alias = ctx.aliases.table(&target_table);
+    let mut nav = SelectBuilder::new();
+    nav.from = Some(FromClause::Table {
+        table: target_table,
+        alias,
+    });
+    nav.where_.push(SqlExpr::Binary {
+        op: SqlBinOp::Eq,
+        lhs: Box::new(SqlExpr::Column {
+            depth: 0,
+            column: target_col,
+        }),
+        rhs: Box::new(SqlExpr::Column {
+            depth: 1,
+            column: outer_col,
+        }),
+    });
+    nav
+}
+
+fn nav_link(schema: &ValidatedSchema, field_id: FieldId) -> (String, String, String) {
+    let relation_id = schema
+        .relation_of_field(field_id)
+        .expect("reference field belongs to a relation");
+    let relation = &schema.relations[relation_id.index()];
+    let (target, target_link, outer_link) = match relation {
+        Relation::OneToOne {
+            child_ref,
+            parent_ref,
+            fk,
+            pk,
+        }
+        | Relation::ManyToOne {
+            child_ref,
+            parent_ref,
+            fk,
+            pk,
+        } => {
+            if *child_ref == field_id {
+                (parent_ref.struct_id(), *pk, *fk)
+            } else if *parent_ref == field_id {
+                (child_ref.struct_id(), *fk, *pk)
+            } else {
+                unreachable!("relation does not contain field");
+            }
+        }
+        Relation::OneToMany {
+            a_ref,
+            b_ref,
+            fk,
+            pk,
+        } => {
+            if *b_ref == field_id {
+                (a_ref.struct_id(), *pk, *fk)
+            } else {
+                unreachable!("list-side navigation in scalar position");
+            }
+        }
+        Relation::ManyToMany { .. } => {
+            unreachable!("many-to-many navigation in scalar position")
+        }
+    };
+    let table = schema.structs[target.index()].table;
+    (
+        schema.tables[table.index()].name.clone(),
+        schema.column_name(target_link).to_string(),
+        schema.column_name(outer_link).to_string(),
+    )
+}
+
+fn field_of(schema: &ValidatedSchema, field_id: FieldId) -> &Field {
+    &schema.structs[field_id.struct_id().index()].fields[field_id.local()]
+}
+
 fn set_select(ctx: &mut Context, builder: &mut SelectBuilder, items: &[TypedProjectionItem]) {
     for item in items {
-        let TypedExprKind::Ident { binding, depth, .. } = &item.value.kind else {
-            todo!("{} in projection", kind_noun(&item.value));
-        };
-        let SqlExpr::Column { column, .. } = bound_column(ctx.schema, *depth, binding) else {
-            unreachable!("bound_column only returns columns");
-        };
-        builder.select.push(SelectItem::Column {
-            depth: *depth,
-            column,
-            output: item.alias.to_string(),
-        });
+        match &item.value.kind {
+            TypedExprKind::Ident { binding, depth, .. } => {
+                let SqlExpr::Column { column, .. } = bound_column(ctx.schema, *depth, binding)
+                else {
+                    unreachable!("bound_column only returns columns");
+                };
+                builder.select.push(SelectItem::Column {
+                    depth: *depth,
+                    column,
+                    output: item.alias.to_string(),
+                });
+            }
+            TypedExprKind::Field { optional, .. } => {
+                if *optional {
+                    todo!("optional field in projection");
+                }
+                match &item.value.ty {
+                    QueryType::List(_) => todo!("collection field in projection"),
+                    QueryType::Record(_) => todo!("record field in projection"),
+                    _ => {
+                        let expr = lower_value(ctx, &item.value);
+                        builder.select.push(SelectItem::Expr {
+                            expr,
+                            output: item.alias.to_string(),
+                        });
+                    }
+                }
+            }
+            _ => todo!("{} in projection", kind_noun(&item.value)),
+        }
     }
 }
 
@@ -711,7 +1112,28 @@ mod tests {
             pos: Tuple<Float, Float>@(lat, lng),
             created: Instant,
             ttl: Duration,
+            manager: &User,
+            subordinates: &List<User>,
+            orders: List<Order>,
+            settings: Settings,
         }
+        struct Order {
+            total: Dec,
+            user: &User,
+            items: List<Item>,
+        }
+        struct Settings {
+            theme: String,
+            user: &User,
+        }
+        struct Item {
+            sku: String,
+            order: &Order,
+        }
+        rel User.manager <<-> User.subordinates (users.manager_id -> users.id);
+        rel Order.user <<-> User.orders (orders.user_id -> users.id);
+        rel Settings.user <-> User.settings (settings.user_id -> users.id);
+        rel Item.order <<-> Order.items (items.order_id -> orders.id);
     "#;
 
     fn compile(query: &str) -> CompiledQuery {
@@ -1423,5 +1845,174 @@ mod tests {
             }
         );
         assert_eq!(compiled.statements[0].shape.columns.len(), 2);
+    }
+
+    fn str_param(s: &str) -> Param {
+        Param::Value(ParamValue::String(s.to_string()))
+    }
+
+    #[test]
+    fn nav_self_ref_filter() {
+        let (sql, params) = sql(r#"users[manager.name == "Ada"] { name }"#);
+        assert_eq!(
+            sql,
+            r#"SELECT "$$users1"."name" FROM "users" AS "$$users1" WHERE ((SELECT "$$users0"."name" FROM "users" AS "$$users0" WHERE ("$$users0"."id" = "$$users1"."manager_id")) = ?)"#
+        );
+        assert_eq!(params, vec![str_param("Ada")]);
+    }
+
+    #[test]
+    fn nav_self_ref_projection() {
+        let (sql, params) = sql("users { boss = manager.name }");
+        assert_eq!(
+            sql,
+            r#"SELECT (SELECT "$$users0"."name" FROM "users" AS "$$users0" WHERE ("$$users0"."id" = "$$users1"."manager_id")) AS "boss" FROM "users" AS "$$users1""#
+        );
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn nav_multi_hop_filter() {
+        let (sql, params) = sql(r#"users[manager.manager.name == "X"] { name }"#);
+        assert_eq!(
+            sql,
+            r#"SELECT "$$users3"."name" FROM "users" AS "$$users3" WHERE ((SELECT (SELECT "$$users1"."name" FROM "users" AS "$$users1" WHERE ("$$users1"."id" = "$$users0"."manager_id")) AS "$$val2" FROM "users" AS "$$users0" WHERE ("$$users0"."id" = "$$users3"."manager_id")) = ?)"#
+        );
+        assert_eq!(params, vec![str_param("X")]);
+    }
+
+    #[test]
+    fn nav_one_to_one_back_ref_filter() {
+        let (sql, params) = sql(r#"users[settings.theme == "dark"] { name }"#);
+        assert_eq!(
+            sql,
+            r#"SELECT "$$users1"."name" FROM "users" AS "$$users1" WHERE ((SELECT "$$settings0"."theme" FROM "settings" AS "$$settings0" WHERE ("$$settings0"."user_id" = "$$users1"."id")) = ?)"#
+        );
+        assert_eq!(params, vec![str_param("dark")]);
+    }
+
+    #[test]
+    fn nav_sort_key() {
+        let (sql, params) = sql("users.sort(manager.name) { name }");
+        assert_eq!(
+            sql,
+            r#"SELECT "$$users1"."name" FROM "users" AS "$$users1" ORDER BY (SELECT "$$users0"."name" FROM "users" AS "$$users0" WHERE ("$$users0"."id" = "$$users1"."manager_id")) ASC"#
+        );
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn flattened_root_scalar() {
+        let (sql, params) = sql("users[active].name");
+        assert_eq!(
+            sql,
+            r#"SELECT "$$users0"."name" FROM "users" AS "$$users0" WHERE "$$users0"."active""#
+        );
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn flatten_collection_bare() {
+        let (sql, params) = sql("users.orders.flatten()");
+        assert_eq!(
+            sql,
+            r#"SELECT "$$orders1".* FROM "orders" AS "$$orders1" WHERE ("$$orders1"."user_id" IN (SELECT "$$users0"."id" FROM "users" AS "$$users0"))"#
+        );
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn flatten_collection_first() {
+        let (sql, params) = sql("users.orders.flatten().first()");
+        assert_eq!(
+            sql,
+            r#"SELECT "$$orders1".* FROM "orders" AS "$$orders1" WHERE ("$$orders1"."user_id" IN (SELECT "$$users0"."id" FROM "users" AS "$$users0")) LIMIT ?"#
+        );
+        assert_eq!(params, vec![int_param(1)]);
+    }
+
+    #[test]
+    fn flatten_collection_pipeline() {
+        let (take_sql, take_params) = case_pos_guard(2, "take");
+        let (sql, params) = sql("users[active].orders.flatten().sort_desc(total).take(2)");
+        assert_eq!(
+            sql,
+            format!(
+                r#"SELECT "$$orders1".* FROM "orders" AS "$$orders1" WHERE ("$$orders1"."user_id" IN (SELECT "$$users0"."id" FROM "users" AS "$$users0" WHERE "$$users0"."active")) ORDER BY "$$orders1"."total" DESC LIMIT ({take_sql})"#
+            )
+        );
+        assert_eq!(params, take_params);
+    }
+
+    #[test]
+    fn flatten_single_ref_collapse() {
+        let (sql, params) = sql("users.manager.first()");
+        assert_eq!(
+            sql,
+            r#"SELECT "$$users1".* FROM "users" AS "$$users1" WHERE ("$$users1"."id" IN (SELECT "$$users0"."manager_id" FROM "users" AS "$$users0")) LIMIT ?"#
+        );
+        assert_eq!(params, vec![int_param(1)]);
+    }
+
+    #[test]
+    fn flatten_single_ref_bare() {
+        let (sql, params) = sql("users.manager");
+        assert_eq!(
+            sql,
+            r#"SELECT "$$users1".* FROM "users" AS "$$users1" WHERE ("$$users1"."id" IN (SELECT "$$users0"."manager_id" FROM "users" AS "$$users0"))"#
+        );
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn flattened_scalar_over_navigation() {
+        let (sql, params) = sql("users.manager.name");
+        assert_eq!(
+            sql,
+            r#"SELECT "$$users1"."name" FROM "users" AS "$$users1" WHERE ("$$users1"."id" IN (SELECT "$$users0"."manager_id" FROM "users" AS "$$users0"))"#
+        );
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn flatten_multi_hop_navigation() {
+        let (sql, params) = sql("users.manager.orders.flatten()");
+        assert_eq!(
+            sql,
+            r#"SELECT "$$orders2".* FROM "orders" AS "$$orders2" WHERE ("$$orders2"."user_id" IN (SELECT "$$users1"."id" FROM "users" AS "$$users1" WHERE ("$$users1"."id" IN (SELECT "$$users0"."manager_id" FROM "users" AS "$$users0"))))"#
+        );
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn flatten_mixed_direction_chain() {
+        let (sql, params) = sql("users.settings.user.orders.flatten()");
+        assert_eq!(
+            sql,
+            r#"SELECT "$$orders3".* FROM "orders" AS "$$orders3" WHERE ("$$orders3"."user_id" IN (SELECT "$$users2"."id" FROM "users" AS "$$users2" WHERE ("$$users2"."id" IN (SELECT "$$settings1"."user_id" FROM "settings" AS "$$settings1" WHERE ("$$settings1"."user_id" IN (SELECT "$$users0"."id" FROM "users" AS "$$users0"))))))"#
+        );
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "flatten over array")]
+    fn flatten_array_literal_defers() {
+        sql("[[1, 3], [2, 4]].flatten()");
+    }
+
+    #[test]
+    #[should_panic(expected = "flatten over method call")]
+    fn flatten_take_pipeline_defers() {
+        sql("users.orders.take(5).flatten()");
+    }
+
+    #[test]
+    fn flatten_chained_through_flatten() {
+        let (sql, params) = sql("users.orders.flatten().items.flatten()");
+        assert_eq!(
+            sql,
+            r#"SELECT "$$items2".* FROM "items" AS "$$items2" WHERE ("$$items2"."order_id" IN (SELECT "$$orders1"."id" FROM "orders" AS "$$orders1" WHERE ("$$orders1"."user_id" IN (SELECT "$$users0"."id" FROM "users" AS "$$users0"))))"#
+        );
+        assert!(params.is_empty());
     }
 }

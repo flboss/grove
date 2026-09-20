@@ -152,9 +152,9 @@ fn record_field_by_name(
     schema: &ValidatedSchema,
 ) -> Option<QueryType> {
     match record {
-        QueryType::Record(RecordSource::Schema(struct_id)) => {
-            schema.struct_field(*struct_id, name).map(field_query_type)
-        }
+        QueryType::Record(RecordSource::Schema(struct_id)) => schema
+            .struct_field(*struct_id, name)
+            .map(|(_, field)| field_query_type(field)),
         QueryType::Record(RecordSource::Projection(fields)) => {
             fields.iter().find(|f| f.name == name).map(|f| f.ty.clone())
         }
