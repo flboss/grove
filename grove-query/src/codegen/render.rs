@@ -115,6 +115,11 @@ fn render_from(
             sql.push_str(&quote(name));
             sql.push_str("()");
         }
+        FromClause::Temp { name, .. } => {
+            sql.push_str(&quote(name));
+            sql.push_str(" AS ");
+            sql.push_str(&quote(name));
+        }
     }
 }
 
@@ -243,6 +248,34 @@ fn render_expr(
                     sql.push_str(", ");
                 }
                 render_expr(value, stack, false, sql, params);
+            }
+            sql.push(')');
+        }
+        SqlExpr::Window {
+            func,
+            partition,
+            order,
+        } => {
+            sql.push_str(&quote(func));
+            sql.push_str("() OVER (PARTITION BY ");
+            for (i, part) in partition.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(", ");
+                }
+                render_expr(part, stack, false, sql, params);
+            }
+            if !order.is_empty() {
+                sql.push_str(" ORDER BY ");
+                for (i, item) in order.iter().enumerate() {
+                    if i > 0 {
+                        sql.push_str(", ");
+                    }
+                    render_expr(&item.expr, stack, false, sql, params);
+                    match item.dir {
+                        OrderDir::Asc => sql.push_str(" ASC"),
+                        OrderDir::Desc => sql.push_str(" DESC"),
+                    }
+                }
             }
             sql.push(')');
         }
@@ -489,6 +522,33 @@ mod tests {
         assert_eq!(
             sql,
             r#"EXISTS (SELECT "$$users0"."id" FROM "users" AS "$$users0")"#
+        );
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn window_renders() {
+        use super::super::builder::OrderItem;
+        let expr = SqlExpr::Window {
+            func: "ROW_NUMBER".to_string(),
+            partition: vec![SqlExpr::Column {
+                depth: 0,
+                column: "user_id".to_string(),
+            }],
+            order: vec![OrderItem {
+                expr: SqlExpr::Column {
+                    depth: 0,
+                    column: "total".to_string(),
+                },
+                dir: OrderDir::Desc,
+            }],
+        };
+        let mut sql = String::new();
+        let mut params = Vec::new();
+        render_expr(&expr, &mut test_stack(), true, &mut sql, &mut params);
+        assert_eq!(
+            sql,
+            r#""ROW_NUMBER"() OVER (PARTITION BY "$$users0"."user_id" ORDER BY "$$users0"."total" DESC)"#
         );
         assert!(params.is_empty());
     }

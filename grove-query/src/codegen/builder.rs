@@ -58,6 +58,10 @@ pub enum FromClause {
     TableFunction {
         name: String,
     },
+    Temp {
+        name: String,
+        columns: Vec<String>,
+    },
 }
 
 impl FromClause {
@@ -65,6 +69,7 @@ impl FromClause {
         match self {
             FromClause::Table { alias, .. } | FromClause::Subquery { alias, .. } => alias,
             FromClause::TableFunction { name } => name,
+            FromClause::Temp { name, .. } => name,
         }
     }
 }
@@ -106,6 +111,11 @@ pub enum SqlExpr {
     Cast {
         expr: Box<SqlExpr>,
         target: &'static str,
+    },
+    Window {
+        func: String,
+        partition: Vec<SqlExpr>,
+        order: Vec<OrderItem>,
     },
 }
 
@@ -157,6 +167,10 @@ impl AliasGen {
 
     pub fn subquery(&mut self) -> String {
         self.generate("subq")
+    }
+
+    pub fn temp(&mut self) -> String {
+        self.generate("split")
     }
 }
 

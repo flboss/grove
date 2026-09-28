@@ -17,12 +17,20 @@ pub struct PlannedStatement {
     pub sql: String,
     pub params: Vec<Param>,
     pub shape: StatementShape,
+    pub kind: StatementKind,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum StatementKind {
+    Query,
+    Temp { name: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SunkStatement {
     pub builder: SelectBuilder,
     pub shape: StatementShape,
+    pub kind: StatementKind,
 }
 
 #[derive(Debug, Clone, PartialEq)]
