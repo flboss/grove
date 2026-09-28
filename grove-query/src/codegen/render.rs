@@ -251,6 +251,9 @@ fn render_expr(
             }
             sql.push(')');
         }
+        SqlExpr::Count => {
+            sql.push_str("COUNT(*)");
+        }
         SqlExpr::Window {
             func,
             partition,
@@ -550,6 +553,21 @@ mod tests {
             sql,
             r#""ROW_NUMBER"() OVER (PARTITION BY "$$users0"."user_id" ORDER BY "$$users0"."total" DESC)"#
         );
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn count_renders() {
+        let mut sql = String::new();
+        let mut params = Vec::new();
+        render_expr(
+            &SqlExpr::Count,
+            &mut test_stack(),
+            true,
+            &mut sql,
+            &mut params,
+        );
+        assert_eq!(sql, "COUNT(*)");
         assert!(params.is_empty());
     }
 }

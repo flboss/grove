@@ -628,6 +628,51 @@ fn rows_method(
                 unreachable!("flatten over flat list is rejected upstream (strict sig)")
             }
         },
+        "max_by" | "min_by" => {
+            let dir = if name.value == "max_by" {
+                OrderDir::Desc
+            } else {
+                OrderDir::Asc
+            };
+            if let Some(fk) = ctx
+                .child
+                .as_ref()
+                .filter(|tail| tail.per_row)
+                .and_then(|tail| tail.partition.clone())
+            {
+                let order_arg = over_arg(ctx, args, name).1;
+                let mut level = window_wrap(
+                    ctx,
+                    level,
+                    &fk,
+                    vec![OrderItem {
+                        expr: order_arg,
+                        dir,
+                    }],
+                );
+                level.builder.where_.push(SqlExpr::Binary {
+                    op: SqlBinOp::Le,
+                    lhs: Box::new(SqlExpr::Column {
+                        depth: 0,
+                        column: "$$rn".to_string(),
+                    }),
+                    rhs: Box::new(SqlExpr::Param(ParamValue::Int(1))),
+                });
+                return level;
+            }
+            if level.pending.is_some() {
+                todo!("M4b max_by over split-pending base");
+            }
+            if needs_wrap(&level) {
+                level = wrap_level(ctx, level);
+            }
+            level.builder.order_by = vec![OrderItem {
+                expr: over_arg(ctx, args, name).1,
+                dir,
+            }];
+            compose_limit(&mut level.builder, "first", &[], ctx);
+            level
+        }
         _ => unreachable!(
             "method {} in row demand: value methods never return row types",
             name.value
@@ -832,11 +877,38 @@ fn non_neg_guard(expr: SqlExpr, method: &str) -> SqlExpr {
 
 fn window_take(
     ctx: &mut Context,
-    level: Level,
+    mut level: Level,
     fk: &str,
     method: &str,
     args: &[TypedMethodArg],
 ) -> Level {
+    let arg = match args {
+        [arg] => {
+            let was = std::mem::replace(&mut ctx.in_take_arg, true);
+            let lowered = scalar(ctx, &arg.expr);
+            ctx.in_take_arg = was;
+            lowered
+        }
+        _ => unreachable!("wrong arity for {method}: the checker enforces Fixed arg counts"),
+    };
+    let guard = non_neg_guard(arg, method);
+    let order = std::mem::take(&mut level.builder.order_by);
+    let mut level = window_wrap(ctx, level, fk, order);
+    let bound = SqlExpr::Binary {
+        op: match method {
+            "take" => SqlBinOp::Le,
+            _ => SqlBinOp::Gt,
+        },
+        lhs: Box::new(SqlExpr::Column {
+            depth: 0,
+            column: "$$rn".to_string(),
+        }),
+        rhs: Box::new(guard),
+    };
+    level.builder.where_.push(bound);
+    level
+}
+fn window_wrap(ctx: &mut Context, level: Level, fk: &str, order: Vec<OrderItem>) -> Level {
     let Level {
         mut builder,
         element,
@@ -855,21 +927,10 @@ fn window_take(
     {
         todo!("M4b stacked per-parent take");
     }
-    let arg = match args {
-        [arg] => {
-            let was = std::mem::replace(&mut ctx.in_take_arg, true);
-            let lowered = scalar(ctx, &arg.expr);
-            ctx.in_take_arg = was;
-            lowered
-        }
-        _ => unreachable!("wrong arity for {method}: the checker enforces Fixed arg counts"),
-    };
-    let guard = non_neg_guard(arg, method);
     if builder.select.is_empty() {
         builder.select = vec![SelectItem::AllFrom { depth: 0 }];
     }
     ensure_key(&mut builder, fk);
-    let order = std::mem::take(&mut builder.order_by);
     builder.select.push(SelectItem::Expr {
         expr: SqlExpr::Window {
             func: "ROW_NUMBER".to_string(),
@@ -881,7 +942,7 @@ fn window_take(
         },
         output: "$$rn".to_string(),
     });
-    let mut level = Level {
+    let level = Level {
         builder,
         element,
         parent,
@@ -889,20 +950,7 @@ fn window_take(
         stmt_bound,
         output_shapes,
     };
-    level = wrap_level(ctx, level);
-    let bound = SqlExpr::Binary {
-        op: match method {
-            "take" => SqlBinOp::Le,
-            _ => SqlBinOp::Gt,
-        },
-        lhs: Box::new(SqlExpr::Column {
-            depth: 0,
-            column: "$$rn".to_string(),
-        }),
-        rhs: Box::new(guard),
-    };
-    level.builder.where_.push(bound);
-    level
+    wrap_level(ctx, level)
 }
 
 fn rows_projection(ctx: &mut Context, base: &TypedExpr, items: &[TypedProjectionItem]) -> Level {
@@ -1166,6 +1214,7 @@ fn shift_depths(expr: SqlExpr, by: usize) -> SqlExpr {
             column,
         },
         SqlExpr::Param(_) => expr,
+        SqlExpr::Count => expr,
         SqlExpr::Binary { op, lhs, rhs } => SqlExpr::Binary {
             op,
             lhs: Box::new(shift_depths(*lhs, by)),
@@ -2157,10 +2206,26 @@ pub fn lower_query(ctx: &mut Context, result: &TypedExpr) -> RootPlan {
     if result.ty.is_scalar() {
         let mut builder = SelectBuilder::new();
         let output = ctx.aliases.generic();
-        builder.select = vec![SelectItem::Expr {
-            expr: scalar(ctx, result),
-            output: output.clone(),
-        }];
+        match scalar(ctx, result) {
+            SqlExpr::Subquery { mut query }
+                if query.select.len() == 1
+                    && !matches!(query.select[0], SelectItem::AllFrom { .. }) =>
+            {
+                match &mut query.select[0] {
+                    SelectItem::Column { output: o, .. } | SelectItem::Expr { output: o, .. } => {
+                        *o = output.clone();
+                    }
+                    SelectItem::AllFrom { .. } => unreachable!("guarded above"),
+                }
+                builder = *query;
+            }
+            expr => {
+                builder.select = vec![SelectItem::Expr {
+                    expr,
+                    output: output.clone(),
+                }];
+            }
+        }
         return RootPlan {
             builder,
             shape: StatementShape {
@@ -2173,6 +2238,9 @@ pub fn lower_query(ctx: &mut Context, result: &TypedExpr) -> RootPlan {
             },
             result: ResultShape::Column(output),
         };
+    }
+    if matches!(result.ty, QueryType::Tuple(_)) {
+        todo!("M7 tuple results");
     }
     let level = rows(ctx, result);
     finalize_level(ctx, level)
@@ -2879,6 +2947,237 @@ fn scalar_ident(ctx: &mut Context, binding: &IdentBinding, depth: usize) -> SqlE
     }
 }
 
+enum AggOp {
+    Len,
+    Bare(BareAgg, ScalarType),
+    Over(OverAgg, ScalarType, SqlExpr),
+}
+
+enum BareAgg {
+    Sum,
+    Avg,
+    Max,
+    Min,
+}
+
+enum OverAgg {
+    Sum,
+    Avg,
+}
+
+fn inner_scalar(inner: &QueryType, method: &str) -> ScalarType {
+    match inner {
+        QueryType::Scalar(s) => *s,
+        _ => unreachable!("{method} over non-scalar elements: the checker restricts inners"),
+    }
+}
+
+fn over_arg(
+    ctx: &mut Context,
+    args: &[TypedMethodArg],
+    name: &grove_types::Spanned<String>,
+) -> (ScalarType, SqlExpr) {
+    let arg = one_arg(args, name);
+    let ty = match &arg.ty {
+        QueryType::Scalar(s) => *s,
+        _ => unreachable!("summable scoped arg is scalar: the checker enforces it"),
+    };
+    if has_field_node(arg) {
+        todo!("M4b scoped navigation");
+    }
+    (ty, scalar(ctx, arg))
+}
+
+fn has_field_node(expr: &TypedExpr) -> bool {
+    match &expr.kind {
+        TypedExprKind::Field { .. } => true,
+        TypedExprKind::Method { base, args, .. } => {
+            has_field_node(base) || args.iter().any(|a| has_field_node(&a.expr))
+        }
+        TypedExprKind::Binary { lhs, rhs, .. } => has_field_node(lhs) || has_field_node(rhs),
+        TypedExprKind::Unary { expr, .. } | TypedExprKind::Cast { expr, .. } => {
+            has_field_node(expr)
+        }
+        TypedExprKind::If { arms, default } => {
+            arms.iter()
+                .any(|(c, t)| has_field_node(c) || has_field_node(t))
+                || has_field_node(default)
+        }
+        TypedExprKind::Some { value } => has_field_node(value),
+        TypedExprKind::Tuple { elements } | TypedExprKind::Array { elements } => {
+            elements.iter().any(has_field_node)
+        }
+        TypedExprKind::Struct { fields } => fields.iter().any(|(_, e)| has_field_node(e)),
+        TypedExprKind::Projection { base, items } => {
+            has_field_node(base) || items.iter().any(|i| has_field_node(&i.value))
+        }
+        _ => false,
+    }
+}
+
+fn scalar_list_col(ctx: &mut Context, base: &TypedExpr) -> String {
+    match &base.kind {
+        TypedExprKind::Ident {
+            binding: IdentBinding::Field(fid),
+            ..
+        } => {
+            let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
+            match field {
+                Field::Value { columns, .. } => match columns.as_slice() {
+                    [col] => ctx.schema.column_name(*col).to_string(),
+                    _ => unreachable!("tuple field in scalar aggregation: tuples aren't summable"),
+                },
+                Field::Array {
+                    element, storage, ..
+                } => match element {
+                    grove_schema::validated::ValueType::Scalar(_) => match storage.value.as_slice()
+                    {
+                        [col] => ctx.schema.column_name(*col).to_string(),
+                        _ => todo!("M4b multi-col array aggregation"),
+                    },
+                    _ => todo!("M4b nested array aggregation"),
+                },
+                _ => unreachable!("reference ident in scalar aggregation: records aren't summable"),
+            }
+        }
+        TypedExprKind::Method { base, name, .. }
+            if ["take", "skip"].contains(&name.value.as_str()) =>
+        {
+            scalar_list_col(ctx, base)
+        }
+        _ => todo!("M4b scalar aggregation over derived rows"),
+    }
+}
+
+fn scalar_aggregate(ctx: &mut Context, base: &TypedExpr, agg: AggOp) -> SqlExpr {
+    let corr = has_row_setting_ident(base) || tail_uses_outer(base);
+    if corr && ctx.in_take_arg {
+        todo!("M4b temp-bound per-row limit");
+    }
+    let was_corr = std::mem::replace(&mut ctx.corr, corr);
+    let was_outer = std::mem::replace(&mut ctx.no_outer, !corr);
+    let mut level = rows(ctx, base);
+    ctx.corr = was_corr;
+    ctx.no_outer = was_outer;
+    if let Some(pending) = level.pending {
+        let _ = pending;
+        match agg {
+            AggOp::Len => {}
+            _ => {
+                unreachable!("reduction over nested lists is rejected upstream (len() excepted)")
+            }
+        }
+        return SqlExpr::Subquery {
+            query: Box::new(SelectBuilder {
+                select: vec![SelectItem::Expr {
+                    expr: SqlExpr::Count,
+                    output: ctx.aliases.generic(),
+                }],
+                from: level.builder.from,
+                where_: level.builder.where_,
+                order_by: level.builder.order_by,
+                limit: level.builder.limit,
+                offset: level.builder.offset,
+            }),
+        };
+    }
+    if !level.builder.select.is_empty() {
+        level = wrap_level(ctx, level);
+    }
+    let output = ctx.aliases.generic();
+    let select = |expr| SelectItem::Expr {
+        expr,
+        output: output.clone(),
+    };
+    let col = |column: String| SqlExpr::Column { depth: 0, column };
+    let expr = match agg {
+        AggOp::Len => SqlExpr::Count,
+        AggOp::Bare(BareAgg::Sum, ScalarType::Int)
+        | AggOp::Bare(BareAgg::Sum, ScalarType::Float) => SqlExpr::Func {
+            name: "SUM".to_string(),
+            args: vec![col(scalar_list_col(ctx, base))],
+        },
+        AggOp::Bare(BareAgg::Sum, ScalarType::Dec) => SqlExpr::Func {
+            name: "$$sum_dec".to_string(),
+            args: vec![col(scalar_list_col(ctx, base))],
+        },
+        AggOp::Bare(BareAgg::Sum, ScalarType::Duration) => SqlExpr::Func {
+            name: "$$sum_dur".to_string(),
+            args: vec![col(scalar_list_col(ctx, base))],
+        },
+        AggOp::Bare(BareAgg::Avg, ScalarType::Int)
+        | AggOp::Bare(BareAgg::Avg, ScalarType::Float) => SqlExpr::Func {
+            name: "AVG".to_string(),
+            args: vec![col(scalar_list_col(ctx, base))],
+        },
+        AggOp::Bare(BareAgg::Avg, ScalarType::Dec) => SqlExpr::Func {
+            name: "$$avg_dec".to_string(),
+            args: vec![col(scalar_list_col(ctx, base))],
+        },
+        AggOp::Bare(BareAgg::Avg, ScalarType::Duration) => SqlExpr::Func {
+            name: "$$avg_dur".to_string(),
+            args: vec![col(scalar_list_col(ctx, base))],
+        },
+        AggOp::Bare(BareAgg::Avg, ScalarType::Instant) => SqlExpr::Func {
+            name: "$$avg_instant".to_string(),
+            args: vec![col(scalar_list_col(ctx, base))],
+        },
+        AggOp::Bare(BareAgg::Max, _) | AggOp::Bare(BareAgg::Min, _) => {
+            let func = match agg {
+                AggOp::Bare(BareAgg::Max, _) => "MAX",
+                _ => "MIN",
+            };
+            SqlExpr::Func {
+                name: func.to_string(),
+                args: vec![col(scalar_list_col(ctx, base))],
+            }
+        }
+        AggOp::Over(OverAgg::Sum, ScalarType::Int, arg)
+        | AggOp::Over(OverAgg::Sum, ScalarType::Float, arg) => SqlExpr::Func {
+            name: "SUM".to_string(),
+            args: vec![arg],
+        },
+        AggOp::Over(OverAgg::Sum, ScalarType::Dec, arg) => SqlExpr::Func {
+            name: "$$sum_dec".to_string(),
+            args: vec![arg],
+        },
+        AggOp::Over(OverAgg::Sum, ScalarType::Duration, arg) => SqlExpr::Func {
+            name: "$$sum_dur".to_string(),
+            args: vec![arg],
+        },
+        AggOp::Over(OverAgg::Avg, ScalarType::Int, arg)
+        | AggOp::Over(OverAgg::Avg, ScalarType::Float, arg) => SqlExpr::Func {
+            name: "AVG".to_string(),
+            args: vec![arg],
+        },
+        AggOp::Over(OverAgg::Avg, ScalarType::Dec, arg) => SqlExpr::Func {
+            name: "$$avg_dec".to_string(),
+            args: vec![arg],
+        },
+        AggOp::Over(OverAgg::Avg, ScalarType::Duration, arg) => SqlExpr::Func {
+            name: "$$avg_dur".to_string(),
+            args: vec![arg],
+        },
+        AggOp::Over(OverAgg::Avg, ScalarType::Instant, arg) => SqlExpr::Func {
+            name: "$$avg_instant".to_string(),
+            args: vec![arg],
+        },
+        _ => unreachable!(
+            "rejected input reaches aggregation: the checker restricts bases and inners"
+        ),
+    };
+    SqlExpr::Subquery {
+        query: Box::new(SelectBuilder {
+            select: vec![select(expr)],
+            from: level.builder.from,
+            where_: level.builder.where_,
+            order_by: level.builder.order_by,
+            limit: level.builder.limit,
+            offset: level.builder.offset,
+        }),
+    }
+}
+
 fn scalar_method(
     ctx: &mut Context,
     base: &TypedExpr,
@@ -2944,8 +3243,38 @@ fn scalar_method(
             _ => todo!("M7 optional tuples"),
         },
         QueryType::List(inner) => match name.value.as_str() {
-            "len" | "sum" | "avg" | "max" | "min" | "sum_over" | "avg_over" | "max_by"
-            | "min_by" => todo!("M5 aggregations: {}", name.value),
+            "len" => scalar_aggregate(ctx, base, AggOp::Len),
+            "sum" => scalar_aggregate(
+                ctx,
+                base,
+                AggOp::Bare(BareAgg::Sum, inner_scalar(inner, "sum")),
+            ),
+            "avg" => scalar_aggregate(
+                ctx,
+                base,
+                AggOp::Bare(BareAgg::Avg, inner_scalar(inner, "avg")),
+            ),
+            "max" => scalar_aggregate(
+                ctx,
+                base,
+                AggOp::Bare(BareAgg::Max, inner_scalar(inner, "max")),
+            ),
+            "min" => scalar_aggregate(
+                ctx,
+                base,
+                AggOp::Bare(BareAgg::Min, inner_scalar(inner, "min")),
+            ),
+            "sum_over" => {
+                let (ty, arg) = over_arg(ctx, args, name);
+                scalar_aggregate(ctx, base, AggOp::Over(OverAgg::Sum, ty, arg))
+            }
+            "avg_over" => {
+                let (ty, arg) = over_arg(ctx, args, name);
+                scalar_aggregate(ctx, base, AggOp::Over(OverAgg::Avg, ty, arg))
+            }
+            "max_by" | "min_by" => {
+                unreachable!("max_by/min_by return records: callers never enter scalar demand")
+            }
             "first" | "nth" => {
                 let mut level = rows(ctx, base);
                 if level.pending.is_some() {

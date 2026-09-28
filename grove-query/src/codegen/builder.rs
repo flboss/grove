@@ -117,6 +117,7 @@ pub enum SqlExpr {
         partition: Vec<SqlExpr>,
         order: Vec<OrderItem>,
     },
+    Count,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
