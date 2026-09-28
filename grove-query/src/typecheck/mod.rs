@@ -694,6 +694,15 @@ fn infer_method(
         _ => signature.return_type,
     };
 
+    let return_ty = match (name.value.as_str(), return_ty) {
+        ("avg", QueryType::Optional(inner)) | ("avg_over", QueryType::Optional(inner))
+            if matches!(inner.as_ref(), QueryType::Scalar(ScalarType::Int)) =>
+        {
+            QueryType::Scalar(ScalarType::Float).wrap_optional()
+        }
+        (_, ty) => ty,
+    };
+
     let return_ty = if optional {
         return_ty.wrap_optional()
     } else {
@@ -1113,7 +1122,12 @@ fn method_signature(base: &QueryType, method: &str) -> Option<MethodSig> {
                 MethodSig::scoped_fixed(QueryType::List(inner.clone()), 1, QueryType::is_bool),
             ),
             "sum" if inner.is_summable() => Some(MethodSig::no_args(inner.clone().wrap_optional())),
-            "avg" if inner.is_summable() => Some(MethodSig::no_args(inner.clone().wrap_optional())),
+            "avg"
+                if inner.is_summable()
+                    || matches!(inner.as_ref(), QueryType::Scalar(ScalarType::Instant)) =>
+            {
+                Some(MethodSig::no_args(inner.clone().wrap_optional()))
+            }
             "max" | "min" if inner.has_defined_order() => {
                 Some(MethodSig::no_args(inner.clone().wrap_optional()))
             }
@@ -1128,7 +1142,7 @@ fn method_signature(base: &QueryType, method: &str) -> Option<MethodSig> {
             )),
             "sum_over" | "avg_over" if matches!(inner.as_ref(), QueryType::Record(_)) => {
                 Some(MethodSig::scoped_fixed(
-                    QueryType::Unknown.wrap_optional(),
+                    QueryType::Unknown,
                     1,
                     QueryType::is_summable,
                 ))
