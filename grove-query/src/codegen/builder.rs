@@ -62,6 +62,11 @@ pub enum FromClause {
         name: String,
         columns: Vec<String>,
     },
+    Literal {
+        module: String,
+        id: String,
+        columns: Vec<String>,
+    },
 }
 
 impl FromClause {
@@ -70,6 +75,7 @@ impl FromClause {
             FromClause::Table { alias, .. } | FromClause::Subquery { alias, .. } => alias,
             FromClause::TableFunction { name } => name,
             FromClause::Temp { name, .. } => name,
+            FromClause::Literal { id, .. } => id,
         }
     }
 }
@@ -172,6 +178,12 @@ impl AliasGen {
 
     pub fn temp(&mut self) -> String {
         self.generate("split")
+    }
+
+    pub fn literal(&mut self) -> String {
+        let id = format!("lit{}", self.next);
+        self.next += 1;
+        id
     }
 }
 

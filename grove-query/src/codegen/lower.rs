@@ -161,7 +161,7 @@ pub fn rows(ctx: &mut Context, expr: &TypedExpr) -> Level {
             optional,
         } => rows_method(ctx, base, name, args, *optional),
         TypedExprKind::Projection { base, items } => rows_projection(ctx, base, items),
-        TypedExprKind::Array { .. } => todo!("M6 array literals"),
+        TypedExprKind::Array { .. } => return rows_array(ctx, expr),
         TypedExprKind::Tuple { .. } => todo!("M7 tuples"),
         TypedExprKind::Struct { .. } => todo!("M7 record literals"),
         TypedExprKind::If { .. } => todo!("M7 if-unions"),
@@ -492,6 +492,23 @@ fn merge_builder(
         output: parent_col,
     }];
     let mut child = SelectBuilder::new();
+    if let FromClause::Literal { columns, .. } = &child_from {
+        child.select = columns
+            .iter()
+            .filter(|c| *c != &child_col)
+            .enumerate()
+            .map(|(i, column)| SelectItem::Column {
+                depth: 0,
+                column: column.clone(),
+                output: format!("c{i}"),
+            })
+            .collect();
+        if child.select.is_empty() {
+            unreachable!(
+                "merge over a key-only literal level: the depth guard keeps merges on leaves"
+            );
+        }
+    }
     child.from = Some(child_from);
     child.where_ = vec![SqlExpr::InSubquery {
         expr: Box::new(SqlExpr::Column {
@@ -1313,6 +1330,7 @@ fn shift_builder(mut builder: SelectBuilder, by: usize) -> SelectBuilder {
         builder.from = Some(match from {
             FromClause::Table { .. } | FromClause::TableFunction { .. } => from,
             FromClause::Temp { .. } => from,
+            FromClause::Literal { .. } => from,
             FromClause::Subquery { query, alias } => FromClause::Subquery {
                 query: Box::new(shift_builder(*query, by)),
                 alias,
@@ -1353,6 +1371,7 @@ fn available_cols(builder: &SelectBuilder, schema: &ValidatedSchema) -> Vec<Stri
                 .unwrap_or_default(),
             Some(FromClause::Subquery { query, .. }) => available_cols(query, schema),
             Some(FromClause::Temp { columns, .. }) => columns.clone(),
+            Some(FromClause::Literal { columns, .. }) => columns.clone(),
             Some(FromClause::TableFunction { .. }) => vec!["value".to_string()],
             None => Vec::new(),
         };
@@ -1776,6 +1795,51 @@ fn rvalue_shape(
     }
     if !keyed && tail_uses_outer(tail) {
         return rcross_shape(ctx, parent, tail, Cardinality::Many);
+    }
+    if array_tail_root(tail) {
+        if tail_uses_outer(tail) || take_bound_ident(tail) {
+            todo!("M6 correlated literal projection item");
+        }
+        let mut lit = rows(ctx, tail);
+        if lit.pending.is_some() {
+            todo!("M6 nested literal projection item");
+        }
+        if lit.builder.select.is_empty() {
+            lit.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+        }
+        let outputs = builder_outputs(&lit.builder, ctx.schema);
+        let shape_cols: Vec<OutputColumn> = outputs
+            .iter()
+            .map(|name| OutputColumn {
+                name: name.clone(),
+                role: ColumnRole::Value,
+                ty: None,
+            })
+            .collect();
+        let element = ResultShape::Record(
+            outputs
+                .iter()
+                .map(|name| (name.clone(), ResultShape::Column(name.clone())))
+                .collect(),
+        );
+        let idx = ctx.sink(
+            lit.builder,
+            StatementShape {
+                columns: shape_cols,
+                rows: RowCount::Many,
+            },
+            StatementKind::Query,
+        );
+        let shape = ResultShape::List {
+            element: Box::new(element),
+            child: ChildRef {
+                stmt: idx,
+                parent: None,
+                cardinality: Cardinality::Many,
+                tag: None,
+            },
+        };
+        return (shape, None);
     }
     let (child_from, child_col, parent_key) = match tail_root_ident(tail) {
         Some(IdentBinding::Field(fid)) => {
@@ -2240,7 +2304,7 @@ pub fn lower_query(ctx: &mut Context, result: &TypedExpr) -> RootPlan {
         };
     }
     if matches!(result.ty, QueryType::Tuple(_)) {
-        todo!("M7 tuple results");
+        return lower_tuple_result(ctx, result);
     }
     let level = rows(ctx, result);
     finalize_level(ctx, level)
@@ -2395,6 +2459,7 @@ fn from_columns(from: &Option<FromClause>, schema: &ValidatedSchema) -> Vec<Stri
         Some(FromClause::Subquery { query, .. }) => builder_outputs(query, schema),
         Some(FromClause::TableFunction { .. }) => vec!["value".to_string()],
         Some(FromClause::Temp { columns, .. }) => columns.clone(),
+        Some(FromClause::Literal { columns, .. }) => columns.clone(),
         None => unreachable!("row pipeline without FROM"),
     }
 }
@@ -2885,15 +2950,7 @@ fn scalar_literal(lit: &Literal) -> SqlExpr {
 }
 
 fn scalar_constant(ty: TypeName, name: ConstantName) -> SqlExpr {
-    let value = match (ty, name) {
-        (TypeName::Int, ConstantName::Min) => ParamValue::Int(i64::MIN),
-        (TypeName::Int, ConstantName::Max) => ParamValue::Int(i64::MAX),
-        (TypeName::Float, ConstantName::Min) => ParamValue::Float(f64::MIN),
-        (TypeName::Float, ConstantName::Max) => ParamValue::Float(f64::MAX),
-        (TypeName::Dec, ConstantName::Min) => ParamValue::Dec(rust_decimal::Decimal::MIN),
-        (TypeName::Dec, ConstantName::Max) => ParamValue::Dec(rust_decimal::Decimal::MAX),
-    };
-    SqlExpr::Param(value)
+    SqlExpr::Param(const_value(ty, name))
 }
 
 fn scalar_ident(ctx: &mut Context, binding: &IdentBinding, depth: usize) -> SqlExpr {
@@ -3045,6 +3102,15 @@ fn scalar_list_col(ctx: &mut Context, base: &TypedExpr) -> String {
         {
             scalar_list_col(ctx, base)
         }
+        TypedExprKind::Array { .. } => match &base.ty {
+            QueryType::List(inner) if matches!(peel_optional(inner), QueryType::Scalar(_)) => {
+                "c0".to_string()
+            }
+            _ => unreachable!(
+                "reduction over non-scalar literal {}: the checker restricts sum/avg/max/min to scalar inners",
+                base.ty
+            ),
+        },
         _ => todo!("M4b scalar aggregation over derived rows"),
     }
 }
@@ -3340,6 +3406,51 @@ fn one_arg<'a>(args: &'a [TypedMethodArg], name: &grove_types::Spanned<String>) 
 fn contains_exists(ctx: &mut Context, base: &TypedExpr, needle: &TypedExpr) -> SqlExpr {
     if !needle.ty.is_scalar() {
         todo!("comparison-overhaul: tuple membership");
+    }
+    if let TypedExprKind::Array { elements } = &base.kind {
+        let inner = match &base.ty {
+            QueryType::List(inner) => inner.as_ref(),
+            _ => unreachable!(
+                "non-list array type {}: the checker types arrays as lists",
+                base.ty
+            ),
+        };
+        match peel_optional(inner) {
+            QueryType::Scalar(_) => {
+                let items: Vec<(&TypedExpr, Option<i64>)> =
+                    elements.iter().map(|e| (e, None)).collect();
+                let (this, child) = register_literal_level(ctx, inner, items);
+                debug_assert!(
+                    child.is_none(),
+                    "scalar-literal contains over a branch: the H1 arm owns nested membership"
+                );
+                let mut query = SelectBuilder::new();
+                query.from = Some(this.to_from_clause());
+                query.select = vec![SelectItem::AllFrom { depth: 0 }];
+                query.where_ = vec![SqlExpr::Binary {
+                    op: SqlBinOp::Eq,
+                    lhs: Box::new(SqlExpr::Column {
+                        depth: 0,
+                        column: "c0".to_string(),
+                    }),
+                    rhs: Box::new(scalar(ctx, needle)),
+                }];
+                return SqlExpr::Exists(Box::new(query));
+            }
+            QueryType::Tuple(_) => todo!("comparison-overhaul: tuple membership"),
+            QueryType::Record(_) => todo!("comparison-overhaul: record membership"),
+            QueryType::List(_) => {
+                unreachable!("nested literal contains: the H1 nested-membership arm fires first")
+            }
+            QueryType::Unknown => {
+                unreachable!(
+                    "un-unified literal contains: the checker rejects it with AmbiguousType"
+                )
+            }
+            QueryType::Optional(_) | QueryType::Void => {
+                unreachable!("impossible contains base {inner}: no checker rule produces it")
+            }
+        }
     }
     let fid = match &base.kind {
         TypedExprKind::Ident {
@@ -3701,5 +3812,333 @@ fn scalar_cast(operand: SqlExpr, from: &QueryType, target: TypeName) -> SqlExpr 
                 .to_string(),
             )),
         ],
+    }
+}
+
+
+struct LitLevel {
+    id: String,
+    module: String,
+    columns: Vec<String>,
+}
+
+impl LitLevel {
+    fn to_from_clause(&self) -> FromClause {
+        FromClause::Literal {
+            module: self.module.clone(),
+            id: self.id.clone(),
+            columns: self.columns.clone(),
+        }
+    }
+}
+
+fn sig_letter(s: ScalarType) -> char {
+    match s {
+        ScalarType::Int | ScalarType::Bool => 'I',
+        ScalarType::Float => 'F',
+        ScalarType::String => 'T',
+        ScalarType::Dec | ScalarType::Instant | ScalarType::Duration => 'B',
+    }
+}
+
+fn peel_optional(ty: &QueryType) -> &QueryType {
+    match ty {
+        QueryType::Optional(inner) => inner.as_ref(),
+        other => other,
+    }
+}
+
+fn peel_some(elem: &TypedExpr) -> &TypedExpr {
+    match &elem.kind {
+        TypedExprKind::Some { value } => value.as_ref(),
+        _ => elem,
+    }
+}
+
+fn literal_depth(inner: &QueryType) -> usize {
+    match peel_optional(inner) {
+        QueryType::Scalar(_) | QueryType::Tuple(_) => 1,
+        QueryType::List(sub) => 1 + literal_depth(sub),
+        QueryType::Record(_) => todo!("M7 record literal element"),
+        QueryType::Unknown => {
+            unreachable!("un-unified literal element: the checker rejects it with AmbiguousType")
+        }
+        QueryType::Optional(_) | QueryType::Void => {
+            unreachable!("impossible literal element type {inner}: no checker rule produces it")
+        }
+    }
+}
+
+fn leaf_value_tys(inner: &QueryType) -> Vec<ScalarType> {
+    match peel_optional(inner) {
+        QueryType::Scalar(s) => vec![*s],
+        QueryType::Tuple(tys) => tys
+            .iter()
+            .map(|t| match peel_optional(t) {
+                QueryType::Scalar(s) => *s,
+                QueryType::List(_) => todo!("M7 tuple with list element"),
+                QueryType::Record(_) => todo!("M7 tuple with record element"),
+                QueryType::Unknown => unreachable!(
+                    "un-unified tuple element: the checker rejects it with AmbiguousType"
+                ),
+                QueryType::Tuple(_) | QueryType::Optional(_) | QueryType::Void => {
+                    unreachable!("impossible tuple element type {t}: no checker rule produces it")
+                }
+            })
+            .collect(),
+        _ => {
+            unreachable!("leaf_value_tys on non-leaf {inner}: callers dispatch on the peeled type")
+        }
+    }
+}
+
+fn fold_static(elem: &TypedExpr) -> ParamValue {
+    match &elem.kind {
+        TypedExprKind::Literal(lit) => match &lit.value {
+            Literal::Int(n) => ParamValue::Int(*n),
+            Literal::Float(f) => ParamValue::Float(*f),
+            Literal::Dec(d) => ParamValue::Dec(*d),
+            Literal::String(s) => ParamValue::String(s.clone()),
+            Literal::Bool(b) => ParamValue::Bool(*b),
+            Literal::Instant(t) => ParamValue::Instant(*t),
+            Literal::Duration(d) => ParamValue::Duration(*d),
+            Literal::None => ParamValue::Null,
+            Literal::Now | Literal::Today(_) => todo!("M6 computed array elements"),
+        },
+        TypedExprKind::TypeConstant { ty, name } => const_value(ty.value, name.value),
+        TypedExprKind::Unary { op, expr } => match op.value {
+            UnaryOp::Neg => match fold_static(expr) {
+                ParamValue::Int(n) => ParamValue::Int(
+                    n.checked_neg()
+                        .unwrap_or_else(|| todo!("M6 negated literal overflow")),
+                ),
+                ParamValue::Float(f) => ParamValue::Float(-f),
+                ParamValue::Dec(d) => ParamValue::Dec(-d),
+                ParamValue::Duration(d) => ParamValue::Duration(
+                    d.checked_mul(-1)
+                        .unwrap_or_else(|| todo!("M6 negated literal overflow")),
+                ),
+                _ => todo!("M6 computed array elements"),
+            },
+            UnaryOp::Not => match fold_static(expr) {
+                ParamValue::Bool(b) => ParamValue::Bool(!b),
+                _ => todo!("M6 computed array elements"),
+            },
+        },
+        TypedExprKind::Some { value } => fold_static(value),
+        _ => todo!("M6 computed array elements"),
+    }
+}
+
+fn const_value(ty: TypeName, name: ConstantName) -> ParamValue {
+    match (ty, name) {
+        (TypeName::Int, ConstantName::Min) => ParamValue::Int(i64::MIN),
+        (TypeName::Int, ConstantName::Max) => ParamValue::Int(i64::MAX),
+        (TypeName::Float, ConstantName::Min) => ParamValue::Float(f64::MIN),
+        (TypeName::Float, ConstantName::Max) => ParamValue::Float(f64::MAX),
+        (TypeName::Dec, ConstantName::Min) => ParamValue::Dec(rust_decimal::Decimal::MIN),
+        (TypeName::Dec, ConstantName::Max) => ParamValue::Dec(rust_decimal::Decimal::MAX),
+    }
+}
+
+fn leaf_cells(elem: &TypedExpr, inner: &QueryType, width: usize) -> Vec<ParamValue> {
+    let node = peel_some(elem);
+    if let TypedExprKind::Literal(lit) = &node.kind
+        && matches!(&lit.value, Literal::None)
+    {
+        return vec![ParamValue::Null; width];
+    }
+    match peel_optional(inner) {
+        QueryType::Tuple(_) => match &node.kind {
+            TypedExprKind::Tuple { elements } => elements.iter().map(fold_static).collect(),
+            _ => todo!("M6 computed array elements"),
+        },
+        _ => vec![fold_static(node)],
+    }
+}
+
+fn register_literal_level<'a>(
+    ctx: &mut Context,
+    inner: &QueryType,
+    items: Vec<(&'a TypedExpr, Option<i64>)>,
+) -> (LitLevel, Option<LitLevel>) {
+    match peel_optional(inner) {
+        QueryType::List(sub) => {
+            let keyed = items.first().is_some_and(|(_, p)| p.is_some());
+            let columns: Vec<String> = if keyed {
+                vec!["c0".to_string(), "c1".to_string()]
+            } else {
+                vec!["c0".to_string()]
+            };
+            let module = if keyed {
+                "$$lit_2_II".to_string()
+            } else {
+                "$$lit_1_I".to_string()
+            };
+            let id = ctx.aliases.literal();
+            let mut child_items: Vec<(&'a TypedExpr, Option<i64>)> = Vec::new();
+            let mut grid: Vec<Vec<ParamValue>> = Vec::with_capacity(items.len());
+            for (i, (elem, pkey)) in items.iter().enumerate() {
+                let key = i as i64;
+                match &peel_some(elem).kind {
+                    TypedExprKind::Array { elements } => {
+                        child_items.extend(elements.iter().map(|e| (e, Some(key))));
+                    }
+                    TypedExprKind::Literal(lit) if matches!(&lit.value, Literal::None) => {}
+                    _ => todo!("M6 query-valued array element"),
+                }
+                let mut row = Vec::with_capacity(2);
+                if let Some(p) = pkey {
+                    row.push(ParamValue::Int(*p));
+                }
+                row.push(ParamValue::Int(key));
+                grid.push(row);
+            }
+            ctx.literals.insert(id.clone(), grid);
+            let this = LitLevel {
+                id,
+                module,
+                columns,
+            };
+            let (child, grandchild) = register_literal_level(ctx, sub, child_items);
+            debug_assert!(
+                grandchild.is_none(),
+                "branch child registered its own child: the depth guard excludes depth-3 literals"
+            );
+            (this, Some(child))
+        }
+        _ => {
+            let value_tys = leaf_value_tys(inner);
+            if value_tys.is_empty() {
+                todo!("M6 empty tuple literal");
+            }
+            let keyed = items.first().is_some_and(|(_, p)| p.is_some());
+            let width = value_tys.len() + usize::from(keyed);
+            let columns: Vec<String> = (0..width).map(|i| format!("c{i}")).collect();
+            let mut sig = String::with_capacity(width);
+            if keyed {
+                sig.push('I');
+            }
+            for ty in &value_tys {
+                sig.push(sig_letter(*ty));
+            }
+            let module = format!("$$lit_{width}_{sig}");
+            let id = ctx.aliases.literal();
+            let grid: Vec<Vec<ParamValue>> = items
+                .iter()
+                .map(|(elem, pkey)| {
+                    let mut row = Vec::with_capacity(width);
+                    if let Some(p) = pkey {
+                        row.push(ParamValue::Int(*p));
+                    }
+                    row.extend(leaf_cells(elem, inner, value_tys.len()));
+                    row
+                })
+                .collect();
+            ctx.literals.insert(id.clone(), grid);
+            (
+                LitLevel {
+                    id,
+                    module,
+                    columns,
+                },
+                None,
+            )
+        }
+    }
+}
+
+fn rows_array(ctx: &mut Context, expr: &TypedExpr) -> Level {
+    let TypedExprKind::Array { elements } = &expr.kind else {
+        unreachable!("rows_array on non-array node: callers dispatch on node kind")
+    };
+    let inner = match &expr.ty {
+        QueryType::List(inner) => inner.as_ref(),
+        QueryType::Optional(_) => todo!("M4b presence: optional list in row demand"),
+        _ => unreachable!(
+            "non-list array type {}: the checker types arrays as lists",
+            expr.ty
+        ),
+    };
+    if literal_depth(inner) > 2 {
+        todo!("M6 deeply nested array literal");
+    }
+    let items: Vec<(&TypedExpr, Option<i64>)> = elements.iter().map(|e| (e, None)).collect();
+    let (this, child) = register_literal_level(ctx, inner, items);
+    let mut builder = SelectBuilder::new();
+    builder.from = Some(this.to_from_clause());
+    Level {
+        builder,
+        element: expr.ty.clone(),
+        parent: ParentLink::Root { root_idx: 0 },
+        pending: child.map(|c| PendingSplit {
+            child_from: c.to_from_clause(),
+            child_col: "c0".to_string(),
+            parent_col: "c0".to_string(),
+            multi_parent: true,
+        }),
+        stmt_bound: true,
+        output_shapes: None,
+    }
+}
+
+fn array_tail_root(mut tail: &TypedExpr) -> bool {
+    loop {
+        match &tail.kind {
+            TypedExprKind::Field { base, .. }
+            | TypedExprKind::Method { base, .. }
+            | TypedExprKind::Projection { base, .. } => tail = base,
+            TypedExprKind::Array { .. } => return true,
+            _ => return false,
+        }
+    }
+}
+
+fn lower_tuple_result(ctx: &mut Context, result: &TypedExpr) -> RootPlan {
+    let TypedExprKind::Tuple { elements } = &result.kind else {
+        todo!("M7 non-literal tuple result")
+    };
+    let QueryType::Tuple(tys) = &result.ty else {
+        unreachable!(
+            "tuple node with non-tuple type {}: the checker types tuples as tuples",
+            result.ty
+        )
+    };
+    if elements.len() != tys.len() {
+        unreachable!("tuple arity drift: the checker unifies tuple arity");
+    }
+    let mut select = Vec::with_capacity(elements.len());
+    let mut shape_cols = Vec::with_capacity(elements.len());
+    let mut tuple = Vec::with_capacity(elements.len());
+    for (i, (elem, ty)) in elements.iter().zip(tys.iter()).enumerate() {
+        if !elem.ty.is_scalar() || !ty.is_scalar() {
+            todo!("M7 tuple with list/record element result");
+        }
+        let output = format!("c{i}");
+        select.push(SelectItem::Expr {
+            expr: scalar(ctx, elem),
+            output: output.clone(),
+        });
+        shape_cols.push(OutputColumn {
+            name: output.clone(),
+            role: ColumnRole::Value,
+            ty: None,
+        });
+        tuple.push(ResultShape::Column(output));
+    }
+    RootPlan {
+        builder: SelectBuilder {
+            select,
+            from: None,
+            where_: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        },
+        shape: StatementShape {
+            columns: shape_cols,
+            rows: RowCount::One,
+        },
+        result: ResultShape::Tuple(tuple),
     }
 }

@@ -345,6 +345,7 @@ fn query_codegen(query_path: &PathBuf, schema_path: &PathBuf, raw: bool) {
         println!("shape: {:#?}", stmt.shape);
     }
     println!("result: {:#?}", compiled.result);
+    println!("literals: {:#?}", compiled.literals);
 }
 
 fn schema_parse(path: &PathBuf, raw: bool) {

@@ -120,6 +120,12 @@ fn render_from(
             sql.push_str(" AS ");
             sql.push_str(&quote(name));
         }
+        FromClause::Literal { module, id, .. } => {
+            sql.push_str(&quote(module));
+            sql.push_str("('");
+            sql.push_str(id);
+            sql.push_str("')");
+        }
     }
 }
 
