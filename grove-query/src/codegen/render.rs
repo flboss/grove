@@ -56,6 +56,10 @@ pub fn render_select(
             render_expr(cond, stack, true, sql, params);
         }
     }
+    for union in &builder.unions {
+        sql.push_str(" UNION ALL ");
+        render_select(union, stack, sql, params);
+    }
     if !builder.order_by.is_empty() {
         sql.push_str(" ORDER BY ");
         for (i, item) in builder.order_by.iter().enumerate() {
@@ -333,6 +337,7 @@ mod tests {
             }],
             limit: Some(SqlExpr::Param(ParamValue::Int(10))),
             offset: None,
+            unions: Vec::new(),
         }
     }
 
@@ -433,6 +438,7 @@ mod tests {
             order_by: vec![],
             limit: None,
             offset: None,
+            unions: Vec::new(),
         };
         let expr = SqlExpr::Subquery {
             query: Box::new(inner),
@@ -464,6 +470,7 @@ mod tests {
             order_by: vec![],
             limit: None,
             offset: None,
+            unions: Vec::new(),
         };
         let expr = SqlExpr::InSubquery {
             expr: Box::new(SqlExpr::Column {

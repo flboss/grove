@@ -80,6 +80,7 @@ pub struct PendingSplit {
     pub child_col: String,
     pub parent_col: String,
     pub multi_parent: bool,
+    pub next: Option<Box<PendingSplit>>,
 }
 
 pub struct Level {
@@ -162,9 +163,9 @@ pub fn rows(ctx: &mut Context, expr: &TypedExpr) -> Level {
         } => rows_method(ctx, base, name, args, *optional),
         TypedExprKind::Projection { base, items } => rows_projection(ctx, base, items),
         TypedExprKind::Array { .. } => return rows_array(ctx, expr),
+        TypedExprKind::If { .. } => return rows_if(ctx, expr),
         TypedExprKind::Tuple { .. } => todo!("M7 tuples"),
         TypedExprKind::Struct { .. } => todo!("M7 record literals"),
-        TypedExprKind::If { .. } => todo!("M7 if-unions"),
         TypedExprKind::Some { .. } => todo!("M4b presence: some() in row demand"),
         TypedExprKind::Literal(_)
         | TypedExprKind::TypeConstant { .. }
@@ -287,7 +288,17 @@ fn rows_field(
             match field {
                 Field::Value { columns, .. } => {
                     let [column] = columns.as_slice() else {
-                        todo!("M7 tuple-valued field in row demand")
+                        if level.pending.is_some() {
+                            todo!("M7 tuple field over nested rows");
+                        }
+                        for column in columns {
+                            level.builder.select.push(SelectItem::Column {
+                                depth: 0,
+                                column: ctx.schema.column_name(*column).to_string(),
+                                output: ctx.schema.column_name(*column).to_string(),
+                            });
+                        }
+                        return level;
                     };
                     level.builder.select.push(SelectItem::Column {
                         depth: 0,
@@ -346,13 +357,16 @@ fn rows_field(
 
 fn navigate_ref(
     ctx: &mut Context,
-    level: Level,
+    mut level: Level,
     multi_parent: bool,
     fid: FieldId,
     target: StructId,
     is_list: bool,
     field_optional: bool,
 ) -> Level {
+    if !level.builder.unions.is_empty() {
+        level = wrap_level(ctx, level);
+    }
     let table = ctx.schema.tables[ctx.schema.structs[target.index()].table.index()]
         .name
         .clone();
@@ -395,6 +409,7 @@ fn navigate_ref(
                 child_col,
                 parent_col,
                 multi_parent,
+                next: None,
             }),
             stmt_bound,
             output_shapes,
@@ -406,12 +421,15 @@ fn navigate_ref(
 
 fn navigate_array(
     ctx: &mut Context,
-    level: Level,
+    mut level: Level,
     element: &grove_schema::validated::ValueType,
     link: grove_schema::validated::ColumnId,
     storage: &grove_schema::validated::StorageTable,
 ) -> Level {
     use grove_schema::validated::ValueType;
+    if !level.builder.unions.is_empty() {
+        level = wrap_level(ctx, level);
+    }
     let table = ctx.schema.tables[storage.table.index()].name.clone();
     let child_from = FromClause::Table {
         table: table.clone(),
@@ -442,6 +460,7 @@ fn navigate_array(
                     child_col,
                     parent_col,
                     multi_parent: true,
+                    next: None,
                 }),
                 stmt_bound,
                 output_shapes,
@@ -637,9 +656,12 @@ fn rows_method(
                     child_from,
                     child_col,
                     parent_col,
+                    next,
                     ..
                 } = pending;
-                merge_navigate(ctx, child_from, child_col, level, parent_col)
+                let mut level = merge_navigate(ctx, child_from, child_col, level, parent_col);
+                level.pending = next.map(|boxed| *boxed);
+                level
             }
             None => {
                 unreachable!("flatten over flat list is rejected upstream (strict sig)")
@@ -701,6 +723,7 @@ fn needs_wrap(level: &Level) -> bool {
     level.builder.limit.is_some()
         || level.builder.offset.is_some()
         || !level.builder.select.is_empty()
+        || !level.builder.unions.is_empty()
 }
 
 fn wrap_level(ctx: &mut Context, level: Level) -> Level {
@@ -970,6 +993,146 @@ fn window_wrap(ctx: &mut Context, level: Level, fk: &str, order: Vec<OrderItem>)
     wrap_level(ctx, level)
 }
 
+fn lower_value(
+    ctx: &mut Context,
+    parent: &mut Level,
+    prefix: String,
+    value: &TypedExpr,
+) -> (Vec<SelectItem>, ResultShape, Vec<String>) {
+    if value.ty.is_scalar() {
+        let item = match scalar(ctx, value) {
+            SqlExpr::Column { depth, column } => SelectItem::Column {
+                depth,
+                column,
+                output: prefix.clone(),
+            },
+            expr => SelectItem::Expr {
+                expr,
+                output: prefix.clone(),
+            },
+        };
+        return (vec![item], ResultShape::Column(prefix), Vec::new());
+    }
+    if let TypedExprKind::Struct { fields } = &value.kind {
+        let QueryType::Record(RecordSource::Projection(_)) = &value.ty else {
+            unreachable!(
+                "struct literal with non-projection type {}: the checker infers anonymous records",
+                value.ty
+            )
+        };
+        let mut select = Vec::new();
+        let mut record = Vec::with_capacity(fields.len());
+        let mut keys = Vec::new();
+        for (name, field) in fields {
+            let (mut sub_select, sub_shape, mut sub_keys) =
+                lower_value(ctx, parent, format!("{prefix}_{}", name.value), field);
+            select.append(&mut sub_select);
+            record.push((name.value.clone(), sub_shape));
+            keys.append(&mut sub_keys);
+        }
+        return (select, ResultShape::Record(record), keys);
+    }
+    match &value.ty {
+        QueryType::List(_) => {
+            if ctx.child.is_some() {
+                todo!("M4b nested list item");
+            }
+            let (shape, parent_key) = rvalue_shape(ctx, parent, value);
+            (Vec::new(), shape, parent_key.into_iter().collect())
+        }
+        QueryType::Record(_) => {
+            if ctx.child.is_some() {
+                todo!("M4b nested record item");
+            }
+            if matches!(value.kind, TypedExprKind::If { .. }) {
+                todo!("M7 If over records");
+            }
+            let (shape, parent_key) = rscalar_shape(ctx, parent, value);
+            (Vec::new(), shape, parent_key.into_iter().collect())
+        }
+        QueryType::Optional(inner) => match inner.as_ref() {
+            QueryType::Record(_) => {
+                if ctx.child.is_some() {
+                    todo!("M4b nested record item");
+                }
+                if matches!(value.kind, TypedExprKind::If { .. }) {
+                    todo!("M7 If over records");
+                }
+                let (shape, parent_key) = rscalar_shape(ctx, parent, value);
+                (Vec::new(), shape, parent_key.into_iter().collect())
+            }
+            QueryType::List(_) => todo!("M4b presence: optional list item"),
+            _ => todo!("M4b exotic optional item"),
+        },
+        QueryType::Tuple(tys) => {
+            if let TypedExprKind::Ident {
+                binding: IdentBinding::Field(fid),
+                depth,
+                ..
+            } = &value.kind
+            {
+                let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
+                match field {
+                    Field::Value { columns, .. } => {
+                        if columns.len() != tys.len() || tys.iter().any(|t| !t.is_scalar()) {
+                            todo!("M7 schema tuple with collection element");
+                        }
+                        let mut select = Vec::with_capacity(columns.len());
+                        let mut shapes = Vec::with_capacity(columns.len());
+                        for (i, column) in columns.iter().enumerate() {
+                            let output = format!("{prefix}_c{i}");
+                            select.push(SelectItem::Column {
+                                depth: *depth,
+                                column: ctx.schema.column_name(*column).to_string(),
+                                output: output.clone(),
+                            });
+                            shapes.push(ResultShape::Column(output));
+                        }
+                        return (select, ResultShape::Tuple(shapes), Vec::new());
+                    }
+                    _ => unreachable!("tuple-typed non-value field: schema tuples are value-typed"),
+                }
+            }
+            let TypedExprKind::Tuple { elements } = &value.kind else {
+                if let TypedExprKind::If { arms, default } = &value.kind {
+                    match distribute_if_tuple(arms, default, tys, value.span, value.ty.clone()) {
+                        Some(synthetic) => {
+                            return lower_value(ctx, parent, prefix, &synthetic);
+                        }
+                        None => todo!("M7 non-literal tuple value"),
+                    }
+                }
+                if let TypedExprKind::Method {
+                    base, name, args, ..
+                } = &value.kind
+                    && ["first", "nth"].contains(&name.value.as_str())
+                {
+                    return collapse_tuple_method(ctx, prefix, base, name, args, tys);
+                }
+                todo!("M7 non-literal tuple value")
+            };
+            if elements.len() != tys.len() {
+                unreachable!("tuple arity drift: the checker unifies tuple arity");
+            }
+            let mut select = Vec::new();
+            let mut shapes = Vec::with_capacity(elements.len());
+            let mut keys = Vec::new();
+            for (i, elem) in elements.iter().enumerate() {
+                let (mut sub_select, sub_shape, mut sub_keys) =
+                    lower_value(ctx, parent, format!("{prefix}_c{i}"), elem);
+                select.append(&mut sub_select);
+                shapes.push(sub_shape);
+                keys.append(&mut sub_keys);
+            }
+            (select, ResultShape::Tuple(shapes), keys)
+        }
+        QueryType::Void | QueryType::Unknown => {
+            unreachable!("void/unknown value: the checker excludes them")
+        }
+        _ => unreachable!("scalar values match the first arm"),
+    }
+}
+
 fn rows_projection(ctx: &mut Context, base: &TypedExpr, items: &[TypedProjectionItem]) -> Level {
     let mut level = rows(ctx, base);
     if level.pending.is_some() {
@@ -980,63 +1143,19 @@ fn rows_projection(ctx: &mut Context, base: &TypedExpr, items: &[TypedProjection
     let mut parent_keys: Vec<String> = Vec::new();
     for item in items {
         let alias = item.alias.value.clone();
-        match &item.value.ty {
-            ty if ty.is_scalar() => {
-                match scalar(ctx, &item.value) {
-                    SqlExpr::Column { depth, column } => select.push(SelectItem::Column {
-                        depth,
-                        column,
-                        output: alias.clone(),
-                    }),
-                    expr => select.push(SelectItem::Expr {
-                        expr,
-                        output: alias.clone(),
-                    }),
-                }
-                fields.push((alias, None));
-            }
-            QueryType::List(_) => {
-                if ctx.child.is_some() {
-                    todo!("M4b nested list item");
-                }
-                let (shape, parent_key) = rvalue_shape(ctx, &mut level, &item.value);
-                fields.push((alias, Some(shape)));
-                if let Some(key) = parent_key {
-                    parent_keys.push(key);
-                }
-            }
-            QueryType::Record(_) => {
-                if ctx.child.is_some() {
-                    todo!("M4b nested record item");
-                }
-                let (shape, parent_key) = rscalar_shape(ctx, &mut level, &item.value);
-                fields.push((alias, Some(shape)));
-                if let Some(key) = parent_key {
-                    parent_keys.push(key);
-                }
-            }
-            QueryType::Optional(inner) => match inner.as_ref() {
-                QueryType::Record(_) => {
-                    if ctx.child.is_some() {
-                        todo!("M4b nested record item");
-                    }
-                    let (shape, parent_key) = rscalar_shape(ctx, &mut level, &item.value);
-                    fields.push((alias, Some(shape)));
-                    if let Some(key) = parent_key {
-                        parent_keys.push(key);
-                    }
-                }
-                QueryType::List(_) => todo!("M4b presence: optional list item"),
-                _ => todo!("M4b exotic optional item"),
+        let (mut item_select, shape, mut keys) =
+            lower_value(ctx, &mut level, alias.clone(), &item.value);
+        select.append(&mut item_select);
+        fields.push((
+            alias,
+            match shape {
+                ResultShape::Column(_) => None,
+                shape => Some(shape),
             },
-            QueryType::Tuple(_) => todo!("M7 tuples"),
-            QueryType::Void | QueryType::Unknown => {
-                unreachable!("void/unknown projection item: the checker excludes them")
-            }
-            _ => unreachable!("scalar items match the first arm"),
-        }
+        ));
+        parent_keys.append(&mut keys);
     }
-    if !level.builder.select.is_empty() {
+    if !level.builder.select.is_empty() || !level.builder.unions.is_empty() {
         level = wrap_level(ctx, level);
     }
     level.builder.select = select;
@@ -1326,6 +1445,11 @@ fn shift_builder(mut builder: SelectBuilder, by: usize) -> SelectBuilder {
     if let Some(offset) = builder.offset.take() {
         builder.offset = Some(shift_depths(offset, by));
     }
+    builder.unions = builder
+        .unions
+        .into_iter()
+        .map(|arm| shift_builder(arm, by))
+        .collect();
     if let Some(from) = builder.from.take() {
         builder.from = Some(match from {
             FromClause::Table { .. } | FromClause::TableFunction { .. } => from,
@@ -1353,10 +1477,14 @@ fn bulk_query() -> SelectBuilder {
         order_by: Vec::new(),
         limit: None,
         offset: None,
+        unions: Vec::new(),
     }
 }
 
 fn available_cols(builder: &SelectBuilder, schema: &ValidatedSchema) -> Vec<String> {
+    if builder.select.is_empty() && !builder.unions.is_empty() {
+        return union_outputs(builder, schema);
+    }
     if builder
         .select
         .iter()
@@ -1644,6 +1772,7 @@ fn rcross_shape(
                 order_by: Vec::new(),
                 limit: None,
                 offset: None,
+                unions: Vec::new(),
             };
             builder_outputs(&probe, ctx.schema)
         };
@@ -1657,6 +1786,7 @@ fn rcross_shape(
             order_by: Vec::new(),
             limit: None,
             offset: None,
+            unions: Vec::new(),
         };
         parent.stmt_bound = true;
         (temp, Some(idx))
@@ -1784,6 +1914,158 @@ fn cross_root_scan(ctx: &mut Context, tail: &TypedExpr) -> FromClause {
     }
 }
 
+fn collapse_tuple_method(
+    ctx: &mut Context,
+    prefix: String,
+    base: &TypedExpr,
+    name: &grove_types::Spanned<String>,
+    args: &[TypedMethodArg],
+    tys: &[QueryType],
+) -> (Vec<SelectItem>, ResultShape, Vec<String>) {
+    let mut level = rows(ctx, base);
+    if level.pending.is_some() {
+        todo!("M4b nested collapse in scalar slot");
+    }
+    compose_limit(&mut level.builder, &name.value, args, ctx);
+    if level.builder.select.is_empty() {
+        level.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+    }
+    let outputs = builder_outputs(&level.builder, ctx.schema);
+    if outputs.len() != tys.len() {
+        unreachable!("tuple-row width drift: tuple levels emit positions in order");
+    }
+    let mut select = Vec::with_capacity(outputs.len());
+    let mut shapes = Vec::with_capacity(outputs.len());
+    for (i, column) in outputs.iter().enumerate() {
+        let output = if prefix.is_empty() {
+            format!("c{i}")
+        } else {
+            format!("{prefix}_c{i}")
+        };
+        select.push(SelectItem::Expr {
+            expr: SqlExpr::Subquery {
+                query: Box::new(SelectBuilder {
+                    select: vec![SelectItem::Column {
+                        depth: 0,
+                        column: column.clone(),
+                        output: column.clone(),
+                    }],
+                    from: level.builder.from.clone(),
+                    where_: level.builder.where_.clone(),
+                    order_by: level.builder.order_by.clone(),
+                    limit: level.builder.limit.clone(),
+                    offset: level.builder.offset.clone(),
+                    unions: Vec::new(),
+                }),
+            },
+            output: output.clone(),
+        });
+        shapes.push(ResultShape::Column(output));
+    }
+    (select, ResultShape::Tuple(shapes), Vec::new())
+}
+
+fn if_broadcast_tail(tail: &TypedExpr) -> bool {
+    matches!(tail.kind, TypedExprKind::If { .. })
+        && !tail_uses_outer(tail)
+        && !has_scope_ident(tail)
+}
+
+fn sink_broadcast_tail(ctx: &mut Context, tail: &TypedExpr) -> (ResultShape, Option<String>) {
+    let mut root = rows(ctx, tail);
+    let hops = root.pending.take().map(drain_pending).unwrap_or_default();
+    if root.builder.select.is_empty() {
+        root.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+    }
+    let outputs = builder_outputs(&root.builder, ctx.schema);
+    let shape_cols: Vec<OutputColumn> = outputs
+        .iter()
+        .map(|name| OutputColumn {
+            name: name.clone(),
+            role: ColumnRole::Value,
+            ty: None,
+        })
+        .collect();
+    let root_creation = ctx.statements.len() + hops.len() + 1;
+    let inner = if hops.is_empty() {
+        ResultShape::Record(
+            outputs
+                .iter()
+                .map(|name| (name.clone(), ResultShape::Column(name.clone())))
+                .collect(),
+        )
+    } else {
+        nest_layers(sink_chain(ctx, &hops, root_creation))
+    };
+    let actual = ctx.sink(
+        root.builder,
+        StatementShape {
+            columns: shape_cols,
+            rows: RowCount::Many,
+        },
+        StatementKind::Query,
+    );
+    debug_assert_eq!(
+        actual, root_creation,
+        "broadcast root sank at an unexpected index: sink order changed"
+    );
+    let shape = ResultShape::List {
+        element: Box::new(inner),
+        child: ChildRef {
+            stmt: root_creation,
+            parent: None,
+            cardinality: Cardinality::Many,
+            tag: None,
+        },
+    };
+    (shape, None)
+}
+
+fn distribute_if_tuple(
+    arms: &[(TypedExpr, TypedExpr)],
+    default: &TypedExpr,
+    tys: &[QueryType],
+    span: grove_types::Span,
+    ty: QueryType,
+) -> Option<TypedExpr> {
+    let mut branch_elements: Vec<Vec<TypedExpr>> = Vec::with_capacity(arms.len() + 1);
+    for (_, body) in arms {
+        match &body.kind {
+            TypedExprKind::Tuple { elements } if elements.len() == tys.len() => {
+                branch_elements.push(elements.clone());
+            }
+            _ => return None,
+        }
+    }
+    match &default.kind {
+        TypedExprKind::Tuple { elements } if elements.len() == tys.len() => {
+            branch_elements.push(elements.clone());
+        }
+        _ => return None,
+    }
+    let mut elements = Vec::with_capacity(tys.len());
+    for (i, ty) in tys.iter().enumerate() {
+        let position_arms: Vec<(TypedExpr, TypedExpr)> = arms
+            .iter()
+            .zip(branch_elements.iter())
+            .map(|((cond, _), elements)| (cond.clone(), elements[i].clone()))
+            .collect();
+        let position_default = branch_elements[arms.len()][i].clone();
+        elements.push(TypedExpr {
+            kind: TypedExprKind::If {
+                arms: position_arms,
+                default: Box::new(position_default),
+            },
+            ty: ty.clone(),
+            span,
+        });
+    }
+    Some(TypedExpr {
+        kind: TypedExprKind::Tuple { elements },
+        ty,
+        span,
+    })
+}
 fn rvalue_shape(
     ctx: &mut Context,
     parent: &mut Level,
@@ -1797,49 +2079,16 @@ fn rvalue_shape(
         return rcross_shape(ctx, parent, tail, Cardinality::Many);
     }
     if array_tail_root(tail) {
-        if tail_uses_outer(tail) || take_bound_ident(tail) {
+        if tail_uses_outer(tail) || has_scope_ident(tail) {
             todo!("M6 correlated literal projection item");
         }
-        let mut lit = rows(ctx, tail);
-        if lit.pending.is_some() {
-            todo!("M6 nested literal projection item");
-        }
-        if lit.builder.select.is_empty() {
-            lit.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
-        }
-        let outputs = builder_outputs(&lit.builder, ctx.schema);
-        let shape_cols: Vec<OutputColumn> = outputs
-            .iter()
-            .map(|name| OutputColumn {
-                name: name.clone(),
-                role: ColumnRole::Value,
-                ty: None,
-            })
-            .collect();
-        let element = ResultShape::Record(
-            outputs
-                .iter()
-                .map(|name| (name.clone(), ResultShape::Column(name.clone())))
-                .collect(),
-        );
-        let idx = ctx.sink(
-            lit.builder,
-            StatementShape {
-                columns: shape_cols,
-                rows: RowCount::Many,
-            },
-            StatementKind::Query,
-        );
-        let shape = ResultShape::List {
-            element: Box::new(element),
-            child: ChildRef {
-                stmt: idx,
-                parent: None,
-                cardinality: Cardinality::Many,
-                tag: None,
-            },
-        };
-        return (shape, None);
+        return sink_broadcast_tail(ctx, tail);
+    }
+    if if_broadcast_tail(tail) {
+        return sink_broadcast_tail(ctx, tail);
+    }
+    if matches!(tail.kind, TypedExprKind::If { .. }) {
+        todo!("M7 correlated If item");
     }
     let (child_from, child_col, parent_key) = match tail_root_ident(tail) {
         Some(IdentBinding::Field(fid)) => {
@@ -2079,6 +2328,7 @@ fn temp_key_query(temp: &str) -> SelectBuilder {
         order_by: Vec::new(),
         limit: None,
         offset: None,
+        unions: Vec::new(),
     }
 }
 
@@ -2174,6 +2424,7 @@ fn rtemp_shape(
         order_by: Vec::new(),
         limit: None,
         offset: None,
+        unions: Vec::new(),
     };
     parent.stmt_bound = true;
     let outputs = builder_outputs(&child.builder, ctx.schema);
@@ -2306,6 +2557,13 @@ pub fn lower_query(ctx: &mut Context, result: &TypedExpr) -> RootPlan {
     if matches!(result.ty, QueryType::Tuple(_)) {
         return lower_tuple_result(ctx, result);
     }
+    if matches!(result.kind, TypedExprKind::If { .. }) && matches!(result.ty, QueryType::Record(_))
+    {
+        return lower_struct_result(ctx, result);
+    }
+    if matches!(result.kind, TypedExprKind::Struct { .. }) {
+        return lower_struct_result(ctx, result);
+    }
     let level = rows(ctx, result);
     finalize_level(ctx, level)
 }
@@ -2313,6 +2571,46 @@ pub fn lower_query(ctx: &mut Context, result: &TypedExpr) -> RootPlan {
 fn finalize_level(ctx: &mut Context, level: Level) -> RootPlan {
     if let Some(pending) = level.pending {
         return emit_split(ctx, level.builder, pending);
+    }
+    if matches!(level.element, QueryType::Tuple(_)) {
+        let mut builder = level.builder;
+        if builder.select.is_empty() {
+            builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+        }
+        let outputs = builder_outputs(&builder, ctx.schema);
+        let shape = StatementShape {
+            columns: outputs
+                .iter()
+                .map(|name| OutputColumn {
+                    name: name.clone(),
+                    role: ColumnRole::Value,
+                    ty: None,
+                })
+                .collect(),
+            rows: RowCount::Many,
+        };
+        let result = ResultShape::List {
+            element: Box::new(ResultShape::Tuple(
+                outputs.into_iter().map(ResultShape::Column).collect(),
+            )),
+            child: ChildRef {
+                stmt: 0,
+                parent: None,
+                cardinality: Cardinality::Many,
+                tag: None,
+            },
+        };
+        return RootPlan {
+            builder,
+            shape,
+            result,
+        };
+    }
+    if matches!(
+        level.element,
+        QueryType::Optional(ref inner) if matches!(inner.as_ref(), QueryType::Tuple(_))
+    ) {
+        todo!("M7 optional tuple result");
     }
     let mut builder = level.builder;
     if builder.select.is_empty() {
@@ -2359,80 +2657,131 @@ fn finalize_level(ctx: &mut Context, level: Level) -> RootPlan {
     }
 }
 
+fn drain_pending(pending: PendingSplit) -> Vec<PendingSplit> {
+    let mut hops: Vec<PendingSplit> = Vec::new();
+    let mut cursor = Some(pending);
+    while let Some(mut hop) = cursor.take() {
+        cursor = hop.next.take().map(|boxed| *boxed);
+        hops.push(hop);
+    }
+    hops
+}
+
+fn sink_chain(
+    ctx: &mut Context,
+    hops: &[PendingSplit],
+    root_creation: usize,
+) -> Vec<(usize, ParentRef, Vec<String>)> {
+    let mut built: Vec<(SelectBuilder, StatementShape, Vec<String>)> =
+        Vec::with_capacity(hops.len());
+    for (i, hop) in hops.iter().enumerate() {
+        let mut child = SelectBuilder::new();
+        child.from = Some(hop.child_from.clone());
+        child.where_ = vec![SqlExpr::InSubquery {
+            expr: Box::new(SqlExpr::Column {
+                depth: 0,
+                column: hop.child_col.clone(),
+            }),
+            query: Box::new(bulk_query()),
+        }];
+        child.select = vec![SelectItem::AllFrom { depth: 0 }];
+        let child_outputs = builder_outputs(&child, ctx.schema);
+        let next_parent = hops.get(i + 1).map(|next| next.parent_col.clone());
+        let child_shape = StatementShape {
+            columns: child_outputs
+                .iter()
+                .map(|name| OutputColumn {
+                    name: name.clone(),
+                    role: if *name == hop.child_col || next_parent.as_ref() == Some(name) {
+                        ColumnRole::Key
+                    } else {
+                        ColumnRole::Value
+                    },
+                    ty: None,
+                })
+                .collect(),
+            rows: RowCount::Many,
+        };
+        built.push((child, child_shape, child_outputs));
+    }
+    let mut creation: Vec<usize> = vec![0; hops.len()];
+    let mut outputs: Vec<Vec<String>> = vec![Vec::new(); hops.len()];
+    for (i, (child, shape, child_outputs)) in built.into_iter().enumerate().rev() {
+        creation[i] = ctx.sink(child, shape, StatementKind::Query);
+        outputs[i] = child_outputs;
+    }
+    let mut layers: Vec<(usize, ParentRef, Vec<String>)> = Vec::with_capacity(hops.len());
+    for (i, hop) in hops.iter().enumerate() {
+        layers.push((
+            creation[i],
+            ParentRef {
+                stmt: if i == 0 {
+                    root_creation
+                } else {
+                    creation[i - 1]
+                },
+                parent_key: hop.parent_col.clone(),
+                child_key: hop.child_col.clone(),
+            },
+            std::mem::take(&mut outputs[i]),
+        ));
+    }
+    layers
+}
+
+fn nest_layers(layers: Vec<(usize, ParentRef, Vec<String>)>) -> ResultShape {
+    let mut element = None;
+    for (idx, pref, outputs) in layers.into_iter().rev() {
+        let inner = match element.take() {
+            Some(inner) => inner,
+            None => ResultShape::Record(
+                outputs
+                    .iter()
+                    .map(|name| (name.clone(), ResultShape::Column(name.clone())))
+                    .collect(),
+            ),
+        };
+        element = Some(ResultShape::List {
+            element: Box::new(inner),
+            child: ChildRef {
+                stmt: idx,
+                parent: Some(pref),
+                cardinality: Cardinality::Many,
+                tag: None,
+            },
+        });
+    }
+    element.unwrap_or_else(|| unreachable!("nesting no layers: callers only nest non-empty chains"))
+}
+
 fn emit_split(ctx: &mut Context, parent_builder: SelectBuilder, pending: PendingSplit) -> RootPlan {
-    let PendingSplit {
-        child_from,
-        child_col,
-        parent_col,
-        ..
-    } = pending;
+    let hops = drain_pending(pending);
     let mut parent_q = parent_builder;
     parent_q.select = vec![SelectItem::Column {
         depth: 0,
-        column: parent_col.clone(),
-        output: parent_col.clone(),
+        column: hops[0].parent_col.clone(),
+        output: hops[0].parent_col.clone(),
     }];
     let parent_shape = StatementShape {
         columns: vec![OutputColumn {
-            name: parent_col.clone(),
+            name: hops[0].parent_col.clone(),
             role: ColumnRole::Key,
             ty: None,
         }],
         rows: RowCount::Many,
     };
-    let mut child = SelectBuilder::new();
-    child.from = Some(child_from);
-    child.where_ = vec![SqlExpr::InSubquery {
-        expr: Box::new(SqlExpr::Column {
-            depth: 0,
-            column: child_col.clone(),
-        }),
-        query: Box::new(bulk_query()),
-    }];
-    child.select = vec![SelectItem::AllFrom { depth: 0 }];
-    let child_outputs = builder_outputs(&child, ctx.schema);
-    let child_shape = StatementShape {
-        columns: child_outputs
-            .iter()
-            .map(|name| OutputColumn {
-                name: name.clone(),
-                role: if *name == child_col {
-                    ColumnRole::Key
-                } else {
-                    ColumnRole::Value
-                },
-                ty: None,
-            })
-            .collect(),
-        rows: RowCount::Many,
-    };
-    let element = ResultShape::Record(
-        child_outputs
-            .iter()
-            .map(|name| (name.clone(), ResultShape::Column(name.clone())))
-            .collect(),
-    );
-    let idx = ctx.sink(child, child_shape, StatementKind::Query);
+    let result = nest_layers(sink_chain(ctx, &hops, 0));
     RootPlan {
         builder: parent_q,
         shape: parent_shape,
-        result: ResultShape::List {
-            element: Box::new(element),
-            child: ChildRef {
-                stmt: idx,
-                parent: Some(ParentRef {
-                    stmt: 0,
-                    parent_key: parent_col,
-                    child_key: child_col,
-                }),
-                cardinality: Cardinality::Many,
-                tag: None,
-            },
-        },
+        result,
     }
 }
 
 fn builder_outputs(builder: &SelectBuilder, schema: &ValidatedSchema) -> Vec<String> {
+    if builder.select.is_empty() && !builder.unions.is_empty() {
+        return union_outputs(builder, schema);
+    }
     builder
         .select
         .iter()
@@ -2443,6 +2792,16 @@ fn builder_outputs(builder: &SelectBuilder, schema: &ValidatedSchema) -> Vec<Str
             }
         })
         .collect()
+}
+
+fn union_outputs(builder: &SelectBuilder, schema: &ValidatedSchema) -> Vec<String> {
+    builder
+        .unions
+        .first()
+        .map(|first| builder_outputs(first, schema))
+        .unwrap_or_else(|| {
+            unreachable!("union outputs without arms: merges always push at least one arm")
+        })
 }
 
 fn from_columns(from: &Option<FromClause>, schema: &ValidatedSchema) -> Vec<String> {
@@ -2773,7 +3132,7 @@ fn single_row_query(ctx: &mut Context, base: &TypedExpr, select: Vec<SelectItem>
     if level.pending.is_some() {
         todo!("M4 single-row query over split-pending base");
     }
-    if !level.builder.select.is_empty() {
+    if !level.builder.select.is_empty() || !level.builder.unions.is_empty() {
         level = wrap_level(ctx, level);
     }
     level.builder.select = select;
@@ -3111,6 +3470,7 @@ fn scalar_list_col(ctx: &mut Context, base: &TypedExpr) -> String {
                 base.ty
             ),
         },
+        TypedExprKind::If { .. } => "c0".to_string(),
         _ => todo!("M4b scalar aggregation over derived rows"),
     }
 }
@@ -3144,10 +3504,11 @@ fn scalar_aggregate(ctx: &mut Context, base: &TypedExpr, agg: AggOp) -> SqlExpr 
                 order_by: level.builder.order_by,
                 limit: level.builder.limit,
                 offset: level.builder.offset,
+                unions: Vec::new(),
             }),
         };
     }
-    if !level.builder.select.is_empty() {
+    if !level.builder.select.is_empty() || !level.builder.unions.is_empty() {
         level = wrap_level(ctx, level);
     }
     let output = ctx.aliases.generic();
@@ -3240,6 +3601,7 @@ fn scalar_aggregate(ctx: &mut Context, base: &TypedExpr, agg: AggOp) -> SqlExpr 
             order_by: level.builder.order_by,
             limit: level.builder.limit,
             offset: level.builder.offset,
+            unions: Vec::new(),
         }),
     }
 }
@@ -3347,6 +3709,9 @@ fn scalar_method(
                     todo!("M4b nested collapse in scalar slot");
                 }
                 compose_limit(&mut level.builder, &name.value, args, ctx);
+                if !level.builder.unions.is_empty() {
+                    level = wrap_level(ctx, level);
+                }
                 if level.builder.select.is_empty() {
                     level.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
                 }
@@ -3359,6 +3724,7 @@ fn scalar_method(
                             order_by: level.builder.order_by,
                             limit: level.builder.limit,
                             offset: level.builder.offset,
+                            unions: Vec::new(),
                         }),
                     },
                     _ => todo!("M4b first over multi-col flat list"),
@@ -3419,11 +3785,12 @@ fn contains_exists(ctx: &mut Context, base: &TypedExpr, needle: &TypedExpr) -> S
             QueryType::Scalar(_) => {
                 let items: Vec<(&TypedExpr, Option<i64>)> =
                     elements.iter().map(|e| (e, None)).collect();
-                let (this, child) = register_literal_level(ctx, inner, items);
-                debug_assert!(
-                    child.is_none(),
-                    "scalar-literal contains over a branch: the H1 arm owns nested membership"
-                );
+                let chain = register_literal_level(ctx, inner, items);
+                let [this] = chain.try_into().ok().unwrap_or_else(|| {
+                    unreachable!(
+                        "scalar-literal contains over a branch: the H1 arm owns nested membership"
+                    )
+                });
                 let mut query = SelectBuilder::new();
                 query.from = Some(this.to_from_clause());
                 query.select = vec![SelectItem::AllFrom { depth: 0 }];
@@ -3961,7 +4328,7 @@ fn register_literal_level<'a>(
     ctx: &mut Context,
     inner: &QueryType,
     items: Vec<(&'a TypedExpr, Option<i64>)>,
-) -> (LitLevel, Option<LitLevel>) {
+) -> Vec<LitLevel> {
     match peel_optional(inner) {
         QueryType::List(sub) => {
             let keyed = items.first().is_some_and(|(_, p)| p.is_some());
@@ -3995,17 +4362,13 @@ fn register_literal_level<'a>(
                 grid.push(row);
             }
             ctx.literals.insert(id.clone(), grid);
-            let this = LitLevel {
+            let mut chain = vec![LitLevel {
                 id,
                 module,
                 columns,
-            };
-            let (child, grandchild) = register_literal_level(ctx, sub, child_items);
-            debug_assert!(
-                grandchild.is_none(),
-                "branch child registered its own child: the depth guard excludes depth-3 literals"
-            );
-            (this, Some(child))
+            }];
+            chain.extend(register_literal_level(ctx, sub, child_items));
+            chain
         }
         _ => {
             let value_tys = leaf_value_tys(inner);
@@ -4036,14 +4399,11 @@ fn register_literal_level<'a>(
                 })
                 .collect();
             ctx.literals.insert(id.clone(), grid);
-            (
-                LitLevel {
-                    id,
-                    module,
-                    columns,
-                },
-                None,
-            )
+            vec![LitLevel {
+                id,
+                module,
+                columns,
+            }]
         }
     }
 }
@@ -4060,23 +4420,27 @@ fn rows_array(ctx: &mut Context, expr: &TypedExpr) -> Level {
             expr.ty
         ),
     };
-    if literal_depth(inner) > 2 {
-        todo!("M6 deeply nested array literal");
-    }
+    literal_depth(inner);
     let items: Vec<(&TypedExpr, Option<i64>)> = elements.iter().map(|e| (e, None)).collect();
-    let (this, child) = register_literal_level(ctx, inner, items);
+    let mut chain = register_literal_level(ctx, inner, items);
+    let this = chain.remove(0);
     let mut builder = SelectBuilder::new();
     builder.from = Some(this.to_from_clause());
+    let mut pending: Option<PendingSplit> = None;
+    for (i, level) in chain.into_iter().enumerate().rev() {
+        pending = Some(PendingSplit {
+            child_from: level.to_from_clause(),
+            child_col: "c0".to_string(),
+            parent_col: if i == 0 { "c0" } else { "c1" }.to_string(),
+            multi_parent: true,
+            next: pending.map(Box::new),
+        });
+    }
     Level {
         builder,
         element: expr.ty.clone(),
         parent: ParentLink::Root { root_idx: 0 },
-        pending: child.map(|c| PendingSplit {
-            child_from: c.to_from_clause(),
-            child_col: "c0".to_string(),
-            parent_col: "c0".to_string(),
-            multi_parent: true,
-        }),
+        pending,
         stmt_bound: true,
         output_shapes: None,
     }
@@ -4094,15 +4458,118 @@ fn array_tail_root(mut tail: &TypedExpr) -> bool {
     }
 }
 
-fn lower_tuple_result(ctx: &mut Context, result: &TypedExpr) -> RootPlan {
-    let TypedExprKind::Tuple { elements } = &result.kind else {
-        todo!("M7 non-literal tuple result")
+fn rows_if(ctx: &mut Context, expr: &TypedExpr) -> Level {
+    let TypedExprKind::If { arms, default } = &expr.kind else {
+        unreachable!("rows_if on non-if node: callers dispatch on node kind")
     };
+    match &expr.ty {
+        QueryType::List(_) => {}
+        QueryType::Record(_) | QueryType::Optional(_) => todo!("M7 If over records"),
+        _ => unreachable!("if over scalars/tuples in row demand: callers dispatch on node type"),
+    }
+    let mut conds: Vec<SqlExpr> = Vec::with_capacity(arms.len());
+    for (cond, _) in arms {
+        conds.push(scalar(ctx, cond));
+    }
+    let sunk_before = ctx.statements.len();
+    let mut branches: Vec<SelectBuilder> = Vec::with_capacity(arms.len() + 1);
+    let mut denied: Vec<SqlExpr> = Vec::new();
+    for ((_, body), cond) in arms.iter().zip(conds.iter()) {
+        let mut guard = denied.clone();
+        guard.push(cond.clone());
+        branches.push(guarded_branch(ctx, body, guard, sunk_before));
+        denied.push(SqlExpr::Not(Box::new(cond.clone())));
+    }
+    branches.push(guarded_branch(ctx, default, denied, sunk_before));
+    let first_outputs = builder_outputs(&branches[0], ctx.schema);
+    for branch in branches.iter().skip(1) {
+        if builder_outputs(branch, ctx.schema) != first_outputs {
+            todo!("M7 mismatched If branch outputs");
+        }
+    }
+    let mut first = branches.remove(0);
+    first.unions = branches;
+    Level {
+        builder: first,
+        element: expr.ty.clone(),
+        parent: ParentLink::Root { root_idx: 0 },
+        pending: None,
+        stmt_bound: true,
+        output_shapes: None,
+    }
+}
+
+fn guarded_branch(
+    ctx: &mut Context,
+    body: &TypedExpr,
+    guard: Vec<SqlExpr>,
+    sunk_before: usize,
+) -> SelectBuilder {
+    let mut level = rows(ctx, body);
+    if level.pending.take().is_some() || ctx.statements.len() != sunk_before {
+        todo!("M7 multi-statement If branches");
+    }
+    if level.builder.select.is_empty() {
+        level.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+    }
+    for cond in guard.into_iter().rev() {
+        level.builder.where_.insert(0, cond);
+    }
+    level.builder
+}
+
+fn lower_tuple_result(ctx: &mut Context, result: &TypedExpr) -> RootPlan {
     let QueryType::Tuple(tys) = &result.ty else {
         unreachable!(
             "tuple node with non-tuple type {}: the checker types tuples as tuples",
             result.ty
         )
+    };
+    if let TypedExprKind::Method {
+        base, name, args, ..
+    } = &result.kind
+        && ["first", "nth"].contains(&name.value.as_str())
+    {
+        let (select, shape, _) = collapse_tuple_method(ctx, String::new(), base, name, args, tys);
+        let ResultShape::Tuple(shapes) = &shape else {
+            unreachable!("collapse yields a tuple shape by construction");
+        };
+        let shape_cols = shapes
+            .iter()
+            .map(|s| match s {
+                ResultShape::Column(output) => OutputColumn {
+                    name: output.clone(),
+                    role: ColumnRole::Value,
+                    ty: None,
+                },
+                _ => unreachable!("collapse yields flat columns by construction"),
+            })
+            .collect();
+        return RootPlan {
+            builder: SelectBuilder {
+                select,
+                from: None,
+                where_: Vec::new(),
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
+                unions: Vec::new(),
+            },
+            shape: StatementShape {
+                columns: shape_cols,
+                rows: RowCount::One,
+            },
+            result: shape,
+        };
+    }
+    let TypedExprKind::Tuple { elements } = &result.kind else {
+        if let TypedExprKind::If { arms, default } = &result.kind {
+            match distribute_if_tuple(arms, default, tys, result.span, result.ty.clone()) {
+                Some(synthetic) => return lower_tuple_result(ctx, &synthetic),
+                None => todo!("M7 non-literal tuple result"),
+            }
+        }
+        todo!("M7 non-literal tuple result")
     };
     if elements.len() != tys.len() {
         unreachable!("tuple arity drift: the checker unifies tuple arity");
@@ -4111,20 +4578,29 @@ fn lower_tuple_result(ctx: &mut Context, result: &TypedExpr) -> RootPlan {
     let mut shape_cols = Vec::with_capacity(elements.len());
     let mut tuple = Vec::with_capacity(elements.len());
     for (i, (elem, ty)) in elements.iter().zip(tys.iter()).enumerate() {
-        if !elem.ty.is_scalar() || !ty.is_scalar() {
-            todo!("M7 tuple with list/record element result");
+        let prefix = format!("c{i}");
+        let (mut sub_select, sub_shape) =
+            root_composite_element(ctx, prefix, elem, ty, "tuple element");
+        for item in &sub_select {
+            match item {
+                SelectItem::Column { output, .. } | SelectItem::Expr { output, .. } => shape_cols
+                    .push(OutputColumn {
+                        name: output.clone(),
+                        role: ColumnRole::Value,
+                        ty: None,
+                    }),
+                SelectItem::AllFrom { .. } => {
+                    unreachable!("tuple element selects are always named")
+                }
+            }
         }
-        let output = format!("c{i}");
-        select.push(SelectItem::Expr {
-            expr: scalar(ctx, elem),
-            output: output.clone(),
-        });
-        shape_cols.push(OutputColumn {
-            name: output.clone(),
-            role: ColumnRole::Value,
-            ty: None,
-        });
-        tuple.push(ResultShape::Column(output));
+        select.append(&mut sub_select);
+        tuple.push(sub_shape);
+    }
+    if select.is_empty() {
+        let (anchor, anchor_col) = unit_anchor(ctx);
+        select.push(anchor);
+        shape_cols.push(anchor_col);
     }
     RootPlan {
         builder: SelectBuilder {
@@ -4134,11 +4610,306 @@ fn lower_tuple_result(ctx: &mut Context, result: &TypedExpr) -> RootPlan {
             order_by: Vec::new(),
             limit: None,
             offset: None,
+            unions: Vec::new(),
         },
         shape: StatementShape {
             columns: shape_cols,
             rows: RowCount::One,
         },
         result: ResultShape::Tuple(tuple),
+    }
+}
+
+fn root_composite_element(
+    ctx: &mut Context,
+    output: String,
+    elem: &TypedExpr,
+    ty: &QueryType,
+    kind: &str,
+) -> (Vec<SelectItem>, ResultShape) {
+    if let TypedExprKind::Struct { fields } = &elem.kind {
+        let QueryType::Record(RecordSource::Projection(_)) = &elem.ty else {
+            unreachable!(
+                "struct literal with non-projection type {}: the checker infers anonymous records",
+                elem.ty
+            )
+        };
+        let mut select = Vec::new();
+        let mut record = Vec::with_capacity(fields.len());
+        for (name, field) in fields {
+            let field_output = if output.is_empty() {
+                name.value.clone()
+            } else {
+                format!("{output}_{}", name.value)
+            };
+            let (mut sub_select, sub_shape) =
+                root_composite_element(ctx, field_output, field, &field.ty, "struct field");
+            select.append(&mut sub_select);
+            record.push((name.value.clone(), sub_shape));
+        }
+        return (select, ResultShape::Record(record));
+    }
+    if elem.ty.is_scalar() && ty.is_scalar() {
+        return (
+            vec![SelectItem::Expr {
+                expr: scalar(ctx, elem),
+                output: output.clone(),
+            }],
+            ResultShape::Column(output),
+        );
+    }
+    match ty {
+        QueryType::List(_) => {
+            if matches!(tail_root_ident(elem), Some(IdentBinding::Field(_)))
+                || tail_uses_outer(elem)
+                || take_bound_ident(elem)
+            {
+                todo!("M7 per-row {kind}");
+            }
+            let mut level = rows(ctx, elem);
+            if let Some(pending) = level.pending.take() {
+                if matches!(pending.child_from, FromClause::Literal { .. }) {
+                    todo!("M7 nested {kind}");
+                }
+                todo!("M7 per-row {kind}");
+            }
+            if level.builder.select.is_empty() {
+                level.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+            }
+            let outputs = builder_outputs(&level.builder, ctx.schema);
+            let shape_cols: Vec<OutputColumn> = outputs
+                .iter()
+                .map(|name| OutputColumn {
+                    name: name.clone(),
+                    role: ColumnRole::Value,
+                    ty: None,
+                })
+                .collect();
+            let element = ResultShape::Record(
+                outputs
+                    .iter()
+                    .map(|name| (name.clone(), ResultShape::Column(name.clone())))
+                    .collect(),
+            );
+            let idx = ctx.sink(
+                level.builder,
+                StatementShape {
+                    columns: shape_cols,
+                    rows: RowCount::Many,
+                },
+                StatementKind::Query,
+            );
+            (
+                Vec::new(),
+                ResultShape::List {
+                    element: Box::new(element),
+                    child: ChildRef {
+                        stmt: idx,
+                        parent: None,
+                        cardinality: Cardinality::Many,
+                        tag: None,
+                    },
+                },
+            )
+        }
+        QueryType::Optional(inner) if matches!(inner.as_ref(), QueryType::Record(_)) => {
+            if matches!(elem.kind, TypedExprKind::If { .. }) {
+                todo!("M7 If over records");
+            }
+            if tail_uses_outer(elem) {
+                todo!("M7 per-row {kind}");
+            }
+            let mut level = rows(ctx, elem);
+            if let Some(pending) = level.pending.take() {
+                if matches!(pending.child_from, FromClause::Literal { .. }) {
+                    todo!("M7 nested {kind}");
+                }
+                todo!("M7 per-row {kind}");
+            }
+            if level.builder.select.is_empty() {
+                level.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+            }
+            let outputs = builder_outputs(&level.builder, ctx.schema);
+            let shape_cols: Vec<OutputColumn> = outputs
+                .iter()
+                .map(|name| OutputColumn {
+                    name: name.clone(),
+                    role: ColumnRole::Value,
+                    ty: None,
+                })
+                .collect();
+            let element = ResultShape::Record(
+                outputs
+                    .iter()
+                    .map(|name| (name.clone(), ResultShape::Column(name.clone())))
+                    .collect(),
+            );
+            let idx = ctx.sink(
+                level.builder,
+                StatementShape {
+                    columns: shape_cols,
+                    rows: RowCount::ZeroOrOne,
+                },
+                StatementKind::Query,
+            );
+            (
+                Vec::new(),
+                ResultShape::Single {
+                    element: Box::new(element),
+                    child: ChildRef {
+                        stmt: idx,
+                        parent: None,
+                        cardinality: Cardinality::One,
+                        tag: None,
+                    },
+                },
+            )
+        }
+        QueryType::Tuple(tys) => {
+            let TypedExprKind::Tuple { elements } = &elem.kind else {
+                todo!("M7 non-literal tuple value")
+            };
+            if elements.len() != tys.len() {
+                unreachable!("tuple arity drift: the checker unifies tuple arity");
+            }
+            let mut shapes = Vec::with_capacity(elements.len());
+            let mut select = Vec::new();
+            for (i, (sub, sub_ty)) in elements.iter().zip(tys.iter()).enumerate() {
+                let (mut sub_select, sub_shape) = root_composite_element(
+                    ctx,
+                    format!("{output}_c{i}"),
+                    sub,
+                    sub_ty,
+                    "tuple element",
+                );
+                select.append(&mut sub_select);
+                shapes.push(sub_shape);
+            }
+            (select, ResultShape::Tuple(shapes))
+        }
+        QueryType::Optional(inner) if matches!(inner.as_ref(), QueryType::List(_)) => {
+            todo!("M4b presence: optional list tuple element")
+        }
+        _ => todo!("M7 exotic {kind}"),
+    }
+}
+
+fn unit_anchor(ctx: &mut Context) -> (SelectItem, OutputColumn) {
+    let output = ctx.aliases.generic();
+    (
+        SelectItem::Expr {
+            expr: SqlExpr::Param(ParamValue::Int(1)),
+            output: output.clone(),
+        },
+        OutputColumn {
+            name: output,
+            role: ColumnRole::Value,
+            ty: None,
+        },
+    )
+}
+
+fn lower_struct_result(ctx: &mut Context, result: &TypedExpr) -> RootPlan {
+    if let TypedExprKind::If { arms, default } = &result.kind {
+        let distributable = matches!(&result.ty, QueryType::Record(RecordSource::Projection(_)))
+            && arms
+                .iter()
+                .all(|(_, body)| matches!(body.kind, TypedExprKind::Struct { .. }))
+            && matches!(default.kind, TypedExprKind::Struct { .. });
+        if !distributable {
+            todo!("M7 If over records");
+        }
+        let QueryType::Record(RecordSource::Projection(unified)) = &result.ty else {
+            unreachable!(
+                "if over non-projection record {}: struct literals infer anonymous records",
+                result.ty
+            )
+        };
+        let field_in = |node: &TypedExpr, name: &str| match &node.kind {
+            TypedExprKind::Struct { fields } => fields
+                .iter()
+                .find(|(field_name, _)| field_name.value == name)
+                .map(|(_, expr)| expr.clone()),
+            _ => None,
+        };
+        let mut fields = Vec::with_capacity(unified.len());
+        for unified_field in unified {
+            let mut field_arms = Vec::with_capacity(arms.len());
+            for (cond, body) in arms {
+                let Some(body_field) = field_in(body, &unified_field.name) else {
+                    todo!("M7 mismatched If branches")
+                };
+                field_arms.push((cond.clone(), body_field));
+            }
+            let Some(default_field) = field_in(default, &unified_field.name) else {
+                todo!("M7 mismatched If branches")
+            };
+            fields.push((
+                grove_types::Spanned {
+                    value: unified_field.name.clone(),
+                    span: result.span,
+                },
+                TypedExpr {
+                    kind: TypedExprKind::If {
+                        arms: field_arms,
+                        default: Box::new(default_field),
+                    },
+                    ty: unified_field.ty.clone(),
+                    span: result.span,
+                },
+            ));
+        }
+        let synthetic = TypedExpr {
+            kind: TypedExprKind::Struct { fields },
+            ty: result.ty.clone(),
+            span: result.span,
+        };
+        return lower_struct_result(ctx, &synthetic);
+    }
+    let TypedExprKind::Struct { fields } = &result.kind else {
+        todo!("M7 non-literal record result")
+    };
+    let mut select = Vec::new();
+    let mut shape_cols = Vec::new();
+    let mut record = Vec::with_capacity(fields.len());
+    for (name, field) in fields {
+        let (mut sub_select, sub_shape) =
+            root_composite_element(ctx, name.value.clone(), field, &field.ty, "struct field");
+        for item in &sub_select {
+            match item {
+                SelectItem::Column { output, .. } | SelectItem::Expr { output, .. } => shape_cols
+                    .push(OutputColumn {
+                        name: output.clone(),
+                        role: ColumnRole::Value,
+                        ty: None,
+                    }),
+                SelectItem::AllFrom { .. } => {
+                    unreachable!("struct field selects are always named")
+                }
+            }
+        }
+        select.append(&mut sub_select);
+        record.push((name.value.clone(), sub_shape));
+    }
+    if select.is_empty() {
+        let (anchor, anchor_col) = unit_anchor(ctx);
+        select.push(anchor);
+        shape_cols.push(anchor_col);
+    }
+    RootPlan {
+        builder: SelectBuilder {
+            select,
+            from: None,
+            where_: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            unions: Vec::new(),
+        },
+        shape: StatementShape {
+            columns: shape_cols,
+            rows: RowCount::One,
+        },
+        result: ResultShape::Record(record),
     }
 }

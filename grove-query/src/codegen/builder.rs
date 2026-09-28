@@ -8,6 +8,7 @@ pub struct SelectBuilder {
     pub order_by: Vec<OrderItem>,
     pub limit: Option<SqlExpr>,
     pub offset: Option<SqlExpr>,
+    pub unions: Vec<SelectBuilder>,
 }
 
 impl SelectBuilder {
@@ -19,6 +20,7 @@ impl SelectBuilder {
             order_by: Vec::new(),
             limit: None,
             offset: None,
+            unions: Vec::new(),
         }
     }
 }
