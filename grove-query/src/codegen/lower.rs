@@ -1,8 +1,12 @@
-
-use super::builder::{AliasGen, SelectBuilder, SelectItem, SqlBinOp, SqlExpr};
+use super::builder::{
+    AliasGen, FromClause, OrderDir, OrderItem, SelectBuilder, SelectItem, SqlBinOp, SqlExpr,
+};
 use super::model::ParamValue;
-use crate::ast::{BinaryOp, ConstantName, Literal, TypeName, UnaryOp};
-use crate::typecheck::types::{IdentBinding, QueryType, TypedExpr, TypedExprKind, TypedMethodArg};
+use crate::ast::{BinaryOp, ConstantName, Literal, SortDir, TypeName, UnaryOp};
+use crate::typecheck::types::{
+    IdentBinding, QueryType, RecordSource, TypedExpr, TypedExprKind, TypedMethodArg,
+    TypedProjectionItem,
+};
 use grove_schema::validated::{Field, ScalarType, ValidatedSchema};
 
 pub struct Context<'s> {
@@ -87,8 +91,385 @@ fn kind_name(expr: &TypedExpr) -> &'static str {
 }
 
 pub fn rows(ctx: &mut Context, expr: &TypedExpr) -> Level {
-    let _ = (ctx, expr);
-    todo!("M2 flat pipelines: row demand");
+    let mut level = match &expr.kind {
+        TypedExprKind::Ident { binding, .. } => rows_ident(ctx, binding, &expr.ty),
+        TypedExprKind::Field {
+            base,
+            name,
+            optional,
+        } => rows_field(ctx, base, name, *optional),
+        TypedExprKind::Method {
+            base,
+            name,
+            args,
+            optional,
+        } => rows_method(ctx, base, name, args, *optional),
+        TypedExprKind::Projection { base, items } => rows_projection(ctx, base, items),
+        TypedExprKind::Array { .. } => todo!("M6 array literals"),
+        TypedExprKind::Tuple { .. } => todo!("M7 tuples"),
+        TypedExprKind::Struct { .. } => todo!("M7 record literals"),
+        TypedExprKind::If { .. } => todo!("M7 if-unions"),
+        TypedExprKind::Some { .. } => todo!("M3 optional presence"),
+        TypedExprKind::Literal(_)
+        | TypedExprKind::TypeConstant { .. }
+        | TypedExprKind::Binary { .. }
+        | TypedExprKind::Unary { .. }
+        | TypedExprKind::Cast { .. } => {
+            unreachable!(
+                "row demand received scalar {}: callers dispatch on node type",
+                expr.ty
+            )
+        }
+    };
+    level.element = expr.ty.clone();
+    level
+}
+
+fn rows_ident(ctx: &mut Context, binding: &IdentBinding, ty: &QueryType) -> Level {
+    match binding {
+        IdentBinding::Root { root_idx } => {
+            let root = &ctx.schema.roots[*root_idx];
+            let table = ctx.schema.tables[ctx.schema.structs[root.struct_id.index()].table.index()]
+                .name
+                .clone();
+            let mut builder = SelectBuilder::new();
+            builder.from = Some(FromClause::Table {
+                alias: ctx.aliases.table(&table),
+                table,
+            });
+            Level {
+                builder,
+                element: ty.clone(),
+                parent: ParentLink::Root {
+                    root_idx: *root_idx,
+                },
+            }
+        }
+        _ => unreachable!(
+            "non-root ident in row demand: scope idents are scalar, projection outputs route through items"
+        ),
+    }
+}
+
+fn rows_field(
+    ctx: &mut Context,
+    base: &TypedExpr,
+    name: &grove_types::Spanned<String>,
+    optional: bool,
+) -> Level {
+    let _ = optional;
+    let mut level = rows(ctx, base);
+    let record = match &base.ty {
+        QueryType::List(inner) => inner.as_ref(),
+        other => unreachable!(
+            "field base {other} is not a list: the checker maps fields over lists only"
+        ),
+    };
+    match record {
+        QueryType::Record(RecordSource::Schema(struct_id)) => {
+            let (_, field) = ctx
+                .schema
+                .struct_field(*struct_id, &name.value)
+                .unwrap_or_else(|| {
+                    unreachable!("resolved field {} vanished from the schema", name.value)
+                });
+            match field {
+                Field::Value { columns, .. } => {
+                    let [column] = columns.as_slice() else {
+                        todo!("M7 tuple-valued field in row demand")
+                    };
+                    level.builder.select.push(SelectItem::Column {
+                        depth: 0,
+                        column: ctx.schema.column_name(*column).to_string(),
+                        output: name.value.clone(),
+                    });
+                    level
+                }
+                _ => todo!("M3 NAVIGATE: collection crossing"),
+            }
+        }
+        QueryType::Record(RecordSource::Projection(fields)) => {
+            let field = fields
+                .iter()
+                .find(|f| f.name == name.value)
+                .unwrap_or_else(|| {
+                    unreachable!("resolved projection field {} vanished", name.value)
+                });
+            if !field.ty.is_scalar() {
+                todo!("M4 non-scalar projection field access");
+            }
+            level.builder.select.push(SelectItem::Column {
+                depth: 0,
+                column: name.value.clone(),
+                output: name.value.clone(),
+            });
+            level
+        }
+        _ => unreachable!("field access over non-record lists is rejected upstream"),
+    }
+}
+
+fn rows_method(
+    ctx: &mut Context,
+    base: &TypedExpr,
+    name: &grove_types::Spanned<String>,
+    args: &[TypedMethodArg],
+    optional: bool,
+) -> Level {
+    let _ = optional;
+    let mut level = rows(ctx, base);
+    match name.value.as_str() {
+        "filter" => {
+            if needs_wrap(&level) {
+                level = wrap_level(ctx, level);
+            }
+            level
+                .builder
+                .where_
+                .insert(0, scalar(ctx, one_arg(args, name)));
+            level
+        }
+        "sort" | "sort_asc" | "sort_desc" => {
+            if needs_wrap(&level) {
+                level = wrap_level(ctx, level);
+            }
+            let default = if name.value == "sort_desc" {
+                OrderDir::Desc
+            } else {
+                OrderDir::Asc
+            };
+            for arg in args {
+                let dir = match &arg.direction {
+                    Some(dir) => match dir.value {
+                        SortDir::Asc => OrderDir::Asc,
+                        SortDir::Desc => OrderDir::Desc,
+                    },
+                    None => default,
+                };
+                level
+                    .builder
+                    .order_by
+                    .extend(sort_keys(ctx, &arg.expr, dir));
+            }
+            level
+        }
+        "take" | "skip" | "first" | "nth" => {
+            compose_limit(&mut level.builder, &name.value, args, ctx);
+            level
+        }
+        "flatten" => todo!("M3 flatten + rewire"),
+        _ => unreachable!(
+            "method {} in row demand: value methods never return row types",
+            name.value
+        ),
+    }
+}
+
+fn needs_wrap(level: &Level) -> bool {
+    level.builder.limit.is_some()
+        || level.builder.offset.is_some()
+        || !level.builder.select.is_empty()
+}
+
+fn wrap_level(ctx: &mut Context, level: Level) -> Level {
+    let Level {
+        mut builder,
+        element,
+        parent,
+    } = level;
+    if builder.select.is_empty() {
+        builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+    }
+    let alias = ctx.aliases.subquery();
+    let mut outer = SelectBuilder::new();
+    outer.from = Some(FromClause::Subquery {
+        query: Box::new(builder),
+        alias,
+    });
+    Level {
+        builder: outer,
+        element,
+        parent,
+    }
+}
+
+fn sort_keys(ctx: &mut Context, expr: &TypedExpr, dir: OrderDir) -> Vec<OrderItem> {
+    if !matches!(expr.ty, QueryType::Tuple(_)) {
+        return vec![OrderItem {
+            expr: scalar(ctx, expr),
+            dir,
+        }];
+    }
+    match &expr.kind {
+        TypedExprKind::Tuple { elements } => elements
+            .iter()
+            .flat_map(|e| sort_keys(ctx, e, dir))
+            .collect(),
+        TypedExprKind::Ident {
+            binding: IdentBinding::Field(fid),
+            depth,
+            ..
+        } => {
+            let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
+            match field {
+                Field::Value { columns, .. } => columns
+                    .iter()
+                    .map(|column| OrderItem {
+                        expr: SqlExpr::Column {
+                            depth: *depth,
+                            column: ctx.schema.column_name(*column).to_string(),
+                        },
+                        dir,
+                    })
+                    .collect(),
+                _ => unreachable!("tuple sort key over non-value field: tuples are value-typed"),
+            }
+        }
+        _ => todo!("M7 sort-key tuple expansion"),
+    }
+}
+
+fn compose_limit(
+    builder: &mut SelectBuilder,
+    method: &str,
+    args: &[TypedMethodArg],
+    ctx: &mut Context,
+) {
+    match method {
+        "take" => {
+            let arg = match args {
+                [arg] => scalar(ctx, &arg.expr),
+                _ => unreachable!("wrong arity for take: the checker enforces Fixed arg counts"),
+            };
+            let guard = non_neg_guard(arg, "take");
+            builder.limit = Some(match builder.limit.take() {
+                Some(existing) => SqlExpr::Func {
+                    name: "min".to_string(),
+                    args: vec![guard, existing],
+                },
+                None => guard,
+            });
+        }
+        "skip" => {
+            let arg = match args {
+                [arg] => scalar(ctx, &arg.expr),
+                _ => unreachable!("wrong arity for skip: the checker enforces Fixed arg counts"),
+            };
+            let guard = non_neg_guard(arg, "skip");
+            builder.offset = Some(match builder.offset.take() {
+                Some(existing) => SqlExpr::Func {
+                    name: "$$add".to_string(),
+                    args: vec![guard.clone(), existing],
+                },
+                None => guard.clone(),
+            });
+            if let Some(limit) = builder.limit.take() {
+                builder.limit = Some(SqlExpr::Func {
+                    name: "max".to_string(),
+                    args: vec![
+                        SqlExpr::Func {
+                            name: "$$sub".to_string(),
+                            args: vec![limit, guard],
+                        },
+                        SqlExpr::Param(ParamValue::Int(0)),
+                    ],
+                });
+            }
+        }
+        "first" => {
+            let one = SqlExpr::Param(ParamValue::Int(1));
+            builder.limit = Some(match builder.limit.take() {
+                Some(existing) => SqlExpr::Func {
+                    name: "min".to_string(),
+                    args: vec![one, existing],
+                },
+                None => one,
+            });
+        }
+        "nth" => {
+            let arg = match args {
+                [arg] => scalar(ctx, &arg.expr),
+                _ => unreachable!("wrong arity for nth: the checker enforces Fixed arg counts"),
+            };
+            let guard = non_neg_guard(arg, "nth");
+            builder.offset = Some(match builder.offset.take() {
+                Some(existing) => SqlExpr::Func {
+                    name: "$$add".to_string(),
+                    args: vec![guard.clone(), existing],
+                },
+                None => guard.clone(),
+            });
+            let one = SqlExpr::Param(ParamValue::Int(1));
+            builder.limit = Some(match builder.limit.take() {
+                Some(existing) => SqlExpr::Func {
+                    name: "min".to_string(),
+                    args: vec![
+                        one,
+                        SqlExpr::Func {
+                            name: "max".to_string(),
+                            args: vec![
+                                SqlExpr::Func {
+                                    name: "$$sub".to_string(),
+                                    args: vec![existing, guard],
+                                },
+                                SqlExpr::Param(ParamValue::Int(0)),
+                            ],
+                        },
+                    ],
+                },
+                None => one,
+            });
+        }
+        _ => unreachable!("{method} is not a take-family method"),
+    }
+}
+
+fn non_neg_guard(expr: SqlExpr, method: &str) -> SqlExpr {
+    SqlExpr::Case {
+        arms: vec![(
+            SqlExpr::Binary {
+                op: SqlBinOp::Ge,
+                lhs: Box::new(expr.clone()),
+                rhs: Box::new(SqlExpr::Param(ParamValue::Int(0))),
+            },
+            expr,
+        )],
+        else_: Box::new(SqlExpr::Func {
+            name: "$$panic".to_string(),
+            args: vec![SqlExpr::Param(ParamValue::String(format!(
+                "{method} requires a non-negative integer"
+            )))],
+        }),
+    }
+}
+
+fn rows_projection(ctx: &mut Context, base: &TypedExpr, items: &[TypedProjectionItem]) -> Level {
+    let mut level = rows(ctx, base);
+    let mut select = Vec::with_capacity(items.len());
+    for item in items {
+        if !item.value.ty.is_scalar() {
+            todo!(
+                "M4 R-value: non-scalar projection item {}",
+                item.alias.value
+            );
+        }
+        match scalar(ctx, &item.value) {
+            SqlExpr::Column { depth, column } => select.push(SelectItem::Column {
+                depth,
+                column,
+                output: item.alias.value.clone(),
+            }),
+            expr => select.push(SelectItem::Expr {
+                expr,
+                output: item.alias.value.clone(),
+            }),
+        }
+    }
+    if !level.builder.select.is_empty() {
+        level = wrap_level(ctx, level);
+    }
+    level.builder.select = select;
+    level
 }
 
 pub fn lower_query(ctx: &mut Context, result: &TypedExpr) -> (SelectBuilder, Vec<String>) {
@@ -101,8 +482,46 @@ pub fn lower_query(ctx: &mut Context, result: &TypedExpr) -> (SelectBuilder, Vec
         }];
         return (builder, vec![output]);
     }
-    let _ = rows(ctx, result);
-    unreachable!("rows() is an M2 stub and diverges");
+    let level = rows(ctx, result);
+    finalize_level(ctx, level)
+}
+
+fn finalize_level(ctx: &mut Context, level: Level) -> (SelectBuilder, Vec<String>) {
+    let mut builder = level.builder;
+    if builder.select.is_empty() {
+        builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+    }
+    let outputs = builder_outputs(&builder, ctx.schema);
+    (builder, outputs)
+}
+
+fn builder_outputs(builder: &SelectBuilder, schema: &ValidatedSchema) -> Vec<String> {
+    builder
+        .select
+        .iter()
+        .flat_map(|item| match item {
+            SelectItem::AllFrom { .. } => from_columns(&builder.from, schema),
+            SelectItem::Column { output, .. } | SelectItem::Expr { output, .. } => {
+                vec![output.clone()]
+            }
+        })
+        .collect()
+}
+
+fn from_columns(from: &Option<FromClause>, schema: &ValidatedSchema) -> Vec<String> {
+    match from {
+        Some(FromClause::Table { table, .. }) => schema
+            .tables
+            .iter()
+            .find(|t| &t.name == table)
+            .unwrap_or_else(|| unreachable!("unknown table {table}"))
+            .columns
+            .iter()
+            .map(|c| c.name.clone())
+            .collect(),
+        Some(FromClause::Subquery { query, .. }) => builder_outputs(query, schema),
+        None => unreachable!("row pipeline without FROM"),
+    }
 }
 
 fn scalar_literal(lit: &Literal) -> SqlExpr {
