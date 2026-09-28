@@ -111,6 +111,10 @@ fn render_from(
             sql.push_str(") AS ");
             sql.push_str(&quote(alias));
         }
+        FromClause::TableFunction { name } => {
+            sql.push_str(&quote(name));
+            sql.push_str("()");
+        }
     }
 }
 

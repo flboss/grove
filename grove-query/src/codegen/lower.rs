@@ -1,7 +1,13 @@
+
+use std::collections::HashMap;
+
 use super::builder::{
     AliasGen, FromClause, OrderDir, OrderItem, SelectBuilder, SelectItem, SqlBinOp, SqlExpr,
 };
-use super::model::ParamValue;
+use super::model::{
+    Cardinality, ChildRef, ColumnRole, OutputColumn, ParamValue, ParentRef, ResultShape, RowCount,
+    StatementShape, SunkStatement,
+};
 use crate::ast::{BinaryOp, ConstantName, Literal, SortDir, TypeName, UnaryOp};
 use crate::typecheck::types::{
     IdentBinding, QueryType, RecordSource, TypedExpr, TypedExprKind, TypedMethodArg,
@@ -12,6 +18,16 @@ use grove_schema::validated::{Field, FieldId, Relation, ScalarType, StructId, Va
 pub struct Context<'s> {
     pub schema: &'s ValidatedSchema,
     pub aliases: AliasGen,
+    pub statements: Vec<SunkStatement>,
+    pub literals: HashMap<String, Vec<Vec<ParamValue>>>,
+    pub no_outer: bool,
+    pub in_take_arg: bool,
+    pub child: Option<ChildCtx>,
+}
+
+pub struct ChildCtx {
+    pub base: Option<Level>,
+    pub per_row: bool,
 }
 
 impl<'s> Context<'s> {
@@ -19,7 +35,18 @@ impl<'s> Context<'s> {
         Context {
             schema,
             aliases: AliasGen::default(),
+            statements: Vec::new(),
+            literals: HashMap::new(),
+            no_outer: false,
+            in_take_arg: false,
+            child: None,
         }
+    }
+
+    pub fn sink(&mut self, builder: SelectBuilder, shape: StatementShape) -> usize {
+        let idx = self.statements.len() + 1;
+        self.statements.push(SunkStatement { builder, shape });
+        idx
     }
 }
 
@@ -40,6 +67,8 @@ pub struct Level {
     pub element: QueryType,
     pub parent: ParentLink,
     pub pending: Option<PendingSplit>,
+    pub stmt_bound: bool,
+    pub output_shapes: Option<Vec<(String, Option<ResultShape>)>>,
 }
 
 pub fn scalar(ctx: &mut Context, expr: &TypedExpr) -> SqlExpr {
@@ -133,29 +162,42 @@ pub fn rows(ctx: &mut Context, expr: &TypedExpr) -> Level {
 }
 
 fn rows_ident(ctx: &mut Context, binding: &IdentBinding, ty: &QueryType) -> Level {
-    match binding {
-        IdentBinding::Root { root_idx } => {
-            let root = &ctx.schema.roots[*root_idx];
-            let table = ctx.schema.tables[ctx.schema.structs[root.struct_id.index()].table.index()]
-                .name
-                .clone();
-            let mut builder = SelectBuilder::new();
-            builder.from = Some(FromClause::Table {
-                alias: ctx.aliases.table(&table),
-                table,
-            });
-            Level {
-                builder,
-                element: ty.clone(),
-                parent: ParentLink::Root {
-                    root_idx: *root_idx,
-                },
-                pending: None,
-            }
+    if let Some(tail) = ctx.child.as_mut() {
+        if let Some(base) = tail.base.take() {
+            return base;
         }
+        match binding {
+            IdentBinding::Root { .. } => todo!("M4b cross-root query inside child tail"),
+            IdentBinding::Field(_) => todo!("M4b nested collection root inside child tail"),
+            IdentBinding::ProjectedField { .. } => todo!("M4b projected root inside child tail"),
+            IdentBinding::Prev { .. } => todo!("mutations era: prev"),
+        }
+    }
+    match binding {
+        IdentBinding::Root { root_idx } => fresh_root_level(ctx, *root_idx, ty),
         _ => unreachable!(
             "non-root ident in row demand: scope idents are scalar, projection outputs route through items"
         ),
+    }
+}
+
+fn fresh_root_level(ctx: &mut Context, root_idx: usize, ty: &QueryType) -> Level {
+    let root = &ctx.schema.roots[root_idx];
+    let table = ctx.schema.tables[ctx.schema.structs[root.struct_id.index()].table.index()]
+        .name
+        .clone();
+    let mut builder = SelectBuilder::new();
+    builder.from = Some(FromClause::Table {
+        alias: ctx.aliases.table(&table),
+        table,
+    });
+    Level {
+        builder,
+        element: ty.clone(),
+        parent: ParentLink::Root { root_idx },
+        pending: None,
+        stmt_bound: true,
+        output_shapes: None,
     }
 }
 
@@ -286,6 +328,8 @@ fn navigate_ref(
             element,
             parent,
             pending,
+            stmt_bound,
+            output_shapes,
         } = level;
         if pending.is_some() {
             unreachable!("collection navigation over a split-pending level");
@@ -300,6 +344,8 @@ fn navigate_ref(
                 parent_col,
                 multi_parent,
             }),
+            stmt_bound,
+            output_shapes,
         }
     } else {
         merge_navigate(ctx, child_from, child_col, level, parent_col)
@@ -329,6 +375,8 @@ fn navigate_array(
                 element,
                 parent,
                 pending,
+                stmt_bound,
+                output_shapes,
             } = level;
             if pending.is_some() {
                 unreachable!("collection navigation over a split-pending level");
@@ -343,6 +391,8 @@ fn navigate_array(
                     parent_col,
                     multi_parent: true,
                 }),
+                stmt_bound,
+                output_shapes,
             }
         }
         _ => merge_navigate(ctx, child_from, child_col, level, parent_col),
@@ -358,15 +408,33 @@ fn merge_navigate(
 ) -> Level {
     let _ = ctx;
     let Level {
-        mut builder,
+        builder,
         element,
         parent,
         pending,
+        stmt_bound,
+        output_shapes,
     } = level;
     if pending.is_some() {
         unreachable!("merge over a split-pending level");
     }
-    builder.select = vec![SelectItem::Column {
+    Level {
+        builder: merge_builder(child_from, child_col, builder, parent_col),
+        element,
+        parent,
+        pending: None,
+        stmt_bound,
+        output_shapes,
+    }
+}
+
+fn merge_builder(
+    child_from: FromClause,
+    child_col: String,
+    mut parent_q: SelectBuilder,
+    parent_col: String,
+) -> SelectBuilder {
+    parent_q.select = vec![SelectItem::Column {
         depth: 0,
         column: parent_col.clone(),
         output: parent_col,
@@ -378,14 +446,49 @@ fn merge_navigate(
             depth: 0,
             column: child_col,
         }),
-        query: Box::new(builder),
+        query: Box::new(parent_q),
     }];
-    Level {
-        builder: child,
-        element,
-        parent,
-        pending: None,
+    child
+}
+
+fn global_first_hop(
+    ctx: &mut Context,
+    parent: Level,
+    source: StructId,
+    fid: FieldId,
+) -> (StructId, SelectBuilder) {
+    let field = &ctx.schema.structs[source.index()].fields[fid.local()];
+    let target = match field {
+        Field::Ref { target, .. } => *target,
+        _ => unreachable!("global hop over non-reference field"),
+    };
+    let (child_col, parent_col) = match link_cols(ctx, fid) {
+        LinkCols::ParentFk {
+            parent_fk,
+            child_pk,
+        } => (child_pk, parent_fk),
+        LinkCols::TargetFk {
+            child_fk,
+            parent_pk,
+        } => (child_fk, parent_pk),
+        LinkCols::ManyToMany => {
+            unreachable!("many-to-many hops are list-typed: scalar chains never cross them")
+        }
+    };
+    let table = ctx.schema.tables[ctx.schema.structs[target.index()].table.index()]
+        .name
+        .clone();
+    let child_from = FromClause::Table {
+        table: table.clone(),
+        alias: ctx.aliases.table(&table),
+    };
+    if parent.pending.is_some() {
+        unreachable!("global root with split-pending rows");
     }
+    (
+        target,
+        merge_builder(child_from, child_col, parent.builder, parent_col),
+    )
 }
 
 fn rows_method(
@@ -442,6 +545,9 @@ fn rows_method(
             level
         }
         "take" | "skip" | "first" | "nth" => {
+            if matches!(&ctx.child, Some(tail) if tail.per_row) {
+                todo!("M4b per-parent take inside child tail");
+            }
             if level.pending.is_some() && !matches!(level.element, QueryType::List(_)) {
                 todo!("M4 per-parent take over single-row parent");
             }
@@ -481,6 +587,8 @@ fn wrap_level(ctx: &mut Context, level: Level) -> Level {
         element,
         parent,
         pending,
+        output_shapes,
+        ..
     } = level;
     if builder.select.is_empty() {
         builder.select = vec![SelectItem::AllFrom { depth: 0 }];
@@ -496,6 +604,8 @@ fn wrap_level(ctx: &mut Context, level: Level) -> Level {
         element,
         parent,
         pending,
+        stmt_bound: false,
+        output_shapes,
     }
 }
 
@@ -536,6 +646,17 @@ fn sort_keys(ctx: &mut Context, expr: &TypedExpr, dir: OrderDir) -> Vec<OrderIte
 }
 
 fn compose_limit(
+    builder: &mut SelectBuilder,
+    method: &str,
+    args: &[TypedMethodArg],
+    ctx: &mut Context,
+) {
+    let was = std::mem::replace(&mut ctx.in_take_arg, true);
+    compose_limit_inner(builder, method, args, ctx);
+    ctx.in_take_arg = was;
+}
+
+fn compose_limit_inner(
     builder: &mut SelectBuilder,
     method: &str,
     args: &[TypedMethodArg],
@@ -655,33 +776,442 @@ fn rows_projection(ctx: &mut Context, base: &TypedExpr, items: &[TypedProjection
         unreachable!("projection over nested/optional lists is rejected upstream");
     }
     let mut select = Vec::with_capacity(items.len());
+    let mut fields: Vec<(String, Option<ResultShape>)> = Vec::with_capacity(items.len());
+    let mut parent_keys: Vec<String> = Vec::new();
     for item in items {
-        if !item.value.ty.is_scalar() {
-            todo!(
-                "M4 R-value: non-scalar projection item {}",
-                item.alias.value
-            );
-        }
-        match scalar(ctx, &item.value) {
-            SqlExpr::Column { depth, column } => select.push(SelectItem::Column {
-                depth,
-                column,
-                output: item.alias.value.clone(),
-            }),
-            expr => select.push(SelectItem::Expr {
-                expr,
-                output: item.alias.value.clone(),
-            }),
+        let alias = item.alias.value.clone();
+        match &item.value.ty {
+            ty if ty.is_scalar() => {
+                match scalar(ctx, &item.value) {
+                    SqlExpr::Column { depth, column } => select.push(SelectItem::Column {
+                        depth,
+                        column,
+                        output: alias.clone(),
+                    }),
+                    expr => select.push(SelectItem::Expr {
+                        expr,
+                        output: alias.clone(),
+                    }),
+                }
+                fields.push((alias, None));
+            }
+            QueryType::List(_) => {
+                if ctx.child.is_some() {
+                    todo!("M4b nested list item");
+                }
+                if !level.stmt_bound {
+                    todo!("M4b R-value under subquery (temp lane)");
+                }
+                let (shape, parent_key) = rvalue_shape(ctx, &mut level, &item.value);
+                fields.push((alias, Some(shape)));
+                if let Some(key) = parent_key {
+                    parent_keys.push(key);
+                }
+            }
+            QueryType::Record(_) => {
+                if ctx.child.is_some() {
+                    todo!("M4b nested record item");
+                }
+                if !level.stmt_bound {
+                    todo!("M4b R-scalar under subquery (temp lane)");
+                }
+                let (shape, parent_key) = rscalar_shape(ctx, &mut level, &item.value);
+                fields.push((alias, Some(shape)));
+                if let Some(key) = parent_key {
+                    parent_keys.push(key);
+                }
+            }
+            QueryType::Optional(inner) => match inner.as_ref() {
+                QueryType::Record(_) => {
+                    if ctx.child.is_some() {
+                        todo!("M4b nested record item");
+                    }
+                    if !level.stmt_bound {
+                        todo!("M4b R-scalar under subquery (temp lane)");
+                    }
+                    let (shape, parent_key) = rscalar_shape(ctx, &mut level, &item.value);
+                    fields.push((alias, Some(shape)));
+                    if let Some(key) = parent_key {
+                        parent_keys.push(key);
+                    }
+                }
+                QueryType::List(_) => todo!("M4b presence: optional list item"),
+                _ => todo!("M4b exotic optional item"),
+            },
+            QueryType::Tuple(_) => todo!("M7 tuples"),
+            QueryType::Void | QueryType::Unknown => {
+                unreachable!("void/unknown projection item: the checker excludes them")
+            }
+            _ => unreachable!("scalar items match the first arm"),
         }
     }
     if !level.builder.select.is_empty() {
         level = wrap_level(ctx, level);
     }
     level.builder.select = select;
+    for key in parent_keys {
+        ensure_key(&mut level.builder, &key);
+    }
+    level.output_shapes = Some(fields);
     level
 }
 
-pub fn lower_query(ctx: &mut Context, result: &TypedExpr) -> (SelectBuilder, Vec<String>) {
+fn ensure_key(builder: &mut SelectBuilder, col: &str) {
+    if builder
+        .select
+        .iter()
+        .any(|item| matches!(item, SelectItem::AllFrom { .. }))
+    {
+        return;
+    }
+    if builder.select.iter().any(|item| match item {
+        SelectItem::AllFrom { .. } => false,
+        SelectItem::Column { output, .. } | SelectItem::Expr { output, .. } => output == col,
+    }) {
+        return;
+    }
+    builder.select.push(SelectItem::Column {
+        depth: 0,
+        column: col.to_string(),
+        output: col.to_string(),
+    });
+}
+
+fn tail_root_ident(tail: &TypedExpr) -> Option<&IdentBinding> {
+    let mut node = tail;
+    loop {
+        match &node.kind {
+            TypedExprKind::Field { base, .. }
+            | TypedExprKind::Method { base, .. }
+            | TypedExprKind::Projection { base, .. } => node = base,
+            TypedExprKind::Ident { binding, .. } => return Some(binding),
+            _ => return None,
+        }
+    }
+}
+
+struct ChildLink {
+    child_from: FromClause,
+    child_col: String,
+    parent_col: String,
+}
+
+fn resolve_tail_link(ctx: &mut Context, fid: FieldId) -> ChildLink {
+    let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
+    match field {
+        Field::Ref { target, .. } => {
+            let table = ctx.schema.tables[ctx.schema.structs[target.index()].table.index()]
+                .name
+                .clone();
+            let (child_col, parent_col) = match link_cols(ctx, fid) {
+                LinkCols::ParentFk {
+                    parent_fk,
+                    child_pk,
+                } => (child_pk, parent_fk),
+                LinkCols::TargetFk {
+                    child_fk,
+                    parent_pk,
+                } => (child_fk, parent_pk),
+                LinkCols::ManyToMany => todo!("M4 many-to-many navigation"),
+            };
+            ChildLink {
+                child_from: FromClause::Table {
+                    table: table.clone(),
+                    alias: ctx.aliases.table(&table),
+                },
+                child_col,
+                parent_col,
+            }
+        }
+        Field::Array {
+            element,
+            link,
+            storage,
+            ..
+        } => {
+            if matches!(element, grove_schema::validated::ValueType::Optional(_)) {
+                todo!("M4 R-presence: optional inner list");
+            }
+            let table = ctx.schema.tables[storage.table.index()].name.clone();
+            ChildLink {
+                child_from: FromClause::Table {
+                    table: table.clone(),
+                    alias: ctx.aliases.table(&table),
+                },
+                child_col: ctx.schema.column_name(storage.key).to_string(),
+                parent_col: ctx.schema.column_name(*link).to_string(),
+            }
+        }
+        Field::Value { .. } => {
+            unreachable!("scalar tail root: scalar methods never return collections")
+        }
+    }
+}
+
+fn bulk_query() -> SelectBuilder {
+    SelectBuilder {
+        select: vec![SelectItem::Column {
+            depth: 0,
+            column: "value".to_string(),
+            output: "value".to_string(),
+        }],
+        from: Some(FromClause::TableFunction {
+            name: "$$bulk_params".to_string(),
+        }),
+        where_: Vec::new(),
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+    }
+}
+
+fn rvalue_shape(
+    ctx: &mut Context,
+    parent: &mut Level,
+    tail: &TypedExpr,
+) -> (ResultShape, Option<String>) {
+    let (child_from, child_col, parent_key) = match tail_root_ident(tail) {
+        Some(IdentBinding::Field(fid)) => {
+            let link = resolve_tail_link(ctx, *fid);
+            let _ = parent;
+            (link.child_from, link.child_col, Some(link.parent_col))
+        }
+        Some(IdentBinding::Root { root_idx }) => {
+            let root = &ctx.schema.roots[*root_idx];
+            let table = ctx.schema.tables[ctx.schema.structs[root.struct_id.index()].table.index()]
+                .name
+                .clone();
+            (
+                FromClause::Table {
+                    table: table.clone(),
+                    alias: ctx.aliases.table(&table),
+                },
+                String::new(),
+                None,
+            )
+        }
+        _ => todo!("M4b exotic tail root"),
+    };
+    let keyed = parent_key.is_some();
+    let mut child_builder = SelectBuilder::new();
+    child_builder.from = Some(child_from);
+    if keyed {
+        child_builder.where_ = vec![SqlExpr::InSubquery {
+            expr: Box::new(SqlExpr::Column {
+                depth: 0,
+                column: child_col.clone(),
+            }),
+            query: Box::new(bulk_query()),
+        }];
+    }
+    let child_level = Level {
+        builder: child_builder,
+        element: tail.ty.clone(),
+        parent: ParentLink::Root { root_idx: 0 },
+        pending: None,
+        stmt_bound: true,
+        output_shapes: None,
+    };
+    let was_child = ctx.child.replace(ChildCtx {
+        base: Some(child_level),
+        per_row: keyed,
+    });
+    let was_outer = std::mem::replace(&mut ctx.no_outer, true);
+    let mut child = rows(ctx, tail);
+    ctx.child = was_child;
+    ctx.no_outer = was_outer;
+    if child.pending.is_some() {
+        todo!("M4b nested collection inside child");
+    }
+    if child.builder.select.is_empty() {
+        child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+    }
+    if keyed {
+        ensure_key(&mut child.builder, &child_col);
+    }
+    let outputs = builder_outputs(&child.builder, ctx.schema);
+    let shape_cols: Vec<OutputColumn> = outputs
+        .iter()
+        .map(|name| OutputColumn {
+            name: name.clone(),
+            role: if keyed && *name == child_col {
+                ColumnRole::Key
+            } else {
+                ColumnRole::Value
+            },
+            ty: None,
+        })
+        .collect();
+    let element = ResultShape::Record(
+        outputs
+            .iter()
+            .map(|name| (name.clone(), ResultShape::Column(name.clone())))
+            .collect(),
+    );
+    let idx = ctx.sink(
+        child.builder,
+        StatementShape {
+            columns: shape_cols,
+            rows: RowCount::Many,
+        },
+    );
+    let shape = ResultShape::List {
+        element: Box::new(element),
+        child: ChildRef {
+            stmt: idx,
+            parent: parent_key.clone().map(|parent_key| ParentRef {
+                stmt: 0,
+                parent_key,
+                child_key: child_col,
+            }),
+            cardinality: Cardinality::Many,
+            tag: None,
+        },
+    };
+    (shape, parent_key)
+}
+
+fn rscalar_shape(
+    ctx: &mut Context,
+    parent: &mut Level,
+    tail: &TypedExpr,
+) -> (ResultShape, Option<String>) {
+    let eff = match &tail.kind {
+        TypedExprKind::Method { base, name, .. } if name.value == "first" => {
+            if filter_chain_to_field_ident(base) {
+                base.as_ref()
+            } else {
+                todo!("M4b ordered per-parent single");
+            }
+        }
+        TypedExprKind::Method { name, .. }
+            if ["nth", "take", "skip"].contains(&name.value.as_str()) =>
+        {
+            todo!("M4b ordered per-parent single")
+        }
+        _ => tail,
+    };
+    let (child_from, child_col, parent_key) = match tail_root_ident(eff) {
+        Some(IdentBinding::Field(fid)) => {
+            let link = resolve_tail_link(ctx, *fid);
+            let _ = parent;
+            (link.child_from, link.child_col, Some(link.parent_col))
+        }
+        Some(IdentBinding::Root { root_idx }) => {
+            let root = &ctx.schema.roots[*root_idx];
+            let table = ctx.schema.tables[ctx.schema.structs[root.struct_id.index()].table.index()]
+                .name
+                .clone();
+            (
+                FromClause::Table {
+                    table: table.clone(),
+                    alias: ctx.aliases.table(&table),
+                },
+                String::new(),
+                None,
+            )
+        }
+        _ => todo!("M4b exotic tail root"),
+    };
+    let keyed = parent_key.is_some();
+    let mut child_builder = SelectBuilder::new();
+    child_builder.from = Some(child_from);
+    if keyed {
+        child_builder.where_ = vec![SqlExpr::InSubquery {
+            expr: Box::new(SqlExpr::Column {
+                depth: 0,
+                column: child_col.clone(),
+            }),
+            query: Box::new(bulk_query()),
+        }];
+    }
+    let child_level = Level {
+        builder: child_builder,
+        element: eff.ty.clone(),
+        parent: ParentLink::Root { root_idx: 0 },
+        pending: None,
+        stmt_bound: true,
+        output_shapes: None,
+    };
+    let was_child = ctx.child.replace(ChildCtx {
+        base: Some(child_level),
+        per_row: keyed,
+    });
+    let was_outer = std::mem::replace(&mut ctx.no_outer, true);
+    let mut child = rows(ctx, eff);
+    ctx.child = was_child;
+    ctx.no_outer = was_outer;
+    if child.pending.is_some() {
+        todo!("M4b nested collection inside child");
+    }
+    if child.builder.select.is_empty() {
+        child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+    }
+    if keyed {
+        ensure_key(&mut child.builder, &child_col);
+    }
+    let outputs = builder_outputs(&child.builder, ctx.schema);
+    let shape_cols: Vec<OutputColumn> = outputs
+        .iter()
+        .map(|name| OutputColumn {
+            name: name.clone(),
+            role: if keyed && *name == child_col {
+                ColumnRole::Key
+            } else {
+                ColumnRole::Value
+            },
+            ty: None,
+        })
+        .collect();
+    let element = ResultShape::Record(
+        outputs
+            .iter()
+            .map(|name| (name.clone(), ResultShape::Column(name.clone())))
+            .collect(),
+    );
+    let idx = ctx.sink(
+        child.builder,
+        StatementShape {
+            columns: shape_cols,
+            rows: RowCount::Many,
+        },
+    );
+    let shape = ResultShape::Single {
+        element: Box::new(element),
+        child: ChildRef {
+            stmt: idx,
+            parent: parent_key.clone().map(|parent_key| ParentRef {
+                stmt: 0,
+                parent_key,
+                child_key: child_col,
+            }),
+            cardinality: Cardinality::One,
+            tag: None,
+        },
+    };
+    (shape, parent_key)
+}
+
+fn filter_chain_to_field_ident(mut node: &TypedExpr) -> bool {
+    loop {
+        match &node.kind {
+            TypedExprKind::Ident {
+                binding: IdentBinding::Field(_),
+                ..
+            } => return true,
+            TypedExprKind::Method { base, name, .. } if name.value == "filter" => node = base,
+            _ => return false,
+        }
+    }
+}
+
+pub struct RootPlan {
+    pub builder: SelectBuilder,
+    pub shape: StatementShape,
+    pub result: ResultShape,
+}
+
+pub fn lower_query(ctx: &mut Context, result: &TypedExpr) -> RootPlan {
     if result.ty.is_scalar() {
         let mut builder = SelectBuilder::new();
         let output = ctx.aliases.generic();
@@ -689,22 +1219,143 @@ pub fn lower_query(ctx: &mut Context, result: &TypedExpr) -> (SelectBuilder, Vec
             expr: scalar(ctx, result),
             output: output.clone(),
         }];
-        return (builder, vec![output]);
+        return RootPlan {
+            builder,
+            shape: StatementShape {
+                columns: vec![OutputColumn {
+                    name: output.clone(),
+                    role: ColumnRole::Value,
+                    ty: None,
+                }],
+                rows: RowCount::One,
+            },
+            result: ResultShape::Column(output),
+        };
     }
     let level = rows(ctx, result);
     finalize_level(ctx, level)
 }
 
-fn finalize_level(ctx: &mut Context, level: Level) -> (SelectBuilder, Vec<String>) {
-    if level.pending.is_some() {
-        todo!("M4 split emission: bare nested result needs parent + child statements");
+fn finalize_level(ctx: &mut Context, level: Level) -> RootPlan {
+    if let Some(pending) = level.pending {
+        return emit_split(ctx, level.builder, pending);
     }
     let mut builder = level.builder;
     if builder.select.is_empty() {
         builder.select = vec![SelectItem::AllFrom { depth: 0 }];
     }
     let outputs = builder_outputs(&builder, ctx.schema);
-    (builder, outputs)
+    let fields: Vec<(String, ResultShape)> = match level.output_shapes {
+        Some(items) => items
+            .into_iter()
+            .map(|(alias, shape)| {
+                let shape = shape.unwrap_or_else(|| ResultShape::Column(alias.clone()));
+                (alias, shape)
+            })
+            .collect(),
+        None => outputs
+            .iter()
+            .map(|name| (name.clone(), ResultShape::Column(name.clone())))
+            .collect(),
+    };
+    let shape = StatementShape {
+        columns: outputs
+            .iter()
+            .map(|name| OutputColumn {
+                name: name.clone(),
+                role: ColumnRole::Value,
+                ty: None,
+            })
+            .collect(),
+        rows: RowCount::Many,
+    };
+    let result = ResultShape::List {
+        element: Box::new(ResultShape::Record(fields)),
+        child: ChildRef {
+            stmt: 0,
+            parent: None,
+            cardinality: Cardinality::Many,
+            tag: None,
+        },
+    };
+    RootPlan {
+        builder,
+        shape,
+        result,
+    }
+}
+
+fn emit_split(ctx: &mut Context, parent_builder: SelectBuilder, pending: PendingSplit) -> RootPlan {
+    let PendingSplit {
+        child_from,
+        child_col,
+        parent_col,
+        ..
+    } = pending;
+    let mut parent_q = parent_builder;
+    parent_q.select = vec![SelectItem::Column {
+        depth: 0,
+        column: parent_col.clone(),
+        output: parent_col.clone(),
+    }];
+    let parent_shape = StatementShape {
+        columns: vec![OutputColumn {
+            name: parent_col.clone(),
+            role: ColumnRole::Key,
+            ty: None,
+        }],
+        rows: RowCount::Many,
+    };
+    let mut child = SelectBuilder::new();
+    child.from = Some(child_from);
+    child.where_ = vec![SqlExpr::InSubquery {
+        expr: Box::new(SqlExpr::Column {
+            depth: 0,
+            column: child_col.clone(),
+        }),
+        query: Box::new(bulk_query()),
+    }];
+    child.select = vec![SelectItem::AllFrom { depth: 0 }];
+    let child_outputs = builder_outputs(&child, ctx.schema);
+    let child_shape = StatementShape {
+        columns: child_outputs
+            .iter()
+            .map(|name| OutputColumn {
+                name: name.clone(),
+                role: if *name == child_col {
+                    ColumnRole::Key
+                } else {
+                    ColumnRole::Value
+                },
+                ty: None,
+            })
+            .collect(),
+        rows: RowCount::Many,
+    };
+    let element = ResultShape::Record(
+        child_outputs
+            .iter()
+            .map(|name| (name.clone(), ResultShape::Column(name.clone())))
+            .collect(),
+    );
+    let idx = ctx.sink(child, child_shape);
+    RootPlan {
+        builder: parent_q,
+        shape: parent_shape,
+        result: ResultShape::List {
+            element: Box::new(element),
+            child: ChildRef {
+                stmt: idx,
+                parent: Some(ParentRef {
+                    stmt: 0,
+                    parent_key: parent_col,
+                    child_key: child_col,
+                }),
+                cardinality: Cardinality::Many,
+                tag: None,
+            },
+        },
+    }
 }
 
 fn builder_outputs(builder: &SelectBuilder, schema: &ValidatedSchema) -> Vec<String> {
@@ -732,8 +1383,15 @@ fn from_columns(from: &Option<FromClause>, schema: &ValidatedSchema) -> Vec<Stri
             .map(|c| c.name.clone())
             .collect(),
         Some(FromClause::Subquery { query, .. }) => builder_outputs(query, schema),
+        Some(FromClause::TableFunction { .. }) => vec!["value".to_string()],
         None => unreachable!("row pipeline without FROM"),
     }
+}
+
+enum ChainRoot<'a> {
+    Enclosing,
+    Global(Box<Level>),
+    Collapsed(&'a TypedExpr),
 }
 
 fn scalar_field(
@@ -771,33 +1429,55 @@ fn scalar_field(
                     _ => unreachable!("value-typed chain root: fields of scalars don't exist"),
                 }
                 hops.push((fid.struct_id(), *fid));
-                break cursor;
+                break ChainRoot::Enclosing;
             }
             TypedExprKind::Ident {
                 binding: IdentBinding::ProjectedField { .. },
                 ..
             } => todo!("M4 navigation over projected records"),
+            TypedExprKind::Ident {
+                binding: IdentBinding::Root { root_idx },
+                ..
+            } => {
+                break ChainRoot::Global(Box::new(fresh_root_level(ctx, *root_idx, &cursor.ty)));
+            }
             TypedExprKind::Ident { .. } => {
                 unreachable!("non-field chain root in scalar demand")
             }
-            _ => break cursor,
+            _ => break ChainRoot::Collapsed(cursor),
         }
     };
     hops.reverse();
 
-    let rooted_at_ident = matches!(root.kind, TypedExprKind::Ident { .. });
-    if hops.is_empty() {
-        if rooted_at_ident {
-            unreachable!("ident chain root always contributes a hop");
+    let global_parent = match root {
+        ChainRoot::Collapsed(base) if hops.is_empty() => {
+            return single_hop_over_collapsed(ctx, base, name);
         }
-        return single_hop_over_collapsed(ctx, root, name);
-    }
-    if !rooted_at_ident {
-        todo!("M3 navigation chained over collapsed records");
-    }
+        ChainRoot::Collapsed(_) => {
+            todo!("M3 navigation chained over collapsed records");
+        }
+        ChainRoot::Enclosing => {
+            if hops.is_empty() {
+                unreachable!("ident chain root always contributes a hop");
+            }
+            None
+        }
+        ChainRoot::Global(parent) => {
+            if hops.is_empty() {
+                unreachable!("global chain root always contributes a hop");
+            }
+            Some(parent)
+        }
+    };
     let mut source = hops[0].0;
-    let mut shells: Vec<SelectBuilder> = Vec::with_capacity(hops.len());
-    for (_, fid) in &hops {
+    let (_, first_fid) = hops[0];
+    let (next_source, first_shell) = match global_parent {
+        Some(parent) => global_first_hop(ctx, *parent, source, first_fid),
+        None => hop_shell(ctx, source, first_fid),
+    };
+    source = next_source;
+    let mut shells = vec![first_shell];
+    for (_, fid) in &hops[1..] {
         let (next, shell) = hop_shell(ctx, source, *fid);
         shells.push(shell);
         source = next;
@@ -842,6 +1522,26 @@ fn single_hop_over_collapsed(
     base: &TypedExpr,
     name: &grove_types::Spanned<String>,
 ) -> SqlExpr {
+    if let TypedExprKind::Method {
+        base: inner,
+        name: m,
+        ..
+    } = &base.kind
+        && m.value == "first"
+        && let TypedExprKind::Ident {
+            binding: IdentBinding::Field(fid),
+            ..
+        } = &inner.kind
+        && is_collection_field(ctx, *fid)
+    {
+        if ctx.in_take_arg {
+            todo!("M4b temp-bound per-row limit");
+        }
+        return scalar_field(ctx, inner, name);
+    }
+    if has_row_setting_ident(base) {
+        todo!("M4b per-parent collapse with pipeline");
+    }
     let column = record_column(ctx, &base.ty, &name.value);
     SqlExpr::Subquery {
         query: Box::new(single_row_query(
@@ -856,8 +1556,53 @@ fn single_hop_over_collapsed(
     }
 }
 
+fn is_collection_field(ctx: &Context, fid: FieldId) -> bool {
+    match &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()] {
+        Field::Ref { is_list, .. } => *is_list,
+        Field::Array { .. } => true,
+        Field::Value { .. } => false,
+    }
+}
+
+fn has_row_setting_ident(expr: &TypedExpr) -> bool {
+    match &expr.kind {
+        TypedExprKind::Ident {
+            binding: IdentBinding::Field(_),
+            ..
+        } => !expr.ty.is_scalar(),
+        TypedExprKind::Ident { .. } => false,
+        TypedExprKind::Literal(_) | TypedExprKind::TypeConstant { .. } => false,
+        TypedExprKind::Field { base, .. } => has_row_setting_ident(base),
+        TypedExprKind::Method { base, args, .. } => {
+            has_row_setting_ident(base) || args.iter().any(|a| has_row_setting_ident(&a.expr))
+        }
+        TypedExprKind::Binary { lhs, rhs, .. } => {
+            has_row_setting_ident(lhs) || has_row_setting_ident(rhs)
+        }
+        TypedExprKind::Unary { expr, .. } | TypedExprKind::Cast { expr, .. } => {
+            has_row_setting_ident(expr)
+        }
+        TypedExprKind::If { arms, default } => {
+            arms.iter()
+                .any(|(c, t)| has_row_setting_ident(c) || has_row_setting_ident(t))
+                || has_row_setting_ident(default)
+        }
+        TypedExprKind::Some { value } => has_row_setting_ident(value),
+        TypedExprKind::Tuple { elements } | TypedExprKind::Array { elements } => {
+            elements.iter().any(has_row_setting_ident)
+        }
+        TypedExprKind::Struct { fields } => fields.iter().any(|(_, e)| has_row_setting_ident(e)),
+        TypedExprKind::Projection { base, items } => {
+            has_row_setting_ident(base) || items.iter().any(|i| has_row_setting_ident(&i.value))
+        }
+    }
+}
+
 fn single_row_query(ctx: &mut Context, base: &TypedExpr, select: Vec<SelectItem>) -> SelectBuilder {
+    let was = std::mem::replace(&mut ctx.no_outer, true);
     let mut level = rows(ctx, base);
+    ctx.no_outer = was;
+    level.stmt_bound = false;
     if level.pending.is_some() {
         todo!("M4 single-row query over split-pending base");
     }
@@ -1050,6 +1795,9 @@ fn scalar_constant(ty: TypeName, name: ConstantName) -> SqlExpr {
 }
 
 fn scalar_ident(ctx: &mut Context, binding: &IdentBinding, depth: usize) -> SqlExpr {
+    if ctx.no_outer && depth > 0 {
+        todo!("M4b correlated reference inside keyed child");
+    }
     match binding {
         IdentBinding::Root { .. } => {
             unreachable!("root idents are List-typed: scalar() only receives scalar inputs")

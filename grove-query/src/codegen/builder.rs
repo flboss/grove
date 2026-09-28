@@ -55,12 +55,16 @@ pub enum FromClause {
         query: Box<SelectBuilder>,
         alias: String,
     },
+    TableFunction {
+        name: String,
+    },
 }
 
 impl FromClause {
     pub fn alias(&self) -> &str {
         match self {
             FromClause::Table { alias, .. } | FromClause::Subquery { alias, .. } => alias,
+            FromClause::TableFunction { name } => name,
         }
     }
 }

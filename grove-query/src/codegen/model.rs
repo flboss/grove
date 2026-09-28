@@ -1,7 +1,15 @@
+
+use std::collections::HashMap;
+
+use grove_schema::validated::ScalarType;
+
+use super::builder::SelectBuilder;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompiledQuery {
     pub statements: Vec<PlannedStatement>,
     pub result: ResultShape,
+    pub literals: HashMap<String, Vec<Vec<ParamValue>>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -12,9 +20,16 @@ pub struct PlannedStatement {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct SunkStatement {
+    pub builder: SelectBuilder,
+    pub shape: StatementShape,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Param {
     Value(ParamValue),
     FromPrior { stmt: usize, column: String },
+    FromPriorKeys { stmt: usize, column: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -32,12 +47,14 @@ pub enum ParamValue {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StatementShape {
     pub columns: Vec<OutputColumn>,
+    pub rows: RowCount,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct OutputColumn {
     pub name: String,
     pub role: ColumnRole,
+    pub ty: Option<ScalarType>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,7 +63,45 @@ pub enum ColumnRole {
     Value,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowCount {
+    One,
+    ZeroOrOne,
+    Many,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResultShape {
-    Rows { columns: Vec<String> },
+    Column(String),
+    Tuple(Vec<ResultShape>),
+    Record(Vec<(String, ResultShape)>),
+    List {
+        element: Box<ResultShape>,
+        child: ChildRef,
+    },
+    Single {
+        element: Box<ResultShape>,
+        child: ChildRef,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChildRef {
+    pub stmt: usize,
+    pub parent: Option<ParentRef>,
+    pub cardinality: Cardinality,
+    pub tag: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParentRef {
+    pub stmt: usize,
+    pub parent_key: String,
+    pub child_key: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cardinality {
+    One,
+    Many,
 }
