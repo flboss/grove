@@ -98,6 +98,7 @@ pub enum SqlExpr {
     Subquery {
         query: Box<SelectBuilder>,
     },
+    Exists(Box<SelectBuilder>),
     Cast {
         expr: Box<SqlExpr>,
         target: &'static str,

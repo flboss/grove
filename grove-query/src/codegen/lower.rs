@@ -7,7 +7,7 @@ use crate::typecheck::types::{
     IdentBinding, QueryType, RecordSource, TypedExpr, TypedExprKind, TypedMethodArg,
     TypedProjectionItem,
 };
-use grove_schema::validated::{Field, ScalarType, ValidatedSchema};
+use grove_schema::validated::{Field, FieldId, Relation, ScalarType, StructId, ValidatedSchema};
 
 pub struct Context<'s> {
     pub schema: &'s ValidatedSchema,
@@ -28,11 +28,18 @@ pub enum ParentLink {
     Root { root_idx: usize },
 }
 
-#[allow(dead_code)]
+pub struct PendingSplit {
+    pub child_from: FromClause,
+    pub child_col: String,
+    pub parent_col: String,
+    pub multi_parent: bool,
+}
+
 pub struct Level {
     pub builder: SelectBuilder,
     pub element: QueryType,
     pub parent: ParentLink,
+    pub pending: Option<PendingSplit>,
 }
 
 pub fn scalar(ctx: &mut Context, expr: &TypedExpr) -> SqlExpr {
@@ -40,7 +47,7 @@ pub fn scalar(ctx: &mut Context, expr: &TypedExpr) -> SqlExpr {
         TypedExprKind::Literal(lit) => scalar_literal(&lit.value),
         TypedExprKind::TypeConstant { ty, name } => scalar_constant(ty.value, name.value),
         TypedExprKind::Ident { binding, depth, .. } => scalar_ident(ctx, binding, *depth),
-        TypedExprKind::Field { .. } => todo!("M3 singular navigation / record access"),
+        TypedExprKind::Field { base, name, .. } => scalar_field(ctx, base, name),
         TypedExprKind::Method {
             base,
             name,
@@ -143,6 +150,7 @@ fn rows_ident(ctx: &mut Context, binding: &IdentBinding, ty: &QueryType) -> Leve
                 parent: ParentLink::Root {
                     root_idx: *root_idx,
                 },
+                pending: None,
             }
         }
         _ => unreachable!(
@@ -159,15 +167,24 @@ fn rows_field(
 ) -> Level {
     let _ = optional;
     let mut level = rows(ctx, base);
-    let record = match &base.ty {
+    let inner = match &base.ty {
         QueryType::List(inner) => inner.as_ref(),
-        other => unreachable!(
-            "field base {other} is not a list: the checker maps fields over lists only"
-        ),
+        QueryType::Optional(inner) => match inner.as_ref() {
+            QueryType::List(inner) => inner.as_ref(),
+            record @ QueryType::Record(_) => record,
+            other => {
+                unreachable!("field base ?{other}: optionals wrap records or lists only")
+            }
+        },
+        other => {
+            unreachable!(
+                "field base {other} is not a list: the checker maps fields over lists only"
+            )
+        }
     };
-    match record {
+    match inner {
         QueryType::Record(RecordSource::Schema(struct_id)) => {
-            let (_, field) = ctx
+            let (fid, field) = ctx
                 .schema
                 .struct_field(*struct_id, &name.value)
                 .unwrap_or_else(|| {
@@ -185,7 +202,26 @@ fn rows_field(
                     });
                     level
                 }
-                _ => todo!("M3 NAVIGATE: collection crossing"),
+                Field::Ref {
+                    target,
+                    is_list,
+                    optional: field_optional,
+                    ..
+                } => navigate_ref(
+                    ctx,
+                    level,
+                    matches!(base.ty, QueryType::List(_)),
+                    fid,
+                    *target,
+                    *is_list,
+                    *field_optional,
+                ),
+                Field::Array {
+                    element,
+                    link,
+                    storage,
+                    ..
+                } => navigate_array(ctx, level, element, *link, storage),
             }
         }
         QueryType::Record(RecordSource::Projection(fields)) => {
@@ -205,7 +241,150 @@ fn rows_field(
             });
             level
         }
-        _ => unreachable!("field access over non-record lists is rejected upstream"),
+        QueryType::List(_) => {
+            unreachable!("field access over nested lists is rejected upstream")
+        }
+        other => {
+            unreachable!("field access over {other} is rejected upstream")
+        }
+    }
+}
+
+fn navigate_ref(
+    ctx: &mut Context,
+    level: Level,
+    multi_parent: bool,
+    fid: FieldId,
+    target: StructId,
+    is_list: bool,
+    field_optional: bool,
+) -> Level {
+    let table = ctx.schema.tables[ctx.schema.structs[target.index()].table.index()]
+        .name
+        .clone();
+    let child_from = FromClause::Table {
+        table: table.clone(),
+        alias: ctx.aliases.table(&table),
+    };
+    let (child_col, parent_col) = match link_cols(ctx, fid) {
+        LinkCols::ParentFk {
+            parent_fk,
+            child_pk,
+        } => (child_pk, parent_fk),
+        LinkCols::TargetFk {
+            child_fk,
+            parent_pk,
+        } => (child_fk, parent_pk),
+        LinkCols::ManyToMany => todo!("M4 many-to-many navigation"),
+    };
+    if is_list {
+        if field_optional {
+            todo!("M4 R-presence: optional inner list");
+        }
+        let Level {
+            builder,
+            element,
+            parent,
+            pending,
+        } = level;
+        if pending.is_some() {
+            unreachable!("collection navigation over a split-pending level");
+        }
+        Level {
+            builder,
+            element,
+            parent,
+            pending: Some(PendingSplit {
+                child_from,
+                child_col,
+                parent_col,
+                multi_parent,
+            }),
+        }
+    } else {
+        merge_navigate(ctx, child_from, child_col, level, parent_col)
+    }
+}
+
+fn navigate_array(
+    ctx: &mut Context,
+    level: Level,
+    element: &grove_schema::validated::ValueType,
+    link: grove_schema::validated::ColumnId,
+    storage: &grove_schema::validated::StorageTable,
+) -> Level {
+    use grove_schema::validated::ValueType;
+    let table = ctx.schema.tables[storage.table.index()].name.clone();
+    let child_from = FromClause::Table {
+        table: table.clone(),
+        alias: ctx.aliases.table(&table),
+    };
+    let child_col = ctx.schema.column_name(storage.key).to_string();
+    let parent_col = ctx.schema.column_name(link).to_string();
+    match element {
+        ValueType::Optional(_) => todo!("M4 R-presence: optional inner list"),
+        ValueType::Array { .. } => {
+            let Level {
+                builder,
+                element,
+                parent,
+                pending,
+            } = level;
+            if pending.is_some() {
+                unreachable!("collection navigation over a split-pending level");
+            }
+            Level {
+                builder,
+                element,
+                parent,
+                pending: Some(PendingSplit {
+                    child_from,
+                    child_col,
+                    parent_col,
+                    multi_parent: true,
+                }),
+            }
+        }
+        _ => merge_navigate(ctx, child_from, child_col, level, parent_col),
+    }
+}
+
+fn merge_navigate(
+    ctx: &mut Context,
+    child_from: FromClause,
+    child_col: String,
+    level: Level,
+    parent_col: String,
+) -> Level {
+    let _ = ctx;
+    let Level {
+        mut builder,
+        element,
+        parent,
+        pending,
+    } = level;
+    if pending.is_some() {
+        unreachable!("merge over a split-pending level");
+    }
+    builder.select = vec![SelectItem::Column {
+        depth: 0,
+        column: parent_col.clone(),
+        output: parent_col,
+    }];
+    let mut child = SelectBuilder::new();
+    child.from = Some(child_from);
+    child.where_ = vec![SqlExpr::InSubquery {
+        expr: Box::new(SqlExpr::Column {
+            depth: 0,
+            column: child_col,
+        }),
+        query: Box::new(builder),
+    }];
+    Level {
+        builder: child,
+        element,
+        parent,
+        pending: None,
     }
 }
 
@@ -220,6 +399,9 @@ fn rows_method(
     let mut level = rows(ctx, base);
     match name.value.as_str() {
         "filter" => {
+            if level.pending.is_some() {
+                todo!("M4 filter over split-pending level");
+            }
             if needs_wrap(&level) {
                 level = wrap_level(ctx, level);
             }
@@ -230,6 +412,12 @@ fn rows_method(
             level
         }
         "sort" | "sort_asc" | "sort_desc" => {
+            if let Some(pending) = level.pending.as_ref() {
+                if pending.multi_parent {
+                    todo!("H1 QT0028: sort over nested lists");
+                }
+                todo!("M4 per-parent sort over single-row parent");
+            }
             if needs_wrap(&level) {
                 level = wrap_level(ctx, level);
             }
@@ -254,10 +442,26 @@ fn rows_method(
             level
         }
         "take" | "skip" | "first" | "nth" => {
+            if level.pending.is_some() && !matches!(level.element, QueryType::List(_)) {
+                todo!("M4 per-parent take over single-row parent");
+            }
             compose_limit(&mut level.builder, &name.value, args, ctx);
             level
         }
-        "flatten" => todo!("M3 flatten + rewire"),
+        "flatten" => match level.pending.take() {
+            Some(pending) => {
+                let PendingSplit {
+                    child_from,
+                    child_col,
+                    parent_col,
+                    ..
+                } = pending;
+                merge_navigate(ctx, child_from, child_col, level, parent_col)
+            }
+            None => {
+                unreachable!("flatten over flat list is rejected upstream (strict sig)")
+            }
+        },
         _ => unreachable!(
             "method {} in row demand: value methods never return row types",
             name.value
@@ -276,6 +480,7 @@ fn wrap_level(ctx: &mut Context, level: Level) -> Level {
         mut builder,
         element,
         parent,
+        pending,
     } = level;
     if builder.select.is_empty() {
         builder.select = vec![SelectItem::AllFrom { depth: 0 }];
@@ -290,6 +495,7 @@ fn wrap_level(ctx: &mut Context, level: Level) -> Level {
         builder: outer,
         element,
         parent,
+        pending,
     }
 }
 
@@ -445,6 +651,9 @@ fn non_neg_guard(expr: SqlExpr, method: &str) -> SqlExpr {
 
 fn rows_projection(ctx: &mut Context, base: &TypedExpr, items: &[TypedProjectionItem]) -> Level {
     let mut level = rows(ctx, base);
+    if level.pending.is_some() {
+        unreachable!("projection over nested/optional lists is rejected upstream");
+    }
     let mut select = Vec::with_capacity(items.len());
     for item in items {
         if !item.value.ty.is_scalar() {
@@ -487,6 +696,9 @@ pub fn lower_query(ctx: &mut Context, result: &TypedExpr) -> (SelectBuilder, Vec
 }
 
 fn finalize_level(ctx: &mut Context, level: Level) -> (SelectBuilder, Vec<String>) {
+    if level.pending.is_some() {
+        todo!("M4 split emission: bare nested result needs parent + child statements");
+    }
     let mut builder = level.builder;
     if builder.select.is_empty() {
         builder.select = vec![SelectItem::AllFrom { depth: 0 }];
@@ -522,6 +734,276 @@ fn from_columns(from: &Option<FromClause>, schema: &ValidatedSchema) -> Vec<Stri
         Some(FromClause::Subquery { query, .. }) => builder_outputs(query, schema),
         None => unreachable!("row pipeline without FROM"),
     }
+}
+
+fn scalar_field(
+    ctx: &mut Context,
+    base: &TypedExpr,
+    name: &grove_types::Spanned<String>,
+) -> SqlExpr {
+    let mut hops: Vec<(StructId, FieldId)> = Vec::new();
+    let mut cursor = base;
+    let root = loop {
+        match &cursor.kind {
+            TypedExprKind::Field {
+                base: next,
+                name: hop,
+                ..
+            } => {
+                let sid = record_struct(&cursor.ty);
+                let (fid, field) = ctx.schema.struct_field(sid, &hop.value).unwrap_or_else(|| {
+                    unreachable!("resolved field {} vanished from the schema", hop.value)
+                });
+                match field {
+                    Field::Ref { .. } => {}
+                    _ => unreachable!("value-typed hop {}: scalar results don't chain", hop.value),
+                }
+                hops.push((sid, fid));
+                cursor = next;
+            }
+            TypedExprKind::Ident {
+                binding: IdentBinding::Field(fid),
+                ..
+            } => {
+                let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
+                match field {
+                    Field::Ref { .. } => {}
+                    _ => unreachable!("value-typed chain root: fields of scalars don't exist"),
+                }
+                hops.push((fid.struct_id(), *fid));
+                break cursor;
+            }
+            TypedExprKind::Ident {
+                binding: IdentBinding::ProjectedField { .. },
+                ..
+            } => todo!("M4 navigation over projected records"),
+            TypedExprKind::Ident { .. } => {
+                unreachable!("non-field chain root in scalar demand")
+            }
+            _ => break cursor,
+        }
+    };
+    hops.reverse();
+
+    let rooted_at_ident = matches!(root.kind, TypedExprKind::Ident { .. });
+    if hops.is_empty() {
+        if rooted_at_ident {
+            unreachable!("ident chain root always contributes a hop");
+        }
+        return single_hop_over_collapsed(ctx, root, name);
+    }
+    if !rooted_at_ident {
+        todo!("M3 navigation chained over collapsed records");
+    }
+    let mut source = hops[0].0;
+    let mut shells: Vec<SelectBuilder> = Vec::with_capacity(hops.len());
+    for (_, fid) in &hops {
+        let (next, shell) = hop_shell(ctx, source, *fid);
+        shells.push(shell);
+        source = next;
+    }
+    let (_, field) = ctx
+        .schema
+        .struct_field(source, &name.value)
+        .unwrap_or_else(|| unreachable!("resolved field {} vanished from the schema", name.value));
+    let final_col = match field {
+        Field::Value { columns, .. } => match columns.as_slice() {
+            [column] => ctx.schema.column_name(*column).to_string(),
+            _ => todo!("M7 tuple-valued navigation endpoint"),
+        },
+        Field::Ref { .. } => todo!("M4 R-scalar: single record in value slot"),
+        Field::Array { .. } => todo!("M4 array in value slot"),
+    };
+    let mut inner = shells
+        .pop()
+        .unwrap_or_else(|| unreachable!("chain with no hops"));
+    inner.select = vec![SelectItem::Column {
+        depth: 0,
+        column: final_col.clone(),
+        output: final_col,
+    }];
+    while let Some(mut outer) = shells.pop() {
+        let output = ctx.aliases.generic();
+        outer.select = vec![SelectItem::Expr {
+            expr: SqlExpr::Subquery {
+                query: Box::new(inner),
+            },
+            output: output.clone(),
+        }];
+        inner = outer;
+    }
+    SqlExpr::Subquery {
+        query: Box::new(inner),
+    }
+}
+
+fn single_hop_over_collapsed(
+    ctx: &mut Context,
+    base: &TypedExpr,
+    name: &grove_types::Spanned<String>,
+) -> SqlExpr {
+    let column = record_column(ctx, &base.ty, &name.value);
+    SqlExpr::Subquery {
+        query: Box::new(single_row_query(
+            ctx,
+            base,
+            vec![SelectItem::Column {
+                depth: 0,
+                column: column.clone(),
+                output: column,
+            }],
+        )),
+    }
+}
+
+fn single_row_query(ctx: &mut Context, base: &TypedExpr, select: Vec<SelectItem>) -> SelectBuilder {
+    let mut level = rows(ctx, base);
+    if level.pending.is_some() {
+        todo!("M4 single-row query over split-pending base");
+    }
+    if !level.builder.select.is_empty() {
+        level = wrap_level(ctx, level);
+    }
+    level.builder.select = select;
+    level.builder
+}
+
+fn record_column(ctx: &Context, ty: &QueryType, name: &str) -> String {
+    match ty {
+        QueryType::Record(RecordSource::Schema(sid)) => {
+            let (_, field) = ctx
+                .schema
+                .struct_field(*sid, name)
+                .unwrap_or_else(|| unreachable!("resolved field {name} vanished from the schema"));
+            match field {
+                Field::Value { columns, .. } => match columns.as_slice() {
+                    [column] => ctx.schema.column_name(*column).to_string(),
+                    _ => todo!("M7 tuple-valued field access"),
+                },
+                Field::Ref { .. } => todo!("M4 R-scalar: single record in value slot"),
+                Field::Array { .. } => todo!("M4 array in value slot"),
+            }
+        }
+        QueryType::Record(RecordSource::Projection(_)) => name.to_string(),
+        QueryType::Optional(inner) => record_column(ctx, inner, name),
+        other => unreachable!("field access over {other}: the checker only admits records"),
+    }
+}
+
+fn record_struct(ty: &QueryType) -> StructId {
+    match ty {
+        QueryType::Record(RecordSource::Schema(sid)) => *sid,
+        QueryType::Optional(inner) => record_struct(inner),
+        QueryType::Record(RecordSource::Projection(_)) => {
+            todo!("M4 navigation over projected records")
+        }
+        other => unreachable!("chain link over {other}: the checker only admits records"),
+    }
+}
+
+enum LinkCols {
+    ParentFk { parent_fk: String, child_pk: String },
+    TargetFk { child_fk: String, parent_pk: String },
+    ManyToMany,
+}
+
+fn link_cols(ctx: &Context, fid: FieldId) -> LinkCols {
+    let relation = &ctx.schema.relations[ctx
+        .schema
+        .relation_of_field(fid)
+        .unwrap_or_else(|| unreachable!("reference field without relation"))
+        .index()];
+    let name = |c| ctx.schema.column_name(c).to_string();
+    match relation {
+        Relation::OneToOne {
+            child_ref,
+            parent_ref,
+            fk,
+            pk,
+        }
+        | Relation::ManyToOne {
+            child_ref,
+            parent_ref,
+            fk,
+            pk,
+        } => {
+            if fid == *child_ref {
+                LinkCols::ParentFk {
+                    parent_fk: name(*fk),
+                    child_pk: name(*pk),
+                }
+            } else if fid == *parent_ref {
+                LinkCols::TargetFk {
+                    child_fk: name(*fk),
+                    parent_pk: name(*pk),
+                }
+            } else {
+                unreachable!("hop field is not an endpoint of its relation")
+            }
+        }
+        Relation::OneToMany {
+            a_ref,
+            b_ref,
+            fk,
+            pk,
+        } => {
+            if fid == *b_ref {
+                LinkCols::ParentFk {
+                    parent_fk: name(*fk),
+                    child_pk: name(*pk),
+                }
+            } else if fid == *a_ref {
+                LinkCols::TargetFk {
+                    child_fk: name(*fk),
+                    parent_pk: name(*pk),
+                }
+            } else {
+                unreachable!("hop field is not an endpoint of its relation")
+            }
+        }
+        Relation::ManyToMany { .. } => LinkCols::ManyToMany,
+    }
+}
+
+fn hop_shell(ctx: &mut Context, source: StructId, fid: FieldId) -> (StructId, SelectBuilder) {
+    let field = &ctx.schema.structs[source.index()].fields[fid.local()];
+    let target = match field {
+        Field::Ref { target, .. } => *target,
+        _ => unreachable!("hop over non-reference field"),
+    };
+    let (child_col, parent_col) = match link_cols(ctx, fid) {
+        LinkCols::ParentFk {
+            parent_fk,
+            child_pk,
+        } => (child_pk, parent_fk),
+        LinkCols::TargetFk {
+            child_fk,
+            parent_pk,
+        } => (child_fk, parent_pk),
+        LinkCols::ManyToMany => {
+            unreachable!("many-to-many hops are list-typed: scalar chains never cross them")
+        }
+    };
+    let table = ctx.schema.tables[ctx.schema.structs[target.index()].table.index()]
+        .name
+        .clone();
+    let mut shell = SelectBuilder::new();
+    shell.from = Some(FromClause::Table {
+        table: table.clone(),
+        alias: ctx.aliases.table(&table),
+    });
+    shell.where_ = vec![SqlExpr::Binary {
+        op: SqlBinOp::Eq,
+        lhs: Box::new(SqlExpr::Column {
+            depth: 0,
+            column: child_col,
+        }),
+        rhs: Box::new(SqlExpr::Column {
+            depth: 1,
+            column: parent_col,
+        }),
+    }];
+    (target, shell)
 }
 
 fn scalar_literal(lit: &Literal) -> SqlExpr {
@@ -639,12 +1121,37 @@ fn scalar_method(
                     _ => apply_scalar_method(ctx, frag, *s, name, args),
                 }
             }
-            _ => todo!("M3 optional record/list/tuple mechanics"),
+            QueryType::Record(_) => {
+                match name.value.as_str() {
+                    "is_some" => SqlExpr::Exists(Box::new(single_row_query(
+                        ctx,
+                        base,
+                        vec![SelectItem::AllFrom { depth: 0 }],
+                    ))),
+                    "is_none" => SqlExpr::Not(Box::new(SqlExpr::Exists(Box::new(
+                        single_row_query(ctx, base, vec![SelectItem::AllFrom { depth: 0 }]),
+                    )))),
+                    "unwrap" | "unwrap_or" => {
+                        todo!("M4 presence-directed unwrap over records")
+                    }
+                    _ => unreachable!("no other methods on ?Record: the checker rejects them"),
+                }
+            }
+            QueryType::List(inner) => match name.value.as_str() {
+                "contains" if matches!(inner.as_ref(), QueryType::List(_)) => {
+                    todo!("H1 QT0028: membership over nested lists")
+                }
+                _ => todo!("M4 list-optional mechanics"),
+            },
+            _ => todo!("M7 optional tuples"),
         },
-        QueryType::List(_) => match name.value.as_str() {
+        QueryType::List(inner) => match name.value.as_str() {
             "len" | "sum" | "avg" | "max" | "min" | "sum_over" | "avg_over" | "max_by"
             | "min_by" => todo!("M5 aggregations: {}", name.value),
             "first" | "nth" => todo!("M3 single collapse: {}", name.value),
+            "contains" if matches!(inner.as_ref(), QueryType::List(_)) => {
+                todo!("H1 QT0028: membership over nested lists")
+            }
             "contains" => todo!("M3 flipped EXISTS over element rows"),
             other => {
                 unreachable!(

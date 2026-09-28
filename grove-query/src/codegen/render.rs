@@ -220,6 +220,11 @@ fn render_expr(
             render_select(query, stack, sql, params);
             sql.push(')');
         }
+        SqlExpr::Exists(query) => {
+            sql.push_str("EXISTS (");
+            render_select(query, stack, sql, params);
+            sql.push(')');
+        }
         SqlExpr::Cast { expr, target } => {
             sql.push_str("CAST(");
             render_expr(expr, stack, false, sql, params);
@@ -460,5 +465,27 @@ mod tests {
             params,
             vec![Param::Value(ParamValue::String("?".to_string()))]
         );
+    }
+
+    #[test]
+    fn exists_renders() {
+        let mut inner = simple_builder();
+        inner.select = vec![SelectItem::Column {
+            depth: 0,
+            column: "id".to_string(),
+            output: "id".to_string(),
+        }];
+        inner.where_ = vec![];
+        inner.order_by = vec![];
+        inner.limit = None;
+        let expr = SqlExpr::Exists(Box::new(inner));
+        let mut sql = String::new();
+        let mut params = Vec::new();
+        render_expr(&expr, &mut test_stack(), true, &mut sql, &mut params);
+        assert_eq!(
+            sql,
+            r#"EXISTS (SELECT "$$users0"."id" FROM "users" AS "$$users0")"#
+        );
+        assert!(params.is_empty());
     }
 }
