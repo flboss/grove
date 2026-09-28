@@ -227,6 +227,16 @@ fn render_expr(
             sql.push_str(target);
             sql.push(')');
         }
+        SqlExpr::Coalesce(values) => {
+            sql.push_str("COALESCE(");
+            for (i, value) in values.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(", ");
+                }
+                render_expr(value, stack, false, sql, params);
+            }
+            sql.push(')');
+        }
     }
 }
 
@@ -431,5 +441,24 @@ mod tests {
         let mut params = Vec::new();
         render_select(&builder, &mut test_stack(), &mut sql, &mut params);
         assert!(sql.ends_with("LIMIT -1 OFFSET ?"));
+    }
+
+    #[test]
+    fn coalesce_renders() {
+        let expr = SqlExpr::Coalesce(vec![
+            SqlExpr::Column {
+                depth: 0,
+                column: "nickname".to_string(),
+            },
+            SqlExpr::Param(ParamValue::String("?".to_string())),
+        ]);
+        let mut sql = String::new();
+        let mut params = Vec::new();
+        render_expr(&expr, &mut test_stack(), true, &mut sql, &mut params);
+        assert_eq!(sql, r#"COALESCE("$$users0"."nickname", ?)"#);
+        assert_eq!(
+            params,
+            vec![Param::Value(ParamValue::String("?".to_string()))]
+        );
     }
 }

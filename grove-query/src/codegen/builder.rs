@@ -90,6 +90,7 @@ pub enum SqlExpr {
         expr: Box<SqlExpr>,
         items: Vec<SqlExpr>,
     },
+    Coalesce(Vec<SqlExpr>),
     InSubquery {
         expr: Box<SqlExpr>,
         query: Box<SelectBuilder>,
