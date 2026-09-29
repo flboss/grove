@@ -27,6 +27,7 @@ pub fn render_select(
                 depth,
                 column,
                 output,
+                ..
             } => {
                 sql.push_str(&quote(resolve(stack, *depth)));
                 sql.push('.');
@@ -36,7 +37,7 @@ pub fn render_select(
                     sql.push_str(&quote(output));
                 }
             }
-            SelectItem::Expr { expr, output } => {
+            SelectItem::Expr { expr, output, .. } => {
                 render_expr(expr, stack, true, sql, params);
                 sql.push_str(" AS ");
                 sql.push_str(&quote(output));
@@ -319,6 +320,7 @@ mod tests {
                 depth: 0,
                 column: "name".to_string(),
                 output: "name".to_string(),
+                ty: None,
             }],
             where_: vec![SqlExpr::Binary {
                 op: SqlBinOp::Gt,
@@ -423,6 +425,7 @@ mod tests {
                 depth: 0,
                 column: "name".to_string(),
                 output: "$$val0".to_string(),
+                ty: None,
             }],
             where_: vec![SqlExpr::Binary {
                 op: SqlBinOp::Eq,
@@ -465,6 +468,7 @@ mod tests {
                 depth: 0,
                 column: "id".to_string(),
                 output: "id".to_string(),
+                ty: None,
             }],
             where_: vec![],
             order_by: vec![],
@@ -527,6 +531,7 @@ mod tests {
             depth: 0,
             column: "id".to_string(),
             output: "id".to_string(),
+            ty: None,
         }];
         inner.where_ = vec![];
         inner.order_by = vec![];

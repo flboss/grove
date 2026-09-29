@@ -1,3 +1,5 @@
+use grove_schema::validated::ScalarType;
+
 use super::model::ParamValue;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -40,11 +42,19 @@ pub enum SelectItem {
         depth: usize,
         column: String,
         output: String,
+        ty: Option<ScalarType>,
     },
     Expr {
         expr: SqlExpr,
         output: String,
+        ty: Option<ScalarType>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NamedColumn {
+    pub name: String,
+    pub ty: Option<ScalarType>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -62,12 +72,12 @@ pub enum FromClause {
     },
     Temp {
         name: String,
-        columns: Vec<String>,
+        columns: Vec<NamedColumn>,
     },
     Literal {
         module: String,
         id: String,
-        columns: Vec<String>,
+        columns: Vec<NamedColumn>,
     },
 }
 

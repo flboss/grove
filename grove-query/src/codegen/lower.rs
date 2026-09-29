@@ -2,7 +2,8 @@
 use std::collections::HashMap;
 
 use super::builder::{
-    AliasGen, FromClause, OrderDir, OrderItem, SelectBuilder, SelectItem, SqlBinOp, SqlExpr,
+    AliasGen, FromClause, NamedColumn, OrderDir, OrderItem, SelectBuilder, SelectItem, SqlBinOp,
+    SqlExpr,
 };
 use super::model::{
     Cardinality, ChildRef, ColumnRole, OutputColumn, ParamValue, ParentRef, ResultShape, RowCount,
@@ -13,7 +14,9 @@ use crate::typecheck::types::{
     IdentBinding, QueryType, RecordSource, TypedExpr, TypedExprKind, TypedMethodArg,
     TypedProjectionItem,
 };
-use grove_schema::validated::{Field, FieldId, Relation, ScalarType, StructId, ValidatedSchema};
+use grove_schema::validated::{
+    Field, FieldId, Relation, ScalarType, StructId, ValidatedSchema, ValueType,
+};
 
 pub struct Context<'s> {
     pub schema: &'s ValidatedSchema,
@@ -355,18 +358,24 @@ fn rows_field(
                     unreachable!("resolved field {} vanished from the schema", name.value)
                 });
             match field {
-                Field::Value { columns, .. } => {
+                Field::Value { columns, ty, .. } => {
                     let [column] = columns.as_slice() else {
                         if level.pending.is_some() {
                             unreachable!(
                                 "tuple field over split-pending rows: field access over nested lists is rejected upstream"
                             )
                         }
-                        for column in columns {
+                        let ValueType::Tuple(items) = ty else {
+                            unreachable!(
+                                "multi-column field with non-tuple type: storage claims one column per scalar"
+                            )
+                        };
+                        for (column, item_ty) in columns.iter().zip(items.iter()) {
                             level.builder.select.push(SelectItem::Column {
                                 depth: 0,
                                 column: ctx.schema.column_name(*column).to_string(),
                                 output: ctx.schema.column_name(*column).to_string(),
+                                ty: value_scalar(item_ty),
                             });
                         }
                         return level;
@@ -375,6 +384,7 @@ fn rows_field(
                         depth: 0,
                         column: ctx.schema.column_name(*column).to_string(),
                         output: name.value.clone(),
+                        ty: value_scalar(ty),
                     });
                     level
                 }
@@ -414,6 +424,7 @@ fn rows_field(
                 depth: 0,
                 column: name.value.clone(),
                 output: name.value.clone(),
+                ty: scalar_of(&field.ty),
             });
             level
         }
@@ -561,7 +572,7 @@ fn merge_navigate(
         unreachable!("merge over a split-pending level");
     }
     Level {
-        builder: merge_builder(child_from, child_col, builder, parent_col),
+        builder: merge_builder(child_from, child_col, builder, parent_col, ctx.schema),
         element,
         parent,
         pending: None,
@@ -575,22 +586,26 @@ fn merge_builder(
     child_col: String,
     mut parent_q: SelectBuilder,
     parent_col: String,
+    schema: &ValidatedSchema,
 ) -> SelectBuilder {
+    let parent_ty = output_ty(&parent_q, &parent_col, schema);
     parent_q.select = vec![SelectItem::Column {
         depth: 0,
         column: parent_col.clone(),
         output: parent_col,
+        ty: parent_ty,
     }];
     let mut child = SelectBuilder::new();
     if let FromClause::Literal { columns, .. } = &child_from {
         child.select = columns
             .iter()
-            .filter(|c| *c != &child_col)
+            .filter(|c| c.name != child_col)
             .enumerate()
             .map(|(i, column)| SelectItem::Column {
                 depth: 0,
-                column: column.clone(),
+                column: column.name.clone(),
                 output: format!("c{i}"),
+                ty: column.ty,
             })
             .collect();
         if child.select.is_empty() {
@@ -646,7 +661,13 @@ fn global_first_hop(
     }
     (
         target,
-        merge_builder(child_from, child_col, parent.builder, parent_col),
+        merge_builder(
+            child_from,
+            child_col,
+            parent.builder,
+            parent_col,
+            ctx.schema,
+        ),
     )
 }
 
@@ -1098,7 +1119,7 @@ fn window_wrap(ctx: &mut Context, level: Level, fk: &str, order: Vec<OrderItem>)
     if builder.select.is_empty() {
         builder.select = vec![SelectItem::AllFrom { depth: 0 }];
     }
-    ensure_key(&mut builder, fk);
+    ensure_key(&mut builder, fk, ctx.schema);
     builder.select.push(SelectItem::Expr {
         expr: SqlExpr::Window {
             func: "ROW_NUMBER".to_string(),
@@ -1109,6 +1130,7 @@ fn window_wrap(ctx: &mut Context, level: Level, fk: &str, order: Vec<OrderItem>)
             order,
         },
         output: "$$rn".to_string(),
+        ty: Some(ScalarType::Int),
     });
     let level = Level {
         builder,
@@ -1133,15 +1155,18 @@ fn lower_value(
         return lower_value(ctx, parent, prefix, field);
     }
     if value.ty.is_scalar() {
+        let value_ty = scalar_of(&value.ty);
         let item = match scalar(ctx, value) {
             SqlExpr::Column { depth, column } => SelectItem::Column {
                 depth,
                 column,
                 output: prefix.clone(),
+                ty: value_ty,
             },
             expr => SelectItem::Expr {
                 expr,
                 output: prefix.clone(),
+                ty: value_ty,
             },
         };
         return (vec![item], ResultShape::Column(prefix), Vec::new());
@@ -1221,6 +1246,7 @@ fn lower_value(
                                 depth: *depth,
                                 column: ctx.schema.column_name(*column).to_string(),
                                 output: output.clone(),
+                                ty: tys.get(i).and_then(scalar_of),
                             });
                             shapes.push(ResultShape::Column(output));
                         }
@@ -1245,7 +1271,7 @@ fn lower_value(
                         name
                     )
                 };
-                let (select, shape) = reslot_shape(shape, *depth, &prefix);
+                let (select, shape) = reslot_shape(shape, *depth, &prefix, parent, ctx.schema);
                 return (select, shape, Vec::new());
             }
             let TypedExprKind::Tuple { elements } = &value.kind else {
@@ -1298,7 +1324,13 @@ fn projected_shape<'a>(parent: &'a Level, name: &str) -> Option<&'a ResultShape>
         .find_map(|(alias, shape)| (alias.as_str() == name).then_some(shape.as_ref()).flatten())
 }
 
-fn reslot_shape(shape: &ResultShape, depth: usize, prefix: &str) -> (Vec<SelectItem>, ResultShape) {
+fn reslot_shape(
+    shape: &ResultShape,
+    depth: usize,
+    prefix: &str,
+    parent: &Level,
+    schema: &ValidatedSchema,
+) -> (Vec<SelectItem>, ResultShape) {
     match shape {
         ResultShape::Column(name) => {
             unreachable!(
@@ -1310,7 +1342,7 @@ fn reslot_shape(shape: &ResultShape, depth: usize, prefix: &str) -> (Vec<SelectI
             let mut out = Vec::with_capacity(shapes.len());
             for (i, sub) in shapes.iter().enumerate() {
                 let (mut sub_select, sub_shape) =
-                    reslot_position(sub, depth, &format!("{prefix}_c{i}"));
+                    reslot_position(sub, depth, &format!("{prefix}_c{i}"), parent, schema);
                 select.append(&mut sub_select);
                 out.push(sub_shape);
             }
@@ -1321,7 +1353,7 @@ fn reslot_shape(shape: &ResultShape, depth: usize, prefix: &str) -> (Vec<SelectI
             let mut out = Vec::with_capacity(fields.len());
             for (name, sub) in fields {
                 let (mut sub_select, sub_shape) =
-                    reslot_position(sub, depth, &format!("{prefix}_{name}"));
+                    reslot_position(sub, depth, &format!("{prefix}_{name}"), parent, schema);
                 select.append(&mut sub_select);
                 out.push((name.clone(), sub_shape));
             }
@@ -1335,6 +1367,8 @@ fn reslot_position(
     shape: &ResultShape,
     depth: usize,
     output: &str,
+    parent: &Level,
+    schema: &ValidatedSchema,
 ) -> (Vec<SelectItem>, ResultShape) {
     match shape {
         ResultShape::Column(name) => (
@@ -1342,10 +1376,13 @@ fn reslot_position(
                 depth,
                 column: name.clone(),
                 output: output.to_string(),
+                ty: output_ty(&parent.builder, name, schema),
             }],
             ResultShape::Column(output.to_string()),
         ),
-        ResultShape::Tuple(_) | ResultShape::Record(_) => reslot_shape(shape, depth, output),
+        ResultShape::Tuple(_) | ResultShape::Record(_) => {
+            reslot_shape(shape, depth, output, parent, schema)
+        }
         ResultShape::List { .. } | ResultShape::Single { .. } => (Vec::new(), shape.clone()),
     }
 }
@@ -1377,13 +1414,13 @@ fn rows_projection(ctx: &mut Context, base: &TypedExpr, items: &[TypedProjection
     }
     level.builder.select = select;
     for key in parent_keys {
-        ensure_key(&mut level.builder, &key);
+        ensure_key(&mut level.builder, &key, ctx.schema);
     }
     level.output_shapes = Some(fields);
     level
 }
 
-fn ensure_key(builder: &mut SelectBuilder, col: &str) {
+fn ensure_key(builder: &mut SelectBuilder, col: &str, schema: &ValidatedSchema) {
     if builder
         .select
         .iter()
@@ -1397,11 +1434,59 @@ fn ensure_key(builder: &mut SelectBuilder, col: &str) {
     }) {
         return;
     }
+    let ty = output_ty(builder, col, schema);
     builder.select.push(SelectItem::Column {
         depth: 0,
         column: col.to_string(),
         output: col.to_string(),
+        ty,
     });
+}
+
+fn output_ty(builder: &SelectBuilder, col: &str, schema: &ValidatedSchema) -> Option<ScalarType> {
+    let mut found: Option<Option<ScalarType>> = None;
+    for item in &builder.select {
+        match item {
+            SelectItem::AllFrom { .. } => {}
+            SelectItem::Column { output, ty, .. } | SelectItem::Expr { output, ty, .. }
+                if output == col =>
+            {
+                found = Some(*ty);
+            }
+            _ => {}
+        }
+    }
+    if let Some(ty) = found {
+        return ty;
+    }
+    for (name, ty) in from_columns_typed(&builder.from, schema) {
+        if name == col {
+            return ty;
+        }
+    }
+    None
+}
+
+fn table_column_ty(schema: &ValidatedSchema, table: &str, column: &str) -> Option<ScalarType> {
+    schema
+        .tables
+        .iter()
+        .find(|t| t.name == table)
+        .and_then(|t| t.columns.iter().find(|c| c.name == column))
+        .and_then(|c| c.ty)
+}
+
+fn temp_column_ty(ctx: &Context, temp: &str, column: &str) -> Option<ScalarType> {
+    ctx.statements
+        .iter()
+        .find(|sunk| matches!(&sunk.kind, StatementKind::Temp { name } if name == temp))
+        .and_then(|sunk| {
+            sunk.shape
+                .columns
+                .iter()
+                .find(|c| c.name == column)
+                .and_then(|c| c.ty)
+        })
 }
 
 fn tail_root_ident(tail: &TypedExpr) -> Option<&IdentBinding> {
@@ -1509,15 +1594,16 @@ fn scalar_ident_temp(ctx: &mut Context, binding: &IdentBinding) -> SqlExpr {
     if !collect.refs.contains(&column) {
         collect.refs.push(column.clone());
     }
-    temp_lookup(&temp, &column, &child_fk)
+    temp_lookup(ctx, &temp, &column, &child_fk)
 }
 
-fn temp_lookup(temp: &str, column: &str, child_fk: &str) -> SqlExpr {
+fn temp_lookup(ctx: &Context, temp: &str, column: &str, child_fk: &str) -> SqlExpr {
     let mut query = SelectBuilder::new();
     query.select = vec![SelectItem::Column {
         depth: 0,
         column: column.to_string(),
         output: column.to_string(),
+        ty: temp_column_ty(ctx, temp, column),
     }];
     query.from = Some(FromClause::Table {
         table: temp.to_string(),
@@ -1636,14 +1722,17 @@ fn shift_builder(mut builder: SelectBuilder, by: usize) -> SelectBuilder {
                 depth,
                 column,
                 output,
+                ty,
             } => SelectItem::Column {
                 depth: depth + by,
                 column,
                 output,
+                ty,
             },
-            SelectItem::Expr { expr, output } => SelectItem::Expr {
+            SelectItem::Expr { expr, output, ty } => SelectItem::Expr {
                 expr: shift_depths(expr, by),
                 output,
+                ty,
             },
         })
         .collect();
@@ -1690,6 +1779,7 @@ fn bulk_query() -> SelectBuilder {
             depth: 0,
             column: "value".to_string(),
             output: "value".to_string(),
+            ty: Some(ScalarType::Int),
         }],
         from: Some(FromClause::TableFunction {
             name: "$$bulk_params".to_string(),
@@ -1719,8 +1809,12 @@ fn available_cols(builder: &SelectBuilder, schema: &ValidatedSchema) -> Vec<Stri
                 .map(|t| t.columns.iter().map(|c| c.name.clone()).collect())
                 .unwrap_or_default(),
             Some(FromClause::Subquery { query, .. }) => available_cols(query, schema),
-            Some(FromClause::Temp { columns, .. }) => columns.clone(),
-            Some(FromClause::Literal { columns, .. }) => columns.clone(),
+            Some(FromClause::Temp { columns, .. }) => {
+                columns.iter().map(|c| c.name.clone()).collect()
+            }
+            Some(FromClause::Literal { columns, .. }) => {
+                columns.iter().map(|c| c.name.clone()).collect()
+            }
             Some(FromClause::TableFunction { .. }) => vec!["value".to_string()],
             None => Vec::new(),
         };
@@ -1964,22 +2058,11 @@ fn rcross_shape(
         if !available_cols(&create_q, ctx.schema).contains(&corr.outer_col) {
             todo!("M4b key threading through subqueries");
         }
-        let create_outputs = builder_outputs(&create_q, ctx.schema);
+        let create_outputs = builder_output_types(&create_q, ctx.schema);
         let idx = ctx.sink(
             create_q,
             StatementShape {
-                columns: create_outputs
-                    .iter()
-                    .map(|name| OutputColumn {
-                        name: name.clone(),
-                        role: if *name == corr.outer_col {
-                            ColumnRole::Key
-                        } else {
-                            ColumnRole::Value
-                        },
-                        ty: None,
-                    })
-                    .collect(),
+                columns: shape_columns(create_outputs.clone(), |name| name == corr.outer_col),
                 rows: RowCount::Many,
             },
             StatementKind::Temp { name: temp.clone() },
@@ -1989,7 +2072,13 @@ fn rcross_shape(
                 select: vec![SelectItem::AllFrom { depth: 0 }],
                 from: Some(FromClause::Temp {
                     name: temp.clone(),
-                    columns: create_outputs,
+                    columns: create_outputs
+                        .iter()
+                        .map(|(name, ty)| NamedColumn {
+                            name: name.clone(),
+                            ty: *ty,
+                        })
+                        .collect(),
                 }),
                 where_: Vec::new(),
                 order_by: Vec::new(),
@@ -1997,13 +2086,19 @@ fn rcross_shape(
                 offset: None,
                 unions: Vec::new(),
             };
-            builder_outputs(&probe, ctx.schema)
+            builder_output_types(&probe, ctx.schema)
         };
         parent.builder = SelectBuilder {
             select: Vec::new(),
             from: Some(FromClause::Temp {
                 name: temp.clone(),
-                columns: readback_cols,
+                columns: readback_cols
+                    .iter()
+                    .map(|(name, ty)| NamedColumn {
+                        name: name.clone(),
+                        ty: *ty,
+                    })
+                    .collect(),
             }),
             where_: Vec::new(),
             order_by: Vec::new(),
@@ -2043,10 +2138,16 @@ fn rcross_shape(
     let child_frag = shift_depths(scalar(ctx, &corr.child), 1);
     ctx.no_outer = was_outer2;
     let mut pkey_q = SelectBuilder::new();
+    let pkey_inner_ty = if temp_idx.is_some() {
+        temp_column_ty(ctx, &source_name, &corr.outer_col)
+    } else {
+        table_column_ty(ctx.schema, &source_name, &corr.outer_col)
+    };
     pkey_q.select = vec![SelectItem::Column {
         depth: 0,
         column: corr.outer_col.clone(),
         output: corr.outer_col.clone(),
+        ty: pkey_inner_ty,
     }];
     let pkey_alias = if temp_idx.is_some() {
         source_name.clone()
@@ -2070,20 +2171,13 @@ fn rcross_shape(
             query: Box::new(pkey_q),
         },
         output: "$$pkey".to_string(),
+        ty: scalar_of(&corr.child.ty),
     });
     let outputs = builder_outputs(&child.builder, ctx.schema);
-    let shape_cols: Vec<OutputColumn> = outputs
-        .iter()
-        .map(|name| OutputColumn {
-            name: name.clone(),
-            role: if *name == "$$pkey" {
-                ColumnRole::Key
-            } else {
-                ColumnRole::Value
-            },
-            ty: None,
-        })
-        .collect();
+    let shape_cols: Vec<OutputColumn> =
+        shape_columns(builder_output_types(&child.builder, ctx.schema), |name| {
+            name == "$$pkey"
+        });
     let element = ResultShape::Record(
         outputs
             .iter()
@@ -2169,6 +2263,7 @@ fn collapse_tuple_method(
         } else {
             format!("{prefix}_c{i}")
         };
+        let position_ty = tys.get(i).and_then(scalar_of);
         select.push(SelectItem::Expr {
             expr: SqlExpr::Subquery {
                 query: Box::new(SelectBuilder {
@@ -2176,6 +2271,7 @@ fn collapse_tuple_method(
                         depth: 0,
                         column: column.clone(),
                         output: column.clone(),
+                        ty: position_ty,
                     }],
                     from: level.builder.from.clone(),
                     where_: level.builder.where_.clone(),
@@ -2186,6 +2282,7 @@ fn collapse_tuple_method(
                 }),
             },
             output: output.clone(),
+            ty: position_ty,
         });
         shapes.push(ResultShape::Column(output));
     }
@@ -2205,14 +2302,8 @@ fn sink_broadcast_tail(ctx: &mut Context, tail: &TypedExpr) -> (ResultShape, Opt
         root.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
     }
     let outputs = builder_outputs(&root.builder, ctx.schema);
-    let shape_cols: Vec<OutputColumn> = outputs
-        .iter()
-        .map(|name| OutputColumn {
-            name: name.clone(),
-            role: ColumnRole::Value,
-            ty: None,
-        })
-        .collect();
+    let shape_cols: Vec<OutputColumn> =
+        shape_columns(builder_output_types(&root.builder, ctx.schema), |_| false);
     let root_creation = ctx.statements.len() + hops.len() + 1;
     let inner = if hops.is_empty() {
         ResultShape::Record(
@@ -2383,21 +2474,13 @@ fn rvalue_shape(
         child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
     }
     if keyed {
-        ensure_key(&mut child.builder, &child_col);
+        ensure_key(&mut child.builder, &child_col, ctx.schema);
     }
     let outputs = builder_outputs(&child.builder, ctx.schema);
-    let shape_cols: Vec<OutputColumn> = outputs
-        .iter()
-        .map(|name| OutputColumn {
-            name: name.clone(),
-            role: if keyed && *name == child_col {
-                ColumnRole::Key
-            } else {
-                ColumnRole::Value
-            },
-            ty: None,
-        })
-        .collect();
+    let shape_cols: Vec<OutputColumn> =
+        shape_columns(builder_output_types(&child.builder, ctx.schema), |name| {
+            keyed && name == child_col
+        });
     let element = ResultShape::Record(
         outputs
             .iter()
@@ -2512,21 +2595,13 @@ fn rscalar_shape(
         child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
     }
     if keyed {
-        ensure_key(&mut child.builder, &child_col);
+        ensure_key(&mut child.builder, &child_col, ctx.schema);
     }
     let outputs = builder_outputs(&child.builder, ctx.schema);
-    let shape_cols: Vec<OutputColumn> = outputs
-        .iter()
-        .map(|name| OutputColumn {
-            name: name.clone(),
-            role: if keyed && *name == child_col {
-                ColumnRole::Key
-            } else {
-                ColumnRole::Value
-            },
-            ty: None,
-        })
-        .collect();
+    let shape_cols: Vec<OutputColumn> =
+        shape_columns(builder_output_types(&child.builder, ctx.schema), |name| {
+            keyed && name == child_col
+        });
     let element = ResultShape::Record(
         outputs
             .iter()
@@ -2563,6 +2638,7 @@ fn temp_key_query(temp: &str) -> SelectBuilder {
             depth: 0,
             column: "$$key".to_string(),
             output: "$$key".to_string(),
+            ty: Some(ScalarType::Int),
         }],
         from: Some(FromClause::Table {
             table: temp.to_string(),
@@ -2626,7 +2702,7 @@ fn rtemp_shape(
     if child.builder.select.is_empty() {
         child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
     }
-    ensure_key(&mut child.builder, &child_col);
+    ensure_key(&mut child.builder, &child_col, ctx.schema);
     let mut create_q = parent_q;
     if create_q.select.is_empty() {
         create_q.select = vec![SelectItem::AllFrom { depth: 0 }];
@@ -2635,29 +2711,19 @@ fn rtemp_shape(
         if !available_cols(&create_q, ctx.schema).contains(col) {
             todo!("M4b key threading through subqueries");
         }
-        ensure_key(&mut create_q, col);
+        ensure_key(&mut create_q, col, ctx.schema);
     }
     create_q.select.push(SelectItem::Column {
         depth: 0,
         column: key_col,
         output: "$$key".to_string(),
+        ty: Some(ScalarType::Int),
     });
-    let create_outputs = builder_outputs(&create_q, ctx.schema);
+    let create_outputs = builder_output_types(&create_q, ctx.schema);
     let temp_idx = ctx.sink(
         create_q,
         StatementShape {
-            columns: create_outputs
-                .iter()
-                .map(|name| OutputColumn {
-                    name: name.clone(),
-                    role: if *name == "$$key" {
-                        ColumnRole::Key
-                    } else {
-                        ColumnRole::Value
-                    },
-                    ty: None,
-                })
-                .collect(),
+            columns: shape_columns(create_outputs.clone(), |name| name == "$$key"),
             rows: RowCount::Many,
         },
         StatementKind::Temp { name: temp.clone() },
@@ -2666,7 +2732,13 @@ fn rtemp_shape(
         select: Vec::new(),
         from: Some(FromClause::Temp {
             name: temp.clone(),
-            columns: create_outputs,
+            columns: create_outputs
+                .iter()
+                .map(|(name, ty)| NamedColumn {
+                    name: name.clone(),
+                    ty: *ty,
+                })
+                .collect(),
         }),
         where_: Vec::new(),
         order_by: Vec::new(),
@@ -2676,18 +2748,10 @@ fn rtemp_shape(
     };
     parent.stmt_bound = true;
     let outputs = builder_outputs(&child.builder, ctx.schema);
-    let shape_cols: Vec<OutputColumn> = outputs
-        .iter()
-        .map(|name| OutputColumn {
-            name: name.clone(),
-            role: if *name == child_col {
-                ColumnRole::Key
-            } else {
-                ColumnRole::Value
-            },
-            ty: None,
-        })
-        .collect();
+    let shape_cols: Vec<OutputColumn> =
+        shape_columns(builder_output_types(&child.builder, ctx.schema), |name| {
+            name == child_col
+        });
     let element = ResultShape::Record(
         outputs
             .iter()
@@ -2786,6 +2850,7 @@ pub fn lower_query(ctx: &mut Context, result: &TypedExpr) -> RootPlan {
                 builder.select = vec![SelectItem::Expr {
                     expr,
                     output: output.clone(),
+                    ty: scalar_of(&result.ty),
                 }];
             }
         }
@@ -2795,7 +2860,7 @@ pub fn lower_query(ctx: &mut Context, result: &TypedExpr) -> RootPlan {
                 columns: vec![OutputColumn {
                     name: output.clone(),
                     role: ColumnRole::Value,
-                    ty: None,
+                    ty: scalar_of(&result.ty),
                 }],
                 rows: RowCount::One,
             },
@@ -2827,14 +2892,7 @@ fn finalize_level(ctx: &mut Context, level: Level) -> RootPlan {
         }
         let outputs = builder_outputs(&builder, ctx.schema);
         let shape = StatementShape {
-            columns: outputs
-                .iter()
-                .map(|name| OutputColumn {
-                    name: name.clone(),
-                    role: ColumnRole::Value,
-                    ty: None,
-                })
-                .collect(),
+            columns: shape_columns(builder_output_types(&builder, ctx.schema), |_| false),
             rows: RowCount::Many,
         };
         let result = ResultShape::List {
@@ -2881,14 +2939,7 @@ fn finalize_level(ctx: &mut Context, level: Level) -> RootPlan {
             .collect(),
     };
     let shape = StatementShape {
-        columns: outputs
-            .iter()
-            .map(|name| OutputColumn {
-                name: name.clone(),
-                role: ColumnRole::Value,
-                ty: None,
-            })
-            .collect(),
+        columns: shape_columns(builder_output_types(&builder, ctx.schema), |_| false),
         rows: RowCount::Many,
     };
     let result = ResultShape::List {
@@ -2938,18 +2989,9 @@ fn sink_chain(
         let child_outputs = builder_outputs(&child, ctx.schema);
         let next_parent = hops.get(i + 1).map(|next| next.parent_col.clone());
         let child_shape = StatementShape {
-            columns: child_outputs
-                .iter()
-                .map(|name| OutputColumn {
-                    name: name.clone(),
-                    role: if *name == hop.child_col || next_parent.as_ref() == Some(name) {
-                        ColumnRole::Key
-                    } else {
-                        ColumnRole::Value
-                    },
-                    ty: None,
-                })
-                .collect(),
+            columns: shape_columns(builder_output_types(&child, ctx.schema), |name| {
+                name == hop.child_col || next_parent.as_deref() == Some(name)
+            }),
             rows: RowCount::Many,
         };
         built.push((child, child_shape, child_outputs));
@@ -3007,10 +3049,12 @@ fn nest_layers(layers: Vec<(usize, ParentRef, Vec<String>)>) -> ResultShape {
 fn emit_split(ctx: &mut Context, parent_builder: SelectBuilder, pending: PendingSplit) -> RootPlan {
     let hops = drain_pending(pending);
     let mut parent_q = parent_builder;
+    let parent_key_ty = output_ty(&parent_q, &hops[0].parent_col, ctx.schema);
     parent_q.select = vec![SelectItem::Column {
         depth: 0,
         column: hops[0].parent_col.clone(),
         output: hops[0].parent_col.clone(),
+        ty: parent_key_ty,
     }];
     let parent_shape = StatementShape {
         columns: vec![OutputColumn {
@@ -3067,10 +3111,115 @@ fn from_columns(from: &Option<FromClause>, schema: &ValidatedSchema) -> Vec<Stri
             .collect(),
         Some(FromClause::Subquery { query, .. }) => builder_outputs(query, schema),
         Some(FromClause::TableFunction { .. }) => vec!["value".to_string()],
-        Some(FromClause::Temp { columns, .. }) => columns.clone(),
-        Some(FromClause::Literal { columns, .. }) => columns.clone(),
+        Some(FromClause::Temp { columns, .. }) => columns.iter().map(|c| c.name.clone()).collect(),
+        Some(FromClause::Literal { columns, .. }) => {
+            columns.iter().map(|c| c.name.clone()).collect()
+        }
         None => unreachable!("row pipeline without FROM"),
     }
+}
+
+fn scalar_of(ty: &QueryType) -> Option<ScalarType> {
+    match ty {
+        QueryType::Scalar(s) => Some(*s),
+        QueryType::Optional(inner) => scalar_of(inner),
+        _ => None,
+    }
+}
+
+fn value_scalar(ty: &ValueType) -> Option<ScalarType> {
+    match ty {
+        ValueType::Scalar(s) => Some(*s),
+        ValueType::Optional(inner) => value_scalar(inner),
+        ValueType::Tuple(_) | ValueType::Array { .. } => None,
+    }
+}
+
+fn builder_output_types(
+    builder: &SelectBuilder,
+    schema: &ValidatedSchema,
+) -> Vec<(String, Option<ScalarType>)> {
+    if builder.select.is_empty() && !builder.unions.is_empty() {
+        return union_output_types(builder, schema);
+    }
+    builder
+        .select
+        .iter()
+        .flat_map(|item| match item {
+            SelectItem::AllFrom { .. } => from_columns_typed(&builder.from, schema),
+            SelectItem::Column { output, ty, .. } | SelectItem::Expr { output, ty, .. } => {
+                vec![(output.clone(), *ty)]
+            }
+        })
+        .collect()
+}
+
+fn union_output_types(
+    builder: &SelectBuilder,
+    schema: &ValidatedSchema,
+) -> Vec<(String, Option<ScalarType>)> {
+    builder
+        .unions
+        .first()
+        .map(|first| builder_output_types(first, schema))
+        .unwrap_or_else(|| {
+            unreachable!("union outputs without arms: merges always push at least one arm")
+        })
+}
+
+fn from_columns_typed(
+    from: &Option<FromClause>,
+    schema: &ValidatedSchema,
+) -> Vec<(String, Option<ScalarType>)> {
+    match from {
+        Some(FromClause::Table { table, .. }) => schema
+            .tables
+            .iter()
+            .find(|t| &t.name == table)
+            .unwrap_or_else(|| unreachable!("unknown table {table}"))
+            .columns
+            .iter()
+            .map(|c| {
+                (c.name.clone(), c.ty.or(Some(ScalarType::Int)))
+            })
+            .collect(),
+        Some(FromClause::Subquery { query, .. }) => builder_output_types(query, schema),
+        Some(FromClause::TableFunction { .. }) => {
+            vec![("value".to_string(), Some(ScalarType::Int))]
+        }
+        Some(FromClause::Temp { columns, .. }) => {
+            columns.iter().map(|c| (c.name.clone(), c.ty)).collect()
+        }
+        Some(FromClause::Literal { columns, .. }) => {
+            columns.iter().map(|c| (c.name.clone(), c.ty)).collect()
+        }
+        None => unreachable!("row pipeline without FROM"),
+    }
+}
+
+fn shape_columns(
+    outputs: Vec<(String, Option<ScalarType>)>,
+    is_key: impl Fn(&str) -> bool,
+) -> Vec<OutputColumn> {
+    outputs
+        .into_iter()
+        .map(|(name, ty)| {
+            let key = is_key(&name);
+            debug_assert!(
+                key || ty.is_some(),
+                "typeless value column {name}: lowering must thread its ScalarType"
+            );
+            OutputColumn {
+                name,
+                role: if key {
+                    ColumnRole::Key
+                } else {
+                    ColumnRole::Value
+                },
+                ty: if key { None } else { ty },
+            }
+        })
+        .collect()
 }
 
 enum ChainRoot<'a> {
@@ -3176,8 +3325,11 @@ fn scalar_field(
         .struct_field(source, &name.value)
         .unwrap_or_else(|| unreachable!("resolved field {} vanished from the schema", name.value));
     let final_col = match field {
-        Field::Value { columns, .. } => match columns.as_slice() {
-            [column] => ctx.schema.column_name(*column).to_string(),
+        Field::Value { columns, ty, .. } => match columns.as_slice() {
+            [column] => (
+                ctx.schema.column_name(*column).to_string(),
+                value_scalar(ty),
+            ),
             _ => unreachable!(
                 "tuple-valued navigation endpoint: scalar-demand chains ending at tuples contradict scalar result types (tuple field access is checker-rejected)"
             ),
@@ -3189,6 +3341,7 @@ fn scalar_field(
             "array in scalar value slot: scalar-demand chains ending at collections contradict scalar result types (list-typed links are checker-rejected)"
         ),
     };
+    let (final_col, final_ty) = final_col;
     let mut inner = shells
         .pop()
         .unwrap_or_else(|| unreachable!("chain with no hops"));
@@ -3196,6 +3349,7 @@ fn scalar_field(
         depth: 0,
         column: final_col.clone(),
         output: final_col,
+        ty: final_ty,
     }];
     while let Some(mut outer) = shells.pop() {
         let output = ctx.aliases.generic();
@@ -3204,6 +3358,7 @@ fn scalar_field(
                 query: Box::new(inner),
             },
             output: output.clone(),
+            ty: final_ty,
         }];
         inner = outer;
     }
@@ -3235,6 +3390,7 @@ fn single_hop_over_collapsed(
         return scalar_field(ctx, inner, name);
     }
     let column = record_column(ctx, &base.ty, &name.value);
+    let column_ty = record_column_ty(ctx, &base.ty, &name.value);
     SqlExpr::Subquery {
         query: Box::new(single_row_query(
             ctx,
@@ -3243,6 +3399,7 @@ fn single_hop_over_collapsed(
                 depth: 0,
                 column: column.clone(),
                 output: column,
+                ty: column_ty,
             }],
         )),
     }
@@ -3424,6 +3581,27 @@ fn record_column(ctx: &Context, ty: &QueryType, name: &str) -> String {
         QueryType::Record(RecordSource::Projection(_)) => name.to_string(),
         QueryType::Optional(inner) => record_column(ctx, inner, name),
         other => unreachable!("field access over {other}: the checker only admits records"),
+    }
+}
+
+fn record_column_ty(ctx: &Context, ty: &QueryType, name: &str) -> Option<ScalarType> {
+    match ty {
+        QueryType::Record(RecordSource::Schema(sid)) => {
+            let (_, field) = ctx
+                .schema
+                .struct_field(*sid, name)
+                .unwrap_or_else(|| unreachable!("resolved field {name} vanished from the schema"));
+            match field {
+                Field::Value { ty, .. } => value_scalar(ty),
+                Field::Ref { .. } | Field::Array { .. } => None,
+            }
+        }
+        QueryType::Record(RecordSource::Projection(fields)) => fields
+            .iter()
+            .find(|f| f.name == name)
+            .and_then(|f| scalar_of(&f.ty)),
+        QueryType::Optional(inner) => record_column_ty(ctx, inner, name),
+        _ => None,
     }
 }
 
@@ -3774,6 +3952,7 @@ fn scalar_aggregate(ctx: &mut Context, base: &TypedExpr, agg: AggOp) -> SqlExpr 
                 select: vec![SelectItem::Expr {
                     expr: SqlExpr::Count,
                     output: ctx.aliases.generic(),
+                    ty: Some(ScalarType::Int),
                 }],
                 from: level.builder.from,
                 where_: level.builder.where_,
@@ -3788,9 +3967,28 @@ fn scalar_aggregate(ctx: &mut Context, base: &TypedExpr, agg: AggOp) -> SqlExpr 
         level = wrap_level(ctx, level);
     }
     let output = ctx.aliases.generic();
+    let result_ty: Option<ScalarType> = Some(match &agg {
+        AggOp::Len => ScalarType::Int,
+        AggOp::Bare(op, s) => match op {
+            BareAgg::Sum => *s,
+            BareAgg::Avg => match s {
+                ScalarType::Int | ScalarType::Float => ScalarType::Float,
+                _ => *s,
+            },
+            BareAgg::Max | BareAgg::Min => *s,
+        },
+        AggOp::Over(op, s, _) => match op {
+            OverAgg::Sum => *s,
+            OverAgg::Avg => match s {
+                ScalarType::Int | ScalarType::Float => ScalarType::Float,
+                _ => *s,
+            },
+        },
+    });
     let select = |expr| SelectItem::Expr {
         expr,
         output: output.clone(),
+        ty: result_ty,
     };
     let col = |column: String| SqlExpr::Column { depth: 0, column };
     let expr = match agg {
@@ -4160,6 +4358,7 @@ fn contains_exists(ctx: &mut Context, base: &TypedExpr, needle: &TypedExpr) -> S
         depth: 0,
         column: key_col.clone(),
         output: key_col.clone(),
+        ty: Some(ScalarType::Int),
     }];
     let value_col = match storage.value.as_slice() {
         [col] => ctx.schema.column_name(*col).to_string(),
@@ -4499,7 +4698,7 @@ fn scalar_cast(operand: SqlExpr, from: &QueryType, target: TypeName) -> SqlExpr 
 struct LitLevel {
     id: String,
     module: String,
-    columns: Vec<String>,
+    columns: Vec<NamedColumn>,
 }
 
 impl LitLevel {
@@ -4645,10 +4844,22 @@ fn register_literal_level<'a>(
     match peel_optional(inner) {
         QueryType::List(sub) => {
             let keyed = items.first().is_some_and(|(_, p)| p.is_some());
-            let columns: Vec<String> = if keyed {
-                vec!["c0".to_string(), "c1".to_string()]
+            let columns: Vec<NamedColumn> = if keyed {
+                vec![
+                    NamedColumn {
+                        name: "c0".to_string(),
+                        ty: Some(ScalarType::Int),
+                    },
+                    NamedColumn {
+                        name: "c1".to_string(),
+                        ty: Some(ScalarType::Int),
+                    },
+                ]
             } else {
-                vec!["c0".to_string()]
+                vec![NamedColumn {
+                    name: "c0".to_string(),
+                    ty: Some(ScalarType::Int),
+                }]
             };
             let module = if keyed {
                 "$$lit_2_II".to_string()
@@ -4690,7 +4901,17 @@ fn register_literal_level<'a>(
             }
             let keyed = items.first().is_some_and(|(_, p)| p.is_some());
             let width = value_tys.len() + usize::from(keyed);
-            let columns: Vec<String> = (0..width).map(|i| format!("c{i}")).collect();
+            let mut columns: Vec<NamedColumn> = Vec::with_capacity(width);
+            if keyed {
+                columns.push(NamedColumn {
+                    name: "c0".to_string(),
+                    ty: Some(ScalarType::Int),
+                });
+            }
+            columns.extend(value_tys.iter().enumerate().map(|(i, ty)| NamedColumn {
+                name: format!("c{}", i + usize::from(keyed)),
+                ty: Some(*ty),
+            }));
             let mut sig = String::with_capacity(width);
             if keyed {
                 sig.push('I');
@@ -4849,11 +5070,12 @@ fn lower_tuple_result(ctx: &mut Context, result: &TypedExpr) -> RootPlan {
         };
         let shape_cols = shapes
             .iter()
-            .map(|s| match s {
+            .zip(tys.iter())
+            .map(|(s, ty)| match s {
                 ResultShape::Column(output) => OutputColumn {
                     name: output.clone(),
                     role: ColumnRole::Value,
-                    ty: None,
+                    ty: scalar_of(ty),
                 },
                 _ => unreachable!("collapse yields flat columns by construction"),
             })
@@ -4900,12 +5122,13 @@ fn lower_tuple_result(ctx: &mut Context, result: &TypedExpr) -> RootPlan {
             root_composite_element(ctx, prefix, elem, ty, "tuple element");
         for item in &sub_select {
             match item {
-                SelectItem::Column { output, .. } | SelectItem::Expr { output, .. } => shape_cols
-                    .push(OutputColumn {
+                SelectItem::Column { output, ty, .. } | SelectItem::Expr { output, ty, .. } => {
+                    shape_cols.push(OutputColumn {
                         name: output.clone(),
                         role: ColumnRole::Value,
-                        ty: None,
-                    }),
+                        ty: *ty,
+                    })
+                }
                 SelectItem::AllFrom { .. } => {
                     unreachable!("tuple element selects are always named")
                 }
@@ -4971,6 +5194,7 @@ fn root_composite_element(
             vec![SelectItem::Expr {
                 expr: scalar(ctx, elem),
                 output: output.clone(),
+                ty: scalar_of(&elem.ty),
             }],
             ResultShape::Column(output),
         );
@@ -4994,14 +5218,8 @@ fn root_composite_element(
                 level.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
             }
             let outputs = builder_outputs(&level.builder, ctx.schema);
-            let shape_cols: Vec<OutputColumn> = outputs
-                .iter()
-                .map(|name| OutputColumn {
-                    name: name.clone(),
-                    role: ColumnRole::Value,
-                    ty: None,
-                })
-                .collect();
+            let shape_cols: Vec<OutputColumn> =
+                shape_columns(builder_output_types(&level.builder, ctx.schema), |_| false);
             let element = ResultShape::Record(
                 outputs
                     .iter()
@@ -5047,14 +5265,8 @@ fn root_composite_element(
                 level.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
             }
             let outputs = builder_outputs(&level.builder, ctx.schema);
-            let shape_cols: Vec<OutputColumn> = outputs
-                .iter()
-                .map(|name| OutputColumn {
-                    name: name.clone(),
-                    role: ColumnRole::Value,
-                    ty: None,
-                })
-                .collect();
+            let shape_cols: Vec<OutputColumn> =
+                shape_columns(builder_output_types(&level.builder, ctx.schema), |_| false);
             let element = ResultShape::Record(
                 outputs
                     .iter()
@@ -5117,11 +5329,12 @@ fn unit_anchor(ctx: &mut Context) -> (SelectItem, OutputColumn) {
         SelectItem::Expr {
             expr: SqlExpr::Param(ParamValue::Int(1)),
             output: output.clone(),
+            ty: Some(ScalarType::Int),
         },
         OutputColumn {
             name: output,
             role: ColumnRole::Value,
-            ty: None,
+            ty: Some(ScalarType::Int),
         },
     )
 }
@@ -5196,12 +5409,13 @@ fn lower_struct_result(ctx: &mut Context, result: &TypedExpr) -> RootPlan {
             root_composite_element(ctx, name.value.clone(), field, &field.ty, "struct field");
         for item in &sub_select {
             match item {
-                SelectItem::Column { output, .. } | SelectItem::Expr { output, .. } => shape_cols
-                    .push(OutputColumn {
+                SelectItem::Column { output, ty, .. } | SelectItem::Expr { output, ty, .. } => {
+                    shape_cols.push(OutputColumn {
                         name: output.clone(),
                         role: ColumnRole::Value,
-                        ty: None,
-                    }),
+                        ty: *ty,
+                    })
+                }
                 SelectItem::AllFrom { .. } => {
                     unreachable!("struct field selects are always named")
                 }
