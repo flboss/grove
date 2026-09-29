@@ -92,12 +92,74 @@ pub struct Level {
     pub output_shapes: Option<Vec<(String, Option<ResultShape>)>>,
 }
 
+fn struct_field_value<'a>(base: &'a TypedExpr, name: &str) -> Option<&'a TypedExpr> {
+    match &base.kind {
+        TypedExprKind::Struct { fields } => fields
+            .iter()
+            .find(|(field_name, _)| field_name.value == name)
+            .map(|(_, expr)| expr),
+        _ => None,
+    }
+}
+
+fn beta_reduce_tail(tail: &TypedExpr) -> std::borrow::Cow<'_, TypedExpr> {
+    let mut current = std::borrow::Cow::Borrowed(tail);
+    loop {
+        match reduce_step(&current) {
+            None => return current,
+            Some(next) => current = std::borrow::Cow::Owned(next),
+        }
+    }
+}
+
+fn reduce_step(node: &TypedExpr) -> Option<TypedExpr> {
+    match &node.kind {
+        TypedExprKind::Field { base, name, .. } => {
+            if let Some(value) = struct_field_value(base, &name.value) {
+                return Some(value.clone());
+            }
+            match beta_reduce_tail(base) {
+                std::borrow::Cow::Borrowed(_) => None,
+                std::borrow::Cow::Owned(base) => {
+                    let mut reduced = node.clone();
+                    if let TypedExprKind::Field { base: slot, .. } = &mut reduced.kind {
+                        **slot = base;
+                    }
+                    Some(reduced)
+                }
+            }
+        }
+        TypedExprKind::Method { base, .. } | TypedExprKind::Projection { base, .. } => {
+            match beta_reduce_tail(base) {
+                std::borrow::Cow::Borrowed(_) => None,
+                std::borrow::Cow::Owned(base) => {
+                    let mut reduced = node.clone();
+                    match &mut reduced.kind {
+                        TypedExprKind::Method { base: slot, .. }
+                        | TypedExprKind::Projection { base: slot, .. } => {
+                            **slot = base;
+                        }
+                        _ => unreachable!("tail spine changed shape under rebuild"),
+                    }
+                    Some(reduced)
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
 pub fn scalar(ctx: &mut Context, expr: &TypedExpr) -> SqlExpr {
     match &expr.kind {
         TypedExprKind::Literal(lit) => scalar_literal(&lit.value),
         TypedExprKind::TypeConstant { ty, name } => scalar_constant(ty.value, name.value),
         TypedExprKind::Ident { binding, depth, .. } => scalar_ident(ctx, binding, *depth),
-        TypedExprKind::Field { base, name, .. } => scalar_field(ctx, base, name),
+        TypedExprKind::Field { base, name, .. } => {
+            if let Some(value) = struct_field_value(base, &name.value) {
+                return scalar(ctx, value);
+            }
+            scalar_field(ctx, base, name)
+        }
         TypedExprKind::Method {
             base,
             name,
@@ -259,6 +321,9 @@ fn rows_field(
     optional: bool,
 ) -> Level {
     let _ = optional;
+    if let Some(value) = struct_field_value(base, &name.value) {
+        return rows(ctx, value);
+    }
     if matches!(base.ty, QueryType::Record(_)) {
         todo!("M4b navigation from single-record base");
     }
@@ -293,7 +358,9 @@ fn rows_field(
                 Field::Value { columns, .. } => {
                     let [column] = columns.as_slice() else {
                         if level.pending.is_some() {
-                            todo!("M7 tuple field over nested rows");
+                            unreachable!(
+                                "tuple field over split-pending rows: field access over nested lists is rejected upstream"
+                            )
                         }
                         for column in columns {
                             level.builder.select.push(SelectItem::Column {
@@ -623,6 +690,7 @@ fn rows_method(
             } else {
                 OrderDir::Asc
             };
+            let mut new_keys = Vec::new();
             for arg in args {
                 let dir = match &arg.direction {
                     Some(dir) => match dir.value {
@@ -631,11 +699,9 @@ fn rows_method(
                     },
                     None => default,
                 };
-                level
-                    .builder
-                    .order_by
-                    .extend(sort_keys(ctx, &arg.expr, dir));
+                new_keys.extend(sort_keys(ctx, &level, &arg.expr, dir));
             }
+            level.builder.order_by.extend(new_keys);
             level
         }
         "take" | "skip" | "first" | "nth" => {
@@ -768,7 +834,7 @@ fn wrap_level(ctx: &mut Context, level: Level) -> Level {
     }
 }
 
-fn sort_keys(ctx: &mut Context, expr: &TypedExpr, dir: OrderDir) -> Vec<OrderItem> {
+fn sort_keys(ctx: &mut Context, parent: &Level, expr: &TypedExpr, dir: OrderDir) -> Vec<OrderItem> {
     if !matches!(expr.ty, QueryType::Tuple(_)) {
         return vec![OrderItem {
             expr: scalar(ctx, expr),
@@ -780,14 +846,14 @@ fn sort_keys(ctx: &mut Context, expr: &TypedExpr, dir: OrderDir) -> Vec<OrderIte
             unreachable!("if with non-tuple type in tuple sort key: caller checks the type")
         };
         match distribute_if_tuple(arms, default, tys, expr.span, expr.ty.clone()) {
-            Some(synthetic) => return sort_keys(ctx, &synthetic, dir),
+            Some(synthetic) => return sort_keys(ctx, parent, &synthetic, dir),
             None => todo!("M7 sort-key tuple expansion"),
         }
     }
     match &expr.kind {
         TypedExprKind::Tuple { elements } => elements
             .iter()
-            .flat_map(|e| sort_keys(ctx, e, dir))
+            .flat_map(|e| sort_keys(ctx, parent, e, dir))
             .collect(),
         TypedExprKind::Ident {
             binding: IdentBinding::Field(fid),
@@ -809,7 +875,46 @@ fn sort_keys(ctx: &mut Context, expr: &TypedExpr, dir: OrderDir) -> Vec<OrderIte
                 _ => unreachable!("tuple sort key over non-value field: tuples are value-typed"),
             }
         }
-        _ => todo!("M7 sort-key tuple expansion"),
+        TypedExprKind::Ident {
+            binding: IdentBinding::ProjectedField { name },
+            depth,
+            ..
+        } => {
+            if *depth != 0 {
+                todo!("M7 projected composite across levels");
+            }
+            let Some(shape) = projected_shape(parent, name) else {
+                unreachable!(
+                    "projected composite {} missing from enclosing outputs: depth-0 projected idents are always projected in the current level",
+                    name
+                )
+            };
+            shape_leaves(shape)
+                .into_iter()
+                .map(|column| OrderItem {
+                    expr: SqlExpr::Column {
+                        depth: *depth,
+                        column,
+                    },
+                    dir,
+                })
+                .collect()
+        }
+        _ => unreachable!(
+            "remaining tuple sort-key shapes: Tuple/If/ProjectedField nodes route above; Field access over tuples is checker-rejected (QT0002) and no method returns bare tuples"
+        ),
+    }
+}
+
+fn shape_leaves(shape: &ResultShape) -> Vec<String> {
+    match shape {
+        ResultShape::Column(name) => vec![name.clone()],
+        ResultShape::Tuple(shapes) => shapes.iter().flat_map(shape_leaves).collect(),
+        ResultShape::Record(_) | ResultShape::List { .. } | ResultShape::Single { .. } => {
+            unreachable!(
+                "non-inline shape in sort key: sort keys are checker-ordered, which lists/records never satisfy"
+            )
+        }
     }
 }
 
@@ -1022,6 +1127,11 @@ fn lower_value(
     prefix: String,
     value: &TypedExpr,
 ) -> (Vec<SelectItem>, ResultShape, Vec<String>) {
+    if let TypedExprKind::Field { base, name, .. } = &value.kind
+        && let Some(field) = struct_field_value(base, &name.value)
+    {
+        return lower_value(ctx, parent, prefix, field);
+    }
     if value.ty.is_scalar() {
         let item = match scalar(ctx, value) {
             SqlExpr::Column { depth, column } => SelectItem::Column {
@@ -1119,6 +1229,25 @@ fn lower_value(
                     _ => unreachable!("tuple-typed non-value field: schema tuples are value-typed"),
                 }
             }
+            if let TypedExprKind::Ident {
+                binding: IdentBinding::ProjectedField { name },
+                depth,
+                ..
+            } = &value.kind
+            {
+                if *depth != 0 {
+                    todo!("M7 projected composite across levels");
+                }
+                let shape = projected_shape(parent, name);
+                let Some(shape) = shape else {
+                    unreachable!(
+                        "projected composite {} missing from enclosing outputs: depth-0 projected idents are always projected in the current level",
+                        name
+                    )
+                };
+                let (select, shape) = reslot_shape(shape, *depth, &prefix);
+                return (select, shape, Vec::new());
+            }
             let TypedExprKind::Tuple { elements } = &value.kind else {
                 if let TypedExprKind::If { arms, default } = &value.kind {
                     match distribute_if_tuple(arms, default, tys, value.span, value.ty.clone()) {
@@ -1135,7 +1264,9 @@ fn lower_value(
                 {
                     return collapse_tuple_method(ctx, prefix, base, name, args, tys);
                 }
-                todo!("M7 non-literal tuple value")
+                unreachable!(
+                    "remaining tuple-typed value shapes: Tuple/If/ProjectedField nodes and collapses route above; field access over tuples is checker-rejected (QT0002) and no method returns bare tuples"
+                )
             };
             if elements.len() != tys.len() {
                 unreachable!("tuple arity drift: the checker unifies tuple arity");
@@ -1156,6 +1287,66 @@ fn lower_value(
             unreachable!("void/unknown value: the checker excludes them")
         }
         _ => unreachable!("scalar values match the first arm"),
+    }
+}
+
+fn projected_shape<'a>(parent: &'a Level, name: &str) -> Option<&'a ResultShape> {
+    parent
+        .output_shapes
+        .as_ref()?
+        .iter()
+        .find_map(|(alias, shape)| (alias.as_str() == name).then_some(shape.as_ref()).flatten())
+}
+
+fn reslot_shape(shape: &ResultShape, depth: usize, prefix: &str) -> (Vec<SelectItem>, ResultShape) {
+    match shape {
+        ResultShape::Column(name) => {
+            unreachable!(
+                "reslot over scalar shape {name}: callers reslot composites positionally, scalars inline directly"
+            )
+        }
+        ResultShape::Tuple(shapes) => {
+            let mut select = Vec::new();
+            let mut out = Vec::with_capacity(shapes.len());
+            for (i, sub) in shapes.iter().enumerate() {
+                let (mut sub_select, sub_shape) =
+                    reslot_position(sub, depth, &format!("{prefix}_c{i}"));
+                select.append(&mut sub_select);
+                out.push(sub_shape);
+            }
+            (select, ResultShape::Tuple(out))
+        }
+        ResultShape::Record(fields) => {
+            let mut select = Vec::new();
+            let mut out = Vec::with_capacity(fields.len());
+            for (name, sub) in fields {
+                let (mut sub_select, sub_shape) =
+                    reslot_position(sub, depth, &format!("{prefix}_{name}"));
+                select.append(&mut sub_select);
+                out.push((name.clone(), sub_shape));
+            }
+            (select, ResultShape::Record(out))
+        }
+        ResultShape::List { .. } | ResultShape::Single { .. } => (Vec::new(), shape.clone()),
+    }
+}
+
+fn reslot_position(
+    shape: &ResultShape,
+    depth: usize,
+    output: &str,
+) -> (Vec<SelectItem>, ResultShape) {
+    match shape {
+        ResultShape::Column(name) => (
+            vec![SelectItem::Column {
+                depth,
+                column: name.clone(),
+                output: output.to_string(),
+            }],
+            ResultShape::Column(output.to_string()),
+        ),
+        ResultShape::Tuple(_) | ResultShape::Record(_) => reslot_shape(shape, depth, output),
+        ResultShape::List { .. } | ResultShape::Single { .. } => (Vec::new(), shape.clone()),
     }
 }
 
@@ -1296,9 +1487,13 @@ fn scalar_ident_temp(ctx: &mut Context, binding: &IdentBinding) -> SqlExpr {
             match field {
                 Field::Value { columns, .. } => match columns.as_slice() {
                     [col] => ctx.schema.column_name(*col).to_string(),
-                    _ => todo!("M4b temp ref to tuple field"),
+                    _ => unreachable!(
+                        "temp ref to tuple field: temp recording fires in scalar demand, whose callers admit scalar-typed nodes only"
+                    ),
                 },
-                _ => todo!("M4b temp ref to non-value field"),
+                _ => unreachable!(
+                    "temp ref to non-value field: temp recording fires in scalar demand, whose callers admit scalar-typed nodes only"
+                ),
             }
         }
         IdentBinding::ProjectedField { name } => name.clone(),
@@ -1739,6 +1934,8 @@ fn rcross_shape(
     tail: &TypedExpr,
     cardinality: Cardinality,
 ) -> (ResultShape, Option<String>) {
+    let reduced_tail = beta_reduce_tail(tail);
+    let tail: &TypedExpr = &reduced_tail;
     let bare = match &parent.builder.from {
         Some(FromClause::Table { .. }) => {
             parent.builder.where_.is_empty()
@@ -1936,7 +2133,9 @@ fn cross_root_scan(ctx: &mut Context, tail: &TypedExpr) -> FromClause {
                 alias: ctx.aliases.table(&table),
             }
         }
-        _ => todo!("M4b exotic cross tail root"),
+        _ => unreachable!(
+            "exotic cross tail root: cross tails bottom at Field/Root idents (single-spine tails admit one root); remaining kinds infer non-List types, contradicting the List-only callers"
+        ),
     }
 }
 
@@ -1950,7 +2149,9 @@ fn collapse_tuple_method(
 ) -> (Vec<SelectItem>, ResultShape, Vec<String>) {
     let mut level = rows(ctx, base);
     if level.pending.is_some() {
-        todo!("M4b nested collapse in scalar slot");
+        unreachable!(
+            "tuple collapse over split-pending rows: tuple-typed collapses imply flat List(Tuple) bases, whose rows never park pendings (crossings that park are nested)"
+        )
     }
     compose_limit(&mut level.builder, &name.value, args, ctx);
     if level.builder.select.is_empty() {
@@ -2054,21 +2255,30 @@ fn distribute_if_tuple(
     span: grove_types::Span,
     ty: QueryType,
 ) -> Option<TypedExpr> {
+    fn branch_positions(
+        node: &TypedExpr,
+        arity: usize,
+        span: grove_types::Span,
+        tys: &[QueryType],
+    ) -> Option<Vec<TypedExpr>> {
+        match &node.kind {
+            TypedExprKind::Tuple { elements } if elements.len() == arity => Some(elements.clone()),
+            TypedExprKind::If {
+                arms: inner_arms,
+                default: inner_default,
+            } => distribute_if_tuple(inner_arms, inner_default, tys, span, node.ty.clone())
+                .and_then(|synthetic| match synthetic.kind {
+                    TypedExprKind::Tuple { elements } => Some(elements),
+                    _ => None,
+                }),
+            _ => None,
+        }
+    }
     let mut branch_elements: Vec<Vec<TypedExpr>> = Vec::with_capacity(arms.len() + 1);
     for (_, body) in arms {
-        match &body.kind {
-            TypedExprKind::Tuple { elements } if elements.len() == tys.len() => {
-                branch_elements.push(elements.clone());
-            }
-            _ => return None,
-        }
+        branch_elements.push(branch_positions(body, tys.len(), span, tys)?);
     }
-    match &default.kind {
-        TypedExprKind::Tuple { elements } if elements.len() == tys.len() => {
-            branch_elements.push(elements.clone());
-        }
-        _ => return None,
-    }
+    branch_elements.push(branch_positions(default, tys.len(), span, tys)?);
     let mut elements = Vec::with_capacity(tys.len());
     for (i, ty) in tys.iter().enumerate() {
         let position_arms: Vec<(TypedExpr, TypedExpr)> = arms
@@ -2097,6 +2307,8 @@ fn rvalue_shape(
     parent: &mut Level,
     tail: &TypedExpr,
 ) -> (ResultShape, Option<String>) {
+    let reduced_tail = beta_reduce_tail(tail);
+    let tail: &TypedExpr = &reduced_tail;
     let keyed = matches!(tail_root_ident(tail), Some(IdentBinding::Field(_)));
     if keyed && (!parent.stmt_bound || tail_uses_outer(tail) || take_bound_ident(tail)) {
         return rtemp_shape(ctx, parent, tail, Cardinality::Many);
@@ -2136,7 +2348,9 @@ fn rvalue_shape(
                 None,
             )
         }
-        _ => todo!("M4b exotic tail root"),
+        _ => unreachable!(
+            "exotic tail root: tail roots are Field/Root idents or Array/If nodes (all routed before this match); remaining kinds infer non-List types, contradicting the List-only callers"
+        ),
     };
     let keyed = parent_key.is_some();
     let mut child_builder = SelectBuilder::new();
@@ -2219,6 +2433,8 @@ fn rscalar_shape(
     parent: &mut Level,
     tail: &TypedExpr,
 ) -> (ResultShape, Option<String>) {
+    let reduced_tail = beta_reduce_tail(tail);
+    let tail: &TypedExpr = &reduced_tail;
     let eff = match &tail.kind {
         TypedExprKind::Method { base, name, .. } if name.value == "first" => {
             if filter_chain_to_field_ident(base) || filter_chain_to_root_ident(base) {
@@ -2261,7 +2477,9 @@ fn rscalar_shape(
                 None,
             )
         }
-        _ => todo!("M4b exotic tail root"),
+        _ => unreachable!(
+            "exotic single tail root: If tails are rejected by callers and Field/Root tails route above; remaining kinds infer non-record types (Some-of-optional is checker-rejected), contradicting the record-only callers"
+        ),
     };
     let keyed = parent_key.is_some();
     let mut child_builder = SelectBuilder::new();
@@ -2364,13 +2582,17 @@ fn rtemp_shape(
     tail: &TypedExpr,
     cardinality: Cardinality,
 ) -> (ResultShape, Option<String>) {
+    let reduced_tail = beta_reduce_tail(tail);
+    let tail: &TypedExpr = &reduced_tail;
     let temp = ctx.aliases.temp();
     let (child_from, child_col, key_col) = match tail_root_ident(tail) {
         Some(IdentBinding::Field(fid)) => {
             let link = resolve_tail_link(ctx, *fid);
             (link.child_from, link.child_col, link.parent_col)
         }
-        _ => todo!("M4b exotic temp tail root"),
+        _ => unreachable!(
+            "exotic temp tail root: temp tails bottom at Field idents (single-spine tails admit one root); remaining kinds infer non-List types, contradicting the List-only callers"
+        ),
     };
     let parent_q = parent.builder.clone();
     let mut child_builder = SelectBuilder::new();
@@ -2871,6 +3093,10 @@ fn scalar_field(
                 name: hop,
                 ..
             } => {
+                if let Some(value) = struct_field_value(next, &hop.value) {
+                    cursor = value;
+                    continue;
+                }
                 let sid = record_struct(&cursor.ty);
                 let (fid, field) = ctx.schema.struct_field(sid, &hop.value).unwrap_or_else(|| {
                     unreachable!("resolved field {} vanished from the schema", hop.value)
@@ -2952,10 +3178,16 @@ fn scalar_field(
     let final_col = match field {
         Field::Value { columns, .. } => match columns.as_slice() {
             [column] => ctx.schema.column_name(*column).to_string(),
-            _ => todo!("M7 tuple-valued navigation endpoint"),
+            _ => unreachable!(
+                "tuple-valued navigation endpoint: scalar-demand chains ending at tuples contradict scalar result types (tuple field access is checker-rejected)"
+            ),
         },
-        Field::Ref { .. } => todo!("M4 R-scalar: single record in value slot"),
-        Field::Array { .. } => todo!("M4 array in value slot"),
+        Field::Ref { .. } => unreachable!(
+            "single record in scalar value slot: scalar-demand chains ending at collections contradict scalar result types (list-typed links are checker-rejected)"
+        ),
+        Field::Array { .. } => unreachable!(
+            "array in scalar value slot: scalar-demand chains ending at collections contradict scalar result types (list-typed links are checker-rejected)"
+        ),
     };
     let mut inner = shells
         .pop()
@@ -3177,10 +3409,16 @@ fn record_column(ctx: &Context, ty: &QueryType, name: &str) -> String {
             match field {
                 Field::Value { columns, .. } => match columns.as_slice() {
                     [column] => ctx.schema.column_name(*column).to_string(),
-                    _ => todo!("M7 tuple-valued field access"),
+                    _ => unreachable!(
+                        "tuple-valued field access: scalar-demand chains ending at tuples contradict scalar result types (tuple field access is checker-rejected)"
+                    ),
                 },
-                Field::Ref { .. } => todo!("M4 R-scalar: single record in value slot"),
-                Field::Array { .. } => todo!("M4 array in value slot"),
+                Field::Ref { .. } => unreachable!(
+                    "single record in scalar value slot: scalar-demand chains ending at collections contradict scalar result types (list-typed links are checker-rejected)"
+                ),
+                Field::Array { .. } => unreachable!(
+                    "array in scalar value slot: scalar-demand chains ending at collections contradict scalar result types (list-typed links are checker-rejected)"
+                ),
             }
         }
         QueryType::Record(RecordSource::Projection(_)) => name.to_string(),
@@ -3489,10 +3727,16 @@ fn scalar_list_col(ctx: &mut Context, base: &TypedExpr) -> String {
             }
         }
         TypedExprKind::Method { base, name, .. }
-            if ["take", "skip"].contains(&name.value.as_str()) =>
+            if ["take", "skip", "sort", "sort_asc", "sort_desc"].contains(&name.value.as_str()) =>
         {
             scalar_list_col(ctx, base)
         }
+        TypedExprKind::Method { base, name, .. } if name.value == "flatten" => match &base.kind {
+            TypedExprKind::Array { .. } | TypedExprKind::Method { .. } => "c0".to_string(),
+            _ => unreachable!(
+                "flatten over non-mergeable rows in aggregation: only array-rooted pipelines flatten to scalar lists"
+            ),
+        },
         TypedExprKind::Array { .. } => match &base.ty {
             QueryType::List(inner) if matches!(peel_optional(inner), QueryType::Scalar(_)) => {
                 "c0".to_string()
@@ -3807,7 +4051,7 @@ fn one_arg<'a>(args: &'a [TypedMethodArg], name: &grove_types::Spanned<String>) 
 
 fn contains_exists(ctx: &mut Context, base: &TypedExpr, needle: &TypedExpr) -> SqlExpr {
     if !needle.ty.is_scalar() {
-        todo!("comparison-overhaul: tuple membership");
+        todo!("comparison-overhaul: composite membership");
     }
     if let TypedExprKind::Array { elements } = &base.kind {
         let inner = match &base.ty {
@@ -3860,6 +4104,31 @@ fn contains_exists(ctx: &mut Context, base: &TypedExpr, needle: &TypedExpr) -> S
         }
     }
     let fid = match &base.kind {
+        TypedExprKind::Method { name, .. }
+            if ["take", "skip", "sort", "sort_asc", "sort_desc", "flatten"]
+                .contains(&name.value.as_str()) =>
+        {
+            let value_col = scalar_list_col(ctx, base);
+            let mut level = rows(ctx, base);
+            if level.pending.is_some() {
+                todo!("M4b contains over derived collection");
+            }
+            if !level.builder.select.is_empty() || !level.builder.unions.is_empty() {
+                level = wrap_level(ctx, level);
+            }
+            if level.builder.select.is_empty() {
+                level.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+            }
+            level.builder.where_.push(SqlExpr::Binary {
+                op: SqlBinOp::Eq,
+                lhs: Box::new(SqlExpr::Column {
+                    depth: 0,
+                    column: value_col,
+                }),
+                rhs: Box::new(scalar(ctx, needle)),
+            });
+            return SqlExpr::Exists(Box::new(level.builder));
+        }
         TypedExprKind::Ident {
             binding: IdentBinding::Field(fid),
             ..
@@ -4610,10 +4879,14 @@ fn lower_tuple_result(ctx: &mut Context, result: &TypedExpr) -> RootPlan {
         if let TypedExprKind::If { arms, default } = &result.kind {
             match distribute_if_tuple(arms, default, tys, result.span, result.ty.clone()) {
                 Some(synthetic) => return lower_tuple_result(ctx, &synthetic),
-                None => todo!("M7 non-literal tuple result"),
+                None => unreachable!(
+                    "undistributable root tuple-`If`: file roots bind nothing, so non-Tuple branches (fields, idents, methods) fail checking upstream"
+                ),
             }
         }
-        todo!("M7 non-literal tuple result")
+        unreachable!(
+            "remaining tuple-typed result shapes: Tuple/Method/If nodes route above; bare tuple-typed fields and idents are unbound at the root (QT0001) and no other node kind infers Tuple"
+        )
     };
     if elements.len() != tys.len() {
         unreachable!("tuple arity drift: the checker unifies tuple arity");
@@ -4911,7 +5184,9 @@ fn lower_struct_result(ctx: &mut Context, result: &TypedExpr) -> RootPlan {
         return lower_struct_result(ctx, &synthetic);
     }
     let TypedExprKind::Struct { fields } = &result.kind else {
-        todo!("M7 non-literal record result")
+        unreachable!(
+            "remaining record-typed result shapes: Struct/If nodes route above (If falls through only when undistributable, which todos); bare record-typed fields and idents are unbound at the root (QT0001), single-record projections are rejected (QT0017), and no other node kind infers a bare record"
+        )
     };
     let mut select = Vec::new();
     let mut shape_cols = Vec::new();
