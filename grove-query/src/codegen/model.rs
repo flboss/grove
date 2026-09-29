@@ -1,7 +1,7 @@
 
 use std::collections::HashMap;
 
-use grove_schema::validated::ScalarType;
+pub use grove_schema::validated::ScalarType;
 
 use super::builder::SelectBuilder;
 

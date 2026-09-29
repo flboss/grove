@@ -329,7 +329,10 @@ dependencies = [
 name = "grove-runtime"
 version = "0.1.0"
 dependencies = [
+ "chrono",
+ "grove-query",
  "rusqlite",
+ "rust_decimal",
 ]
 
 [[package]]
