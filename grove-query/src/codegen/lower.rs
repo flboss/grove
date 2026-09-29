@@ -164,8 +164,12 @@ pub fn rows(ctx: &mut Context, expr: &TypedExpr) -> Level {
         TypedExprKind::Projection { base, items } => rows_projection(ctx, base, items),
         TypedExprKind::Array { .. } => return rows_array(ctx, expr),
         TypedExprKind::If { .. } => return rows_if(ctx, expr),
-        TypedExprKind::Tuple { .. } => todo!("M7 tuples"),
-        TypedExprKind::Struct { .. } => todo!("M7 record literals"),
+        TypedExprKind::Tuple { .. } => unreachable!(
+            "tuple-typed node in row demand: row slots admit lists/records only — Tuple-kind nodes infer Tuple types, which no method base, field base, or projection base signature admits"
+        ),
+        TypedExprKind::Struct { .. } => unreachable!(
+            "struct-literal node in row demand: row slots admit lists/records only — Struct-kind nodes infer Record types, which no row-slot signature admits (struct literals route via lower_struct_result)"
+        ),
         TypedExprKind::Some { .. } => todo!("M4b presence: some() in row demand"),
         TypedExprKind::Literal(_)
         | TypedExprKind::TypeConstant { .. }
@@ -591,7 +595,9 @@ fn rows_method(
     match name.value.as_str() {
         "filter" => {
             if level.pending.is_some() {
-                todo!("M4 filter over split-pending level");
+                unreachable!(
+                    "filter over split-pending level: pendings imply List inners, which the filter signature (Record-only) rejects"
+                )
             }
             if needs_wrap(&level) {
                 level = wrap_level(ctx, level);
@@ -700,7 +706,9 @@ fn rows_method(
                 return level;
             }
             if level.pending.is_some() {
-                todo!("M4b max_by over split-pending base");
+                unreachable!(
+                    "max_by over split-pending level: pendings imply List inners, which the max_by signature (Record-only) rejects"
+                )
             }
             if needs_wrap(&level) {
                 level = wrap_level(ctx, level);
@@ -712,8 +720,14 @@ fn rows_method(
             compose_limit(&mut level.builder, "first", &[], ctx);
             level
         }
+        "unwrap" | "unwrap_or" if matches!(peel_optional(&level.element), QueryType::Record(_)) => {
+            todo!("M4 presence-directed unwrap over records")
+        }
+        "unwrap" | "unwrap_or" => {
+            todo!("M4b presence: unwrap over list in row demand")
+        }
         _ => unreachable!(
-            "method {} in row demand: value methods never return row types",
+            "method {} in row demand: no other value method returns row types",
             name.value
         ),
     }
@@ -760,6 +774,15 @@ fn sort_keys(ctx: &mut Context, expr: &TypedExpr, dir: OrderDir) -> Vec<OrderIte
             expr: scalar(ctx, expr),
             dir,
         }];
+    }
+    if let TypedExprKind::If { arms, default } = &expr.kind {
+        let QueryType::Tuple(tys) = &expr.ty else {
+            unreachable!("if with non-tuple type in tuple sort key: caller checks the type")
+        };
+        match distribute_if_tuple(arms, default, tys, expr.span, expr.ty.clone()) {
+            Some(synthetic) => return sort_keys(ctx, &synthetic, dir),
+            None => todo!("M7 sort-key tuple expansion"),
+        }
     }
     match &expr.kind {
         TypedExprKind::Tuple { elements } => elements
@@ -1062,6 +1085,9 @@ fn lower_value(
                 (Vec::new(), shape, parent_key.into_iter().collect())
             }
             QueryType::List(_) => todo!("M4b presence: optional list item"),
+            QueryType::Tuple(_) => unreachable!(
+                "optional-tuple value: Optional(Tuple) node types never arise — wrap_optional maps tuples element-wise, Some-of-tuple is rejected by the final check (QT0027)"
+            ),
             _ => todo!("M4b exotic optional item"),
         },
         QueryType::Tuple(tys) => {
@@ -2610,7 +2636,9 @@ fn finalize_level(ctx: &mut Context, level: Level) -> RootPlan {
         level.element,
         QueryType::Optional(ref inner) if matches!(inner.as_ref(), QueryType::Tuple(_))
     ) {
-        todo!("M7 optional tuple result");
+        unreachable!(
+            "optional-tuple level in finalize: Optional(Tuple) node types never arise — wrap_optional maps tuples element-wise instead of wrapping, Some-of-tuple is rejected by the final check (QT0027), and no method signature wraps a bare tuple"
+        )
     }
     let mut builder = level.builder;
     if builder.select.is_empty() {
@@ -3449,9 +3477,13 @@ fn scalar_list_col(ctx: &mut Context, base: &TypedExpr) -> String {
                     grove_schema::validated::ValueType::Scalar(_) => match storage.value.as_slice()
                     {
                         [col] => ctx.schema.column_name(*col).to_string(),
-                        _ => todo!("M4b multi-col array aggregation"),
+                        _ => unreachable!(
+                            "multi-column via array in aggregation: via clauses carry exactly key+value columns"
+                        ),
                     },
-                    _ => todo!("M4b nested array aggregation"),
+                    _ => unreachable!(
+                        "nested via array in aggregation: reductions require summable scalar inners, which nested inners never satisfy"
+                    ),
                 },
                 _ => unreachable!("reference ident in scalar aggregation: records aren't summable"),
             }
@@ -3668,7 +3700,9 @@ fn scalar_method(
                 }
                 _ => todo!("M4 list-optional mechanics"),
             },
-            _ => todo!("M7 optional tuples"),
+            _ => unreachable!(
+                "method on optional tuple: Optional(Tuple) node types never arise — wrap_optional maps tuples element-wise, Some-of-tuple is rejected by the final check (QT0027)"
+            ),
         },
         QueryType::List(inner) => match name.value.as_str() {
             "len" => scalar_aggregate(ctx, base, AggOp::Len),
@@ -3706,7 +3740,9 @@ fn scalar_method(
             "first" | "nth" => {
                 let mut level = rows(ctx, base);
                 if level.pending.is_some() {
-                    todo!("M4b nested collapse in scalar slot");
+                    unreachable!(
+                        "collapse over split-pending rows in scalar demand: scalar results imply List(Scalar) bases, whose rows never park pendings (crossings that park are nested)"
+                    )
                 }
                 compose_limit(&mut level.builder, &name.value, args, ctx);
                 if !level.builder.unions.is_empty() {
@@ -3804,8 +3840,12 @@ fn contains_exists(ctx: &mut Context, base: &TypedExpr, needle: &TypedExpr) -> S
                 }];
                 return SqlExpr::Exists(Box::new(query));
             }
-            QueryType::Tuple(_) => todo!("comparison-overhaul: tuple membership"),
-            QueryType::Record(_) => todo!("comparison-overhaul: record membership"),
+            QueryType::Tuple(_) => unreachable!(
+                "tuple-typed literal base with scalar needle: the contains signature gates needles to the element type, so scalar needles never meet tuple inners"
+            ),
+            QueryType::Record(_) => unreachable!(
+                "record-typed literal base with scalar needle: the contains signature gates needles to the element type, so scalar needles never meet record inners"
+            ),
             QueryType::List(_) => {
                 unreachable!("nested literal contains: the H1 nested-membership arm fires first")
             }
@@ -3838,7 +3878,9 @@ fn contains_exists(ctx: &mut Context, base: &TypedExpr, needle: &TypedExpr) -> S
     let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
     let (storage, link) = match field {
         Field::Array { storage, link, .. } => (storage, link),
-        _ => todo!("comparison-overhaul: record membership"),
+        _ => unreachable!(
+            "contains over non-array field with scalar needle: the contains signature gates needles to the element type, so scalar needles never meet reference-typed inners"
+        ),
     };
     let table = ctx.schema.tables[storage.table.index()].name.clone();
     let alias = ctx.aliases.table(&table);
@@ -3852,7 +3894,9 @@ fn contains_exists(ctx: &mut Context, base: &TypedExpr, needle: &TypedExpr) -> S
     }];
     let value_col = match storage.value.as_slice() {
         [col] => ctx.schema.column_name(*col).to_string(),
-        _ => todo!("comparison-overhaul: tuple membership"),
+        _ => unreachable!(
+            "multi-column via array in contains: via clauses carry exactly key+value columns"
+        ),
     };
     query.where_ = vec![
         SqlExpr::Binary {
