@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["grove-types", "grove-schema", "grove-query", "grove-debug"]
+members = ["grove-types", "grove-schema", "grove-query", "grove-debug", "grove-runtime"]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,6 +13,7 @@ grove-query = { path = "grove-query" }
 
 chrono = "0.4"
 rust_decimal = "1"
+rusqlite = { version = "0.40", features = ["bundled", "vtab", "functions"] }
 
 ariadne = "0.6"
 clap = { version = "4", features = ["derive"] }

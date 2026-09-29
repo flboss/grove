@@ -1,0 +1,7 @@
+[package]
+name = "grove-runtime"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rusqlite = { workspace = true }
