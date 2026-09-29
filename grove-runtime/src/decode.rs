@@ -6,49 +6,51 @@ use rust_decimal::Decimal;
 use super::error::RuntimeError;
 use super::value::Value;
 
-const DEC_BYTES: usize = 32;
-const DEC_DIGITS: usize = 29;
+const DEC_BYTES: usize = 13;
 const DEC_EXP_BIAS: i32 = 28;
+const DEC_BIASED_MAX: u8 = 56;
+const TEN_POW_29: u128 = 100_000_000_000_000_000_000_000_000_000;
+const TWO_POW_96: u128 = 1 << 96;
 const TEMPORAL_BYTES: usize = 12;
 const NANOS_PER_SEC: i64 = 1_000_000_000;
 
-pub fn encode_dec(d: &Decimal) -> [u8; DEC_BYTES] {
-    let scale = d.scale() as i32;
-    let mut magnitude = d.mantissa().unsigned_abs();
-    let negative = d.is_sign_negative();
-
-    let mut digits = [0u8; DEC_DIGITS];
-    let mut count = 0usize;
-    let exp = if magnitude == 0 {
-        count = scale as usize + 1;
-        -DEC_EXP_BIAS
-    } else {
-        let mut i = DEC_DIGITS;
-        while magnitude > 0 {
-            i -= 1;
-            digits[i] = (magnitude % 10) as u8;
-            magnitude /= 10;
-            count += 1;
-        }
-        digits.copy_within(i.., 0);
-        count as i32 - 1 - scale
-    };
-    debug_assert!((1..=DEC_DIGITS).contains(&count));
-    debug_assert!((-DEC_EXP_BIAS..=DEC_EXP_BIAS).contains(&exp));
-
+pub fn assemble_dec(negative: bool, exp: i8, significand: u128) -> [u8; DEC_BYTES] {
+    let biased = exp as i16 + DEC_EXP_BIAS as i16;
     let mut out = [0u8; DEC_BYTES];
-    out[0] = if negative { 0x00 } else { 0x02 };
-    out[1] = (exp + DEC_EXP_BIAS) as u8;
-    out[2..31].copy_from_slice(&digits);
-    out[31] = count as u8;
+    out[0] = (((biased as u16) << 1) as u8) | ((significand >> 96) & 1) as u8 | 0x80;
+    let low = significand & (TWO_POW_96 - 1);
+    out[1..13].copy_from_slice(&low.to_be_bytes()[4..16]);
     if negative {
-        out[1] ^= 0xFF;
-        out[31] ^= 0xFF;
-        for byte in out.iter_mut().skip(2).take(DEC_DIGITS) {
-            *byte = 9 - *byte;
+        for byte in out.iter_mut() {
+            *byte ^= 0xFF;
         }
     }
     out
+}
+
+pub fn encode_dec(d: &Decimal) -> [u8; DEC_BYTES] {
+    let mut mantissa = d.mantissa().unsigned_abs();
+    let mut scale = d.scale();
+    while scale > 0 && mantissa.is_multiple_of(10) {
+        mantissa /= 10;
+        scale -= 1;
+    }
+    if mantissa == 0 {
+        return [0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    }
+    let negative = d.is_sign_negative();
+    let mut digits = 0u32;
+    let mut probe = mantissa;
+    while probe > 0 {
+        digits += 1;
+        probe /= 10;
+    }
+    let exp = digits as i32 - 1 - scale as i32;
+    debug_assert!((1..=29).contains(&digits));
+    debug_assert!((-DEC_EXP_BIAS..=DEC_EXP_BIAS).contains(&exp));
+    let aligned = mantissa * 10u128.pow(29 - digits);
+    debug_assert!(aligned < TEN_POW_29);
+    assemble_dec(negative, exp as i8, aligned)
 }
 
 pub fn decode_dec(bytes: &[u8], column: &str) -> Result<Decimal, RuntimeError> {
@@ -60,50 +62,60 @@ pub fn decode_dec(bytes: &[u8], column: &str) -> Result<Decimal, RuntimeError> {
     if bytes.len() != DEC_BYTES {
         return Err(decode_err(format!("{}-byte blob", bytes.len())));
     }
-    let negative = match bytes[0] {
-        0x00 => true,
-        0x02 => false,
-        class => return Err(decode_err(format!("bad class byte {class:#04x}"))),
-    };
-    let (exp_byte, count_byte) = if negative {
-        (bytes[1] ^ 0xFF, bytes[31] ^ 0xFF)
-    } else {
-        (bytes[1], bytes[31])
-    };
-    let exp = exp_byte as i32 - DEC_EXP_BIAS;
-    let count = count_byte as usize;
-    if !(-DEC_EXP_BIAS..=DEC_EXP_BIAS).contains(&exp) {
+    let negative = bytes[0] & 0x80 == 0;
+    let mut raw = [0u8; DEC_BYTES];
+    raw.copy_from_slice(bytes);
+    if negative {
+        for byte in raw.iter_mut() {
+            *byte ^= 0xFF;
+        }
+    }
+    let biased = (raw[0] >> 1) & 0x3F;
+    if biased > DEC_BIASED_MAX {
         return Err(decode_err("exponent out of range".to_string()));
     }
-    if !(1..=DEC_DIGITS).contains(&count) {
-        return Err(decode_err("digit count out of range".to_string()));
+    let exp = biased as i32 - DEC_EXP_BIAS;
+    let mut field = [0u8; 16];
+    field[3] = raw[0] & 1;
+    field[4..16].copy_from_slice(&raw[1..13]);
+    let aligned = u128::from_be_bytes(field);
+    if aligned >= TEN_POW_29 {
+        return Err(decode_err("significand out of range".to_string()));
     }
-    let mut digits = [0u8; DEC_DIGITS];
-    digits.copy_from_slice(&bytes[2..31]);
-    for byte in digits.iter_mut() {
-        if *byte > 9 {
-            return Err(decode_err("bad digit byte".to_string()));
-        }
-        if negative {
-            *byte = 9 - *byte;
+    if aligned == 0 {
+        return Ok(Decimal::ZERO);
+    }
+    let mut trailing = 0u32;
+    let mut probe = aligned;
+    while probe.is_multiple_of(10) {
+        probe /= 10;
+        trailing += 1;
+    }
+    let stripped = probe;
+    let mut stripped_digits = 0u32;
+    let mut probe = stripped;
+    while probe > 0 {
+        stripped_digits += 1;
+        probe /= 10;
+    }
+    let mut split = None;
+    for k in 0..=trailing {
+        let scale = stripped_digits as i32 + k as i32 - 1 - exp;
+        if scale >= 0 {
+            split = Some((stripped * 10u128.pow(k), scale as u32));
+            break;
         }
     }
-    let mut magnitude: i128 = 0;
-    let mut all_zero = true;
-    for &digit in &digits[..count] {
-        magnitude = magnitude * 10 + digit as i128;
-        all_zero &= digit == 0;
-    }
-    let scale = if all_zero {
-        count as i32 - 1
-    } else {
-        let scale = count as i32 - 1 - exp;
-        if !(0..=28).contains(&scale) {
-            return Err(decode_err("scale out of range".to_string()));
-        }
-        scale
+    let Some((mantissa, scale)) = split else {
+        return Err(decode_err("unrepresentable scale".to_string()));
     };
-    let mut value = Decimal::try_from_i128_with_scale(magnitude, scale as u32)
+    if scale > 28 {
+        return Err(decode_err("scale out of range".to_string()));
+    }
+    if mantissa >= TWO_POW_96 {
+        return Err(decode_err("mantissa out of range".to_string()));
+    }
+    let mut value = Decimal::try_from_i128_with_scale(mantissa as i128, scale)
         .map_err(|_| decode_err("mantissa out of range".to_string()))?;
     value.set_sign_negative(negative);
     Ok(value)

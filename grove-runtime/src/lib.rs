@@ -6,7 +6,7 @@ pub mod params;
 pub mod value;
 
 pub use conn::Runtime;
-pub use decode::{decode_dec, decode_duration, decode_instant};
+pub use decode::{assemble_dec, decode_dec, decode_duration, decode_instant};
 pub use error::RuntimeError;
 pub use value::Value;
 
