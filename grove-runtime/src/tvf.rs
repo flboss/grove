@@ -12,7 +12,7 @@ use rusqlite::vtab::{
 };
 use rusqlite::{Connection, Result};
 
-pub type BulkSlot = Arc<Mutex<Vec<i64>>>;
+pub type BulkSlot = Arc<Mutex<Vec<SqlValue>>>;
 
 pub type LitState = Arc<Mutex<HashMap<String, Vec<Vec<SqlValue>>>>>;
 
@@ -65,7 +65,7 @@ unsafe impl<'vtab> VTab<'vtab> for BulkTab {
 struct BulkCursor<'vtab> {
     base: sqlite3_vtab_cursor,
     slot: BulkSlot,
-    rows: Vec<i64>,
+    rows: Vec<SqlValue>,
     pos: usize,
     phantom: PhantomData<&'vtab BulkTab>,
 }

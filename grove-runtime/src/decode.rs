@@ -233,6 +233,22 @@ pub fn decode_value(
     }
 }
 
+pub fn encode_value(v: &Value) -> Option<rusqlite::types::Value> {
+    use rusqlite::types::Value as SqlValue;
+    match v {
+        Value::Null => None,
+        Value::Int(n) => Some(SqlValue::Integer(*n)),
+        Value::Float(f) if f.is_nan() => None,
+        Value::Float(f) => Some(SqlValue::Real(*f)),
+        Value::Dec(d) => Some(SqlValue::Blob(encode_dec(d).to_vec())),
+        Value::String(s) => Some(SqlValue::Text(s.clone())),
+        Value::Bool(b) => Some(SqlValue::Integer(i64::from(*b))),
+        Value::Instant(t) => Some(SqlValue::Blob(encode_instant(t).to_vec())),
+        Value::Duration(d) => Some(SqlValue::Blob(encode_duration(d).to_vec())),
+        Value::List(_) | Value::Tuple(_) | Value::Record(_) => None,
+    }
+}
+
 pub fn encode_param(p: &grove_query::codegen::model::ParamValue) -> rusqlite::types::Value {
     use grove_query::codegen::model::ParamValue;
     use rusqlite::types::Value as SqlValue;

@@ -81,12 +81,15 @@ impl Runtime {
                 })?;
                 match value {
                     Value::Null => {}
-                    Value::Int(n) => keys.push(*n),
-                    other => {
-                        return Err(RuntimeError::Contract(format!(
-                            "statement {index}: key column holds {other:?}, not an id"
-                        )));
-                    }
+                    Value::Float(f) if f.is_nan() => {}
+                    v => match super::decode::encode_value(v) {
+                        Some(s) => keys.push(s),
+                        None => {
+                            return Err(RuntimeError::Contract(format!(
+                                "statement {index}: non-scalar key value {v:?}"
+                            )));
+                        }
+                    },
                 }
             }
         }
