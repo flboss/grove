@@ -1,7 +1,7 @@
 
 use std::fmt;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum RuntimeError {
     Prepare { index: usize, message: String },
     Bind { index: usize, message: String },

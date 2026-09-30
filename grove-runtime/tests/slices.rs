@@ -513,6 +513,26 @@ fn slice_tuples() {
         value("(1, 2.5)"),
         Value::Tuple(vec![Value::Int(1), n("2.5")])
     );
+    assert_eq!(
+        value("(1, [2, 3])"),
+        Value::Tuple(vec![
+            Value::Int(1),
+            Value::List(vec![
+                rec(&[("c0", Value::Int(2))]),
+                rec(&[("c0", Value::Int(3))]),
+            ]),
+        ])
+    );
+    assert_eq!(
+        value("{ a = [1, 2] }"),
+        Value::Record(vec![(
+            "a".to_string(),
+            Value::List(vec![
+                rec(&[("c0", Value::Int(1))]),
+                rec(&[("c0", Value::Int(2))]),
+            ]),
+        )])
+    );
 }
 
 #[test]
