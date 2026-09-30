@@ -3,7 +3,7 @@ use std::collections::HashMap;
 
 use super::builder::{
     AliasGen, FromClause, NamedColumn, OrderDir, OrderItem, SelectBuilder, SelectItem, SqlBinOp,
-    SqlExpr,
+    SqlExpr, TuplePart,
 };
 use super::model::{
     Cardinality, ChildRef, ColumnRole, OutputColumn, ParamValue, ParentRef, ResultShape, RowCount,
@@ -84,6 +84,7 @@ pub struct PendingSplit {
     pub parent_col: String,
     pub multi_parent: bool,
     pub next: Option<Box<PendingSplit>>,
+    pub tuple_parts: Option<Vec<TuplePart>>,
 }
 
 pub struct Level {
@@ -492,6 +493,7 @@ fn navigate_ref(
                 parent_col,
                 multi_parent,
                 next: None,
+                tuple_parts: None,
             }),
             stmt_bound,
             output_shapes,
@@ -543,6 +545,7 @@ fn navigate_array(
                     parent_col,
                     multi_parent: true,
                     next: None,
+                    tuple_parts: None,
                 }),
                 stmt_bound,
                 output_shapes,
@@ -2178,11 +2181,16 @@ fn rcross_shape(
         shape_columns(builder_output_types(&child.builder, ctx.schema), |name| {
             name == "$$pkey"
         });
-    let element = ResultShape::Record(
-        outputs
-            .iter()
-            .map(|name| (name.clone(), ResultShape::Column(name.clone())))
-            .collect(),
+    let item_ty = match &local_tail.ty {
+        QueryType::List(sub) => sub.as_ref(),
+        _ => &local_tail.ty,
+    };
+    let element = child_element(
+        ctx.schema,
+        child.output_shapes.as_ref(),
+        item_ty,
+        &outputs,
+        |name| name == "$$pkey",
     );
     let idx = ctx.sink(
         child.builder,
@@ -2305,15 +2313,32 @@ fn sink_broadcast_tail(ctx: &mut Context, tail: &TypedExpr) -> (ResultShape, Opt
     let shape_cols: Vec<OutputColumn> =
         shape_columns(builder_output_types(&root.builder, ctx.schema), |_| false);
     let root_creation = ctx.statements.len() + hops.len() + 1;
+    let root_parts = match &root.builder.from {
+        Some(FromClause::Literal { tuple_parts, .. }) => tuple_parts.clone(),
+        _ => None,
+    };
     let inner = if hops.is_empty() {
-        ResultShape::Record(
-            outputs
-                .iter()
-                .map(|name| (name.clone(), ResultShape::Column(name.clone())))
-                .collect(),
+        let item_ty = match peel_optional(&tail.ty) {
+            QueryType::List(sub) => sub.as_ref(),
+            _ => &tail.ty,
+        };
+        child_element(
+            ctx.schema,
+            root.output_shapes.as_ref(),
+            item_ty,
+            &outputs,
+            |_| false,
         )
     } else {
-        nest_layers(sink_chain(ctx, &hops, root_creation))
+        let layers = sink_chain(ctx, &hops, root_creation);
+        nest_layers(
+            ctx.schema,
+            layers,
+            &tail.ty,
+            false,
+            root_parts.clone(),
+            root_creation,
+        )
     };
     let actual = ctx.sink(
         root.builder,
@@ -2327,14 +2352,19 @@ fn sink_broadcast_tail(ctx: &mut Context, tail: &TypedExpr) -> (ResultShape, Opt
         actual, root_creation,
         "broadcast root sank at an unexpected index: sink order changed"
     );
-    let shape = ResultShape::List {
-        element: Box::new(inner),
-        child: ChildRef {
-            stmt: root_creation,
-            parent: None,
-            cardinality: Cardinality::Many,
-            tag: None,
-        },
+    let complete = root_parts.is_some();
+    let shape = if complete {
+        inner
+    } else {
+        ResultShape::List {
+            element: Box::new(inner),
+            child: ChildRef {
+                stmt: root_creation,
+                parent: None,
+                cardinality: Cardinality::Many,
+                tag: None,
+            },
+        }
     };
     (shape, None)
 }
@@ -2481,11 +2511,16 @@ fn rvalue_shape(
         shape_columns(builder_output_types(&child.builder, ctx.schema), |name| {
             keyed && name == child_col
         });
-    let element = ResultShape::Record(
-        outputs
-            .iter()
-            .map(|name| (name.clone(), ResultShape::Column(name.clone())))
-            .collect(),
+    let item_ty = match &tail.ty {
+        QueryType::List(sub) => sub.as_ref(),
+        _ => &tail.ty,
+    };
+    let element = child_element(
+        ctx.schema,
+        child.output_shapes.as_ref(),
+        item_ty,
+        &outputs,
+        |name| keyed && name == child_col,
     );
     let idx = ctx.sink(
         child.builder,
@@ -2602,11 +2637,16 @@ fn rscalar_shape(
         shape_columns(builder_output_types(&child.builder, ctx.schema), |name| {
             keyed && name == child_col
         });
-    let element = ResultShape::Record(
-        outputs
-            .iter()
-            .map(|name| (name.clone(), ResultShape::Column(name.clone())))
-            .collect(),
+    let item_ty = match &eff.ty {
+        QueryType::List(sub) => sub.as_ref(),
+        _ => &eff.ty,
+    };
+    let element = child_element(
+        ctx.schema,
+        child.output_shapes.as_ref(),
+        item_ty,
+        &outputs,
+        |name| keyed && name == child_col,
     );
     let idx = ctx.sink(
         child.builder,
@@ -2752,11 +2792,16 @@ fn rtemp_shape(
         shape_columns(builder_output_types(&child.builder, ctx.schema), |name| {
             name == child_col
         });
-    let element = ResultShape::Record(
-        outputs
-            .iter()
-            .map(|name| (name.clone(), ResultShape::Column(name.clone())))
-            .collect(),
+    let item_ty = match &tail.ty {
+        QueryType::List(sub) => sub.as_ref(),
+        _ => &tail.ty,
+    };
+    let element = child_element(
+        ctx.schema,
+        child.output_shapes.as_ref(),
+        item_ty,
+        &outputs,
+        |name| name == child_col,
     );
     let idx = ctx.sink(
         child.builder,
@@ -2883,7 +2928,7 @@ pub fn lower_query(ctx: &mut Context, result: &TypedExpr) -> RootPlan {
 
 fn finalize_level(ctx: &mut Context, level: Level) -> RootPlan {
     if let Some(pending) = level.pending {
-        return emit_split(ctx, level.builder, pending);
+        return emit_split(ctx, level.builder, pending, &level.element);
     }
     if matches!(level.element, QueryType::Tuple(_)) {
         let mut builder = level.builder;
@@ -2925,25 +2970,34 @@ fn finalize_level(ctx: &mut Context, level: Level) -> RootPlan {
         builder.select = vec![SelectItem::AllFrom { depth: 0 }];
     }
     let outputs = builder_outputs(&builder, ctx.schema);
-    let fields: Vec<(String, ResultShape)> = match level.output_shapes {
-        Some(items) => items
-            .into_iter()
-            .map(|(alias, shape)| {
-                let shape = shape.unwrap_or_else(|| ResultShape::Column(alias.clone()));
-                (alias, shape)
-            })
-            .collect(),
-        None => outputs
-            .iter()
-            .map(|name| (name.clone(), ResultShape::Column(name.clone())))
-            .collect(),
+    let element = match level.output_shapes.as_ref() {
+        Some(items) => ResultShape::Record(
+            items
+                .iter()
+                .map(|(alias, shape)| {
+                    (
+                        alias.clone(),
+                        shape
+                            .clone()
+                            .unwrap_or_else(|| ResultShape::Column(alias.clone())),
+                    )
+                })
+                .collect(),
+        ),
+        None => {
+            let item_ty = match peel_optional(&level.element) {
+                QueryType::List(sub) => sub.as_ref(),
+                _ => &level.element,
+            };
+            child_element(ctx.schema, None, item_ty, &outputs, |_| false)
+        }
     };
     let shape = StatementShape {
         columns: shape_columns(builder_output_types(&builder, ctx.schema), |_| false),
         rows: RowCount::Many,
     };
     let result = ResultShape::List {
-        element: Box::new(ResultShape::Record(fields)),
+        element: Box::new(element),
         child: ChildRef {
             stmt: 0,
             parent: None,
@@ -2968,11 +3022,7 @@ fn drain_pending(pending: PendingSplit) -> Vec<PendingSplit> {
     hops
 }
 
-fn sink_chain(
-    ctx: &mut Context,
-    hops: &[PendingSplit],
-    root_creation: usize,
-) -> Vec<(usize, ParentRef, Vec<String>)> {
+fn sink_chain(ctx: &mut Context, hops: &[PendingSplit], root_creation: usize) -> Vec<NestLayer> {
     let mut built: Vec<(SelectBuilder, StatementShape, Vec<String>)> =
         Vec::with_capacity(hops.len());
     for (i, hop) in hops.iter().enumerate() {
@@ -3002,11 +3052,11 @@ fn sink_chain(
         creation[i] = ctx.sink(child, shape, StatementKind::Query);
         outputs[i] = child_outputs;
     }
-    let mut layers: Vec<(usize, ParentRef, Vec<String>)> = Vec::with_capacity(hops.len());
+    let mut layers: Vec<NestLayer> = Vec::with_capacity(hops.len());
     for (i, hop) in hops.iter().enumerate() {
-        layers.push((
-            creation[i],
-            ParentRef {
+        layers.push(NestLayer {
+            creation: creation[i],
+            pref: ParentRef {
                 stmt: if i == 0 {
                     root_creation
                 } else {
@@ -3015,56 +3065,177 @@ fn sink_chain(
                 parent_key: hop.parent_col.clone(),
                 child_key: hop.child_col.clone(),
             },
-            std::mem::take(&mut outputs[i]),
-        ));
+            outputs: std::mem::take(&mut outputs[i]),
+            middle: hop.tuple_parts.clone(),
+        });
     }
     layers
 }
 
-fn nest_layers(layers: Vec<(usize, ParentRef, Vec<String>)>) -> ResultShape {
-    let mut element = None;
-    for (idx, pref, outputs) in layers.into_iter().rev() {
-        let inner = match element.take() {
-            Some(inner) => inner,
-            None => ResultShape::Record(
-                outputs
-                    .iter()
+struct NestLayer {
+    creation: usize,
+    pref: ParentRef,
+    outputs: Vec<String>,
+    middle: Option<Vec<TuplePart>>,
+}
+
+fn peel_lists(mut ty: &QueryType) -> &QueryType {
+    loop {
+        match peel_optional(ty) {
+            QueryType::List(sub) => ty = sub,
+            _ => return peel_optional(ty),
+        }
+    }
+}
+
+fn nest_layers(
+    schema: &ValidatedSchema,
+    layers: Vec<NestLayer>,
+    root_ty: &QueryType,
+    root_dup: bool,
+    root_parts: Option<Vec<TuplePart>>,
+    root_stmt: usize,
+) -> ResultShape {
+    if layers.is_empty() {
+        unreachable!("nesting no layers: callers only nest non-empty chains");
+    }
+    let wrap = |element: ResultShape, layer: &NestLayer| ResultShape::List {
+        element: Box::new(element),
+        child: ChildRef {
+            stmt: layer.creation,
+            parent: Some(layer.pref.clone()),
+            cardinality: Cardinality::Many,
+            tag: None,
+        },
+    };
+    let innermost = layers.len() - 1;
+    let has_middle = root_parts.is_some() || layers.iter().any(|layer| layer.middle.is_some());
+    let mut element = if layers[innermost].middle.is_some() {
+        middle_tuple(
+            layers[innermost].middle.as_ref().unwrap_or_else(|| {
+                unreachable!("middle hop lost its parts: markers travel with the hop")
+            }),
+            None,
+        )
+    } else if has_middle {
+        let inner = &layers[innermost];
+        let kept: Vec<String> = inner
+            .outputs
+            .iter()
+            .filter(|name| name.as_str() != inner.pref.child_key)
+            .cloned()
+            .collect();
+        debug_assert_eq!(
+            kept.len(),
+            1,
+            "position leaf serves one scalar besides its pairing key"
+        );
+        match kept.as_slice() {
+            [col] => ResultShape::Column(col.clone()),
+            kept => ResultShape::Record(
+                kept.iter()
                     .map(|name| (name.clone(), ResultShape::Column(name.clone())))
                     .collect(),
             ),
-        };
-        element = Some(ResultShape::List {
-            element: Box::new(inner),
+        }
+    } else {
+        let inner = &layers[innermost];
+        child_element(schema, None, peel_lists(root_ty), &inner.outputs, |name| {
+            name == inner.pref.child_key
+        })
+    };
+    let grouped = matches!(element, ResultShape::Column(_) | ResultShape::Tuple(_));
+    let (first_creation, first_pref) = (layers[0].creation, layers[0].pref.clone());
+    if grouped {
+        element = wrap(element, &layers[innermost]);
+    }
+    let skip = usize::from(grouped);
+    for layer in layers.iter().rev().skip(skip) {
+        if let Some(parts) = layer.middle.as_ref() {
+            element = wrap(middle_tuple(parts, Some(element)), layer);
+        } else {
+            element = wrap(element, layer);
+        }
+    }
+    if grouped && root_dup && root_parts.is_none() {
+        element = ResultShape::List {
+            element: Box::new(element),
             child: ChildRef {
-                stmt: idx,
-                parent: Some(pref),
+                stmt: first_creation,
+                parent: Some(first_pref),
                 cardinality: Cardinality::Many,
                 tag: None,
             },
-        });
+        };
     }
-    element.unwrap_or_else(|| unreachable!("nesting no layers: callers only nest non-empty chains"))
+    match root_parts {
+        Some(parts) => ResultShape::List {
+            element: Box::new(middle_tuple(&parts, Some(element))),
+            child: ChildRef {
+                stmt: root_stmt,
+                parent: None,
+                cardinality: Cardinality::Many,
+                tag: None,
+            },
+        },
+        None => element,
+    }
 }
 
-fn emit_split(ctx: &mut Context, parent_builder: SelectBuilder, pending: PendingSplit) -> RootPlan {
+fn middle_tuple(parts: &[TuplePart], sub: Option<ResultShape>) -> ResultShape {
+    let mut out = Vec::with_capacity(parts.len());
+    for part in parts {
+        match part {
+            TuplePart::Value(col) => out.push(ResultShape::Column(col.clone())),
+            TuplePart::Nested => out.push(sub.clone().unwrap_or_else(|| {
+                unreachable!("tuple slot without sub-shape: chained levels always accumulate one")
+            })),
+        }
+    }
+    ResultShape::Tuple(out)
+}
+
+fn emit_split(
+    ctx: &mut Context,
+    parent_builder: SelectBuilder,
+    pending: PendingSplit,
+    root_ty: &QueryType,
+) -> RootPlan {
     let hops = drain_pending(pending);
     let mut parent_q = parent_builder;
-    let parent_key_ty = output_ty(&parent_q, &hops[0].parent_col, ctx.schema);
-    parent_q.select = vec![SelectItem::Column {
-        depth: 0,
-        column: hops[0].parent_col.clone(),
-        output: hops[0].parent_col.clone(),
-        ty: parent_key_ty,
-    }];
+    let root_parts = match &parent_q.from {
+        Some(FromClause::Literal { tuple_parts, .. }) => tuple_parts.clone(),
+        _ => None,
+    };
+    if root_parts.is_some() {
+        if parent_q.select.is_empty() {
+            parent_q.select = vec![SelectItem::AllFrom { depth: 0 }];
+        }
+    } else {
+        let parent_key_ty = output_ty(&parent_q, &hops[0].parent_col, ctx.schema);
+        parent_q.select = vec![SelectItem::Column {
+            depth: 0,
+            column: hops[0].parent_col.clone(),
+            output: hops[0].parent_col.clone(),
+            ty: parent_key_ty,
+        }];
+    }
     let parent_shape = StatementShape {
-        columns: vec![OutputColumn {
-            name: hops[0].parent_col.clone(),
-            role: ColumnRole::Key,
-            ty: None,
-        }],
+        columns: if root_parts.is_some() {
+            shape_columns(builder_output_types(&parent_q, ctx.schema), |name| {
+                name == hops[0].parent_col
+            })
+        } else {
+            vec![OutputColumn {
+                name: hops[0].parent_col.clone(),
+                role: ColumnRole::Key,
+                ty: None,
+            }]
+        },
         rows: RowCount::Many,
     };
-    let result = nest_layers(sink_chain(ctx, &hops, 0));
+    let layers = sink_chain(ctx, &hops, 0);
+    let result = nest_layers(ctx.schema, layers, root_ty, true, root_parts, 0);
     RootPlan {
         builder: parent_q,
         shape: parent_shape,
@@ -3194,6 +3365,83 @@ fn from_columns_typed(
             columns.iter().map(|c| (c.name.clone(), c.ty)).collect()
         }
         None => unreachable!("row pipeline without FROM"),
+    }
+}
+
+fn struct_declares_column(schema: &ValidatedSchema, sid: StructId, name: &str) -> bool {
+    schema.structs[sid.index()].fields.iter().any(|f| {
+        matches!(f, Field::Value { columns, .. }
+            if columns.iter().any(|c| schema.column_name(*c) == name))
+    })
+}
+
+fn child_element(
+    schema: &ValidatedSchema,
+    output_shapes: Option<&Vec<(String, Option<ResultShape>)>>,
+    element_ty: &QueryType,
+    outputs: &[String],
+    is_key: impl Fn(&str) -> bool,
+) -> ResultShape {
+    if let Some(fields) = output_shapes
+        && !fields.is_empty()
+    {
+        return ResultShape::Record(
+            fields
+                .iter()
+                .map(|(alias, shape)| {
+                    (
+                        alias.clone(),
+                        shape
+                            .clone()
+                            .unwrap_or_else(|| ResultShape::Column(alias.clone())),
+                    )
+                })
+                .collect(),
+        );
+    }
+    let declared = match peel_optional(element_ty) {
+        QueryType::Record(RecordSource::Schema(sid)) => Some(*sid),
+        _ => None,
+    };
+    let kept: Vec<&String> = outputs
+        .iter()
+        .filter(|name| {
+            name.as_str() != "$$rn"
+                && match declared {
+                    Some(sid) => struct_declares_column(schema, sid, name),
+                    None => !is_key(name),
+                }
+        })
+        .collect();
+    match peel_optional(element_ty) {
+        QueryType::Scalar(_) if kept.len() == 1 => ResultShape::Column(kept[0].clone()),
+        QueryType::Tuple(tys)
+            if tys.len() == kept.len()
+                && tys
+                    .iter()
+                    .all(|t| matches!(peel_optional(t), QueryType::Scalar(_))) =>
+        {
+            ResultShape::Tuple(
+                kept.into_iter()
+                    .map(|name| ResultShape::Column(name.clone()))
+                    .collect(),
+            )
+        }
+        _ => {
+            debug_assert!(
+                !matches!(
+                    peel_optional(element_ty),
+                    QueryType::Scalar(_) | QueryType::Tuple(_)
+                ),
+                "scalar/tuple element over {} kept columns: type/row mismatch",
+                kept.len(),
+            );
+            ResultShape::Record(
+                kept.into_iter()
+                    .map(|name| (name.clone(), ResultShape::Column(name.clone())))
+                    .collect(),
+            )
+        }
     }
 }
 
@@ -4699,6 +4947,8 @@ struct LitLevel {
     id: String,
     module: String,
     columns: Vec<NamedColumn>,
+    tuple_parts: Option<Vec<TuplePart>>,
+    own_key: Option<String>,
 }
 
 impl LitLevel {
@@ -4707,6 +4957,7 @@ impl LitLevel {
             module: self.module.clone(),
             id: self.id.clone(),
             columns: self.columns.clone(),
+            tuple_parts: self.tuple_parts.clone(),
         }
     }
 }
@@ -4755,8 +5006,12 @@ fn leaf_value_tys(inner: &QueryType) -> Vec<ScalarType> {
             .iter()
             .map(|t| match peel_optional(t) {
                 QueryType::Scalar(s) => *s,
-                QueryType::List(_) => todo!("M7 tuple with list element"),
-                QueryType::Record(_) => todo!("M7 tuple with record element"),
+                QueryType::List(_) => unreachable!(
+                    "tuple with list element in leaf lowering: register routes tuples via register_tuple_middle"
+                ),
+                QueryType::Record(_) => unreachable!(
+                    "tuple with record element in leaf lowering: register routes tuples via register_tuple_middle"
+                ),
                 QueryType::Unknown => unreachable!(
                     "un-unified tuple element: the checker rejects it with AmbiguousType"
                 ),
@@ -4820,6 +5075,132 @@ fn const_value(ty: TypeName, name: ConstantName) -> ParamValue {
     }
 }
 
+fn register_tuple_middle<'a>(
+    ctx: &mut Context,
+    tys: &[QueryType],
+    items: Vec<(&'a TypedExpr, Option<i64>)>,
+    keyed: bool,
+) -> Vec<LitLevel> {
+    let mut scalar_positions: Vec<(usize, ScalarType)> = Vec::new();
+    let mut list_positions: Vec<(usize, QueryType)> = Vec::new();
+    for (j, t) in tys.iter().enumerate() {
+        match peel_optional(t) {
+            QueryType::Scalar(s) => scalar_positions.push((j, *s)),
+            QueryType::List(_) => list_positions.push((j, t.clone())),
+            QueryType::Record(_) => todo!("M7 tuple with record element"),
+            _ => todo!("M7 exotic tuple position"),
+        }
+    }
+    if list_positions.len() > 1 {
+        todo!("M7 multi-list tuple literal");
+    }
+    let list_position = list_positions.first();
+    let chained = list_position.is_some();
+    let mut columns: Vec<NamedColumn> = Vec::new();
+    if keyed {
+        columns.push(NamedColumn {
+            name: "c0".to_string(),
+            ty: Some(ScalarType::Int),
+        });
+    }
+    if chained {
+        columns.push(NamedColumn {
+            name: format!("c{}", columns.len()),
+            ty: Some(ScalarType::Int),
+        });
+    }
+    let mut parts: Vec<TuplePart> = Vec::with_capacity(tys.len());
+    for t in tys.iter() {
+        match peel_optional(t) {
+            QueryType::Scalar(s) => {
+                parts.push(TuplePart::Value(format!("c{}", columns.len())));
+                columns.push(NamedColumn {
+                    name: format!("c{}", columns.len()),
+                    ty: Some(*s),
+                });
+            }
+            QueryType::List(_) => parts.push(TuplePart::Nested),
+            _ => {
+                unreachable!("tuple position reclassified: classification above owns all positions")
+            }
+        }
+    }
+    let mut sig = String::with_capacity(columns.len());
+    if keyed {
+        sig.push('I');
+    }
+    if chained {
+        sig.push('I');
+    }
+    for (_, s) in &scalar_positions {
+        sig.push(sig_letter(*s));
+    }
+    let module = format!("$$lit_{}_{sig}", columns.len());
+    let id = ctx.aliases.literal();
+    let mut grid: Vec<Vec<ParamValue>> = Vec::with_capacity(items.len());
+    for (i, (elem, pkey)) in items.iter().enumerate() {
+        let node = peel_some(elem);
+        let mut row = Vec::with_capacity(columns.len());
+        if let Some(p) = pkey {
+            row.push(ParamValue::Int(*p));
+        }
+        if chained {
+            row.push(ParamValue::Int(i as i64));
+        }
+        match &node.kind {
+            TypedExprKind::Tuple { elements } => {
+                if elements.len() != tys.len() {
+                    unreachable!("tuple arity drift: the checker unifies tuple arity");
+                }
+                for (pos, _) in &scalar_positions {
+                    row.push(fold_static(&elements[*pos]));
+                }
+            }
+            TypedExprKind::Literal(lit) if matches!(&lit.value, Literal::None) => {
+                row.extend(scalar_positions.iter().map(|_| ParamValue::Null));
+            }
+            _ => todo!("M6 query-valued array element"),
+        }
+        grid.push(row);
+    }
+    ctx.literals.insert(id.clone(), grid);
+    let mut chain = vec![LitLevel {
+        id,
+        module,
+        columns,
+        tuple_parts: Some(parts),
+        own_key: chained.then(|| format!("c{}", usize::from(keyed))),
+    }];
+    if let Some((list_pos, list_ty)) = list_position {
+        let sub = match peel_optional(list_ty) {
+            QueryType::List(sub) => sub,
+            _ => unreachable!("list position without list type: classification owns positions"),
+        };
+        let mut child_items: Vec<(&'a TypedExpr, Option<i64>)> = Vec::new();
+        for (i, (elem, _)) in items.iter().enumerate() {
+            let node = peel_some(elem);
+            match &node.kind {
+                TypedExprKind::Tuple { elements } => {
+                    let Some(pos) = elements.get(*list_pos).map(peel_some) else {
+                        unreachable!("tuple arity drift: the checker unifies tuple arity");
+                    };
+                    match &pos.kind {
+                        TypedExprKind::Array { elements } => {
+                            child_items.extend(elements.iter().map(|e| (e, Some(i as i64))));
+                        }
+                        TypedExprKind::Literal(lit) if matches!(&lit.value, Literal::None) => {}
+                        _ => todo!("M6 query-valued array element"),
+                    }
+                }
+                TypedExprKind::Literal(lit) if matches!(&lit.value, Literal::None) => {}
+                _ => todo!("M6 query-valued array element"),
+            }
+        }
+        chain.extend(register_literal_level(ctx, sub, child_items));
+    }
+    chain
+}
+
 fn leaf_cells(elem: &TypedExpr, inner: &QueryType, width: usize) -> Vec<ParamValue> {
     let node = peel_some(elem);
     if let TypedExprKind::Literal(lit) = &node.kind
@@ -4843,7 +5224,46 @@ fn register_literal_level<'a>(
 ) -> Vec<LitLevel> {
     match peel_optional(inner) {
         QueryType::List(sub) => {
-            let keyed = items.first().is_some_and(|(_, p)| p.is_some());
+            if let QueryType::Tuple(tys) = peel_optional(sub) {
+                let rooted = items.first().is_some_and(|(_, p)| p.is_some());
+                let mut tuple_items: Vec<(&'a TypedExpr, Option<i64>)> = Vec::new();
+                let mut root_grid: Vec<Vec<ParamValue>> = Vec::new();
+                for (i, (elem, pkey)) in items.iter().enumerate() {
+                    let parent = if rooted { *pkey } else { Some(i as i64) };
+                    match &peel_some(elem).kind {
+                        TypedExprKind::Array { elements } => {
+                            tuple_items.extend(elements.iter().map(|e| (e, parent)));
+                            if !rooted {
+                                root_grid.push(vec![ParamValue::Int(i as i64)]);
+                            }
+                        }
+                        TypedExprKind::Literal(lit) if matches!(&lit.value, Literal::None) => {
+                            if !rooted {
+                                root_grid.push(vec![ParamValue::Int(i as i64)]);
+                            }
+                        }
+                        _ => todo!("M6 query-valued array element"),
+                    }
+                }
+                let mut chain = Vec::new();
+                if !rooted {
+                    let root_id = ctx.aliases.literal();
+                    ctx.literals.insert(root_id.clone(), root_grid);
+                    chain.push(LitLevel {
+                        id: root_id,
+                        module: "$$lit_1_I".to_string(),
+                        columns: vec![NamedColumn {
+                            name: "c0".to_string(),
+                            ty: Some(ScalarType::Int),
+                        }],
+                        tuple_parts: None,
+                        own_key: None,
+                    });
+                }
+                chain.extend(register_tuple_middle(ctx, tys, tuple_items, true));
+                return chain;
+            }
+            let keyed = items.is_empty() || items.first().is_some_and(|(_, p)| p.is_some());
             let columns: Vec<NamedColumn> = if keyed {
                 vec![
                     NamedColumn {
@@ -4890,11 +5310,20 @@ fn register_literal_level<'a>(
                 id,
                 module,
                 columns,
+                tuple_parts: None,
+                own_key: None,
             }];
             chain.extend(register_literal_level(ctx, sub, child_items));
             chain
         }
         _ => {
+            if let QueryType::Tuple(tys) = peel_optional(inner)
+                && tys
+                    .iter()
+                    .any(|t| matches!(peel_optional(t), QueryType::List(_) | QueryType::Record(_)))
+            {
+                return register_tuple_middle(ctx, tys, items, false);
+            }
             let value_tys = leaf_value_tys(inner);
             if value_tys.is_empty() {
                 todo!("M6 empty tuple literal");
@@ -4937,6 +5366,8 @@ fn register_literal_level<'a>(
                 id,
                 module,
                 columns,
+                tuple_parts: None,
+                own_key: None,
             }]
         }
     }
@@ -4960,14 +5391,20 @@ fn rows_array(ctx: &mut Context, expr: &TypedExpr) -> Level {
     let this = chain.remove(0);
     let mut builder = SelectBuilder::new();
     builder.from = Some(this.to_from_clause());
+    let root_key = this.own_key.unwrap_or_else(|| "c0".to_string());
     let mut pending: Option<PendingSplit> = None;
     for (i, level) in chain.into_iter().enumerate().rev() {
         pending = Some(PendingSplit {
             child_from: level.to_from_clause(),
             child_col: "c0".to_string(),
-            parent_col: if i == 0 { "c0" } else { "c1" }.to_string(),
+            parent_col: if i == 0 {
+                root_key.clone()
+            } else {
+                "c1".to_string()
+            },
             multi_parent: true,
             next: pending.map(Box::new),
+            tuple_parts: level.tuple_parts,
         });
     }
     Level {
@@ -5220,11 +5657,16 @@ fn root_composite_element(
             let outputs = builder_outputs(&level.builder, ctx.schema);
             let shape_cols: Vec<OutputColumn> =
                 shape_columns(builder_output_types(&level.builder, ctx.schema), |_| false);
-            let element = ResultShape::Record(
-                outputs
-                    .iter()
-                    .map(|name| (name.clone(), ResultShape::Column(name.clone())))
-                    .collect(),
+            let item_ty = match ty {
+                QueryType::List(sub) => sub.as_ref(),
+                _ => ty,
+            };
+            let element = child_element(
+                ctx.schema,
+                level.output_shapes.as_ref(),
+                item_ty,
+                &outputs,
+                |_| false,
             );
             let idx = ctx.sink(
                 level.builder,
@@ -5267,11 +5709,12 @@ fn root_composite_element(
             let outputs = builder_outputs(&level.builder, ctx.schema);
             let shape_cols: Vec<OutputColumn> =
                 shape_columns(builder_output_types(&level.builder, ctx.schema), |_| false);
-            let element = ResultShape::Record(
-                outputs
-                    .iter()
-                    .map(|name| (name.clone(), ResultShape::Column(name.clone())))
-                    .collect(),
+            let element = child_element(
+                ctx.schema,
+                level.output_shapes.as_ref(),
+                ty,
+                &outputs,
+                |_| false,
             );
             let idx = ctx.sink(
                 level.builder,

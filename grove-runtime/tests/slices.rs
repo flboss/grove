@@ -352,10 +352,7 @@ fn slice_optional_hops() {
             rec(&[("mname", Value::Null)]),
         ])
     );
-    assert_eq!(
-        value("users.manager.name"),
-        Value::List(vec![rec(&[("name", s("Bob"))])])
-    );
+    assert_eq!(value("users.manager.name"), Value::List(vec![s("Bob")]));
 }
 
 
@@ -368,21 +365,148 @@ fn slice_nested_children() {
                 ("name", s("Ada")),
                 (
                     "o",
-                    Value::List(vec![
-                        rec(&[("total", n("10")), ("user_id", Value::Int(1))]),
-                        rec(&[("total", n("20")), ("user_id", Value::Int(1))]),
-                    ])
+                    Value::List(vec![rec(&[("total", n("10"))]), rec(&[("total", n("20"))]),])
                 ),
             ]),
             rec(&[
                 ("name", s("Bob")),
-                (
-                    "o",
-                    Value::List(vec![rec(&[("total", n("30")), ("user_id", Value::Int(2))])]),
-                ),
+                ("o", Value::List(vec![rec(&[("total", n("30"))])]),),
             ]),
             rec(&[("name", s("Cyd")), ("o", Value::List(vec![]))]),
         ])
+    );
+}
+
+#[test]
+fn slice_via_array_values() {
+    assert_eq!(
+        value("users { sc = scores }"),
+        Value::List(vec![
+            rec(&[("sc", Value::List(vec![Value::Int(5), Value::Int(7)]))]),
+            rec(&[("sc", Value::List(vec![Value::Int(9)]))]),
+            rec(&[("sc", Value::List(vec![]))]),
+        ])
+    );
+    assert_eq!(
+        value("users { t = tags }"),
+        Value::List(vec![
+            rec(&[("t", Value::List(vec![s("x"), s("y")]))]),
+            rec(&[("t", Value::List(vec![s("z")]))]),
+            rec(&[("t", Value::List(vec![]))]),
+        ])
+    );
+}
+
+#[test]
+fn slice_take_window_values() {
+    assert_eq!(
+        value("users { o = orders.take(2) { total } }"),
+        Value::List(vec![
+            rec(&[(
+                "o",
+                Value::List(vec![rec(&[("total", n("10"))]), rec(&[("total", n("20"))])]),
+            )]),
+            rec(&[("o", Value::List(vec![rec(&[("total", n("30"))])]))]),
+            rec(&[("o", Value::List(vec![]))]),
+        ])
+    );
+}
+
+#[test]
+fn slice_broadcast_nested() {
+    assert_eq!(
+        value("users { x = [[1, 2], [3]] }"),
+        Value::List(vec![
+            rec(&[(
+                "x",
+                Value::List(vec![
+                    Value::List(vec![Value::Int(1), Value::Int(2)]),
+                    Value::List(vec![Value::Int(3)]),
+                ]),
+            )]),
+            rec(&[(
+                "x",
+                Value::List(vec![
+                    Value::List(vec![Value::Int(1), Value::Int(2)]),
+                    Value::List(vec![Value::Int(3)]),
+                ]),
+            )]),
+            rec(&[(
+                "x",
+                Value::List(vec![
+                    Value::List(vec![Value::Int(1), Value::Int(2)]),
+                    Value::List(vec![Value::Int(3)]),
+                ]),
+            )]),
+        ])
+    );
+}
+
+#[test]
+fn slice_declared_key_column() {
+    const SCHEMA: &str = r#"
+        root users: User;
+        struct User {
+            name: String,
+            orders: List<Order>,
+        }
+        struct Order {
+            user_id: Int,
+            total: Dec,
+            user: &User,
+        }
+        rel Order.user <<-> User.orders (orders.user_id -> users.id);
+    "#;
+    let schema = grove_schema::validate(grove_schema::parse_schema(SCHEMA).0.unwrap())
+        .0
+        .unwrap();
+    let compile = |query: &str| {
+        let (file, parse_diags) = grove_query::parse_query(query);
+        assert!(parse_diags.is_empty());
+        let (typed, type_diags) = grove_query::typecheck::typecheck(file.unwrap(), &schema);
+        assert!(type_diags.is_empty());
+        grove_query::codegen::codegen(&typed.unwrap(), &schema)
+    };
+    let mut rt = Runtime::open_in_memory().unwrap();
+    let zero = encode_dec(&Decimal::ZERO);
+    rt.conn()
+        .execute_batch("CREATE TABLE users(id INTEGER, name TEXT);")
+        .unwrap();
+    rt.conn()
+        .execute(
+            "CREATE TABLE orders(id INTEGER, user_id INTEGER, total BLOB);",
+            [],
+        )
+        .unwrap();
+    rt.conn()
+        .execute("INSERT INTO users(id, name) VALUES (1, 'Ada')", [])
+        .unwrap();
+    rt.conn()
+        .execute(
+            "INSERT INTO orders(id, user_id, total) VALUES (10, 1, ?)",
+            rusqlite::params![zero.to_vec()],
+        )
+        .unwrap();
+    assert_eq!(
+        rt.execute_value(&compile("users { o = orders }")).unwrap(),
+        Value::List(vec![Value::Record(vec![(
+            "o".to_string(),
+            Value::List(vec![Value::Record(vec![
+                ("user_id".to_string(), Value::Int(1)),
+                ("total".to_string(), Value::Dec(Decimal::ZERO)),
+            ])]),
+        )])])
+    );
+    assert_eq!(
+        rt.execute_value(&compile("users { o = orders { total } }"))
+            .unwrap(),
+        Value::List(vec![Value::Record(vec![(
+            "o".to_string(),
+            Value::List(vec![Value::Record(vec![(
+                "total".to_string(),
+                Value::Dec(Decimal::ZERO)
+            )])]),
+        )])])
     );
 }
 
@@ -444,11 +568,7 @@ fn slice_cross_root() {
                 ("name", s("Ada")),
                 (
                     "cs",
-                    Value::List(vec![rec(&[
-                        ("name", s("n1")),
-                        ("owner", s("a@x")),
-                        ("$$pkey", s("a@x")),
-                    ])]),
+                    Value::List(vec![rec(&[("name", s("n1")), ("owner", s("a@x")),])]),
                 ),
             ]),
             rec(&[("name", s("Bob")), ("cs", Value::List(vec![]))]),
@@ -478,24 +598,53 @@ fn slice_cross_root() {
 fn slice_literals() {
     assert_eq!(
         value("[1, 2, 3]"),
-        Value::List(vec![
-            rec(&[("c0", Value::Int(1))]),
-            rec(&[("c0", Value::Int(2))]),
-            rec(&[("c0", Value::Int(3))]),
-        ])
+        Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3),])
     );
-    assert_eq!(
-        value("[\"a\", \"b\"]"),
-        Value::List(vec![rec(&[("c0", s("a"))]), rec(&[("c0", s("b"))]),])
-    );
+    assert_eq!(value("[\"a\", \"b\"]"), Value::List(vec![s("a"), s("b"),]));
     assert_eq!(
         value("[[1, 3], [2, 4]]"),
         Value::List(vec![
-            rec(&[("c0", Value::Int(0)), ("c1", Value::Int(1))]),
-            rec(&[("c0", Value::Int(0)), ("c1", Value::Int(3))]),
-            rec(&[("c0", Value::Int(1)), ("c1", Value::Int(2))]),
-            rec(&[("c0", Value::Int(1)), ("c1", Value::Int(4))]),
+            Value::List(vec![Value::Int(1), Value::Int(3)]),
+            Value::List(vec![Value::Int(2), Value::Int(4)]),
         ])
+    );
+    assert_eq!(
+        value("[[[1]]]"),
+        Value::List(vec![Value::List(vec![Value::List(vec![Value::Int(1)])])])
+    );
+    assert_eq!(
+        value("[(1, 2), (3, 4)]"),
+        Value::List(vec![
+            Value::Tuple(vec![Value::Int(1), Value::Int(2)]),
+            Value::Tuple(vec![Value::Int(3), Value::Int(4)]),
+        ])
+    );
+    assert_eq!(
+        value("[[(1, 2)], [(3, 4)]]"),
+        Value::List(vec![
+            Value::List(vec![Value::Tuple(vec![Value::Int(1), Value::Int(2)])]),
+            Value::List(vec![Value::Tuple(vec![Value::Int(3), Value::Int(4)])]),
+        ])
+    );
+    assert_eq!(
+        value("[[(20, [1, 2])], [(30, [3, 4, 5])]]"),
+        Value::List(vec![
+            Value::List(vec![Value::Tuple(vec![
+                Value::Int(20),
+                Value::List(vec![Value::Int(1), Value::Int(2)]),
+            ])]),
+            Value::List(vec![Value::Tuple(vec![
+                Value::Int(30),
+                Value::List(vec![Value::Int(3), Value::Int(4), Value::Int(5)]),
+            ])]),
+        ])
+    );
+    assert_eq!(
+        value("[(1, [2])]"),
+        Value::List(vec![Value::Tuple(vec![
+            Value::Int(1),
+            Value::List(vec![Value::Int(2)]),
+        ])])
     );
 }
 
@@ -517,20 +666,14 @@ fn slice_tuples() {
         value("(1, [2, 3])"),
         Value::Tuple(vec![
             Value::Int(1),
-            Value::List(vec![
-                rec(&[("c0", Value::Int(2))]),
-                rec(&[("c0", Value::Int(3))]),
-            ]),
+            Value::List(vec![Value::Int(2), Value::Int(3)]),
         ])
     );
     assert_eq!(
         value("{ a = [1, 2] }"),
         Value::Record(vec![(
             "a".to_string(),
-            Value::List(vec![
-                rec(&[("c0", Value::Int(1))]),
-                rec(&[("c0", Value::Int(2))]),
-            ]),
+            Value::List(vec![Value::Int(1), Value::Int(2)]),
         )])
     );
 }
@@ -559,7 +702,7 @@ fn slice_structs() {
 fn slice_unions() {
     assert_eq!(
         value("if true { [1] } else { [2] }"),
-        Value::List(vec![rec(&[("c0", Value::Int(1))])])
+        Value::List(vec![Value::Int(1)])
     );
     assert_eq!(
         value("if true { (1, 2) } else { (3, 4) }"),
@@ -568,9 +711,9 @@ fn slice_unions() {
     assert_eq!(
         value("users { x = if true { [1] } else { [2] } }"),
         Value::List(vec![
-            rec(&[("x", Value::List(vec![rec(&[("c0", Value::Int(1))])]))]),
-            rec(&[("x", Value::List(vec![rec(&[("c0", Value::Int(1))])]))]),
-            rec(&[("x", Value::List(vec![rec(&[("c0", Value::Int(1))])]))]),
+            rec(&[("x", Value::List(vec![Value::Int(1)]))]),
+            rec(&[("x", Value::List(vec![Value::Int(1)]))]),
+            rec(&[("x", Value::List(vec![Value::Int(1)]))]),
         ])
     );
 }

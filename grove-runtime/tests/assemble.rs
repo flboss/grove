@@ -88,14 +88,8 @@ fn nested_keyed_tree() {
                 (
                     "o".to_string(),
                     Value::List(vec![
-                        Value::Record(vec![
-                            ("total".to_string(), Value::Dec(dec("10"))),
-                            ("user_id".to_string(), Value::Int(1)),
-                        ]),
-                        Value::Record(vec![
-                            ("total".to_string(), Value::Dec(dec("20"))),
-                            ("user_id".to_string(), Value::Int(1)),
-                        ]),
+                        Value::Record(vec![("total".to_string(), Value::Dec(dec("10")))]),
+                        Value::Record(vec![("total".to_string(), Value::Dec(dec("20")))]),
                     ])
                 ),
             ]),
@@ -103,10 +97,10 @@ fn nested_keyed_tree() {
                 ("name".to_string(), Value::String("Bob".to_string())),
                 (
                     "o".to_string(),
-                    Value::List(vec![Value::Record(vec![
-                        ("total".to_string(), Value::Dec(dec("30"))),
-                        ("user_id".to_string(), Value::Int(2)),
-                    ])]),
+                    Value::List(vec![Value::Record(vec![(
+                        "total".to_string(),
+                        Value::Dec(dec("30"))
+                    )])]),
                 ),
             ]),
         ])
@@ -121,10 +115,7 @@ fn broadcast_literal_field() {
             ("name".to_string(), Value::String("Ada".to_string())),
             (
                 "ls".to_string(),
-                Value::List(vec![
-                    Value::Record(vec![("c0".to_string(), Value::Int(1))]),
-                    Value::Record(vec![("c0".to_string(), Value::Int(2))]),
-                ])
+                Value::List(vec![Value::Int(1), Value::Int(2)])
             ),
         ])])
     );

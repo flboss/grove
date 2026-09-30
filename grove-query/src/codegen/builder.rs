@@ -78,7 +78,14 @@ pub enum FromClause {
         module: String,
         id: String,
         columns: Vec<NamedColumn>,
+        tuple_parts: Option<Vec<TuplePart>>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TuplePart {
+    Value(String),
+    Nested,
 }
 
 impl FromClause {

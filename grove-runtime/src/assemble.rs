@@ -196,6 +196,16 @@ fn assemble_list(
                                 pref.stmt
                             ))
                         })?;
+                    if matches!(
+                        element,
+                        ResultShape::List { .. } | ResultShape::Single { .. }
+                    ) {
+                        return parents
+                            .iter()
+                            .map(|prow| assemble_shape(element, outputs, Some(prow)))
+                            .collect::<Result<Vec<_>, _>>()
+                            .map(Value::List);
+                    }
                     let mut all = Vec::new();
                     for prow in parents {
                         let key = prow.get(&pref.parent_key).ok_or_else(|| {
