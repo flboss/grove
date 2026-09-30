@@ -3,13 +3,17 @@ pub mod aggs;
 pub mod conn;
 pub mod decode;
 pub mod error;
+pub mod exec;
 pub mod funcs;
 pub mod params;
+pub mod temp;
+pub mod tvf;
 pub mod value;
 
 pub use conn::Runtime;
 pub use decode::{assemble_dec, decode_dec, decode_duration, decode_instant};
 pub use error::RuntimeError;
+pub use exec::{Row, StatementOutput};
 pub use value::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

@@ -9,3 +9,8 @@ rusqlite = { workspace = true }
 chrono = { workspace = true }
 rust_decimal = { workspace = true }
 num-traits = { workspace = true }
+
+# Test harnesses drive real codegen (mirroring the codegen corpus);
+# the library itself never touches schemas (see R4 fixtures note).
+[dev-dependencies]
+grove-schema = { workspace = true }

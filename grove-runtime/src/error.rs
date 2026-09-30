@@ -43,3 +43,13 @@ impl fmt::Display for RuntimeError {
 }
 
 impl std::error::Error for RuntimeError {}
+
+impl RuntimeError {
+    pub fn step_error(index: usize, err: rusqlite::Error) -> Self {
+        let message = err.to_string();
+        if let Some(at) = message.find("grove-abort: ") {
+            return RuntimeError::Aborted(message[at + "grove-abort: ".len()..].to_string());
+        }
+        RuntimeError::Step { index, message }
+    }
+}
