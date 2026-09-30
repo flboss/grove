@@ -266,11 +266,26 @@ fn cast_kinds() {
     assert_eq!(query_int(&rt, r#"SELECT "$$cast"(1e30, 'int')"#), i64::MAX);
     assert_eq!(query_int(&rt, r#"SELECT "$$cast"(-1e30, 'int')"#), i64::MIN);
     let nan: f64 = f64::NAN;
-    let n: Option<i64> = rt
+    let n: i64 = rt
         .conn()
         .query_row(r#"SELECT "$$cast"(?, 'int')"#, [nan], |row| row.get(0))
         .unwrap();
-    assert_eq!(n, None);
+    assert_eq!(n, 0);
+    let n: i64 = rt
+        .conn()
+        .query_row(r#"SELECT "$$cast"(NULL, 'int')"#, [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(n, 0);
+    let d: Vec<u8> = rt
+        .conn()
+        .query_row(r#"SELECT "$$cast"(NULL, 'dec')"#, [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(decode_dec(&d, "c").unwrap(), Decimal::ZERO);
+    let f: Option<f64> = rt
+        .conn()
+        .query_row(r#"SELECT "$$cast"(NULL, 'float')"#, [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(f, None);
     let d: Vec<u8> = rt
         .conn()
         .query_row(r#"SELECT "$$cast"(0.1, 'dec')"#, [], |row| row.get(0))
@@ -547,35 +562,17 @@ fn duration_scaling() {
         )
         .unwrap();
     assert_eq!(decode_duration(&out, "c").unwrap(), TimeDelta::seconds(135));
-    let out: Vec<u8> = rt
-        .conn()
-        .query_row(
-            r#"SELECT "$$mod"(?, 7, 'duration', NULL)"#,
-            [&d[..]],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        decode_duration(&out, "c").unwrap(),
-        TimeDelta::nanoseconds(1)
-    );
-    let d5 = blob12(&encode_duration(
-        &TimeDelta::seconds(90)
-            .checked_add(&TimeDelta::nanoseconds(5))
-            .unwrap(),
-    ));
-    let out: Vec<u8> = rt
-        .conn()
-        .query_row(
-            r#"SELECT "$$mod"(?, 7, 'duration', NULL)"#,
-            [&d5[..]],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        decode_duration(&out, "c").unwrap(),
-        TimeDelta::nanoseconds(6)
-    );
+    for op in ["$$rem", "$$mod"] {
+        let err = rt
+            .conn()
+            .query_row(
+                &format!(r#"SELECT "{op}"(?, 7, 'duration', NULL)"#),
+                [&d[..]],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("unsupported"), "{op}: {err}");
+    }
     let err = rt
         .conn()
         .query_row(
@@ -585,6 +582,76 @@ fn duration_scaling() {
         )
         .unwrap_err();
     assert!(err.to_string().contains("unsupported"), "unexpected: {err}");
+}
+
+#[test]
+fn duration_div_rem_mod_duration() {
+    let rt = checked();
+    let a = duration_blob(90);
+    let b = duration_blob(7);
+    let out: Vec<u8> = rt
+        .conn()
+        .query_row(
+            r#"SELECT "$$div"(?, ?, 'duration', 'duration')"#,
+            [&a[..], &b[..]],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        decode_dec(&out, "c").unwrap().to_string(),
+        "12.857142857142857142857142857"
+    );
+    let c = duration_blob(30);
+    let out: Vec<u8> = rt
+        .conn()
+        .query_row(
+            r#"SELECT "$$div"(?, ?, 'duration', 'duration')"#,
+            [&a[..], &c[..]],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(decode_dec(&out, "c").unwrap().to_string(), "3");
+    let z = duration_blob(0);
+    let err = rt
+        .conn()
+        .query_row(
+            r#"SELECT "$$div"(?, ?, 'duration', 'duration')"#,
+            [&a[..], &z[..]],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("division by zero"),
+        "unexpected: {err}"
+    );
+    let out: Vec<u8> = rt
+        .conn()
+        .query_row(
+            r#"SELECT "$$rem"(?, ?, 'duration', 'duration')"#,
+            [&a[..], &b[..]],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(decode_duration(&out, "c").unwrap(), TimeDelta::seconds(6));
+    let neg = duration_blob(-90);
+    let out: Vec<u8> = rt
+        .conn()
+        .query_row(
+            r#"SELECT "$$rem"(?, ?, 'duration', 'duration')"#,
+            [&neg[..], &b[..]],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(decode_duration(&out, "c").unwrap(), TimeDelta::seconds(-6));
+    let out: Vec<u8> = rt
+        .conn()
+        .query_row(
+            r#"SELECT "$$mod"(?, ?, 'duration', 'duration')"#,
+            [&neg[..], &b[..]],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(decode_duration(&out, "c").unwrap(), TimeDelta::seconds(1));
 }
 
 #[test]

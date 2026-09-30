@@ -257,7 +257,14 @@ fn scale_duration(
     ))
 }
 
-fn temporal_op(op: &str, a: &Arg, b: &Arg, ta: &Arg, tb: &Arg) -> Result<SqlValue, Error> {
+fn temporal_op(
+    op: &str,
+    a: &Arg,
+    b: &Arg,
+    ta: &Arg,
+    tb: &Arg,
+    cfg: RuntimeConfig,
+) -> Result<SqlValue, Error> {
     if matches!(a, Arg::Null) || matches!(b, Arg::Null) {
         return Ok(SqlValue::Null);
     }
@@ -266,7 +273,7 @@ fn temporal_op(op: &str, a: &Arg, b: &Arg, ta: &Arg, tb: &Arg) -> Result<SqlValu
             let dir: i8 = if op == "$$add" { 1 } else { -1 };
             temporal_add_sub(op, dir, a, b, ta, tb)
         }
-        "$$mul" | "$$div" | "$$rem" | "$$mod" => temporal_scale(op, a, b, ta, tb),
+        "$$mul" | "$$div" | "$$rem" | "$$mod" => temporal_scale(op, a, b, ta, tb, cfg),
         _ => Err(fail(op, "unknown temporal operator")),
     }
 }
@@ -323,7 +330,14 @@ fn temporal_add_sub(
     }
 }
 
-fn temporal_scale(op: &str, a: &Arg, b: &Arg, ta: &Arg, tb: &Arg) -> Result<SqlValue, Error> {
+fn temporal_scale(
+    op: &str,
+    a: &Arg,
+    b: &Arg,
+    ta: &Arg,
+    tb: &Arg,
+    cfg: RuntimeConfig,
+) -> Result<SqlValue, Error> {
     let span = |arg: &Arg, desc: &Arg| -> Result<Option<TimeDelta>, Error> {
         match (arg, descriptor_is(desc, "duration")) {
             (Arg::Blob(blob), true) => decode_duration(blob, op)
@@ -338,34 +352,40 @@ fn temporal_scale(op: &str, a: &Arg, b: &Arg, ta: &Arg, tb: &Arg) -> Result<SqlV
             match op {
                 "$$mul" => scale_duration(op, d, factor, false),
                 "$$div" => scale_duration(op, d, factor, true),
-                "$$rem" | "$$mod" => {
-                    if factor.is_zero() {
-                        return Err(div_by_zero(op));
-                    }
-                    let total = Decimal::from(d.num_seconds()) * Decimal::new(1_000_000_000, 0)
-                        + Decimal::from(d.subsec_nanos() as i64);
-                    let mut r = total
-                        .checked_rem(factor)
-                        .ok_or_else(|| fail(op, "duration overflow"))?;
-                    if op == "$$mod" && r.is_sign_negative() {
-                        r = r
-                            .checked_add(factor.abs())
-                            .ok_or_else(|| fail(op, "duration overflow"))?;
-                    }
-                    let nanos = r
-                        .trunc()
-                        .to_i128()
-                        .ok_or_else(|| fail(op, "duration overflow"))?;
-                    Ok(SqlValue::Blob(
-                        encode_duration(&duration_from_nanos(op, nanos)?).to_vec(),
-                    ))
-                }
-                _ => Err(fail(op, "unknown temporal operator")),
+                _ => Err(fail(op, "unsupported duration/scalar combination")),
             }
         }
         (None, Some(d)) if op == "$$mul" => {
             let factor = factor_to_decimal(op, a)?;
             scale_duration(op, d, factor, false)
+        }
+        (Some(x), Some(y)) => {
+            let a_total = duration_nanos(&x);
+            let b_total = duration_nanos(&y);
+            if b_total == 0 {
+                return Err(div_by_zero(op));
+            }
+            match op {
+                "$$div" => {
+                    let ratio = div_dec(
+                        op,
+                        nanos_to_dec(a_total),
+                        nanos_to_dec(b_total),
+                        cfg.dec_arithmetic,
+                    )?;
+                    Ok(SqlValue::Blob(encode_dec(&ratio).to_vec()))
+                }
+                "$$rem" => duration_from_nanos(op, a_total % b_total)
+                    .map(|d| SqlValue::Blob(encode_duration(&d).to_vec())),
+                "$$mod" => {
+                    let mut r = a_total % b_total;
+                    if r < 0 {
+                        r += b_total.abs();
+                    }
+                    duration_from_nanos(op, r).map(|d| SqlValue::Blob(encode_duration(&d).to_vec()))
+                }
+                _ => Err(fail(op, "unsupported duration/duration combination")),
+            }
         }
         _ => Err(fail(op, "unsupported duration/scalar combination")),
     }
@@ -401,7 +421,7 @@ fn apply_arith4(op: &str, ctx: &Context<'_>, cfg: RuntimeConfig) -> Result<SqlVa
             && (descriptor_is(desc, "instant") || descriptor_is(desc, "duration"))
     };
     if temporal_side(&a, &ta) || temporal_side(&b, &tb) {
-        return temporal_op(op, &a, &b, &ta, &tb);
+        return temporal_op(op, &a, &b, &ta, &tb, cfg);
     }
     match (&a, &b) {
         (Arg::Int(x), Arg::Int(y)) => int_op(op, *x, *y, cfg.int_arithmetic),
@@ -455,13 +475,18 @@ fn apply_neg(ctx: &Context<'_>, cfg: RuntimeConfig) -> Result<SqlValue, Error> {
 fn apply_cast(ctx: &Context<'_>) -> Result<SqlValue, Error> {
     let op = "$$cast";
     let value = arg(ctx, 0)?;
-    if matches!(value, Arg::Null) {
-        return Ok(SqlValue::Null);
-    }
     let target = match arg(ctx, 1)? {
         Arg::Text(t) => t,
         _ => return Err(fail(op, "target must be 'int', 'float' or 'dec'")),
     };
+    if matches!(value, Arg::Null) {
+        return match target.as_str() {
+            "int" => Ok(SqlValue::Integer(0)),
+            "dec" => Ok(SqlValue::Blob(encode_dec(&Decimal::ZERO).to_vec())),
+            "float" => Ok(SqlValue::Null),
+            _ => Err(fail(op, "target must be 'int', 'float' or 'dec'")),
+        };
+    }
     match target.as_str() {
         "int" => match value {
             Arg::Int(n) => Ok(SqlValue::Integer(n)),
