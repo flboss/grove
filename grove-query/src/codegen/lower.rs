@@ -551,7 +551,10 @@ fn navigate_array(
                 output_shapes,
             }
         }
-        _ => merge_navigate(ctx, child_from, child_col, level, parent_col),
+        _ => {
+            level.element = QueryType::List(Box::new(QueryType::from(element)));
+            merge_navigate(ctx, child_from, child_col, level, parent_col)
+        }
     }
 }
 
@@ -575,7 +578,18 @@ fn merge_navigate(
         unreachable!("merge over a split-pending level");
     }
     Level {
-        builder: merge_builder(child_from, child_col, builder, parent_col, ctx.schema),
+        builder: merge_builder(
+            child_from,
+            child_col,
+            builder,
+            parent_col,
+            ctx.schema,
+            matches!(peel_optional(&element), QueryType::List(sub)
+            if matches!(
+                peel_optional(sub),
+                QueryType::Scalar(_) | QueryType::Tuple(_)
+            )),
+        ),
         element,
         parent,
         pending: None,
@@ -590,6 +604,7 @@ fn merge_builder(
     mut parent_q: SelectBuilder,
     parent_col: String,
     schema: &ValidatedSchema,
+    project_values: bool,
 ) -> SelectBuilder {
     let parent_ty = output_ty(&parent_q, &parent_col, schema);
     parent_q.select = vec![SelectItem::Column {
@@ -614,6 +629,22 @@ fn merge_builder(
         if child.select.is_empty() {
             unreachable!(
                 "merge over a key-only literal level: the depth guard keeps merges on leaves"
+            );
+        }
+    } else if project_values {
+        child.select = from_columns_typed(&Some(child_from.clone()), schema)
+            .into_iter()
+            .filter(|(name, _)| name != &child_col)
+            .map(|(name, ty)| SelectItem::Column {
+                depth: 0,
+                column: name.clone(),
+                output: name,
+                ty,
+            })
+            .collect();
+        if child.select.is_empty() {
+            unreachable!(
+                "merge over a key-only storage level: scalar/tuple elements always serve a value column"
             );
         }
     }
@@ -670,6 +701,7 @@ fn global_first_hop(
             parent.builder,
             parent_col,
             ctx.schema,
+            false,
         ),
     )
 }

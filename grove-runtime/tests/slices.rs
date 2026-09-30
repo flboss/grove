@@ -398,6 +398,17 @@ fn slice_via_array_values() {
 }
 
 #[test]
+fn slice_merged_scalar_root() {
+    assert_eq!(
+        value("users.scores.take(2)"),
+        Value::List(vec![
+            rec(&[("score_value", Value::Int(5))]),
+            rec(&[("score_value", Value::Int(7))]),
+        ])
+    );
+}
+
+#[test]
 fn slice_take_window_values() {
     assert_eq!(
         value("users { o = orders.take(2) { total } }"),
