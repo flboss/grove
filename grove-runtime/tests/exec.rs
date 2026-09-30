@@ -1,100 +1,12 @@
 
+#[allow(dead_code)]
+#[path = "common.rs"]
+mod common;
+
 use chrono::{DateTime, TimeDelta};
-use grove_query::codegen::model::{CompiledQuery, Param, StatementKind};
-use grove_runtime::decode::{encode_dec, encode_duration, encode_instant};
+use common::{compile, fixture, names};
+use grove_query::codegen::model::{Param, StatementKind};
 use grove_runtime::{Runtime, RuntimeError, Value};
-use rust_decimal::Decimal;
-use std::str::FromStr;
-
-const SCHEMA_SRC: &str = r#"
-    root users: User;
-    struct User {
-        name: String,
-        age: Int,
-        balance: Dec,
-        active: Bool,
-        created: Instant,
-        ttl: Duration,
-        orders: List<Order>,
-    }
-    struct Order {
-        total: Dec,
-        user: &User,
-    }
-    rel Order.user <<-> User.orders (orders.user_id -> users.id);
-"#;
-
-fn compile(query: &str) -> CompiledQuery {
-    let schema = grove_schema::validate(
-        grove_schema::parse_schema(SCHEMA_SRC)
-            .0
-            .expect("invalid test schema"),
-    )
-    .0
-    .expect("invalid test schema");
-    let (file, parse_diags) = grove_query::parse_query(query);
-    assert!(parse_diags.is_empty());
-    let (typed, type_diags) = grove_query::typecheck::typecheck(file.unwrap(), &schema);
-    assert!(type_diags.is_empty());
-    grove_query::codegen::codegen(&typed.unwrap(), &schema)
-}
-
-fn dec(s: &str) -> Decimal {
-    Decimal::from_str(s).unwrap()
-}
-
-fn fixture() -> Runtime {
-    let rt = Runtime::open_in_memory().unwrap();
-    rt.conn()
-        .execute_batch(
-            "CREATE TABLE users(id INTEGER, name TEXT, age INTEGER, balance BLOB, active INTEGER, created BLOB, ttl BLOB);
-             CREATE TABLE orders(id INTEGER, total BLOB, user_id INTEGER);",
-        )
-        .unwrap();
-    let created = encode_instant(&DateTime::from_timestamp(1_700_000_000, 0).unwrap());
-    let ttl = encode_duration(&TimeDelta::seconds(3600));
-    let users: &[(i64, &str, i64, &str, i64)] =
-        &[(1, "Ada", 30, "100.50", 1), (2, "Bob", 40, "200.25", 0)];
-    for (id, name, age, balance, active) in users {
-        rt.conn()
-            .execute(
-                "INSERT INTO users(id, name, age, balance, active, created, ttl) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                rusqlite::params![
-                    id,
-                    name,
-                    age,
-                    encode_dec(&dec(balance)).to_vec(),
-                    active,
-                    created.to_vec(),
-                    ttl.to_vec(),
-                ],
-            )
-            .unwrap();
-    }
-    let orders: &[(i64, &str, i64)] = &[(10, "10.00", 1), (11, "20.00", 1), (12, "30.00", 2)];
-    for (id, total, user_id) in orders {
-        rt.conn()
-            .execute(
-                "INSERT INTO orders(id, total, user_id) VALUES (?, ?, ?)",
-                rusqlite::params![id, encode_dec(&dec(total)).to_vec(), user_id],
-            )
-            .unwrap();
-    }
-    rt
-}
-
-fn names(rt: &mut Runtime, query: &str) -> Vec<String> {
-    let compiled = compile(query);
-    let outputs = rt.execute(&compiled).unwrap();
-    outputs[0]
-        .rows
-        .iter()
-        .map(|row| match row.get("name") {
-            Some(Value::String(s)) => s.clone(),
-            other => panic!("expected name string, got {other:?}"),
-        })
-        .collect()
-}
 
 #[test]
 fn flat_rows_decode() {

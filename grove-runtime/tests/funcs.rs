@@ -1,41 +1,18 @@
 
 use chrono::{DateTime, TimeDelta, Utc};
+use common::{
+    agg_table, blob_param, blob12, checked, dec, decs, duration_blob, instant_blob, leap_instant,
+    query_dec, query_int, query_text,
+};
 use grove_runtime::decode::{
     decode_dec, decode_duration, decode_instant, encode_dec, encode_duration, encode_instant,
 };
 use grove_runtime::{DecArithmetic, IntArithmetic, Runtime, RuntimeConfig};
 use rust_decimal::Decimal;
-use std::str::FromStr;
 
-fn dec(s: &str) -> Decimal {
-    Decimal::from_str(s).unwrap()
-}
-
-fn blob_param(bytes: &[u8; 13]) -> Vec<u8> {
-    bytes.to_vec()
-}
-
-fn blob12(bytes: &[u8; 12]) -> Vec<u8> {
-    bytes.to_vec()
-}
-
-fn checked() -> Runtime {
-    Runtime::open_in_memory().unwrap()
-}
-
-fn query_dec(rt: &Runtime, sql: &str) -> Decimal {
-    let bytes: Vec<u8> = rt.conn().query_row(sql, [], |row| row.get(0)).unwrap();
-    decode_dec(&bytes, "c").unwrap()
-}
-
-fn query_int(rt: &Runtime, sql: &str) -> i64 {
-    rt.conn().query_row(sql, [], |row| row.get(0)).unwrap()
-}
-
-fn query_text(rt: &Runtime, sql: &str) -> String {
-    rt.conn().query_row(sql, [], |row| row.get(0)).unwrap()
-}
-
+#[allow(dead_code)]
+#[path = "common.rs"]
+mod common;
 
 #[test]
 fn int_arithmetic_basic() {
@@ -398,14 +375,6 @@ fn dec_to_string_renders() {
     assert_eq!(s, "2.5");
 }
 
-fn leap_instant() -> DateTime<Utc> {
-    chrono::NaiveDate::from_ymd_opt(2024, 2, 29)
-        .unwrap()
-        .and_hms_opt(15, 4, 5)
-        .unwrap()
-        .and_utc()
-}
-
 #[test]
 fn instant_extractors() {
     let rt = checked();
@@ -465,16 +434,6 @@ fn duration_extractors() {
     }
 }
 
-
-fn instant_blob(secs: i64, nanos: u32) -> Vec<u8> {
-    blob12(&encode_instant(
-        &DateTime::from_timestamp(secs, nanos).unwrap(),
-    ))
-}
-
-fn duration_blob(total_secs: i64) -> Vec<u8> {
-    blob12(&encode_duration(&TimeDelta::seconds(total_secs)))
-}
 
 #[test]
 fn temporal_add_sub() {
@@ -750,24 +709,6 @@ fn nulls_propagate_and_mismatches_fail() {
     assert!(err.to_string().contains("unsupported"), "unexpected: {err}");
 }
 
-
-fn agg_table(rt: &Runtime, values: &[Vec<u8>]) {
-    rt.conn()
-        .execute("CREATE TABLE IF NOT EXISTS m(v BLOB)", [])
-        .unwrap();
-    rt.conn().execute("DELETE FROM m", []).unwrap();
-    for v in values {
-        rt.conn()
-            .execute("INSERT INTO m(v) VALUES (?)", [&v[..]])
-            .unwrap();
-    }
-}
-
-fn decs(strs: &[&str]) -> Vec<Vec<u8>> {
-    strs.iter()
-        .map(|s| blob_param(&encode_dec(&dec(s))))
-        .collect()
-}
 
 #[test]
 fn custom_aggregates() {

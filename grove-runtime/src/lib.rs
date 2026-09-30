@@ -1,5 +1,6 @@
 
 pub mod aggs;
+pub mod assemble;
 pub mod conn;
 pub mod decode;
 pub mod error;
@@ -10,6 +11,7 @@ pub mod temp;
 pub mod tvf;
 pub mod value;
 
+pub use assemble::assemble;
 pub use conn::Runtime;
 pub use decode::{assemble_dec, decode_dec, decode_duration, decode_instant};
 pub use error::RuntimeError;

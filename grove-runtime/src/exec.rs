@@ -262,10 +262,7 @@ fn collect(
                     col.name
                 ))
             })?;
-            values.push((
-                col.name.clone(),
-                decode_value(raw, &col.name, col.ty)?,
-            ));
+            values.push((col.name.clone(), decode_value(raw, &col.name, col.ty)?));
         }
         out.push(Row { values });
     }
