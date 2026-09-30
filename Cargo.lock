@@ -311,6 +311,7 @@ dependencies = [
  "ariadne",
  "clap",
  "grove-query",
+ "grove-runtime",
  "grove-schema",
  "grove-types",
 ]

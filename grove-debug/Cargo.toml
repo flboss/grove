@@ -7,6 +7,7 @@ edition.workspace = true
 grove-schema.workspace = true
 grove-query.workspace = true
 grove-types.workspace = true
+grove-runtime.workspace = true
 
 ariadne.workspace = true
 clap.workspace = true

@@ -77,7 +77,6 @@ enum Command {
         #[arg(long)]
         raw: bool,
     },
-
     /// Generate SQL for a query file against a schema and display it.
     QueryCodegen {
         /// Path to the query file
@@ -87,6 +86,20 @@ enum Command {
         schema: PathBuf,
 
         /// Display diagnostics as raw Debug output instead of using ariadne
+        #[arg(long)]
+        raw: bool,
+    },
+
+    QueryRun {
+        query: PathBuf,
+
+        schema: PathBuf,
+
+        db: PathBuf,
+
+        #[arg(long)]
+        sql: bool,
+
         #[arg(long)]
         raw: bool,
     },
@@ -102,6 +115,13 @@ fn main() {
         Command::QueryParse { path, raw } => query_parse(&path, raw),
         Command::QueryTypecheck { query, schema, raw } => query_typecheck(&query, &schema, raw),
         Command::QueryCodegen { query, schema, raw } => query_codegen(&query, &schema, raw),
+        Command::QueryRun {
+            query,
+            schema,
+            db,
+            sql,
+            raw,
+        } => query_run(&query, &schema, &db, sql, raw),
     }
 }
 
@@ -346,6 +366,110 @@ fn query_codegen(query_path: &PathBuf, schema_path: &PathBuf, raw: bool) {
     }
     println!("result: {:#?}", compiled.result);
     println!("literals: {:#?}", compiled.literals);
+}
+
+fn query_run(
+    query_path: &PathBuf,
+    schema_path: &PathBuf,
+    db_path: &PathBuf,
+    dump_sql: bool,
+    raw: bool,
+) {
+    let query_source = match std::fs::read_to_string(query_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error reading query file {}: {e}", query_path.display());
+            std::process::exit(1);
+        }
+    };
+
+    let schema_source = match std::fs::read_to_string(schema_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error reading schema file {}: {e}", schema_path.display());
+            std::process::exit(1);
+        }
+    };
+
+    let (schema, schema_parse_diagnostics) = grove_schema::parse_schema(&schema_source);
+    let Some(schema) = schema else {
+        println!("No validated schema. (parse failed)");
+        print_diagnostics(
+            &query_source,
+            query_path,
+            &schema_parse_diagnostics,
+            raw,
+            "Schema Parse ",
+        );
+        return;
+    };
+
+    let (validated_schema, schema_validation_diagnostics) = grove_schema::validate(schema);
+    let Some(validated_schema) = validated_schema else {
+        println!("No validated schema. (validation failed)");
+        print_diagnostics(
+            &schema_source,
+            schema_path,
+            &schema_validation_diagnostics,
+            raw,
+            "Schema Validation ",
+        );
+        return;
+    };
+
+    let (file, parse_diagnostics) = grove_query::parse_query(&query_source);
+    let Some(file) = file else {
+        println!("No query AST. (parse failed)");
+        print_diagnostics(
+            &query_source,
+            query_path,
+            &parse_diagnostics,
+            raw,
+            "Query Parse ",
+        );
+        return;
+    };
+
+    let (typed_file, typecheck_diagnostics) = typecheck(file, &validated_schema);
+    if !typecheck_diagnostics.is_empty() {
+        println!("No SQL. (typecheck failed)");
+        print_diagnostics(
+            &query_source,
+            query_path,
+            &typecheck_diagnostics,
+            raw,
+            "Query Typecheck ",
+        );
+        return;
+    }
+    let Some(typed_file) = typed_file else {
+        println!("No SQL. (typecheck failed)");
+        return;
+    };
+
+    let compiled = grove_query::codegen::codegen(&typed_file, &validated_schema);
+    if dump_sql {
+        println!("=== SQL ===");
+        for (i, stmt) in compiled.statements.iter().enumerate() {
+            println!("--- statement {i} ---");
+            println!("{}", stmt.sql);
+        }
+    }
+
+    let mut rt = match grove_runtime::Runtime::open(db_path) {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("error opening database {}: {e}", db_path.display());
+            std::process::exit(1);
+        }
+    };
+    match rt.execute_value(&compiled) {
+        Ok(value) => println!("{value}"),
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn schema_parse(path: &PathBuf, raw: bool) {
