@@ -1,7 +1,9 @@
 
+pub mod aggs;
 pub mod conn;
 pub mod decode;
 pub mod error;
+pub mod funcs;
 pub mod params;
 pub mod value;
 

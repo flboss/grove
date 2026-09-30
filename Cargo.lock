@@ -331,6 +331,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "grove-query",
+ "num-traits",
  "rusqlite",
  "rust_decimal",
 ]
