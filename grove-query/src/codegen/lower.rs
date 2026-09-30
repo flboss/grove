@@ -552,8 +552,36 @@ fn navigate_array(
             }
         }
         _ => {
-            level.element = QueryType::List(Box::new(QueryType::from(element)));
-            merge_navigate(ctx, child_from, child_col, level, parent_col)
+            if ctx.child.is_some() {
+                level.element = QueryType::List(Box::new(QueryType::from(element)));
+                return merge_navigate(ctx, child_from, child_col, level, parent_col);
+            }
+            let Level {
+                builder,
+                element,
+                parent,
+                pending,
+                stmt_bound,
+                output_shapes,
+            } = level;
+            if pending.is_some() {
+                unreachable!("collection navigation over a split-pending level");
+            }
+            Level {
+                builder,
+                element,
+                parent,
+                pending: Some(PendingSplit {
+                    child_from,
+                    child_col,
+                    parent_col,
+                    multi_parent: true,
+                    next: None,
+                    middle_parts: None,
+                }),
+                stmt_bound,
+                output_shapes,
+            }
         }
     }
 }
@@ -604,6 +632,36 @@ fn parts_named(parts: &[MiddlePart]) -> bool {
         MiddlePart::Tuple(inner) => parts_named(inner),
         MiddlePart::Record { fields, .. } => parts_named(fields),
     })
+}
+
+fn flat_value_hop(pending: &PendingSplit, ty: &QueryType) -> bool {
+    pending.next.is_none()
+        && pending.middle_parts.is_none()
+        && matches!(peel_optional(ty), QueryType::List(sub)
+        if matches!(peel_optional(sub), QueryType::List(inner)
+            if matches!(
+                peel_optional(inner),
+                QueryType::Scalar(_) | QueryType::Tuple(_)
+            )))
+}
+
+fn narrow_element(element: QueryType) -> QueryType {
+    match peel_optional(&element).clone() {
+        QueryType::List(sub) => *sub,
+        _ => element,
+    }
+}
+
+fn merge_flat_hop(ctx: &mut Context, level: Level, pending: PendingSplit) -> Level {
+    let PendingSplit {
+        child_from,
+        child_col,
+        parent_col,
+        ..
+    } = pending;
+    let mut level = level;
+    level.element = narrow_element(level.element);
+    merge_navigate(ctx, child_from, child_col, level, parent_col)
 }
 
 fn merge_builder(
@@ -806,6 +864,7 @@ fn rows_method(
                     next,
                     ..
                 } = pending;
+                level.element = narrow_element(level.element);
                 let mut level = merge_navigate(ctx, child_from, child_col, level, parent_col);
                 level.pending = next.map(|boxed| *boxed);
                 level
@@ -5862,7 +5921,14 @@ fn guarded_branch(
     sunk_before: usize,
 ) -> SelectBuilder {
     let mut level = rows(ctx, body);
-    if level.pending.take().is_some() || ctx.statements.len() != sunk_before {
+    if let Some(pending) = level.pending.take() {
+        if flat_value_hop(&pending, &body.ty) {
+            level = merge_flat_hop(ctx, level, pending);
+        } else {
+            todo!("M7 multi-statement If branches");
+        }
+    }
+    if ctx.statements.len() != sunk_before {
         todo!("M7 multi-statement If branches");
     }
     if level.builder.select.is_empty() {
@@ -6034,7 +6100,11 @@ fn root_composite_element(
                 if matches!(pending.child_from, FromClause::Literal { .. }) {
                     todo!("M7 nested {kind}");
                 }
-                todo!("M7 per-row {kind}");
+                if flat_value_hop(&pending, ty) {
+                    level = merge_flat_hop(ctx, level, pending);
+                } else {
+                    todo!("M7 per-row {kind}");
+                }
             }
             if level.builder.select.is_empty() {
                 level.builder.select = vec![SelectItem::AllFrom { depth: 0 }];

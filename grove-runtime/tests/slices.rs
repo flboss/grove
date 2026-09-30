@@ -398,13 +398,25 @@ fn slice_via_array_values() {
 }
 
 #[test]
-fn slice_merged_scalar_root() {
+fn slice_nested_via_root() {
+    assert_eq!(
+        value("users.scores"),
+        Value::List(vec![
+            Value::List(vec![Value::Int(5), Value::Int(7)]),
+            Value::List(vec![Value::Int(9)]),
+            Value::List(vec![]),
+        ])
+    );
     assert_eq!(
         value("users.scores.take(2)"),
         Value::List(vec![
-            rec(&[("score_value", Value::Int(5))]),
-            rec(&[("score_value", Value::Int(7))]),
+            Value::List(vec![Value::Int(5), Value::Int(7)]),
+            Value::List(vec![Value::Int(9)]),
         ])
+    );
+    assert_eq!(
+        value("users.scores.flatten()"),
+        Value::List(vec![Value::Int(5), Value::Int(7), Value::Int(9)])
     );
 }
 
