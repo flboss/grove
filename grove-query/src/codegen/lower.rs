@@ -2,8 +2,8 @@
 use std::collections::HashMap;
 
 use super::builder::{
-    AliasGen, FromClause, NamedColumn, OrderDir, OrderItem, SelectBuilder, SelectItem, SqlBinOp,
-    SqlExpr, TuplePart,
+    AliasGen, FromClause, MiddlePart, NamedColumn, OrderDir, OrderItem, SelectBuilder, SelectItem,
+    SqlBinOp, SqlExpr,
 };
 use super::model::{
     Cardinality, ChildRef, ColumnRole, OutputColumn, ParamValue, ParentRef, ResultShape, RowCount,
@@ -84,7 +84,7 @@ pub struct PendingSplit {
     pub parent_col: String,
     pub multi_parent: bool,
     pub next: Option<Box<PendingSplit>>,
-    pub tuple_parts: Option<Vec<TuplePart>>,
+    pub middle_parts: Option<Vec<MiddlePart>>,
 }
 
 pub struct Level {
@@ -493,7 +493,7 @@ fn navigate_ref(
                 parent_col,
                 multi_parent,
                 next: None,
-                tuple_parts: None,
+                middle_parts: None,
             }),
             stmt_bound,
             output_shapes,
@@ -545,7 +545,7 @@ fn navigate_array(
                     parent_col,
                     multi_parent: true,
                     next: None,
-                    tuple_parts: None,
+                    middle_parts: None,
                 }),
                 stmt_bound,
                 output_shapes,
@@ -598,6 +598,14 @@ fn merge_navigate(
     }
 }
 
+fn parts_named(parts: &[MiddlePart]) -> bool {
+    parts.iter().any(|part| match part {
+        MiddlePart::Value { name, .. } | MiddlePart::Nested { name, .. } => name.is_some(),
+        MiddlePart::Tuple(inner) => parts_named(inner),
+        MiddlePart::Record { fields, .. } => parts_named(fields),
+    })
+}
+
 fn merge_builder(
     child_from: FromClause,
     child_col: String,
@@ -614,7 +622,18 @@ fn merge_builder(
         ty: parent_ty,
     }];
     let mut child = SelectBuilder::new();
-    if let FromClause::Literal { columns, .. } = &child_from {
+    if let FromClause::Literal {
+        columns,
+        middle_parts,
+        ..
+    } = &child_from
+    {
+        if middle_parts
+            .as_ref()
+            .is_some_and(|parts| parts_named(parts))
+        {
+            todo!("M7 flatten over record literals");
+        }
         child.select = columns
             .iter()
             .filter(|c| c.name != child_col)
@@ -2346,7 +2365,7 @@ fn sink_broadcast_tail(ctx: &mut Context, tail: &TypedExpr) -> (ResultShape, Opt
         shape_columns(builder_output_types(&root.builder, ctx.schema), |_| false);
     let root_creation = ctx.statements.len() + hops.len() + 1;
     let root_parts = match &root.builder.from {
-        Some(FromClause::Literal { tuple_parts, .. }) => tuple_parts.clone(),
+        Some(FromClause::Literal { middle_parts, .. }) => middle_parts.clone(),
         _ => None,
     };
     let inner = if hops.is_empty() {
@@ -2384,7 +2403,7 @@ fn sink_broadcast_tail(ctx: &mut Context, tail: &TypedExpr) -> (ResultShape, Opt
         actual, root_creation,
         "broadcast root sank at an unexpected index: sink order changed"
     );
-    let complete = root_parts.is_some();
+    let complete = root_parts.is_some() && !hops.is_empty();
     let shape = if complete {
         inner
     } else {
@@ -3098,7 +3117,7 @@ fn sink_chain(ctx: &mut Context, hops: &[PendingSplit], root_creation: usize) ->
                 child_key: hop.child_col.clone(),
             },
             outputs: std::mem::take(&mut outputs[i]),
-            middle: hop.tuple_parts.clone(),
+            middle: hop.middle_parts.clone(),
         });
     }
     layers
@@ -3108,7 +3127,7 @@ struct NestLayer {
     creation: usize,
     pref: ParentRef,
     outputs: Vec<String>,
-    middle: Option<Vec<TuplePart>>,
+    middle: Option<Vec<MiddlePart>>,
 }
 
 fn peel_lists(mut ty: &QueryType) -> &QueryType {
@@ -3125,7 +3144,7 @@ fn nest_layers(
     layers: Vec<NestLayer>,
     root_ty: &QueryType,
     root_dup: bool,
-    root_parts: Option<Vec<TuplePart>>,
+    root_parts: Option<Vec<MiddlePart>>,
     root_stmt: usize,
 ) -> ResultShape {
     if layers.is_empty() {
@@ -3176,7 +3195,8 @@ fn nest_layers(
             name == inner.pref.child_key
         })
     };
-    let grouped = matches!(element, ResultShape::Column(_) | ResultShape::Tuple(_));
+    let grouped = matches!(element, ResultShape::Column(_) | ResultShape::Tuple(_))
+        || layers[innermost].middle.is_some();
     let (first_creation, first_pref) = (layers[0].creation, layers[0].pref.clone());
     if grouped {
         element = wrap(element, &layers[innermost]);
@@ -3214,17 +3234,45 @@ fn nest_layers(
     }
 }
 
-fn middle_tuple(parts: &[TuplePart], sub: Option<ResultShape>) -> ResultShape {
-    let mut out = Vec::with_capacity(parts.len());
-    for part in parts {
-        match part {
-            TuplePart::Value(col) => out.push(ResultShape::Column(col.clone())),
-            TuplePart::Nested => out.push(sub.clone().unwrap_or_else(|| {
-                unreachable!("tuple slot without sub-shape: chained levels always accumulate one")
-            })),
-        }
+fn middle_tuple(parts: &[MiddlePart], sub: Option<ResultShape>) -> ResultShape {
+    if parts.iter().any(|part| middle_name(part).is_some()) {
+        ResultShape::Record(
+            parts
+                .iter()
+                .map(|part| {
+                    (
+                        middle_name(part).cloned().unwrap_or_else(|| {
+                            unreachable!(
+                                "mixed named and unnamed middle positions: composite levels are uniformly tuples or records"
+                            )
+                        }),
+                        middle_shape(part, &sub),
+                    )
+                })
+                .collect(),
+        )
+    } else {
+        ResultShape::Tuple(parts.iter().map(|part| middle_shape(part, &sub)).collect())
     }
-    ResultShape::Tuple(out)
+}
+
+fn middle_name(part: &MiddlePart) -> Option<&String> {
+    match part {
+        MiddlePart::Value { name, .. } | MiddlePart::Nested { name, .. } => name.as_ref(),
+        MiddlePart::Tuple(_) => None,
+        MiddlePart::Record { name, .. } => name.as_ref(),
+    }
+}
+
+fn middle_shape(part: &MiddlePart, sub: &Option<ResultShape>) -> ResultShape {
+    match part {
+        MiddlePart::Value { col, .. } => ResultShape::Column(col.clone()),
+        MiddlePart::Nested { .. } => sub.clone().unwrap_or_else(|| {
+            unreachable!("composite slot without sub-shape: chained levels always accumulate one")
+        }),
+        MiddlePart::Tuple(inner) => middle_tuple(inner, sub.clone()),
+        MiddlePart::Record { fields, .. } => middle_tuple(fields, sub.clone()),
+    }
 }
 
 fn emit_split(
@@ -3236,7 +3284,7 @@ fn emit_split(
     let hops = drain_pending(pending);
     let mut parent_q = parent_builder;
     let root_parts = match &parent_q.from {
-        Some(FromClause::Literal { tuple_parts, .. }) => tuple_parts.clone(),
+        Some(FromClause::Literal { middle_parts, .. }) => middle_parts.clone(),
         _ => None,
     };
     if root_parts.is_some() {
@@ -3447,25 +3495,22 @@ fn child_element(
         .collect();
     match peel_optional(element_ty) {
         QueryType::Scalar(_) if kept.len() == 1 => ResultShape::Column(kept[0].clone()),
-        QueryType::Tuple(tys)
-            if tys.len() == kept.len()
-                && tys
-                    .iter()
-                    .all(|t| matches!(peel_optional(t), QueryType::Scalar(_))) =>
-        {
-            ResultShape::Tuple(
-                kept.into_iter()
-                    .map(|name| ResultShape::Column(name.clone()))
-                    .collect(),
-            )
-        }
         _ => {
+            let mut cursor = kept.iter();
+            let shape = mirror_shape(peel_optional(element_ty), &mut cursor);
+            if shape.is_some() && cursor.next().is_none() {
+                return shape.unwrap_or_else(|| {
+                    unreachable!("mirror without shape: constructors always build one")
+                });
+            }
             debug_assert!(
                 !matches!(
                     peel_optional(element_ty),
-                    QueryType::Scalar(_) | QueryType::Tuple(_)
+                    QueryType::Scalar(_)
+                        | QueryType::Tuple(_)
+                        | QueryType::Record(RecordSource::Projection(_))
                 ),
-                "scalar/tuple element over {} kept columns: type/row mismatch",
+                "composite element over {} kept columns: type/row mismatch",
                 kept.len(),
             );
             ResultShape::Record(
@@ -3474,6 +3519,28 @@ fn child_element(
                     .collect(),
             )
         }
+    }
+}
+
+fn mirror_shape<'a>(
+    ty: &QueryType,
+    cursor: &mut impl Iterator<Item = &'a &'a String>,
+) -> Option<ResultShape> {
+    match peel_optional(ty) {
+        QueryType::Scalar(_) => cursor
+            .next()
+            .map(|name| ResultShape::Column((*name).clone())),
+        QueryType::Tuple(tys) => tys
+            .iter()
+            .map(|ty| mirror_shape(ty, cursor))
+            .collect::<Option<Vec<_>>>()
+            .map(ResultShape::Tuple),
+        QueryType::Record(RecordSource::Projection(fields)) => fields
+            .iter()
+            .map(|field| mirror_shape(&field.ty, cursor).map(|shape| (field.name.clone(), shape)))
+            .collect::<Option<Vec<_>>>()
+            .map(ResultShape::Record),
+        _ => None,
     }
 }
 
@@ -4979,7 +5046,7 @@ struct LitLevel {
     id: String,
     module: String,
     columns: Vec<NamedColumn>,
-    tuple_parts: Option<Vec<TuplePart>>,
+    middle_parts: Option<Vec<MiddlePart>>,
     own_key: Option<String>,
 }
 
@@ -4989,7 +5056,7 @@ impl LitLevel {
             module: self.module.clone(),
             id: self.id.clone(),
             columns: self.columns.clone(),
-            tuple_parts: self.tuple_parts.clone(),
+            middle_parts: self.middle_parts.clone(),
         }
     }
 }
@@ -5021,7 +5088,13 @@ fn literal_depth(inner: &QueryType) -> usize {
     match peel_optional(inner) {
         QueryType::Scalar(_) | QueryType::Tuple(_) => 1,
         QueryType::List(sub) => 1 + literal_depth(sub),
-        QueryType::Record(_) => todo!("M7 record literal element"),
+        QueryType::Record(RecordSource::Projection(fields)) => {
+            for field in fields {
+                literal_depth(&field.ty);
+            }
+            1
+        }
+        QueryType::Record(RecordSource::Schema(_)) => todo!("M6 query-valued array element"),
         QueryType::Unknown => {
             unreachable!("un-unified literal element: the checker rejects it with AmbiguousType")
         }
@@ -5039,10 +5112,10 @@ fn leaf_value_tys(inner: &QueryType) -> Vec<ScalarType> {
             .map(|t| match peel_optional(t) {
                 QueryType::Scalar(s) => *s,
                 QueryType::List(_) => unreachable!(
-                    "tuple with list element in leaf lowering: register routes tuples via register_tuple_middle"
+                    "tuple with list element in leaf lowering: register routes composites via register_composite_middle"
                 ),
                 QueryType::Record(_) => unreachable!(
-                    "tuple with record element in leaf lowering: register routes tuples via register_tuple_middle"
+                    "tuple with record element in leaf lowering: register routes composites via register_composite_middle"
                 ),
                 QueryType::Unknown => unreachable!(
                     "un-unified tuple element: the checker rejects it with AmbiguousType"
@@ -5107,27 +5180,93 @@ fn const_value(ty: TypeName, name: ConstantName) -> ParamValue {
     }
 }
 
-fn register_tuple_middle<'a>(
+enum PlanNode {
+    Scalar(ScalarType),
+    List(QueryType),
+    Tuple(Vec<PlanNode>),
+    Record(Vec<(String, PlanNode)>),
+}
+
+fn plan_node(ty: &QueryType) -> PlanNode {
+    let mut ty = ty;
+    while let QueryType::Optional(inner) = ty {
+        ty = inner;
+    }
+    match ty {
+        QueryType::Scalar(s) => PlanNode::Scalar(*s),
+        QueryType::List(_) => PlanNode::List(ty.clone()),
+        QueryType::Tuple(tys) => PlanNode::Tuple(tys.iter().map(plan_node).collect()),
+        QueryType::Record(RecordSource::Projection(fields)) => PlanNode::Record(
+            fields
+                .iter()
+                .map(|field| (field.name.clone(), plan_node(&field.ty)))
+                .collect(),
+        ),
+        QueryType::Record(RecordSource::Schema(_)) => todo!("M6 query-valued array element"),
+        QueryType::Unknown => {
+            unreachable!("un-unified composite position: the checker rejects it with AmbiguousType")
+        }
+        QueryType::Void => {
+            unreachable!("void composite position: the checker excludes it")
+        }
+        QueryType::Optional(_) => {
+            unreachable!("optional composite position: peeling owns optionals")
+        }
+    }
+}
+
+fn plan_lists(plan: &PlanNode) -> usize {
+    match plan {
+        PlanNode::Scalar(_) => 0,
+        PlanNode::List(_) => 1,
+        PlanNode::Tuple(ps) => ps.iter().map(plan_lists).sum(),
+        PlanNode::Record(fs) => fs.iter().map(|(_, p)| plan_lists(p)).sum(),
+    }
+}
+
+fn plan_leaves(plan: &PlanNode) -> usize {
+    match plan {
+        PlanNode::Scalar(_) => 1,
+        PlanNode::List(_) => 0,
+        PlanNode::Tuple(ps) => ps.iter().map(plan_leaves).sum(),
+        PlanNode::Record(fs) => fs.iter().map(|(_, p)| plan_leaves(p)).sum(),
+    }
+}
+
+fn register_composite_middle<'a>(
     ctx: &mut Context,
-    tys: &[QueryType],
+    sub: &QueryType,
     items: Vec<(&'a TypedExpr, Option<i64>)>,
     keyed: bool,
 ) -> Vec<LitLevel> {
-    let mut scalar_positions: Vec<(usize, ScalarType)> = Vec::new();
-    let mut list_positions: Vec<(usize, QueryType)> = Vec::new();
-    for (j, t) in tys.iter().enumerate() {
-        match peel_optional(t) {
-            QueryType::Scalar(s) => scalar_positions.push((j, *s)),
-            QueryType::List(_) => list_positions.push((j, t.clone())),
-            QueryType::Record(_) => todo!("M7 tuple with record element"),
-            _ => todo!("M7 exotic tuple position"),
-        }
+    let top: Vec<(Option<String>, QueryType)> = match peel_optional(sub) {
+        QueryType::Tuple(tys) => tys.iter().map(|ty| (None, ty.clone())).collect(),
+        QueryType::Record(RecordSource::Projection(fields)) => fields
+            .iter()
+            .map(|field| (Some(field.name.clone()), field.ty.clone()))
+            .collect(),
+        _ => unreachable!(
+            "composite middle over {sub}: callers route tuples and projection records only"
+        ),
+    };
+    let kind = if top.iter().any(|(name, _)| name.is_some()) {
+        "record"
+    } else {
+        "tuple"
+    };
+    let plans: Vec<(Option<String>, PlanNode)> = top
+        .iter()
+        .map(|(name, ty)| (name.clone(), plan_node(ty)))
+        .collect();
+    if plans
+        .iter()
+        .map(|(_, plan)| plan_lists(plan))
+        .sum::<usize>()
+        > 1
+    {
+        todo!("M7 multi-list {kind} literal");
     }
-    if list_positions.len() > 1 {
-        todo!("M7 multi-list tuple literal");
-    }
-    let list_position = list_positions.first();
-    let chained = list_position.is_some();
+    let chained = plans.iter().any(|(_, plan)| plan_lists(plan) > 0);
     let mut columns: Vec<NamedColumn> = Vec::new();
     if keyed {
         columns.push(NamedColumn {
@@ -5141,21 +5280,9 @@ fn register_tuple_middle<'a>(
             ty: Some(ScalarType::Int),
         });
     }
-    let mut parts: Vec<TuplePart> = Vec::with_capacity(tys.len());
-    for t in tys.iter() {
-        match peel_optional(t) {
-            QueryType::Scalar(s) => {
-                parts.push(TuplePart::Value(format!("c{}", columns.len())));
-                columns.push(NamedColumn {
-                    name: format!("c{}", columns.len()),
-                    ty: Some(*s),
-                });
-            }
-            QueryType::List(_) => parts.push(TuplePart::Nested),
-            _ => {
-                unreachable!("tuple position reclassified: classification above owns all positions")
-            }
-        }
+    let mut parts: Vec<MiddlePart> = Vec::with_capacity(plans.len());
+    for (name, plan) in &plans {
+        parts.push(lower_plan(plan, name.clone(), &mut columns));
     }
     let mut sig = String::with_capacity(columns.len());
     if keyed {
@@ -5164,14 +5291,11 @@ fn register_tuple_middle<'a>(
     if chained {
         sig.push('I');
     }
-    for (_, s) in &scalar_positions {
-        sig.push(sig_letter(*s));
-    }
+    push_sig(&plans, &mut sig);
     let module = format!("$$lit_{}_{sig}", columns.len());
     let id = ctx.aliases.literal();
     let mut grid: Vec<Vec<ParamValue>> = Vec::with_capacity(items.len());
     for (i, (elem, pkey)) in items.iter().enumerate() {
-        let node = peel_some(elem);
         let mut row = Vec::with_capacity(columns.len());
         if let Some(p) = pkey {
             row.push(ParamValue::Int(*p));
@@ -5179,20 +5303,7 @@ fn register_tuple_middle<'a>(
         if chained {
             row.push(ParamValue::Int(i as i64));
         }
-        match &node.kind {
-            TypedExprKind::Tuple { elements } => {
-                if elements.len() != tys.len() {
-                    unreachable!("tuple arity drift: the checker unifies tuple arity");
-                }
-                for (pos, _) in &scalar_positions {
-                    row.push(fold_static(&elements[*pos]));
-                }
-            }
-            TypedExprKind::Literal(lit) if matches!(&lit.value, Literal::None) => {
-                row.extend(scalar_positions.iter().map(|_| ParamValue::Null));
-            }
-            _ => todo!("M6 query-valued array element"),
-        }
+        push_row_cells(&plans, elem, &mut row);
         grid.push(row);
     }
     ctx.literals.insert(id.clone(), grid);
@@ -5200,37 +5311,262 @@ fn register_tuple_middle<'a>(
         id,
         module,
         columns,
-        tuple_parts: Some(parts),
+        middle_parts: Some(parts),
         own_key: chained.then(|| format!("c{}", usize::from(keyed))),
     }];
-    if let Some((list_pos, list_ty)) = list_position {
-        let sub = match peel_optional(list_ty) {
-            QueryType::List(sub) => sub,
-            _ => unreachable!("list position without list type: classification owns positions"),
-        };
+    if chained {
+        let mut chain_ty: Option<QueryType> = None;
         let mut child_items: Vec<(&'a TypedExpr, Option<i64>)> = Vec::new();
         for (i, (elem, _)) in items.iter().enumerate() {
-            let node = peel_some(elem);
-            match &node.kind {
-                TypedExprKind::Tuple { elements } => {
-                    let Some(pos) = elements.get(*list_pos).map(peel_some) else {
-                        unreachable!("tuple arity drift: the checker unifies tuple arity");
-                    };
-                    match &pos.kind {
-                        TypedExprKind::Array { elements } => {
-                            child_items.extend(elements.iter().map(|e| (e, Some(i as i64))));
-                        }
-                        TypedExprKind::Literal(lit) if matches!(&lit.value, Literal::None) => {}
-                        _ => todo!("M6 query-valued array element"),
-                    }
-                }
-                TypedExprKind::Literal(lit) if matches!(&lit.value, Literal::None) => {}
-                _ => todo!("M6 query-valued array element"),
+            if let Some(ty) = collect_row(&plans, elem, i as i64, &mut child_items) {
+                chain_ty = Some(ty);
             }
         }
+        let Some(list_ty) = chain_ty else {
+            unreachable!("chained middle without list site: the plan counts exactly one")
+        };
+        let sub = match peel_optional(&list_ty) {
+            QueryType::List(sub) => sub,
+            _ => unreachable!("list site without list type: planning owns positions"),
+        };
         chain.extend(register_literal_level(ctx, sub, child_items));
     }
     chain
+}
+
+fn lower_plan(plan: &PlanNode, name: Option<String>, columns: &mut Vec<NamedColumn>) -> MiddlePart {
+    match plan {
+        PlanNode::Scalar(s) => {
+            let col = format!("c{}", columns.len());
+            columns.push(NamedColumn {
+                name: col.clone(),
+                ty: Some(*s),
+            });
+            MiddlePart::Value { name, col }
+        }
+        PlanNode::List(_) => MiddlePart::Nested { name },
+        PlanNode::Tuple(ps) => {
+            MiddlePart::Tuple(ps.iter().map(|p| lower_plan(p, None, columns)).collect())
+        }
+        PlanNode::Record(fs) => MiddlePart::Record {
+            name,
+            fields: fs
+                .iter()
+                .map(|(fname, p)| lower_plan(p, Some(fname.clone()), columns))
+                .collect(),
+        },
+    }
+}
+
+fn push_sig(plans: &[(Option<String>, PlanNode)], sig: &mut String) {
+    for (_, plan) in plans {
+        push_sig_node(plan, sig);
+    }
+}
+
+fn push_sig_node(plan: &PlanNode, sig: &mut String) {
+    match plan {
+        PlanNode::Scalar(s) => sig.push(sig_letter(*s)),
+        PlanNode::List(_) => {}
+        PlanNode::Tuple(ps) => ps.iter().for_each(|p| push_sig_node(p, sig)),
+        PlanNode::Record(fs) => fs.iter().for_each(|(_, p)| push_sig_node(p, sig)),
+    }
+}
+
+fn push_row_cells(
+    plans: &[(Option<String>, PlanNode)],
+    elem: &TypedExpr,
+    row: &mut Vec<ParamValue>,
+) {
+    let leaves: usize = plans.iter().map(|(_, plan)| plan_leaves(plan)).sum();
+    let node = peel_some(elem);
+    if let TypedExprKind::Literal(lit) = &node.kind
+        && matches!(&lit.value, Literal::None)
+    {
+        row.extend(std::iter::repeat_n(ParamValue::Null, leaves));
+        return;
+    }
+    match &node.kind {
+        TypedExprKind::Tuple { elements } => {
+            if elements.len() != plans.len() {
+                unreachable!("tuple arity drift: the checker unifies tuple arity");
+            }
+            for ((_, plan), e) in plans.iter().zip(elements.iter()) {
+                push_cells(plan, e, row);
+            }
+        }
+        TypedExprKind::Struct { fields } => {
+            if fields.len() != plans.len() {
+                unreachable!("record arity drift: checking unifies struct field sets");
+            }
+            for ((name, plan), _) in plans.iter().zip(fields.iter()) {
+                let name = name.as_ref().unwrap_or_else(|| {
+                    unreachable!(
+                        "record plan without field names: planning names every record field"
+                    )
+                });
+                let (_, e) = fields
+                    .iter()
+                    .find(|(fname, _)| fname.value == *name)
+                    .unwrap_or_else(|| {
+                        unreachable!(
+                            "record field {name} vanished after checking: unification matches field sets"
+                        )
+                    });
+                push_cells(plan, e, row);
+            }
+        }
+        _ => todo!("M6 query-valued array element"),
+    }
+}
+
+fn push_cells(plan: &PlanNode, elem: &TypedExpr, out: &mut Vec<ParamValue>) {
+    let node = peel_some(elem);
+    if let TypedExprKind::Literal(lit) = &node.kind
+        && matches!(&lit.value, Literal::None)
+    {
+        out.extend(std::iter::repeat_n(ParamValue::Null, plan_leaves(plan)));
+        return;
+    }
+    match (plan, &node.kind) {
+        (PlanNode::Scalar(_), _) => out.push(fold_static(node)),
+        (PlanNode::List(_), _) => {}
+        (PlanNode::Tuple(ps), TypedExprKind::Tuple { elements }) => {
+            if elements.len() != ps.len() {
+                unreachable!("tuple arity drift: the checker unifies tuple arity");
+            }
+            for (p, e) in ps.iter().zip(elements.iter()) {
+                push_cells(p, e, out);
+            }
+        }
+        (PlanNode::Record(fs), TypedExprKind::Struct { fields }) => {
+            for (name, p) in fs {
+                let (_, e) = fields
+                    .iter()
+                    .find(|(fname, _)| fname.value == *name)
+                    .unwrap_or_else(|| {
+                        unreachable!(
+                            "record field {name} vanished after checking: unification matches field sets"
+                        )
+                    });
+                push_cells(p, e, out);
+            }
+        }
+        _ => todo!("M6 query-valued array element"),
+    }
+}
+
+fn collect_row<'a>(
+    plans: &[(Option<String>, PlanNode)],
+    elem: &'a TypedExpr,
+    own: i64,
+    out: &mut Vec<(&'a TypedExpr, Option<i64>)>,
+) -> Option<QueryType> {
+    let node = peel_some(elem);
+    if let TypedExprKind::Literal(lit) = &node.kind
+        && matches!(&lit.value, Literal::None)
+    {
+        return None;
+    }
+    match &node.kind {
+        TypedExprKind::Tuple { elements } => {
+            if elements.len() != plans.len() {
+                unreachable!("tuple arity drift: the checker unifies tuple arity");
+            }
+            let mut found = None;
+            for ((_, plan), e) in plans.iter().zip(elements.iter()) {
+                if let Some(ty) = collect_chain(plan, e, own, out)
+                    && found.replace(ty).is_some()
+                {
+                    unreachable!("second list site: planning counts exactly one per middle")
+                }
+            }
+            found
+        }
+        TypedExprKind::Struct { fields } => {
+            if fields.len() != plans.len() {
+                unreachable!("record arity drift: checking unifies struct field sets");
+            }
+            let mut found = None;
+            for ((name, plan), _) in plans.iter().zip(fields.iter()) {
+                let name = name.as_ref().unwrap_or_else(|| {
+                    unreachable!(
+                        "record plan without field names: planning names every record field"
+                    )
+                });
+                let (_, e) = fields
+                    .iter()
+                    .find(|(fname, _)| fname.value == *name)
+                    .unwrap_or_else(|| {
+                        unreachable!(
+                            "record field {name} vanished after checking: unification matches field sets"
+                        )
+                    });
+                if let Some(ty) = collect_chain(plan, e, own, out)
+                    && found.replace(ty).is_some()
+                {
+                    unreachable!("second list site: planning counts exactly one per middle")
+                }
+            }
+            found
+        }
+        _ => todo!("M6 query-valued array element"),
+    }
+}
+
+fn collect_chain<'a>(
+    plan: &PlanNode,
+    elem: &'a TypedExpr,
+    own: i64,
+    out: &mut Vec<(&'a TypedExpr, Option<i64>)>,
+) -> Option<QueryType> {
+    let node = peel_some(elem);
+    if let TypedExprKind::Literal(lit) = &node.kind
+        && matches!(&lit.value, Literal::None)
+    {
+        return None;
+    }
+    match (plan, &node.kind) {
+        (PlanNode::Scalar(_), _) => None,
+        (PlanNode::List(ty), TypedExprKind::Array { elements }) => {
+            out.extend(elements.iter().map(|e| (e, Some(own))));
+            Some(ty.clone())
+        }
+        (PlanNode::Tuple(ps), TypedExprKind::Tuple { elements }) => {
+            if elements.len() != ps.len() {
+                unreachable!("tuple arity drift: the checker unifies tuple arity");
+            }
+            let mut found = None;
+            for (p, e) in ps.iter().zip(elements.iter()) {
+                if let Some(ty) = collect_chain(p, e, own, out)
+                    && found.replace(ty).is_some()
+                {
+                    unreachable!("second list site: planning counts exactly one per middle")
+                }
+            }
+            found
+        }
+        (PlanNode::Record(fs), TypedExprKind::Struct { fields }) => {
+            let mut found = None;
+            for (name, p) in fs {
+                let (_, e) = fields
+                    .iter()
+                    .find(|(fname, _)| fname.value == *name)
+                    .unwrap_or_else(|| {
+                        unreachable!(
+                            "record field {name} vanished after checking: unification matches field sets"
+                        )
+                    });
+                if let Some(ty) = collect_chain(p, e, own, out)
+                    && found.replace(ty).is_some()
+                {
+                    unreachable!("second list site: planning counts exactly one per middle")
+                }
+            }
+            found
+        }
+        _ => todo!("M6 query-valued array element"),
+    }
 }
 
 fn leaf_cells(elem: &TypedExpr, inner: &QueryType, width: usize) -> Vec<ParamValue> {
@@ -5256,15 +5592,25 @@ fn register_literal_level<'a>(
 ) -> Vec<LitLevel> {
     match peel_optional(inner) {
         QueryType::List(sub) => {
-            if let QueryType::Tuple(tys) = peel_optional(sub) {
+            let sub = peel_optional(sub);
+            if matches!(
+                sub,
+                QueryType::Tuple(_) | QueryType::Record(RecordSource::Projection(_))
+            ) {
                 let rooted = items.first().is_some_and(|(_, p)| p.is_some());
-                let mut tuple_items: Vec<(&'a TypedExpr, Option<i64>)> = Vec::new();
+                let mut composite_items: Vec<(&'a TypedExpr, Option<i64>)> = Vec::new();
                 let mut root_grid: Vec<Vec<ParamValue>> = Vec::new();
                 for (i, (elem, pkey)) in items.iter().enumerate() {
                     let parent = if rooted { *pkey } else { Some(i as i64) };
                     match &peel_some(elem).kind {
                         TypedExprKind::Array { elements } => {
-                            tuple_items.extend(elements.iter().map(|e| (e, parent)));
+                            composite_items.extend(elements.iter().map(|e| (e, parent)));
+                            if !rooted {
+                                root_grid.push(vec![ParamValue::Int(i as i64)]);
+                            }
+                        }
+                        TypedExprKind::Tuple { .. } | TypedExprKind::Struct { .. } => {
+                            composite_items.push((elem, parent));
                             if !rooted {
                                 root_grid.push(vec![ParamValue::Int(i as i64)]);
                             }
@@ -5288,11 +5634,11 @@ fn register_literal_level<'a>(
                             name: "c0".to_string(),
                             ty: Some(ScalarType::Int),
                         }],
-                        tuple_parts: None,
+                        middle_parts: None,
                         own_key: None,
                     });
                 }
-                chain.extend(register_tuple_middle(ctx, tys, tuple_items, true));
+                chain.extend(register_composite_middle(ctx, sub, composite_items, true));
                 return chain;
             }
             let keyed = items.is_empty() || items.first().is_some_and(|(_, p)| p.is_some());
@@ -5342,19 +5688,26 @@ fn register_literal_level<'a>(
                 id,
                 module,
                 columns,
-                tuple_parts: None,
+                middle_parts: None,
                 own_key: None,
             }];
             chain.extend(register_literal_level(ctx, sub, child_items));
             chain
         }
         _ => {
-            if let QueryType::Tuple(tys) = peel_optional(inner)
-                && tys
-                    .iter()
-                    .any(|t| matches!(peel_optional(t), QueryType::List(_) | QueryType::Record(_)))
-            {
-                return register_tuple_middle(ctx, tys, items, false);
+            let composite = match peel_optional(inner) {
+                QueryType::Tuple(tys)
+                    if tys.iter().any(|t| {
+                        matches!(peel_optional(t), QueryType::List(_) | QueryType::Record(_))
+                    }) =>
+                {
+                    true
+                }
+                QueryType::Record(RecordSource::Projection(_)) => true,
+                _ => false,
+            };
+            if composite {
+                return register_composite_middle(ctx, inner, items, false);
             }
             let value_tys = leaf_value_tys(inner);
             if value_tys.is_empty() {
@@ -5398,7 +5751,7 @@ fn register_literal_level<'a>(
                 id,
                 module,
                 columns,
-                tuple_parts: None,
+                middle_parts: None,
                 own_key: None,
             }]
         }
@@ -5436,7 +5789,7 @@ fn rows_array(ctx: &mut Context, expr: &TypedExpr) -> Level {
             },
             multi_parent: true,
             next: pending.map(Box::new),
-            tuple_parts: level.tuple_parts,
+            middle_parts: level.middle_parts,
         });
     }
     Level {

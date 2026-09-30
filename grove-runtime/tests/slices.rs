@@ -659,6 +659,57 @@ fn slice_literals() {
     );
 }
 
+#[test]
+fn slice_record_literals() {
+    assert_eq!(
+        value("[{name = \"Bob\", age = 40}, {name = \"Alice\", age = 30}]"),
+        Value::List(vec![
+            rec(&[("name", s("Bob")), ("age", Value::Int(40))]),
+            rec(&[("name", s("Alice")), ("age", Value::Int(30))]),
+        ])
+    );
+    assert_eq!(
+        value("[{a = 1, b = 2}, {b = 3, a = 4}]"),
+        Value::List(vec![
+            rec(&[("a", Value::Int(1)), ("b", Value::Int(2))]),
+            rec(&[("a", Value::Int(4)), ("b", Value::Int(3))]),
+        ])
+    );
+    assert_eq!(
+        value("[[{a = 1}]]"),
+        Value::List(vec![Value::List(vec![rec(&[("a", Value::Int(1))])])])
+    );
+    assert_eq!(
+        value("[{a = {x = 1}}]"),
+        Value::List(vec![rec(&[(
+            "a",
+            Value::Record(vec![("x".to_string(), Value::Int(1))])
+        )])])
+    );
+    assert_eq!(
+        value("[[{a = [1, 2]}]]"),
+        Value::List(vec![Value::List(vec![rec(&[(
+            "a",
+            Value::List(vec![Value::Int(1), Value::Int(2)])
+        )])])])
+    );
+    assert_eq!(
+        value("[(1, {x = 1})]"),
+        Value::List(vec![Value::Tuple(vec![
+            Value::Int(1),
+            Value::Record(vec![("x".to_string(), Value::Int(1))]),
+        ])])
+    );
+    assert_eq!(
+        value("users { x = [{a = 1}] }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![rec(&[("a", Value::Int(1))])]))]),
+            rec(&[("x", Value::List(vec![rec(&[("a", Value::Int(1))])]))]),
+            rec(&[("x", Value::List(vec![rec(&[("a", Value::Int(1))])]))]),
+        ])
+    );
+}
+
 
 #[test]
 fn slice_tuples() {
