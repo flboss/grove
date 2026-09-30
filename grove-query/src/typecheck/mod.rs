@@ -871,6 +871,10 @@ fn infer_arithmetic_op(
         (lhs @ QueryType::Scalar(Duration), rhs @ QueryType::Scalar(Duration)) => {
             if matches!(op, BinaryOp::Add | BinaryOp::Sub) {
                 Ok(QueryType::Scalar(Duration))
+            } else if matches!(op, BinaryOp::Div) {
+                Ok(QueryType::Scalar(Dec))
+            } else if matches!(op, BinaryOp::Rem | BinaryOp::Mod) {
+                Ok(QueryType::Scalar(Duration))
             } else {
                 Err(TypeError::BinaryOpTypeMismatch {
                     left: lhs.to_string(),
@@ -893,10 +897,7 @@ fn infer_arithmetic_op(
             }
         }
         (lhs @ QueryType::Scalar(Duration), rhs) if rhs.is_numeric() => {
-            if matches!(
-                op,
-                BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem | BinaryOp::Mod
-            ) {
+            if matches!(op, BinaryOp::Mul | BinaryOp::Div) {
                 Ok(QueryType::Scalar(Duration))
             } else {
                 Err(TypeError::BinaryOpTypeMismatch {
@@ -2355,10 +2356,46 @@ mod tests {
     }
 
     #[test]
-    fn binary_duration_rem_int() {
+    fn binary_duration_rem_int_error() {
         let schema = test_schema();
         let mut env = TypeEnv::new(&schema);
         let (file, _) = crate::parse_query("#30d % 7");
+        let result = infer(&file.unwrap().result, &mut env);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn binary_duration_mod_int_error() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("#30d mod 7");
+        let result = infer(&file.unwrap().result, &mut env);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn binary_duration_div_duration() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("#90s / #30s");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Dec));
+    }
+
+    #[test]
+    fn binary_duration_rem_duration() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("#90s % #7s");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Duration));
+    }
+
+    #[test]
+    fn binary_duration_mod_duration() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("#90s mod #7s");
         let result = infer(&file.unwrap().result, &mut env).unwrap();
         assert_eq!(result.ty, QueryType::Scalar(ScalarType::Duration));
     }
