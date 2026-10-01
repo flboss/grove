@@ -800,6 +800,92 @@ fn slice_computed_neg_overflow_errors() {
 }
 
 #[test]
+fn slice_correlated_arrays() {
+    assert_eq!(
+        value("users { x = [age] }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![Value::Int(30)]))]),
+            rec(&[("x", Value::List(vec![Value::Int(40)]))]),
+            rec(&[("x", Value::List(vec![Value::Int(50)]))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [age, age + 1] }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![Value::Int(30), Value::Int(31)]))]),
+            rec(&[("x", Value::List(vec![Value::Int(40), Value::Int(41)]))]),
+            rec(&[("x", Value::List(vec![Value::Int(50), Value::Int(51)]))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [(age, 1)] }"),
+        Value::List(vec![
+            rec(&[(
+                "x",
+                Value::List(vec![Value::Tuple(vec![Value::Int(30), Value::Int(1)])]),
+            )]),
+            rec(&[(
+                "x",
+                Value::List(vec![Value::Tuple(vec![Value::Int(40), Value::Int(1)])]),
+            )]),
+            rec(&[(
+                "x",
+                Value::List(vec![Value::Tuple(vec![Value::Int(50), Value::Int(1)])]),
+            )]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [{a = age}] }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![rec(&[("a", Value::Int(30))])]))]),
+            rec(&[("x", Value::List(vec![rec(&[("a", Value::Int(40))])]))]),
+            rec(&[("x", Value::List(vec![rec(&[("a", Value::Int(50))])]))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [if age > 40 {1} else {2}] }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![Value::Int(2)]))]),
+            rec(&[("x", Value::List(vec![Value::Int(2)]))]),
+            rec(&[("x", Value::List(vec![Value::Int(1)]))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [{a = age, b = name}] }"),
+        Value::List(vec![
+            rec(&[(
+                "x",
+                Value::List(vec![rec(&[("a", Value::Int(30)), ("b", s("Ada"))])]),
+            )]),
+            rec(&[(
+                "x",
+                Value::List(vec![rec(&[("a", Value::Int(40)), ("b", s("Bob"))])]),
+            )]),
+            rec(&[(
+                "x",
+                Value::List(vec![rec(&[("a", Value::Int(50)), ("b", s("Cyd"))])]),
+            )]),
+        ])
+    );
+    assert_eq!(
+        value("users { n = name } { x = [n] }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![s("Ada")]))]),
+            rec(&[("x", Value::List(vec![s("Bob")]))]),
+            rec(&[("x", Value::List(vec![s("Cyd")]))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [age], n = name }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![Value::Int(30)])), ("n", s("Ada"))]),
+            rec(&[("x", Value::List(vec![Value::Int(40)])), ("n", s("Bob"))]),
+            rec(&[("x", Value::List(vec![Value::Int(50)])), ("n", s("Cyd"))]),
+        ])
+    );
+}
+
+#[test]
 fn slice_composite_roots() {
     assert_eq!(
         value("{ xs = [[1]] }"),

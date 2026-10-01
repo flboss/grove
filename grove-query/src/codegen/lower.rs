@@ -28,6 +28,7 @@ pub struct Context<'s> {
     pub corr: bool,
     pub child: Option<ChildCtx>,
     pub temp_collect: Option<TempCollect>,
+    pub in_array_temp: bool,
 }
 
 pub struct ChildCtx {
@@ -54,6 +55,7 @@ impl<'s> Context<'s> {
             corr: false,
             child: None,
             temp_collect: None,
+            in_array_temp: false,
         }
     }
 
@@ -1697,14 +1699,18 @@ fn scalar_ident_temp(ctx: &mut Context, binding: &IdentBinding) -> SqlExpr {
         }
         IdentBinding::Prev { .. } => todo!("mutations era: prev"),
     };
+    record_temp_ref(ctx, &column);
+    temp_lookup(ctx, &temp, &column, &child_fk)
+}
+
+fn record_temp_ref(ctx: &mut Context, column: &str) {
     let collect = ctx
         .temp_collect
         .as_mut()
-        .unwrap_or_else(|| unreachable!("temp collect vanished mid-lowering"));
-    if !collect.refs.contains(&column) {
-        collect.refs.push(column.clone());
+        .unwrap_or_else(|| unreachable!("temp record outside temp mode"));
+    if !collect.refs.iter().any(|r| r == column) {
+        collect.refs.push(column.to_string());
     }
-    temp_lookup(ctx, &temp, &column, &child_fk)
 }
 
 fn temp_lookup(ctx: &Context, temp: &str, column: &str, child_fk: &str) -> SqlExpr {
@@ -2547,7 +2553,13 @@ fn rvalue_shape(
         return rcross_shape(ctx, parent, tail, Cardinality::Many);
     }
     if array_tail_root(tail) {
-        if tail_uses_outer(tail) || has_scope_ident(tail) {
+        if tail_uses_outer(tail) {
+            todo!("M6 correlated literal projection item");
+        }
+        if has_scope_ident(tail) {
+            if matches!(tail.kind, TypedExprKind::Array { .. }) {
+                return rtemp_array_shape(ctx, parent, tail);
+            }
             todo!("M6 correlated literal projection item");
         }
         return sink_broadcast_tail(ctx, tail);
@@ -2952,6 +2964,235 @@ fn rtemp_shape(
         },
     };
     (shape, None)
+}
+
+fn null_cells(ty: &QueryType, out: &mut Vec<(SqlExpr, Option<ScalarType>)>) {
+    match peel_optional(ty) {
+        QueryType::Scalar(s) => out.push((SqlExpr::Param(ParamValue::Null), Some(*s))),
+        QueryType::Tuple(tys) => tys.iter().for_each(|t| null_cells(t, out)),
+        QueryType::Record(RecordSource::Projection(fields)) => {
+            fields.iter().for_each(|field| null_cells(&field.ty, out))
+        }
+        _ => unreachable!(
+            "null cells over {ty}: lists pre-excluded, schema records rejected upfront"
+        ),
+    }
+}
+
+fn temp_array_cell(
+    ctx: &mut Context,
+    ty: &QueryType,
+    elem: &TypedExpr,
+    out: &mut Vec<(SqlExpr, Option<ScalarType>)>,
+) {
+    let node = peel_some(elem);
+    match peel_optional(ty) {
+        QueryType::Scalar(s) => out.push((scalar(ctx, node), Some(*s))),
+        QueryType::Tuple(tys) => {
+            let TypedExprKind::Tuple { elements } = &node.kind else {
+                todo!("M6 correlated literal projection item");
+            };
+            if elements.len() != tys.len() {
+                unreachable!("tuple arity drift: the checker unifies tuple arity");
+            }
+            for (t, e) in tys.iter().zip(elements.iter()) {
+                temp_array_cell(ctx, t, e, out);
+            }
+        }
+        QueryType::Record(RecordSource::Projection(fields)) => {
+            let TypedExprKind::Struct { fields: elements } = &node.kind else {
+                todo!("M6 correlated literal projection item");
+            };
+            for field in fields {
+                let (_, e) = elements
+                    .iter()
+                    .find(|(fname, _)| fname.value == field.name)
+                    .unwrap_or_else(|| {
+                        unreachable!(
+                            "record field {} vanished after checking: unification matches field sets",
+                            field.name
+                        )
+                    });
+                temp_array_cell(ctx, &field.ty, e, out);
+            }
+        }
+        _ => todo!("M6 correlated literal projection item"),
+    }
+}
+
+fn temp_array_cells(
+    ctx: &mut Context,
+    elem: &TypedExpr,
+    inner: &QueryType,
+    out: &mut Vec<(SqlExpr, Option<ScalarType>)>,
+) {
+    let node = peel_some(elem);
+    if let TypedExprKind::Literal(lit) = &node.kind
+        && matches!(&lit.value, Literal::None)
+    {
+        null_cells(inner, out);
+        return;
+    }
+    temp_array_cell(ctx, inner, elem, out);
+}
+
+fn rtemp_array_shape(
+    ctx: &mut Context,
+    parent: &mut Level,
+    tail: &TypedExpr,
+) -> (ResultShape, Option<String>) {
+    let TypedExprKind::Array { elements } = &tail.kind else {
+        unreachable!("rtemp array over non-array tail: the rvalue gate admits bare arrays only")
+    };
+    let inner = match &tail.ty {
+        QueryType::List(inner) => inner.as_ref(),
+        _ => unreachable!(
+            "non-list array type {}: the checker types arrays as lists",
+            tail.ty
+        ),
+    };
+    if array_has_list_leaf(inner) {
+        todo!("M6 nested correlated array");
+    }
+    if !matches!(
+        peel_optional(inner),
+        QueryType::Scalar(_) | QueryType::Tuple(_) | QueryType::Record(RecordSource::Projection(_))
+    ) {
+        todo!("M6 query-valued array element");
+    }
+    if elements.iter().any(|e| !temp_readable_element(e)) {
+        todo!("M6 correlated literal projection item");
+    }
+    let parent_q = parent.builder.clone();
+    let temp = ctx.aliases.temp();
+    ctx.temp_collect = Some(TempCollect {
+        temp: temp.clone(),
+        child_fk: "$$key".to_string(),
+        refs: Vec::new(),
+    });
+    ctx.in_array_temp = true;
+    let mut arms: Vec<SelectBuilder> = Vec::with_capacity(elements.len());
+    for elem in elements {
+        let mut cells = Vec::new();
+        temp_array_cells(ctx, elem, inner, &mut cells);
+        let mut select = vec![SelectItem::Column {
+            depth: 0,
+            column: "$$key".to_string(),
+            output: "c0".to_string(),
+            ty: None,
+        }];
+        for (i, (expr, ty)) in cells.into_iter().enumerate() {
+            select.push(SelectItem::Expr {
+                expr,
+                output: format!("c{}", i + 1),
+                ty,
+            });
+        }
+        arms.push(SelectBuilder {
+            select,
+            from: Some(FromClause::Table {
+                table: temp.clone(),
+                alias: temp.clone(),
+            }),
+            where_: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            unions: Vec::new(),
+        });
+    }
+    ctx.in_array_temp = false;
+    let refs = ctx
+        .temp_collect
+        .take()
+        .unwrap_or_else(|| unreachable!("temp collect vanished mid-lowering"))
+        .refs;
+    let mut create_q = parent_q;
+    if create_q.select.is_empty() {
+        create_q.select = vec![SelectItem::AllFrom { depth: 0 }];
+    }
+    for col in &refs {
+        if !available_cols(&create_q, ctx.schema).contains(col) {
+            todo!("M4b key threading through subqueries");
+        }
+        ensure_key(&mut create_q, col, ctx.schema);
+    }
+    create_q.select.push(SelectItem::Expr {
+        expr: SqlExpr::Window {
+            func: "ROW_NUMBER".to_string(),
+            partition: Vec::new(),
+            order: Vec::new(),
+        },
+        output: "$$key".to_string(),
+        ty: Some(ScalarType::Int),
+    });
+    let create_outputs = builder_output_types(&create_q, ctx.schema);
+    let temp_idx = ctx.sink(
+        create_q,
+        StatementShape {
+            columns: shape_columns(create_outputs.clone(), |name| name == "$$key"),
+            rows: RowCount::Many,
+        },
+        StatementKind::Temp { name: temp.clone() },
+    );
+    parent.builder = SelectBuilder {
+        select: Vec::new(),
+        from: Some(FromClause::Temp {
+            name: temp.clone(),
+            columns: create_outputs
+                .iter()
+                .map(|(name, ty)| NamedColumn {
+                    name: name.clone(),
+                    ty: *ty,
+                })
+                .collect(),
+        }),
+        where_: Vec::new(),
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        unions: Vec::new(),
+    };
+    parent.stmt_bound = true;
+    let mut arms = arms.into_iter();
+    let mut child_builder = arms.next().unwrap_or_else(|| {
+        unreachable!("temp array without arms: empty arrays are untypeable upstream")
+    });
+    child_builder.unions = arms.collect();
+    let outputs = builder_outputs(&child_builder, ctx.schema);
+    let shape_cols: Vec<OutputColumn> =
+        shape_columns(builder_output_types(&child_builder, ctx.schema), |name| {
+            name == "c0"
+        });
+    let item_ty = match &tail.ty {
+        QueryType::List(sub) => sub.as_ref(),
+        _ => &tail.ty,
+    };
+    let element = child_element(ctx.schema, None, item_ty, &outputs, |name| name == "c0");
+    let idx = ctx.sink(
+        child_builder,
+        StatementShape {
+            columns: shape_cols,
+            rows: RowCount::Many,
+        },
+        StatementKind::Query,
+    );
+    (
+        ResultShape::List {
+            element: Box::new(element),
+            child: ChildRef {
+                stmt: idx,
+                parent: Some(ParentRef {
+                    stmt: temp_idx,
+                    parent_key: "$$key".to_string(),
+                    child_key: "c0".to_string(),
+                }),
+                cardinality: Cardinality::Many,
+                tag: None,
+            },
+        },
+        Some("$$key".to_string()),
+    )
 }
 
 fn filter_chain_to_field_ident(mut node: &TypedExpr) -> bool {
@@ -4228,6 +4469,36 @@ fn scalar_ident(ctx: &mut Context, binding: &IdentBinding, depth: usize) -> SqlE
             return scalar_ident_temp(ctx, binding);
         }
         todo!("M4b temp-bound per-row limit");
+    }
+    if depth == 0 && ctx.in_array_temp {
+        match binding {
+            IdentBinding::Field(fid) => {
+                let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
+                match field {
+                    Field::Value { columns, .. } => match columns.as_slice() {
+                        [col] => {
+                            let column = ctx.schema.column_name(*col).to_string();
+                            record_temp_ref(ctx, &column);
+                            return SqlExpr::Column { depth: 0, column };
+                        }
+                        _ => unreachable!(
+                            "tuple field ident in temp array: readability gates tuple-typed idents"
+                        ),
+                    },
+                    _ => unreachable!(
+                        "non-value field ident in temp array: readability gates non-scalar idents"
+                    ),
+                }
+            }
+            IdentBinding::ProjectedField { name } => {
+                record_temp_ref(ctx, name);
+                return SqlExpr::Column {
+                    depth: 0,
+                    column: name.clone(),
+                };
+            }
+            _ => {}
+        }
     }
     if depth > 0 {
         if ctx.temp_collect.is_some() {
@@ -5977,6 +6248,13 @@ fn register_literal_level<'a>(
     inner: &QueryType,
     items: Vec<(&'a TypedExpr, Option<i64>)>,
 ) -> Vec<LitLevel> {
+    if ctx.temp_collect.is_none()
+        && items
+            .iter()
+            .any(|(elem, _)| has_scope_ident(elem) || uses_outer(elem))
+    {
+        todo!("M6 correlated literal outside temp lane");
+    }
     match peel_optional(inner) {
         QueryType::List(sub) => {
             let sub = peel_optional(sub);
@@ -6227,6 +6505,53 @@ fn array_tail_root(mut tail: &TypedExpr) -> bool {
             _ => return false,
         }
     }
+}
+
+fn array_has_list_leaf(ty: &QueryType) -> bool {
+    match peel_optional(ty) {
+        QueryType::List(_) => true,
+        QueryType::Tuple(tys) => tys.iter().any(array_has_list_leaf),
+        QueryType::Record(RecordSource::Projection(fields)) => {
+            fields.iter().any(|field| array_has_list_leaf(&field.ty))
+        }
+        _ => false,
+    }
+}
+
+fn temp_readable_element(elem: &TypedExpr) -> bool {
+    fn go(elem: &TypedExpr, under_row: bool) -> bool {
+        match &elem.kind {
+            TypedExprKind::Ident { binding, depth, .. } => match binding {
+                IdentBinding::Root { .. } => true,
+                IdentBinding::Field(_) | IdentBinding::ProjectedField { .. } => {
+                    !under_row && *depth == 0 && scalar_of(&elem.ty).is_some()
+                }
+                IdentBinding::Prev { .. } => false,
+            },
+            TypedExprKind::Field { base, .. } => go(base, true),
+            TypedExprKind::Method { base, args, .. } => {
+                go(base, true) && args.iter().all(|arg| go(&arg.expr, true))
+            }
+            TypedExprKind::Projection { base, items } => {
+                go(base, true) && items.iter().all(|item| go(&item.value, true))
+            }
+            TypedExprKind::Tuple { elements } | TypedExprKind::Array { elements } => {
+                elements.iter().all(|e| go(e, under_row))
+            }
+            TypedExprKind::Struct { fields } => fields.iter().all(|(_, e)| go(e, under_row)),
+            TypedExprKind::Binary { lhs, rhs, .. } => go(lhs, under_row) && go(rhs, under_row),
+            TypedExprKind::Unary { expr, .. }
+            | TypedExprKind::Cast { expr, .. }
+            | TypedExprKind::Some { value: expr } => go(expr, under_row),
+            TypedExprKind::If { arms, default } => {
+                arms.iter()
+                    .all(|(cond, then)| go(cond, under_row) && go(then, under_row))
+                    && go(default, under_row)
+            }
+            TypedExprKind::Literal(_) | TypedExprKind::TypeConstant { .. } => true,
+        }
+    }
+    go(elem, false)
 }
 
 struct IfArm {

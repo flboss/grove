@@ -278,12 +278,15 @@ fn render_expr(
             order,
         } => {
             sql.push_str(&quote(func));
-            sql.push_str("() OVER (PARTITION BY ");
-            for (i, part) in partition.iter().enumerate() {
-                if i > 0 {
-                    sql.push_str(", ");
+            sql.push_str("() OVER (");
+            if !partition.is_empty() {
+                sql.push_str("PARTITION BY ");
+                for (i, part) in partition.iter().enumerate() {
+                    if i > 0 {
+                        sql.push_str(", ");
+                    }
+                    render_expr(part, stack, false, sql, params);
                 }
-                render_expr(part, stack, false, sql, params);
             }
             if !order.is_empty() {
                 sql.push_str(" ORDER BY ");
