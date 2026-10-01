@@ -1141,6 +1141,62 @@ fn slice_navigated_arrays() {
 }
 
 #[test]
+fn slice_temp_method_chains() {
+    assert_eq!(
+        value("users { x = [{a = age}, {a = age + 1}].filter(true).take(1) }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![rec(&[("a", Value::Int(30))])]))]),
+            rec(&[("x", Value::List(vec![rec(&[("a", Value::Int(40))])]))]),
+            rec(&[("x", Value::List(vec![rec(&[("a", Value::Int(50))])]))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [age, age + 1, age + 2].sort_desc(age).take(1) }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![Value::Int(32)]))]),
+            rec(&[("x", Value::List(vec![Value::Int(42)]))]),
+            rec(&[("x", Value::List(vec![Value::Int(52)]))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [age, age + 1, age + 2].take(2).len() }"),
+        Value::List(vec![
+            rec(&[("x", Value::Int(2))]),
+            rec(&[("x", Value::Int(2))]),
+            rec(&[("x", Value::Int(2))]),
+        ])
+    );
+}
+
+#[test]
+fn slice_chained_scalar_temp() {
+    assert_eq!(
+        value("users { x = [age, age + 1, age + 2].take(2).sum() }"),
+        Value::List(vec![
+            rec(&[("x", Value::Int(61))]),
+            rec(&[("x", Value::Int(81))]),
+            rec(&[("x", Value::Int(101))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [age + 2, age].sort_asc(age).first() }"),
+        Value::List(vec![
+            rec(&[("x", Value::Int(30))]),
+            rec(&[("x", Value::Int(40))]),
+            rec(&[("x", Value::Int(50))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [age, age + 1, age + 2].take(2).max() }"),
+        Value::List(vec![
+            rec(&[("x", Value::Int(31))]),
+            rec(&[("x", Value::Int(41))]),
+            rec(&[("x", Value::Int(51))]),
+        ])
+    );
+}
+
+#[test]
 fn slice_composite_roots() {
     assert_eq!(
         value("{ xs = [[1]] }"),

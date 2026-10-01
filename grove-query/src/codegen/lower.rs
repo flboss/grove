@@ -2563,12 +2563,14 @@ fn rvalue_shape(
             if matches!(tail.kind, TypedExprKind::Array { .. }) {
                 return rtemp_array_shape(ctx, parent, tail);
             }
+            if let Some((_, methods)) = peel_row_ops(tail)
+                && !methods.is_empty()
+            {
+                return rtemp_method_shape(ctx, parent, tail);
+            }
             if let TypedExprKind::Method { base, name, .. } = &tail.kind
                 && matches!(base.kind, TypedExprKind::Array { .. })
-                && matches!(
-                    name.value.as_str(),
-                    "take" | "skip" | "sort" | "sort_asc" | "sort_desc" | "filter" | "flatten"
-                )
+                && name.value == "flatten"
             {
                 return rtemp_method_shape(ctx, parent, tail);
             }
@@ -3389,6 +3391,55 @@ fn temp_branch_arms<'a>(
     (arms, sub_items)
 }
 
+fn peel_row_ops<'a>(mut node: &'a TypedExpr) -> Option<(&'a TypedExpr, Vec<EntryMethod<'a>>)> {
+    let mut methods = Vec::new();
+    let mut sorted = false;
+    loop {
+        match &node.kind {
+            TypedExprKind::Method {
+                base, name, args, ..
+            } => {
+                let entry = match name.value.as_str() {
+                    "take" | "skip" => {
+                        if sorted {
+                            return None;
+                        }
+                        EntryMethod::TakeSkip {
+                            name: name.value.clone(),
+                            args,
+                        }
+                    }
+                    "sort" | "sort_asc" | "sort_desc" => {
+                        sorted = true;
+                        EntryMethod::Sort {
+                            args,
+                            default: if name.value == "sort_desc" {
+                                OrderDir::Desc
+                            } else {
+                                OrderDir::Asc
+                            },
+                        }
+                    }
+                    "filter" => {
+                        sorted = true;
+                        EntryMethod::Filter {
+                            pred: one_arg(args, name),
+                        }
+                    }
+                    _ => return None,
+                };
+                methods.push(entry);
+                node = base;
+            }
+            TypedExprKind::Array { .. } => {
+                methods.reverse();
+                return Some((node, methods));
+            }
+            _ => return None,
+        }
+    }
+}
+
 enum EntryMethod<'a> {
     TakeSkip {
         name: String,
@@ -3456,10 +3507,10 @@ fn temp_array_level<'a>(
     refs: &[(String, Option<ScalarType>)],
     elem_ty: &QueryType,
     items: Vec<(Option<i64>, &'a TypedExpr)>,
-    method: Option<EntryMethod<'a>>,
+    methods: Vec<EntryMethod<'a>>,
 ) -> (ResultShape, ChildRef) {
     if !array_has_list_leaf(elem_ty) {
-        return temp_leaf_level(ctx, temp, temp_idx, elem_ty, items, method);
+        return temp_leaf_level(ctx, temp, temp_idx, elem_ty, items, methods);
     }
     let mut next_col = 2usize;
     let plan = branch_plan(elem_ty, &mut next_col);
@@ -3470,14 +3521,14 @@ fn temp_array_level<'a>(
     branch_value_cols(&plan, &mut value_cols);
     let (arms, sub_items) = temp_branch_arms(ctx, temp, refs, &plan, &value_cols, &items);
     let mut union = union_builders(arms);
-    if let Some(m) = method {
+    for m in methods {
         union = apply_entry_method(ctx, m, union, elem_ty);
     }
     let (next_temp, next_idx) = sink_arm_temp(ctx, union);
     let sub = branch_nested_sub(&plan)
         .unwrap_or_else(|| unreachable!("branch without nested slot: multi-list is gated upfront"));
     let (sub_element, sub_child) =
-        temp_array_level(ctx, &next_temp, next_idx, refs, &sub, sub_items, None);
+        temp_array_level(ctx, &next_temp, next_idx, refs, &sub, sub_items, Vec::new());
     let element = shape_branch_plan(&plan, Some((&sub_element, &sub_child)));
     let child = ChildRef {
         stmt: next_idx,
@@ -3559,11 +3610,11 @@ fn temp_leaf_level(
     temp_idx: usize,
     elem_ty: &QueryType,
     items: Vec<(Option<i64>, &TypedExpr)>,
-    method: Option<EntryMethod>,
+    methods: Vec<EntryMethod>,
 ) -> (ResultShape, ChildRef) {
     let arms = temp_leaf_arms(ctx, temp, elem_ty, &items);
     let mut union = union_builders(arms);
-    if let Some(m) = method {
+    for m in methods {
         union = apply_entry_method(ctx, m, union, elem_ty);
     }
     let child_builder = union;
@@ -3717,7 +3768,8 @@ fn rtemp_array_shape(
     });
     ctx.in_array_temp = true;
     let items: Vec<(Option<i64>, &TypedExpr)> = elements.iter().map(|e| (None, e)).collect();
-    let (element, child) = temp_array_level(ctx, &temp, temp_idx, &ref_tys, inner, items, None);
+    let (element, child) =
+        temp_array_level(ctx, &temp, temp_idx, &ref_tys, inner, items, Vec::new());
     ctx.in_array_temp = false;
     ctx.temp_collect.take();
     (
@@ -3734,22 +3786,26 @@ fn rtemp_method_shape(
     parent: &mut Level,
     tail: &TypedExpr,
 ) -> (ResultShape, Option<String>) {
-    let TypedExprKind::Method {
-        base, name, args, ..
-    } = &tail.kind
-    else {
-        unreachable!("rtemp method over non-method tail: the rvalue gate admits method tails only")
+    let (array, methods): (&TypedExpr, Vec<EntryMethod>) = match &tail.kind {
+        TypedExprKind::Method { base, name, .. } if name.value == "flatten" => {
+            let TypedExprKind::Array { .. } = &base.kind else {
+                todo!("M6 correlated literal projection item");
+            };
+            (base.as_ref(), Vec::new())
+        }
+        _ => match peel_row_ops(tail) {
+            Some((array, methods)) if !methods.is_empty() => (array, methods),
+            _ => todo!("M6 correlated literal projection item"),
+        },
     };
-    let TypedExprKind::Array { elements } = &base.kind else {
-        unreachable!(
-            "rtemp method over non-array base: the rvalue gate admits methods over bare arrays only"
-        )
+    let TypedExprKind::Array { elements } = &array.kind else {
+        unreachable!("peeled chain bottom is always the bare array")
     };
-    let inner = match &base.ty {
+    let inner = match &array.ty {
         QueryType::List(inner) => inner.as_ref(),
         _ => unreachable!(
             "non-list array type {}: the checker types arrays as lists",
-            base.ty
+            array.ty
         ),
     };
     if !temp_nest_ok(inner) {
@@ -3779,33 +3835,10 @@ fn rtemp_method_shape(
     });
     ctx.in_array_temp = true;
     let items: Vec<(Option<i64>, &TypedExpr)> = elements.iter().map(|e| (None, e)).collect();
-    let (element, child) = match name.value.as_str() {
-        "flatten" => temp_flatten_level(ctx, &temp, temp_idx, &ref_tys, inner, items),
-        method @ ("take" | "skip") => {
-            let entry = EntryMethod::TakeSkip {
-                name: method.to_string(),
-                args,
-            };
-            temp_array_level(ctx, &temp, temp_idx, &ref_tys, inner, items, Some(entry))
-        }
-        method @ ("sort" | "sort_asc" | "sort_desc") => {
-            let entry = EntryMethod::Sort {
-                args,
-                default: if method == "sort_desc" {
-                    OrderDir::Desc
-                } else {
-                    OrderDir::Asc
-                },
-            };
-            temp_array_level(ctx, &temp, temp_idx, &ref_tys, inner, items, Some(entry))
-        }
-        "filter" => {
-            let entry = EntryMethod::Filter {
-                pred: one_arg(args, name),
-            };
-            temp_array_level(ctx, &temp, temp_idx, &ref_tys, inner, items, Some(entry))
-        }
-        _ => unreachable!("rtemp method outside the gate allowlist: gates admit row-ops only"),
+    let (element, child) = if methods.is_empty() {
+        temp_flatten_level(ctx, &temp, temp_idx, &ref_tys, inner, items)
+    } else {
+        temp_array_level(ctx, &temp, temp_idx, &ref_tys, inner, items, methods)
     };
     ctx.in_array_temp = false;
     ctx.temp_collect.take();
@@ -3954,10 +3987,17 @@ fn scalar_temp_array(
     ) {
         return None;
     }
-    let TypedExprKind::Array { elements } = &base.kind else {
-        return None;
+    let (array, methods): (&TypedExpr, Vec<EntryMethod>) = match &base.kind {
+        TypedExprKind::Array { .. } => (base, Vec::new()),
+        _ => match peel_row_ops(base) {
+            Some((array, methods)) if !methods.is_empty() => (array, methods),
+            _ => return None,
+        },
     };
-    let inner = match &base.ty {
+    let TypedExprKind::Array { elements } = &array.kind else {
+        unreachable!("peeled chain bottom is always the bare array")
+    };
+    let inner = match &array.ty {
         QueryType::List(inner) => inner.as_ref(),
         _ => return None,
     };
@@ -3996,9 +4036,13 @@ fn scalar_temp_array(
     ctx.in_array_temp = true;
     let items: Vec<(Option<i64>, &TypedExpr)> = elements.iter().map(|e| (None, e)).collect();
     let arms = temp_leaf_arms(ctx, &temp, inner, &items);
+    let mut union = union_builders(arms);
+    for m in methods {
+        union = apply_entry_method(ctx, m, union, inner);
+    }
     let inner_alias = ctx.aliases.subquery();
     let inner_from = FromClause::Subquery {
-        query: Box::new(union_builders(arms)),
+        query: Box::new(union),
         alias: inner_alias,
     };
     let key_pred = || SqlExpr::Binary {
