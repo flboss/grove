@@ -80,6 +80,12 @@ pub enum FromClause {
         columns: Vec<NamedColumn>,
         middle_parts: Option<Vec<MiddlePart>>,
     },
+    Computed {
+        query: Box<SelectBuilder>,
+        alias: String,
+        columns: Vec<NamedColumn>,
+        middle_parts: Option<Vec<MiddlePart>>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -101,7 +107,9 @@ pub enum MiddlePart {
 impl FromClause {
     pub fn alias(&self) -> &str {
         match self {
-            FromClause::Table { alias, .. } | FromClause::Subquery { alias, .. } => alias,
+            FromClause::Table { alias, .. }
+            | FromClause::Subquery { alias, .. }
+            | FromClause::Computed { alias, .. } => alias,
             FromClause::TableFunction { name } => name,
             FromClause::Temp { name, .. } => name,
             FromClause::Literal { id, .. } => id,

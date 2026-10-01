@@ -132,6 +132,12 @@ fn render_from(
             sql.push_str("') AS ");
             sql.push_str(&quote(id));
         }
+        FromClause::Computed { query, alias, .. } => {
+            sql.push('(');
+            render_select(query, stack, sql, params);
+            sql.push_str(") AS ");
+            sql.push_str(&quote(alias));
+        }
     }
 }
 

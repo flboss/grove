@@ -672,6 +672,11 @@ fn merge_builder(
         columns,
         middle_parts,
         ..
+    }
+    | FromClause::Computed {
+        columns,
+        middle_parts,
+        ..
     } = &child_from
     {
         if middle_parts
@@ -1874,6 +1879,17 @@ fn shift_builder(mut builder: SelectBuilder, by: usize) -> SelectBuilder {
                 query: Box::new(shift_builder(*query, by)),
                 alias,
             },
+            FromClause::Computed {
+                query,
+                alias,
+                columns,
+                middle_parts,
+            } => FromClause::Computed {
+                query: Box::new(shift_builder(*query, by)),
+                alias,
+                columns,
+                middle_parts,
+            },
         });
     }
     builder
@@ -1917,7 +1933,8 @@ fn available_cols(builder: &SelectBuilder, schema: &ValidatedSchema) -> Vec<Stri
             Some(FromClause::Temp { columns, .. }) => {
                 columns.iter().map(|c| c.name.clone()).collect()
             }
-            Some(FromClause::Literal { columns, .. }) => {
+            Some(FromClause::Literal { columns, .. })
+            | Some(FromClause::Computed { columns, .. }) => {
                 columns.iter().map(|c| c.name.clone()).collect()
             }
             Some(FromClause::TableFunction { .. }) => vec!["value".to_string()],
@@ -3460,7 +3477,7 @@ fn from_columns(from: &Option<FromClause>, schema: &ValidatedSchema) -> Vec<Stri
         Some(FromClause::Subquery { query, .. }) => builder_outputs(query, schema),
         Some(FromClause::TableFunction { .. }) => vec!["value".to_string()],
         Some(FromClause::Temp { columns, .. }) => columns.iter().map(|c| c.name.clone()).collect(),
-        Some(FromClause::Literal { columns, .. }) => {
+        Some(FromClause::Literal { columns, .. }) | Some(FromClause::Computed { columns, .. }) => {
             columns.iter().map(|c| c.name.clone()).collect()
         }
         None => unreachable!("row pipeline without FROM"),
@@ -3538,7 +3555,7 @@ fn from_columns_typed(
         Some(FromClause::Temp { columns, .. }) => {
             columns.iter().map(|c| (c.name.clone(), c.ty)).collect()
         }
-        Some(FromClause::Literal { columns, .. }) => {
+        Some(FromClause::Literal { columns, .. }) | Some(FromClause::Computed { columns, .. }) => {
             columns.iter().map(|c| (c.name.clone(), c.ty)).collect()
         }
         None => unreachable!("row pipeline without FROM"),
@@ -5140,20 +5157,35 @@ fn scalar_cast(operand: SqlExpr, from: &QueryType, target: TypeName) -> SqlExpr 
 
 
 struct LitLevel {
-    id: String,
-    module: String,
+    source: LitSource,
     columns: Vec<NamedColumn>,
     middle_parts: Option<Vec<MiddlePart>>,
     own_key: Option<String>,
 }
 
+enum LitSource {
+    Grid { module: String, id: String },
+    Computed {
+        query: Box<SelectBuilder>,
+        alias: String,
+    },
+}
+
 impl LitLevel {
     fn to_from_clause(&self) -> FromClause {
-        FromClause::Literal {
-            module: self.module.clone(),
-            id: self.id.clone(),
-            columns: self.columns.clone(),
-            middle_parts: self.middle_parts.clone(),
+        match &self.source {
+            LitSource::Grid { module, id } => FromClause::Literal {
+                module: module.clone(),
+                id: id.clone(),
+                columns: self.columns.clone(),
+                middle_parts: self.middle_parts.clone(),
+            },
+            LitSource::Computed { query, alias } => FromClause::Computed {
+                query: query.clone(),
+                alias: alias.clone(),
+                columns: self.columns.clone(),
+                middle_parts: self.middle_parts.clone(),
+            },
         }
     }
 }
@@ -5228,41 +5260,22 @@ fn leaf_value_tys(inner: &QueryType) -> Vec<ScalarType> {
     }
 }
 
-fn fold_static(elem: &TypedExpr) -> ParamValue {
-    match &elem.kind {
+fn try_fold_static(elem: &TypedExpr) -> Option<ParamValue> {
+    let node = peel_some(elem);
+    match &node.kind {
         TypedExprKind::Literal(lit) => match &lit.value {
-            Literal::Int(n) => ParamValue::Int(*n),
-            Literal::Float(f) => ParamValue::Float(*f),
-            Literal::Dec(d) => ParamValue::Dec(*d),
-            Literal::String(s) => ParamValue::String(s.clone()),
-            Literal::Bool(b) => ParamValue::Bool(*b),
-            Literal::Instant(t) => ParamValue::Instant(*t),
-            Literal::Duration(d) => ParamValue::Duration(*d),
-            Literal::None => ParamValue::Null,
-            Literal::Now | Literal::Today(_) => todo!("M6 computed array elements"),
+            Literal::Int(n) => Some(ParamValue::Int(*n)),
+            Literal::Float(f) => Some(ParamValue::Float(*f)),
+            Literal::Dec(d) => Some(ParamValue::Dec(*d)),
+            Literal::String(s) => Some(ParamValue::String(s.clone())),
+            Literal::Bool(b) => Some(ParamValue::Bool(*b)),
+            Literal::Instant(t) => Some(ParamValue::Instant(*t)),
+            Literal::Duration(d) => Some(ParamValue::Duration(*d)),
+            Literal::None => Some(ParamValue::Null),
+            Literal::Now | Literal::Today(_) => None,
         },
-        TypedExprKind::TypeConstant { ty, name } => const_value(ty.value, name.value),
-        TypedExprKind::Unary { op, expr } => match op.value {
-            UnaryOp::Neg => match fold_static(expr) {
-                ParamValue::Int(n) => ParamValue::Int(
-                    n.checked_neg()
-                        .unwrap_or_else(|| todo!("M6 negated literal overflow")),
-                ),
-                ParamValue::Float(f) => ParamValue::Float(-f),
-                ParamValue::Dec(d) => ParamValue::Dec(-d),
-                ParamValue::Duration(d) => ParamValue::Duration(
-                    d.checked_mul(-1)
-                        .unwrap_or_else(|| todo!("M6 negated literal overflow")),
-                ),
-                _ => todo!("M6 computed array elements"),
-            },
-            UnaryOp::Not => match fold_static(expr) {
-                ParamValue::Bool(b) => ParamValue::Bool(!b),
-                _ => todo!("M6 computed array elements"),
-            },
-        },
-        TypedExprKind::Some { value } => fold_static(value),
-        _ => todo!("M6 computed array elements"),
+        TypedExprKind::TypeConstant { ty, name } => Some(const_value(ty.value, name.value)),
+        _ => None,
     }
 }
 
@@ -5274,6 +5287,101 @@ fn const_value(ty: TypeName, name: ConstantName) -> ParamValue {
         (TypeName::Float, ConstantName::Max) => ParamValue::Float(f64::MAX),
         (TypeName::Dec, ConstantName::Min) => ParamValue::Dec(rust_decimal::Decimal::MIN),
         (TypeName::Dec, ConstantName::Max) => ParamValue::Dec(rust_decimal::Decimal::MAX),
+    }
+}
+
+fn cells_fold(plan: &PlanNode, elem: &TypedExpr) -> bool {
+    let node = peel_some(elem);
+    if let TypedExprKind::Literal(lit) = &node.kind
+        && matches!(&lit.value, Literal::None)
+    {
+        return true;
+    }
+    match (plan, &node.kind) {
+        (PlanNode::Scalar(_), _) => try_fold_static(node).is_some(),
+        (PlanNode::List(_), _) => true,
+        (PlanNode::Tuple(ps), TypedExprKind::Tuple { elements }) => {
+            if elements.len() != ps.len() {
+                unreachable!("tuple arity drift: the checker unifies tuple arity");
+            }
+            ps.iter()
+                .zip(elements.iter())
+                .all(|(p, e)| cells_fold(p, e))
+        }
+        (PlanNode::Record(fs), TypedExprKind::Struct { fields }) => {
+            fs.iter().all(|(name, p)| {
+                let (_, e) = fields
+                    .iter()
+                    .find(|(fname, _)| fname.value == *name)
+                    .unwrap_or_else(|| {
+                        unreachable!(
+                            "record field {name} vanished after checking: unification matches field sets"
+                        )
+                    });
+                cells_fold(p, e)
+            })
+        }
+        _ => false,
+    }
+}
+
+fn middle_folds(plans: &[(Option<String>, PlanNode)], elem: &TypedExpr) -> bool {
+    let node = peel_some(elem);
+    if let TypedExprKind::Literal(lit) = &node.kind
+        && matches!(&lit.value, Literal::None)
+    {
+        return true;
+    }
+    match &node.kind {
+        TypedExprKind::Tuple { elements } => {
+            if elements.len() != plans.len() {
+                unreachable!("tuple arity drift: the checker unifies tuple arity");
+            }
+            plans
+                .iter()
+                .zip(elements.iter())
+                .all(|((_, plan), e)| cells_fold(plan, e))
+        }
+        TypedExprKind::Struct { fields } => {
+            if fields.len() != plans.len() {
+                unreachable!("record arity drift: checking unifies struct field sets");
+            }
+            plans.iter().all(|(name, plan)| {
+                let name = name.as_ref().unwrap_or_else(|| {
+                    unreachable!(
+                        "record plan without field names: planning names every record field"
+                    )
+                });
+                let (_, e) = fields
+                    .iter()
+                    .find(|(fname, _)| fname.value == *name)
+                    .unwrap_or_else(|| {
+                        unreachable!(
+                            "record field {name} vanished after checking: unification matches field sets"
+                        )
+                    });
+                cells_fold(plan, e)
+            })
+        }
+        _ => false,
+    }
+}
+
+fn leaf_folds(elem: &TypedExpr, inner: &QueryType) -> bool {
+    let node = peel_some(elem);
+    if let TypedExprKind::Literal(lit) = &node.kind
+        && matches!(&lit.value, Literal::None)
+    {
+        return true;
+    }
+    match peel_optional(inner) {
+        QueryType::Tuple(_) => match &node.kind {
+            TypedExprKind::Tuple { elements } => {
+                elements.iter().all(|e| try_fold_static(e).is_some())
+            }
+            _ => false,
+        },
+        _ => try_fold_static(node).is_some(),
     }
 }
 
@@ -5389,27 +5497,54 @@ fn register_composite_middle<'a>(
         sig.push('I');
     }
     push_sig(&plans, &mut sig);
-    let module = format!("$$lit_{}_{sig}", columns.len());
-    let id = ctx.aliases.literal();
-    let mut grid: Vec<Vec<ParamValue>> = Vec::with_capacity(items.len());
-    for (i, (elem, pkey)) in items.iter().enumerate() {
-        let mut row = Vec::with_capacity(columns.len());
-        if let Some(p) = pkey {
-            row.push(ParamValue::Int(*p));
+    let own_key = chained.then(|| format!("c{}", usize::from(keyed)));
+    let source = if items.iter().all(|(elem, _)| middle_folds(&plans, elem)) {
+        let module = format!("$$lit_{}_{sig}", columns.len());
+        let id = ctx.aliases.literal();
+        let mut grid: Vec<Vec<ParamValue>> = Vec::with_capacity(items.len());
+        for (i, (elem, pkey)) in items.iter().enumerate() {
+            let mut row = Vec::with_capacity(columns.len());
+            if let Some(p) = pkey {
+                row.push(ParamValue::Int(*p));
+            }
+            if chained {
+                row.push(ParamValue::Int(i as i64));
+            }
+            push_row_cells(&plans, elem, &mut row);
+            grid.push(row);
         }
-        if chained {
-            row.push(ParamValue::Int(i as i64));
+        ctx.literals.insert(id.clone(), grid);
+        LitSource::Grid { module, id }
+    } else {
+        let mut arms: Vec<SelectBuilder> = Vec::with_capacity(items.len());
+        for (i, (elem, pkey)) in items.iter().enumerate() {
+            let mut exprs = Vec::with_capacity(columns.len());
+            if let Some(p) = pkey {
+                exprs.push(SqlExpr::Param(ParamValue::Int(*p)));
+            }
+            if chained {
+                exprs.push(SqlExpr::Param(ParamValue::Int(i as i64)));
+            }
+            let mut cells = Vec::new();
+            push_computed_row_cells(ctx, &plans, elem, &mut cells);
+            exprs.extend(cells.into_iter().map(|(expr, _)| expr));
+            arms.push(computed_arm(&columns, exprs));
         }
-        push_row_cells(&plans, elem, &mut row);
-        grid.push(row);
-    }
-    ctx.literals.insert(id.clone(), grid);
+        let mut arms = arms.into_iter();
+        let mut query = arms.next().unwrap_or_else(|| {
+            unreachable!("computed level without arms: empty item sets stay grids")
+        });
+        query.unions = arms.collect();
+        LitSource::Computed {
+            query: Box::new(query),
+            alias: ctx.aliases.literal(),
+        }
+    };
     let mut chain = vec![LitLevel {
-        id,
-        module,
+        source,
         columns,
         middle_parts: Some(parts),
-        own_key: chained.then(|| format!("c{}", usize::from(keyed))),
+        own_key,
     }];
     if chained {
         let mut chain_ty: Option<QueryType> = None;
@@ -5526,7 +5661,11 @@ fn push_cells(plan: &PlanNode, elem: &TypedExpr, out: &mut Vec<ParamValue>) {
         return;
     }
     match (plan, &node.kind) {
-        (PlanNode::Scalar(_), _) => out.push(fold_static(node)),
+        (PlanNode::Scalar(_), _) => {
+            out.push(try_fold_static(node).unwrap_or_else(|| {
+                unreachable!("grid cell refused to fold after eligibility passed")
+            }))
+        }
         (PlanNode::List(_), _) => {}
         (PlanNode::Tuple(ps), TypedExprKind::Tuple { elements }) => {
             if elements.len() != ps.len() {
@@ -5550,6 +5689,153 @@ fn push_cells(plan: &PlanNode, elem: &TypedExpr, out: &mut Vec<ParamValue>) {
             }
         }
         _ => todo!("M6 query-valued array element"),
+    }
+}
+
+fn push_computed_row_cells(
+    ctx: &mut Context,
+    plans: &[(Option<String>, PlanNode)],
+    elem: &TypedExpr,
+    out: &mut Vec<(SqlExpr, Option<ScalarType>)>,
+) {
+    let leaves: usize = plans.iter().map(|(_, plan)| plan_leaves(plan)).sum();
+    let node = peel_some(elem);
+    if let TypedExprKind::Literal(lit) = &node.kind
+        && matches!(&lit.value, Literal::None)
+    {
+        out.extend(std::iter::repeat_n(
+            (SqlExpr::Param(ParamValue::Null), None),
+            leaves,
+        ));
+        return;
+    }
+    match &node.kind {
+        TypedExprKind::Tuple { elements } => {
+            if elements.len() != plans.len() {
+                unreachable!("tuple arity drift: the checker unifies tuple arity");
+            }
+            for ((_, plan), e) in plans.iter().zip(elements.iter()) {
+                push_computed_cells(ctx, plan, e, out);
+            }
+        }
+        TypedExprKind::Struct { fields } => {
+            if fields.len() != plans.len() {
+                unreachable!("record arity drift: checking unifies struct field sets");
+            }
+            for (name, plan) in plans.iter() {
+                let name = name.as_ref().unwrap_or_else(|| {
+                    unreachable!(
+                        "record plan without field names: planning names every record field"
+                    )
+                });
+                let (_, e) = fields
+                    .iter()
+                    .find(|(fname, _)| fname.value == *name)
+                    .unwrap_or_else(|| {
+                        unreachable!(
+                            "record field {name} vanished after checking: unification matches field sets"
+                        )
+                    });
+                push_computed_cells(ctx, plan, e, out);
+            }
+        }
+        _ => todo!("M6 query-valued array element"),
+    }
+}
+
+fn push_computed_cells(
+    ctx: &mut Context,
+    plan: &PlanNode,
+    elem: &TypedExpr,
+    out: &mut Vec<(SqlExpr, Option<ScalarType>)>,
+) {
+    let node = peel_some(elem);
+    if let TypedExprKind::Literal(lit) = &node.kind
+        && matches!(&lit.value, Literal::None)
+    {
+        out.extend(std::iter::repeat_n(
+            (SqlExpr::Param(ParamValue::Null), None),
+            plan_leaves(plan),
+        ));
+        return;
+    }
+    match (plan, &node.kind) {
+        (PlanNode::Scalar(s), _) => out.push((scalar(ctx, node), Some(*s))),
+        (PlanNode::List(_), _) => {}
+        (PlanNode::Tuple(ps), TypedExprKind::Tuple { elements }) => {
+            if elements.len() != ps.len() {
+                unreachable!("tuple arity drift: the checker unifies tuple arity");
+            }
+            for (p, e) in ps.iter().zip(elements.iter()) {
+                push_computed_cells(ctx, p, e, out);
+            }
+        }
+        (PlanNode::Record(fs), TypedExprKind::Struct { fields }) => {
+            for (name, p) in fs {
+                let (_, e) = fields
+                    .iter()
+                    .find(|(fname, _)| fname.value == *name)
+                    .unwrap_or_else(|| {
+                        unreachable!(
+                            "record field {name} vanished after checking: unification matches field sets"
+                        )
+                    });
+                push_computed_cells(ctx, p, e, out);
+            }
+        }
+        _ => todo!("M6 query-valued array element"),
+    }
+}
+
+fn leaf_computed_cells(
+    ctx: &mut Context,
+    elem: &TypedExpr,
+    inner: &QueryType,
+) -> Vec<(SqlExpr, Option<ScalarType>)> {
+    let node = peel_some(elem);
+    if let TypedExprKind::Literal(lit) = &node.kind
+        && matches!(&lit.value, Literal::None)
+    {
+        let width = leaf_value_tys(inner).len();
+        return vec![(SqlExpr::Param(ParamValue::Null), None); width];
+    }
+    match peel_optional(inner) {
+        QueryType::Tuple(tys) => match &node.kind {
+            TypedExprKind::Tuple { elements } => elements
+                .iter()
+                .zip(tys.iter())
+                .map(|(e, ty)| (scalar(ctx, e), scalar_of(ty)))
+                .collect(),
+            _ => todo!("M6 computed array elements"),
+        },
+        _ => vec![(scalar(ctx, node), scalar_of(inner))],
+    }
+}
+
+fn computed_arm(columns: &[NamedColumn], exprs: Vec<SqlExpr>) -> SelectBuilder {
+    if exprs.len() != columns.len() {
+        unreachable!(
+            "computed arm arity drift: {} expressions for {} served columns",
+            exprs.len(),
+            columns.len()
+        );
+    }
+    SelectBuilder {
+        select: exprs
+            .into_iter()
+            .zip(columns.iter())
+            .map(|(expr, column)| SelectItem::Expr {
+                expr,
+                output: column.name.clone(),
+                ty: column.ty,
+            })
+            .collect(),
+        from: None,
+        where_: Vec::new(),
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        unions: Vec::new(),
     }
 }
 
@@ -5673,12 +5959,16 @@ fn leaf_cells(elem: &TypedExpr, inner: &QueryType, width: usize) -> Vec<ParamVal
     {
         return vec![ParamValue::Null; width];
     }
+    let fold = |e: &TypedExpr| {
+        try_fold_static(e)
+            .unwrap_or_else(|| unreachable!("grid cell refused to fold after eligibility passed"))
+    };
     match peel_optional(inner) {
         QueryType::Tuple(_) => match &node.kind {
-            TypedExprKind::Tuple { elements } => elements.iter().map(fold_static).collect(),
+            TypedExprKind::Tuple { elements } => elements.iter().map(fold).collect(),
             _ => todo!("M6 computed array elements"),
         },
-        _ => vec![fold_static(node)],
+        _ => vec![fold(node)],
     }
 }
 
@@ -5725,8 +6015,10 @@ fn register_literal_level<'a>(
                     let root_id = ctx.aliases.literal();
                     ctx.literals.insert(root_id.clone(), root_grid);
                     chain.push(LitLevel {
-                        id: root_id,
-                        module: "$$lit_1_I".to_string(),
+                        source: LitSource::Grid {
+                            module: "$$lit_1_I".to_string(),
+                            id: root_id,
+                        },
                         columns: vec![NamedColumn {
                             name: "c0".to_string(),
                             ty: Some(ScalarType::Int),
@@ -5782,8 +6074,7 @@ fn register_literal_level<'a>(
             }
             ctx.literals.insert(id.clone(), grid);
             let mut chain = vec![LitLevel {
-                id,
-                module,
+                source: LitSource::Grid { module, id },
                 columns,
                 middle_parts: None,
                 own_key: None,
@@ -5830,23 +6121,48 @@ fn register_literal_level<'a>(
             for ty in &value_tys {
                 sig.push(sig_letter(*ty));
             }
-            let module = format!("$$lit_{width}_{sig}");
-            let id = ctx.aliases.literal();
-            let grid: Vec<Vec<ParamValue>> = items
-                .iter()
-                .map(|(elem, pkey)| {
-                    let mut row = Vec::with_capacity(width);
+            let source = if items.iter().all(|(elem, _)| leaf_folds(elem, inner)) {
+                let module = format!("$$lit_{width}_{sig}");
+                let id = ctx.aliases.literal();
+                let grid: Vec<Vec<ParamValue>> = items
+                    .iter()
+                    .map(|(elem, pkey)| {
+                        let mut row = Vec::with_capacity(width);
+                        if let Some(p) = pkey {
+                            row.push(ParamValue::Int(*p));
+                        }
+                        row.extend(leaf_cells(elem, inner, value_tys.len()));
+                        row
+                    })
+                    .collect();
+                ctx.literals.insert(id.clone(), grid);
+                LitSource::Grid { module, id }
+            } else {
+                let mut arms: Vec<SelectBuilder> = Vec::with_capacity(items.len());
+                for (elem, pkey) in items.iter() {
+                    let mut exprs = Vec::with_capacity(width);
                     if let Some(p) = pkey {
-                        row.push(ParamValue::Int(*p));
+                        exprs.push(SqlExpr::Param(ParamValue::Int(*p)));
                     }
-                    row.extend(leaf_cells(elem, inner, value_tys.len()));
-                    row
-                })
-                .collect();
-            ctx.literals.insert(id.clone(), grid);
+                    exprs.extend(
+                        leaf_computed_cells(ctx, elem, inner)
+                            .into_iter()
+                            .map(|(expr, _)| expr),
+                    );
+                    arms.push(computed_arm(&columns, exprs));
+                }
+                let mut arms = arms.into_iter();
+                let mut query = arms.next().unwrap_or_else(|| {
+                    unreachable!("computed level without arms: empty item sets stay grids")
+                });
+                query.unions = arms.collect();
+                LitSource::Computed {
+                    query: Box::new(query),
+                    alias: ctx.aliases.literal(),
+                }
+            };
             vec![LitLevel {
-                id,
-                module,
+                source,
                 columns,
                 middle_parts: None,
                 own_key: None,
@@ -6317,7 +6633,10 @@ fn root_composite_element(
             }
             let mut level = rows(ctx, elem);
             if let Some(pending) = level.pending.take() {
-                if matches!(pending.child_from, FromClause::Literal { .. }) {
+                if matches!(
+                    pending.child_from,
+                    FromClause::Literal { .. } | FromClause::Computed { .. }
+                ) {
                     todo!("M7 nested {kind}");
                 }
                 todo!("M7 per-row {kind}");

@@ -723,6 +723,83 @@ fn slice_record_literals() {
 }
 
 #[test]
+fn slice_computed_literals() {
+    assert_eq!(
+        value("[1 + 2, 3]"),
+        Value::List(vec![Value::Int(3), Value::Int(3)])
+    );
+    assert_eq!(value("[\"abc\".len()]"), Value::List(vec![Value::Int(3)]));
+    assert_eq!(
+        value("[[1 + 2]]"),
+        Value::List(vec![Value::List(vec![Value::Int(3)])])
+    );
+    assert_eq!(
+        value("[(20, [1 + 1])]"),
+        Value::List(vec![Value::Tuple(vec![
+            Value::Int(20),
+            Value::List(vec![Value::Int(2)]),
+        ])])
+    );
+    assert_eq!(
+        value("[{a = 1 + 2}]"),
+        Value::List(vec![rec(&[("a", Value::Int(3))])])
+    );
+    assert_eq!(
+        value("[(1, {x = 1 + 2})]"),
+        Value::List(vec![Value::Tuple(vec![
+            Value::Int(1),
+            Value::Record(vec![("x".to_string(), Value::Int(3))]),
+        ])])
+    );
+    assert_eq!(
+        value("[if true {1} else {2}]"),
+        Value::List(vec![Value::Int(1)])
+    );
+    assert_eq!(
+        value("[if false {1} else {2}]"),
+        Value::List(vec![Value::Int(2)])
+    );
+    assert_eq!(value("[(users.name.first())]"), Value::List(vec![s("Ada")]));
+    assert_eq!(value("[1 + 2, 3].sum()"), Value::Int(6));
+    assert_eq!(value("[1 + 1, 2].contains(2)"), Value::Bool(true));
+    assert_eq!(
+        value("[[1 + 2], [3]].flatten()"),
+        Value::List(vec![Value::Int(3), Value::Int(3)])
+    );
+    assert_eq!(
+        value("[1 + 2, 3].take(1)"),
+        Value::List(vec![Value::Int(3)])
+    );
+    assert_eq!(
+        value("users { x = [1 + 2] }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![Value::Int(3)]))]),
+            rec(&[("x", Value::List(vec![Value::Int(3)]))]),
+            rec(&[("x", Value::List(vec![Value::Int(3)]))]),
+        ])
+    );
+    assert_eq!(
+        value("if true { [1 + 2] } else { [3] }"),
+        Value::List(vec![Value::Int(3)])
+    );
+    assert!(matches!(
+        value("[@now]"),
+        Value::List(v) if v.len() == 1 && matches!(&v[0], Value::Instant(_))
+    ));
+}
+
+#[test]
+fn slice_computed_neg_overflow_errors() {
+    let mut rt = fixture();
+    let compiled = compile_q("[-Int::MIN]");
+    let err = rt.execute_value(&compiled).unwrap_err();
+    assert!(
+        matches!(err, grove_runtime::RuntimeError::Step { .. }),
+        "expected execution failure, got {err:?}"
+    );
+}
+
+#[test]
 fn slice_composite_roots() {
     assert_eq!(
         value("{ xs = [[1]] }"),
