@@ -2466,15 +2466,7 @@ fn sink_broadcast_tail(ctx: &mut Context, tail: &TypedExpr) -> (ResultShape, Opt
     let shape = if complete {
         inner
     } else {
-        ResultShape::List {
-            element: Box::new(inner),
-            child: ChildRef {
-                stmt: root_creation,
-                parent: None,
-                cardinality: Cardinality::Many,
-                tag: None,
-            },
-        }
+        unkeyed_attach(inner, root_creation)
     };
     (shape, None)
 }
@@ -3334,14 +3326,11 @@ fn middle_shape(part: &MiddlePart, sub: &Option<ResultShape>) -> ResultShape {
     }
 }
 
-fn emit_split(
-    ctx: &mut Context,
-    parent_builder: SelectBuilder,
-    pending: PendingSplit,
-    root_ty: &QueryType,
-) -> RootPlan {
-    let hops = drain_pending(pending);
-    let mut parent_q = parent_builder;
+fn split_parent_shape(
+    parent_q: &mut SelectBuilder,
+    hops: &[PendingSplit],
+    schema: &ValidatedSchema,
+) -> (StatementShape, Option<Vec<MiddlePart>>) {
     let root_parts = match &parent_q.from {
         Some(FromClause::Literal { middle_parts, .. }) => middle_parts.clone(),
         _ => None,
@@ -3350,35 +3339,94 @@ fn emit_split(
         if parent_q.select.is_empty() {
             parent_q.select = vec![SelectItem::AllFrom { depth: 0 }];
         }
+        let outputs = builder_output_types(parent_q, schema);
+        (
+            StatementShape {
+                columns: shape_columns(outputs, |name| name == hops[0].parent_col),
+                rows: RowCount::Many,
+            },
+            root_parts,
+        )
     } else {
-        let parent_key_ty = output_ty(&parent_q, &hops[0].parent_col, ctx.schema);
+        let parent_key_ty = output_ty(parent_q, &hops[0].parent_col, schema);
         parent_q.select = vec![SelectItem::Column {
             depth: 0,
             column: hops[0].parent_col.clone(),
             output: hops[0].parent_col.clone(),
             ty: parent_key_ty,
         }];
+        (
+            StatementShape {
+                columns: vec![OutputColumn {
+                    name: hops[0].parent_col.clone(),
+                    role: ColumnRole::Key,
+                    ty: None,
+                }],
+                rows: RowCount::Many,
+            },
+            None,
+        )
     }
-    let parent_shape = StatementShape {
-        columns: if root_parts.is_some() {
-            shape_columns(builder_output_types(&parent_q, ctx.schema), |name| {
-                name == hops[0].parent_col
-            })
-        } else {
-            vec![OutputColumn {
-                name: hops[0].parent_col.clone(),
-                role: ColumnRole::Key,
-                ty: None,
-            }]
+}
+
+fn unkeyed_attach(element: ResultShape, stmt: usize) -> ResultShape {
+    ResultShape::List {
+        element: Box::new(element),
+        child: ChildRef {
+            stmt,
+            parent: None,
+            cardinality: Cardinality::Many,
+            tag: None,
         },
-        rows: RowCount::Many,
-    };
+    }
+}
+
+fn emit_split(
+    ctx: &mut Context,
+    parent_builder: SelectBuilder,
+    pending: PendingSplit,
+    root_ty: &QueryType,
+) -> RootPlan {
+    let hops = drain_pending(pending);
+    let mut parent_q = parent_builder;
+    let (parent_shape, root_parts) = split_parent_shape(&mut parent_q, &hops, ctx.schema);
     let layers = sink_chain(ctx, &hops, 0);
     let result = nest_layers(ctx.schema, layers, root_ty, true, root_parts, 0);
     RootPlan {
         builder: parent_q,
         shape: parent_shape,
         result,
+    }
+}
+
+fn anchor_split(
+    ctx: &mut Context,
+    level_builder: SelectBuilder,
+    pending: PendingSplit,
+    ty: &QueryType,
+) -> ResultShape {
+    let hops = drain_pending(pending);
+    let mut parent_q = level_builder;
+    let (parent_shape, root_parts) = split_parent_shape(&mut parent_q, &hops, ctx.schema);
+    let parent_idx = ctx.statements.len() + hops.len() + 1;
+    let layers = sink_chain(ctx, &hops, parent_idx);
+    let actual = ctx.sink(parent_q, parent_shape, StatementKind::Query);
+    debug_assert_eq!(
+        actual, parent_idx,
+        "anchor parent sank at an unexpected index: sink order changed"
+    );
+    let inner = nest_layers(
+        ctx.schema,
+        layers,
+        ty,
+        false,
+        root_parts.clone(),
+        parent_idx,
+    );
+    if root_parts.is_some() {
+        inner
+    } else {
+        unkeyed_attach(inner, parent_idx)
     }
 }
 
@@ -6097,14 +6145,8 @@ fn root_composite_element(
             }
             let mut level = rows(ctx, elem);
             if let Some(pending) = level.pending.take() {
-                if matches!(pending.child_from, FromClause::Literal { .. }) {
-                    todo!("M7 nested {kind}");
-                }
-                if flat_value_hop(&pending, ty) {
-                    level = merge_flat_hop(ctx, level, pending);
-                } else {
-                    todo!("M7 per-row {kind}");
-                }
+                let shape = anchor_split(ctx, level.builder, pending, ty);
+                return (Vec::new(), shape);
             }
             if level.builder.select.is_empty() {
                 level.builder.select = vec![SelectItem::AllFrom { depth: 0 }];

@@ -722,6 +722,60 @@ fn slice_record_literals() {
     );
 }
 
+#[test]
+fn slice_composite_roots() {
+    assert_eq!(
+        value("{ xs = [[1]] }"),
+        Value::Record(vec![(
+            "xs".to_string(),
+            Value::List(vec![Value::List(vec![Value::Int(1)])]),
+        )])
+    );
+    assert_eq!(
+        value("(1, [[2]])"),
+        Value::Tuple(vec![
+            Value::Int(1),
+            Value::List(vec![Value::List(vec![Value::Int(2)])]),
+        ])
+    );
+    assert_eq!(
+        value("{ x = 1, y = users.orders }"),
+        Value::Record(vec![
+            ("x".to_string(), Value::Int(1)),
+            (
+                "y".to_string(),
+                Value::List(vec![
+                    Value::List(vec![rec(&[("total", n("10"))]), rec(&[("total", n("20"))]),]),
+                    Value::List(vec![rec(&[("total", n("30"))])]),
+                    Value::List(vec![]),
+                ]),
+            ),
+        ])
+    );
+    assert_eq!(
+        value("(1, users.orders)"),
+        Value::Tuple(vec![
+            Value::Int(1),
+            Value::List(vec![
+                Value::List(vec![rec(&[("total", n("10"))]), rec(&[("total", n("20"))]),]),
+                Value::List(vec![rec(&[("total", n("30"))])]),
+                Value::List(vec![]),
+            ]),
+        ])
+    );
+    assert_eq!(
+        value("{ a = users.scores }"),
+        Value::Record(vec![(
+            "a".to_string(),
+            Value::List(vec![
+                Value::List(vec![Value::Int(5), Value::Int(7)]),
+                Value::List(vec![Value::Int(9)]),
+                Value::List(vec![]),
+            ]),
+        )])
+    );
+}
+
 
 #[test]
 fn slice_tuples() {
