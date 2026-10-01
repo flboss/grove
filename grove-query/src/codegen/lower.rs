@@ -94,6 +94,7 @@ pub struct Level {
     pub pending: Option<PendingSplit>,
     pub stmt_bound: bool,
     pub output_shapes: Option<Vec<(String, Option<ResultShape>)>>,
+    pub root_parts: Option<Vec<MiddlePart>>,
 }
 
 fn struct_field_value<'a>(base: &'a TypedExpr, name: &str) -> Option<&'a TypedExpr> {
@@ -295,6 +296,7 @@ fn corr_base_level(ctx: &mut Context, fid: FieldId, ty: &QueryType) -> Level {
         pending: None,
         stmt_bound: true,
         output_shapes: None,
+        root_parts: None,
     }
 }
 
@@ -315,6 +317,7 @@ fn fresh_root_level(ctx: &mut Context, root_idx: usize, ty: &QueryType) -> Level
         pending: None,
         stmt_bound: true,
         output_shapes: None,
+        root_parts: None,
     }
 }
 
@@ -479,6 +482,7 @@ fn navigate_ref(
             pending,
             stmt_bound,
             output_shapes,
+            root_parts,
         } = level;
         if pending.is_some() {
             unreachable!("collection navigation over a split-pending level");
@@ -497,6 +501,7 @@ fn navigate_ref(
             }),
             stmt_bound,
             output_shapes,
+            root_parts,
         }
     } else {
         merge_navigate(ctx, child_from, child_col, level, parent_col)
@@ -531,6 +536,7 @@ fn navigate_array(
                 pending,
                 stmt_bound,
                 output_shapes,
+                root_parts,
             } = level;
             if pending.is_some() {
                 unreachable!("collection navigation over a split-pending level");
@@ -549,6 +555,7 @@ fn navigate_array(
                 }),
                 stmt_bound,
                 output_shapes,
+                root_parts,
             }
         }
         _ => {
@@ -563,6 +570,7 @@ fn navigate_array(
                 pending,
                 stmt_bound,
                 output_shapes,
+                root_parts,
             } = level;
             if pending.is_some() {
                 unreachable!("collection navigation over a split-pending level");
@@ -581,6 +589,7 @@ fn navigate_array(
                 }),
                 stmt_bound,
                 output_shapes,
+                root_parts,
             }
         }
     }
@@ -601,6 +610,7 @@ fn merge_navigate(
         pending,
         stmt_bound,
         output_shapes,
+        root_parts,
     } = level;
     if pending.is_some() {
         unreachable!("merge over a split-pending level");
@@ -623,6 +633,7 @@ fn merge_navigate(
         pending: None,
         stmt_bound,
         output_shapes,
+        root_parts,
     }
 }
 
@@ -924,6 +935,7 @@ fn wrap_level(ctx: &mut Context, level: Level) -> Level {
         parent,
         pending,
         output_shapes,
+        root_parts,
         ..
     } = level;
     if builder.select.is_empty() {
@@ -942,6 +954,7 @@ fn wrap_level(ctx: &mut Context, level: Level) -> Level {
         pending,
         stmt_bound: false,
         output_shapes,
+        root_parts,
     }
 }
 
@@ -1195,6 +1208,7 @@ fn window_wrap(ctx: &mut Context, level: Level, fk: &str, order: Vec<OrderItem>)
         pending,
         stmt_bound,
         output_shapes,
+        root_parts,
     } = level;
     if pending.is_some() {
         todo!("M4b window over split-pending child");
@@ -1229,6 +1243,7 @@ fn window_wrap(ctx: &mut Context, level: Level, fk: &str, order: Vec<OrderItem>)
         pending: None,
         stmt_bound,
         output_shapes,
+        root_parts,
     };
     wrap_level(ctx, level)
 }
@@ -2208,6 +2223,7 @@ fn rcross_shape(
         pending: None,
         stmt_bound: true,
         output_shapes: None,
+        root_parts: None,
     };
     let was_child = ctx.child.replace(ChildCtx {
         base: Some(child_level),
@@ -2400,10 +2416,7 @@ fn sink_broadcast_tail(ctx: &mut Context, tail: &TypedExpr) -> (ResultShape, Opt
     let shape_cols: Vec<OutputColumn> =
         shape_columns(builder_output_types(&root.builder, ctx.schema), |_| false);
     let root_creation = ctx.statements.len() + hops.len() + 1;
-    let root_parts = match &root.builder.from {
-        Some(FromClause::Literal { middle_parts, .. }) => middle_parts.clone(),
-        _ => None,
-    };
+    let root_parts = root.root_parts.clone();
     let inner = if hops.is_empty() {
         let item_ty = match peel_optional(&tail.ty) {
             QueryType::List(sub) => sub.as_ref(),
@@ -2571,6 +2584,7 @@ fn rvalue_shape(
         pending: None,
         stmt_bound: true,
         output_shapes: None,
+        root_parts: None,
     };
     let mut child = lower_tail(
         ctx,
@@ -2697,6 +2711,7 @@ fn rscalar_shape(
         pending: None,
         stmt_bound: true,
         output_shapes: None,
+        root_parts: None,
     };
     let mut child = lower_tail(
         ctx,
@@ -2806,6 +2821,7 @@ fn rtemp_shape(
         pending: None,
         stmt_bound: true,
         output_shapes: None,
+        root_parts: None,
     };
     ctx.temp_collect = Some(TempCollect {
         temp: temp.clone(),
@@ -3007,7 +3023,13 @@ pub fn lower_query(ctx: &mut Context, result: &TypedExpr) -> RootPlan {
 
 fn finalize_level(ctx: &mut Context, level: Level) -> RootPlan {
     if let Some(pending) = level.pending {
-        return emit_split(ctx, level.builder, pending, &level.element);
+        return emit_split(
+            ctx,
+            level.builder,
+            pending,
+            &level.element,
+            level.root_parts,
+        );
     }
     if matches!(level.element, QueryType::Tuple(_)) {
         let mut builder = level.builder;
@@ -3298,36 +3320,27 @@ fn split_parent_shape(
     parent_q: &mut SelectBuilder,
     hops: &[PendingSplit],
     schema: &ValidatedSchema,
-) -> (StatementShape, Option<Vec<MiddlePart>>) {
-    let root_parts = match &parent_q.from {
-        Some(FromClause::Literal { middle_parts, .. }) => middle_parts.clone(),
-        _ => None,
-    };
+    root_parts: &Option<Vec<MiddlePart>>,
+) -> StatementShape {
     if root_parts.is_some() {
         if parent_q.select.is_empty() {
             parent_q.select = vec![SelectItem::AllFrom { depth: 0 }];
         }
         let outputs = builder_output_types(parent_q, schema);
-        (
-            StatementShape {
-                columns: shape_columns(outputs, |name| name == hops[0].parent_col),
-                rows: RowCount::Many,
-            },
-            root_parts,
-        )
+        StatementShape {
+            columns: shape_columns(outputs, |name| name == hops[0].parent_col),
+            rows: RowCount::Many,
+        }
     } else {
         narrow_to_key(parent_q, &hops[0].parent_col, schema);
-        (
-            StatementShape {
-                columns: vec![OutputColumn {
-                    name: hops[0].parent_col.clone(),
-                    role: ColumnRole::Key,
-                    ty: None,
-                }],
-                rows: RowCount::Many,
-            },
-            None,
-        )
+        StatementShape {
+            columns: vec![OutputColumn {
+                name: hops[0].parent_col.clone(),
+                role: ColumnRole::Key,
+                ty: None,
+            }],
+            rows: RowCount::Many,
+        }
     }
 }
 
@@ -3361,10 +3374,11 @@ fn emit_split(
     parent_builder: SelectBuilder,
     pending: PendingSplit,
     root_ty: &QueryType,
+    root_parts: Option<Vec<MiddlePart>>,
 ) -> RootPlan {
     let hops = drain_pending(pending);
     let mut parent_q = parent_builder;
-    let (parent_shape, root_parts) = split_parent_shape(&mut parent_q, &hops, ctx.schema);
+    let parent_shape = split_parent_shape(&mut parent_q, &hops, ctx.schema, &root_parts);
     let layers = sink_chain(ctx, &hops, 0);
     let result = nest_layers(ctx.schema, layers, root_ty, true, root_parts, 0);
     RootPlan {
@@ -3379,10 +3393,11 @@ fn anchor_split(
     level_builder: SelectBuilder,
     pending: PendingSplit,
     ty: &QueryType,
+    root_parts: Option<Vec<MiddlePart>>,
 ) -> ResultShape {
     let hops = drain_pending(pending);
     let mut parent_q = level_builder;
-    let (parent_shape, root_parts) = split_parent_shape(&mut parent_q, &hops, ctx.schema);
+    let parent_shape = split_parent_shape(&mut parent_q, &hops, ctx.schema, &root_parts);
     let parent_idx = ctx.statements.len() + hops.len() + 1;
     let layers = sink_chain(ctx, &hops, parent_idx);
     let actual = ctx.sink(parent_q, parent_shape, StatementKind::Query);
@@ -5858,6 +5873,7 @@ fn rows_array(ctx: &mut Context, expr: &TypedExpr) -> Level {
     let this = chain.remove(0);
     let mut builder = SelectBuilder::new();
     builder.from = Some(this.to_from_clause());
+    let root_parts = this.middle_parts.clone();
     let root_key = this.own_key.unwrap_or_else(|| "c0".to_string());
     let mut pending: Option<PendingSplit> = None;
     for (i, level) in chain.into_iter().enumerate().rev() {
@@ -5881,6 +5897,7 @@ fn rows_array(ctx: &mut Context, expr: &TypedExpr) -> Level {
         pending,
         stmt_bound: true,
         output_shapes: None,
+        root_parts,
     }
 }
 
@@ -5975,6 +5992,7 @@ fn rows_if(ctx: &mut Context, expr: &TypedExpr) -> Level {
             pending: None,
             stmt_bound: true,
             output_shapes: None,
+            root_parts: None,
         };
     }
     union_branches(ctx, lowered, expr.ty.clone())
@@ -5984,22 +6002,20 @@ fn union_branches(ctx: &mut Context, arms: Vec<IfArm>, ty: QueryType) -> Level {
     let mut builders: Vec<SelectBuilder> = Vec::with_capacity(arms.len());
     let mut guards: Vec<Vec<SqlExpr>> = Vec::with_capacity(arms.len());
     let mut chains: Vec<Vec<PendingSplit>> = Vec::with_capacity(arms.len());
+    let mut roots: Vec<Option<Vec<MiddlePart>>> = Vec::with_capacity(arms.len());
     for arm in arms {
         let Some(pending) = arm.pending else {
             todo!("M7 multi-statement If branches");
         };
-        if matches!(
-            arm.level.builder.from,
-            Some(FromClause::Literal {
-                middle_parts: Some(_),
-                ..
-            })
-        ) {
-            todo!("M7 multi-statement If branches");
-        }
         builders.push(arm.level.builder);
         guards.push(arm.guard);
         chains.push(drain_pending(pending));
+        roots.push(arm.level.root_parts);
+    }
+    let mut roots = roots.into_iter();
+    let root_parts = roots.next().unwrap_or(None);
+    if roots.any(|parts| parts != root_parts) {
+        todo!("M7 mismatched If branch outputs");
     }
     let depth = chains[0].len();
     if chains.iter().any(|chain| chain.len() != depth) {
@@ -6053,9 +6069,7 @@ fn union_branches(ctx: &mut Context, arms: Vec<IfArm>, ty: QueryType) -> Level {
             },
             child_col: first.child_col.clone(),
             parent_col: first.parent_col.clone(),
-            multi_parent: chains
-                .iter()
-                .any(|chain| chain[level].multi_parent),
+            multi_parent: chains.iter().any(|chain| chain[level].multi_parent),
             next: None,
             middle_parts: first.middle_parts.clone(),
         });
@@ -6074,6 +6088,7 @@ fn union_branches(ctx: &mut Context, arms: Vec<IfArm>, ty: QueryType) -> Level {
         pending,
         stmt_bound: true,
         output_shapes: None,
+        root_parts,
     }
 }
 
@@ -6252,7 +6267,7 @@ fn root_composite_element(
             }
             let mut level = rows(ctx, elem);
             if let Some(pending) = level.pending.take() {
-                let shape = anchor_split(ctx, level.builder, pending, ty);
+                let shape = anchor_split(ctx, level.builder, pending, ty, level.root_parts);
                 return (Vec::new(), shape);
             }
             if level.builder.select.is_empty() {

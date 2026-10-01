@@ -802,6 +802,27 @@ fn slice_if_branch_nesting() {
         value("if false { [[1, 2]] } else { [[3]] }"),
         Value::List(vec![Value::List(vec![Value::Int(3)])])
     );
+    assert_eq!(
+        value("if true { [(1, [2])] } else { [(3, [4])] }"),
+        Value::List(vec![Value::Tuple(vec![
+            Value::Int(1),
+            Value::List(vec![Value::Int(2)]),
+        ])])
+    );
+    assert_eq!(
+        value("if false { [(1, [2])] } else { [(3, [4])] }"),
+        Value::List(vec![Value::Tuple(vec![
+            Value::Int(3),
+            Value::List(vec![Value::Int(4)]),
+        ])])
+    );
+    assert_eq!(
+        value("if true { [{a = [1]}] } else { [{a = [2]}] }"),
+        Value::List(vec![Value::Record(vec![(
+            "a".to_string(),
+            Value::List(vec![Value::Int(1)]),
+        )])])
+    );
 }
 
 
