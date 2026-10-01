@@ -634,34 +634,11 @@ fn parts_named(parts: &[MiddlePart]) -> bool {
     })
 }
 
-fn flat_value_hop(pending: &PendingSplit, ty: &QueryType) -> bool {
-    pending.next.is_none()
-        && pending.middle_parts.is_none()
-        && matches!(peel_optional(ty), QueryType::List(sub)
-        if matches!(peel_optional(sub), QueryType::List(inner)
-            if matches!(
-                peel_optional(inner),
-                QueryType::Scalar(_) | QueryType::Tuple(_)
-            )))
-}
-
 fn narrow_element(element: QueryType) -> QueryType {
     match peel_optional(&element).clone() {
         QueryType::List(sub) => *sub,
         _ => element,
     }
-}
-
-fn merge_flat_hop(ctx: &mut Context, level: Level, pending: PendingSplit) -> Level {
-    let PendingSplit {
-        child_from,
-        child_col,
-        parent_col,
-        ..
-    } = pending;
-    let mut level = level;
-    level.element = narrow_element(level.element);
-    merge_navigate(ctx, child_from, child_col, level, parent_col)
 }
 
 fn merge_builder(
@@ -3128,16 +3105,7 @@ fn sink_chain(ctx: &mut Context, hops: &[PendingSplit], root_creation: usize) ->
     let mut built: Vec<(SelectBuilder, StatementShape, Vec<String>)> =
         Vec::with_capacity(hops.len());
     for (i, hop) in hops.iter().enumerate() {
-        let mut child = SelectBuilder::new();
-        child.from = Some(hop.child_from.clone());
-        child.where_ = vec![SqlExpr::InSubquery {
-            expr: Box::new(SqlExpr::Column {
-                depth: 0,
-                column: hop.child_col.clone(),
-            }),
-            query: Box::new(bulk_query()),
-        }];
-        child.select = vec![SelectItem::AllFrom { depth: 0 }];
+        let child = hop_builder(hop);
         let child_outputs = builder_outputs(&child, ctx.schema);
         let next_parent = hops.get(i + 1).map(|next| next.parent_col.clone());
         let child_shape = StatementShape {
@@ -3260,7 +3228,7 @@ fn nest_layers(
             element = wrap(element, layer);
         }
     }
-    if grouped && root_dup && root_parts.is_none() {
+    if root_dup && root_parts.is_none() {
         element = ResultShape::List {
             element: Box::new(element),
             child: ChildRef {
@@ -3348,13 +3316,7 @@ fn split_parent_shape(
             root_parts,
         )
     } else {
-        let parent_key_ty = output_ty(parent_q, &hops[0].parent_col, schema);
-        parent_q.select = vec![SelectItem::Column {
-            depth: 0,
-            column: hops[0].parent_col.clone(),
-            output: hops[0].parent_col.clone(),
-            ty: parent_key_ty,
-        }];
+        narrow_to_key(parent_q, &hops[0].parent_col, schema);
         (
             StatementShape {
                 columns: vec![OutputColumn {
@@ -3366,6 +3328,19 @@ fn split_parent_shape(
             },
             None,
         )
+    }
+}
+
+fn narrow_to_key(builder: &mut SelectBuilder, col: &str, schema: &ValidatedSchema) {
+    let ty = output_ty(builder, col, schema);
+    builder.select = vec![SelectItem::Column {
+        depth: 0,
+        column: col.to_string(),
+        output: col.to_string(),
+        ty,
+    }];
+    for arm in &mut builder.unions {
+        narrow_to_key(arm, col, schema);
     }
 }
 
@@ -5921,6 +5896,11 @@ fn array_tail_root(mut tail: &TypedExpr) -> bool {
     }
 }
 
+struct IfArm {
+    level: Level,
+    guard: Vec<SqlExpr>,
+    pending: Option<PendingSplit>,
+}
 fn rows_if(ctx: &mut Context, expr: &TypedExpr) -> Level {
     let TypedExprKind::If { arms, default } = &expr.kind else {
         unreachable!("rows_if on non-if node: callers dispatch on node kind")
@@ -5935,57 +5915,184 @@ fn rows_if(ctx: &mut Context, expr: &TypedExpr) -> Level {
         conds.push(scalar(ctx, cond));
     }
     let sunk_before = ctx.statements.len();
-    let mut branches: Vec<SelectBuilder> = Vec::with_capacity(arms.len() + 1);
+    let mut lowered: Vec<IfArm> = Vec::with_capacity(arms.len() + 1);
     let mut denied: Vec<SqlExpr> = Vec::new();
     for ((_, body), cond) in arms.iter().zip(conds.iter()) {
         let mut guard = denied.clone();
         guard.push(cond.clone());
-        branches.push(guarded_branch(ctx, body, guard, sunk_before));
+        let mut level = rows(ctx, body);
+        let pending = level.pending.take();
+        if ctx.statements.len() != sunk_before {
+            todo!("M7 multi-statement If branches");
+        }
+        if level.builder.select.is_empty() {
+            level.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+        }
+        for cond in guard.iter().rev() {
+            level.builder.where_.insert(0, cond.clone());
+        }
         denied.push(SqlExpr::Not(Box::new(cond.clone())));
+        lowered.push(IfArm {
+            level,
+            guard,
+            pending,
+        });
     }
-    branches.push(guarded_branch(ctx, default, denied, sunk_before));
-    let first_outputs = builder_outputs(&branches[0], ctx.schema);
-    for branch in branches.iter().skip(1) {
+    {
+        let guard = denied.clone();
+        let mut level = rows(ctx, default);
+        let pending = level.pending.take();
+        if ctx.statements.len() != sunk_before {
+            todo!("M7 multi-statement If branches");
+        }
+        if level.builder.select.is_empty() {
+            level.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+        }
+        for cond in guard.iter().rev() {
+            level.builder.where_.insert(0, cond.clone());
+        }
+        lowered.push(IfArm {
+            level,
+            guard,
+            pending,
+        });
+    }
+    if lowered.iter().all(|arm| arm.pending.is_none()) {
+        let mut branches: Vec<SelectBuilder> =
+            lowered.into_iter().map(|arm| arm.level.builder).collect();
+        let first_outputs = builder_outputs(&branches[0], ctx.schema);
+        for branch in branches.iter().skip(1) {
+            if builder_outputs(branch, ctx.schema) != first_outputs {
+                todo!("M7 mismatched If branch outputs");
+            }
+        }
+        let mut first = branches.remove(0);
+        first.unions = branches;
+        return Level {
+            builder: first,
+            element: expr.ty.clone(),
+            parent: ParentLink::Root { root_idx: 0 },
+            pending: None,
+            stmt_bound: true,
+            output_shapes: None,
+        };
+    }
+    union_branches(ctx, lowered, expr.ty.clone())
+}
+
+fn union_branches(ctx: &mut Context, arms: Vec<IfArm>, ty: QueryType) -> Level {
+    let mut builders: Vec<SelectBuilder> = Vec::with_capacity(arms.len());
+    let mut guards: Vec<Vec<SqlExpr>> = Vec::with_capacity(arms.len());
+    let mut chains: Vec<Vec<PendingSplit>> = Vec::with_capacity(arms.len());
+    for arm in arms {
+        let Some(pending) = arm.pending else {
+            todo!("M7 multi-statement If branches");
+        };
+        if matches!(
+            arm.level.builder.from,
+            Some(FromClause::Literal {
+                middle_parts: Some(_),
+                ..
+            })
+        ) {
+            todo!("M7 multi-statement If branches");
+        }
+        builders.push(arm.level.builder);
+        guards.push(arm.guard);
+        chains.push(drain_pending(pending));
+    }
+    let depth = chains[0].len();
+    if chains.iter().any(|chain| chain.len() != depth) {
+        todo!("M7 multi-statement If branches");
+    }
+    for level in 0..depth {
+        let first = &chains[0][level];
+        let first_outputs = pending_outputs(&first.child_from, ctx.schema);
+        for chain in chains.iter().skip(1) {
+            let hop = &chain[level];
+            if pending_outputs(&hop.child_from, ctx.schema) != first_outputs
+                || hop.child_col != first.child_col
+                || hop.parent_col != first.parent_col
+                || hop.middle_parts != first.middle_parts
+            {
+                todo!("M7 mismatched If branch outputs");
+            }
+        }
+    }
+    let first_outputs = builder_outputs(&builders[0], ctx.schema);
+    for branch in builders.iter().skip(1) {
         if builder_outputs(branch, ctx.schema) != first_outputs {
             todo!("M7 mismatched If branch outputs");
         }
     }
-    let mut first = branches.remove(0);
-    first.unions = branches;
+    let mut first = builders.remove(0);
+    first.unions = builders;
+    let mut hop_unions: Vec<PendingSplit> = Vec::with_capacity(depth);
+    for level in 0..depth {
+        let mut hop_builders: Vec<SelectBuilder> = Vec::with_capacity(chains.len());
+        for (chain, guard) in chains.iter().zip(guards.iter()) {
+            let mut hop = hop_builder(&chain[level]);
+            for cond in guard {
+                hop.where_.push(cond.clone());
+            }
+            hop_builders.push(hop);
+        }
+        let first_outputs = builder_outputs(&hop_builders[0], ctx.schema);
+        for hop in hop_builders.iter().skip(1) {
+            if builder_outputs(hop, ctx.schema) != first_outputs {
+                todo!("M7 mismatched If branch outputs");
+            }
+        }
+        let mut first_hop = hop_builders.remove(0);
+        first_hop.unions = hop_builders;
+        let first = &chains[0][level];
+        hop_unions.push(PendingSplit {
+            child_from: FromClause::Subquery {
+                query: Box::new(first_hop),
+                alias: ctx.aliases.subquery(),
+            },
+            child_col: first.child_col.clone(),
+            parent_col: first.parent_col.clone(),
+            multi_parent: chains
+                .iter()
+                .any(|chain| chain[level].multi_parent),
+            next: None,
+            middle_parts: first.middle_parts.clone(),
+        });
+    }
+    let mut pending: Option<PendingSplit> = None;
+    for hop in hop_unions.into_iter().rev() {
+        pending = Some(PendingSplit {
+            next: pending.map(Box::new),
+            ..hop
+        });
+    }
     Level {
         builder: first,
-        element: expr.ty.clone(),
+        element: ty,
         parent: ParentLink::Root { root_idx: 0 },
-        pending: None,
+        pending,
         stmt_bound: true,
         output_shapes: None,
     }
 }
 
-fn guarded_branch(
-    ctx: &mut Context,
-    body: &TypedExpr,
-    guard: Vec<SqlExpr>,
-    sunk_before: usize,
-) -> SelectBuilder {
-    let mut level = rows(ctx, body);
-    if let Some(pending) = level.pending.take() {
-        if flat_value_hop(&pending, &body.ty) {
-            level = merge_flat_hop(ctx, level, pending);
-        } else {
-            todo!("M7 multi-statement If branches");
-        }
-    }
-    if ctx.statements.len() != sunk_before {
-        todo!("M7 multi-statement If branches");
-    }
-    if level.builder.select.is_empty() {
-        level.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
-    }
-    for cond in guard.into_iter().rev() {
-        level.builder.where_.insert(0, cond);
-    }
-    level.builder
+fn pending_outputs(from: &FromClause, schema: &ValidatedSchema) -> Vec<String> {
+    from_columns(&Some(from.clone()), schema)
+}
+
+fn hop_builder(hop: &PendingSplit) -> SelectBuilder {
+    let mut child = SelectBuilder::new();
+    child.from = Some(hop.child_from.clone());
+    child.where_ = vec![SqlExpr::InSubquery {
+        expr: Box::new(SqlExpr::Column {
+            depth: 0,
+            column: hop.child_col.clone(),
+        }),
+        query: Box::new(bulk_query()),
+    }];
+    child.select = vec![SelectItem::AllFrom { depth: 0 }];
+    child
 }
 
 fn lower_tuple_result(ctx: &mut Context, result: &TypedExpr) -> RootPlan {

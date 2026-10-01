@@ -776,6 +776,34 @@ fn slice_composite_roots() {
     );
 }
 
+#[test]
+fn slice_if_branch_nesting() {
+    assert_eq!(
+        value("if true { users.orders } else { users.orders }"),
+        Value::List(vec![
+            Value::List(vec![rec(&[("total", n("10"))]), rec(&[("total", n("20"))]),]),
+            Value::List(vec![rec(&[("total", n("30"))])]),
+            Value::List(vec![]),
+        ])
+    );
+    assert_eq!(
+        value("users.orders"),
+        Value::List(vec![
+            Value::List(vec![rec(&[("total", n("10"))]), rec(&[("total", n("20"))]),]),
+            Value::List(vec![rec(&[("total", n("30"))])]),
+            Value::List(vec![]),
+        ])
+    );
+    assert_eq!(
+        value("if true { [[1, 2]] } else { [[3]] }"),
+        Value::List(vec![Value::List(vec![Value::Int(1), Value::Int(2)])])
+    );
+    assert_eq!(
+        value("if false { [[1, 2]] } else { [[3]] }"),
+        Value::List(vec![Value::List(vec![Value::Int(3)])])
+    );
+}
+
 
 #[test]
 fn slice_tuples() {
