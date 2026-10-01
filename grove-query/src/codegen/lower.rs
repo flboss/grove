@@ -462,7 +462,7 @@ fn navigate_ref(
         table: table.clone(),
         alias: ctx.aliases.table(&table),
     };
-    let (child_col, parent_col) = match link_cols(ctx, fid) {
+    let (child_col, parent_col) = match link_cols(ctx.schema, fid) {
         LinkCols::ParentFk {
             parent_fk,
             child_pk,
@@ -742,7 +742,7 @@ fn global_first_hop(
         Field::Ref { target, .. } => *target,
         _ => unreachable!("global hop over non-reference field"),
     };
-    let (child_col, parent_col) = match link_cols(ctx, fid) {
+    let (child_col, parent_col) = match link_cols(ctx.schema, fid) {
         LinkCols::ParentFk {
             parent_fk,
             child_pk,
@@ -1267,6 +1267,9 @@ fn lower_value(
         return lower_value(ctx, parent, prefix, field);
     }
     if value.ty.is_scalar() {
+        if let Some((select, shape, keys)) = scalar_temp_array(ctx, parent, &prefix, value) {
+            return (select, shape, keys);
+        }
         let value_ty = scalar_of(&value.ty);
         let item = match scalar(ctx, value) {
             SqlExpr::Column { depth, column } => SelectItem::Column {
@@ -1627,7 +1630,7 @@ fn resolve_tail_link(ctx: &mut Context, fid: FieldId) -> ChildLink {
             let table = ctx.schema.tables[ctx.schema.structs[target.index()].table.index()]
                 .name
                 .clone();
-            let (child_col, parent_col) = match link_cols(ctx, fid) {
+            let (child_col, parent_col) = match link_cols(ctx.schema, fid) {
                 LinkCols::ParentFk {
                     parent_fk,
                     child_pk,
@@ -2560,6 +2563,15 @@ fn rvalue_shape(
             if matches!(tail.kind, TypedExprKind::Array { .. }) {
                 return rtemp_array_shape(ctx, parent, tail);
             }
+            if let TypedExprKind::Method { base, name, .. } = &tail.kind
+                && matches!(base.kind, TypedExprKind::Array { .. })
+                && matches!(
+                    name.value.as_str(),
+                    "take" | "skip" | "sort" | "sort_asc" | "sort_desc" | "filter" | "flatten"
+                )
+            {
+                return rtemp_method_shape(ctx, parent, tail);
+            }
             todo!("M6 correlated literal projection item");
         }
         return sink_broadcast_tail(ctx, tail);
@@ -2963,7 +2975,7 @@ fn rtemp_shape(
             },
         },
     };
-    (shape, None)
+    (shape, Some("$$key".to_string()))
 }
 
 fn null_cells(ty: &QueryType, out: &mut Vec<(SqlExpr, Option<ScalarType>)>) {
@@ -3036,45 +3048,460 @@ fn temp_array_cells(
     temp_array_cell(ctx, inner, elem, out);
 }
 
-fn rtemp_array_shape(
-    ctx: &mut Context,
-    parent: &mut Level,
-    tail: &TypedExpr,
-) -> (ResultShape, Option<String>) {
-    let TypedExprKind::Array { elements } = &tail.kind else {
-        unreachable!("rtemp array over non-array tail: the rvalue gate admits bare arrays only")
-    };
-    let inner = match &tail.ty {
-        QueryType::List(inner) => inner.as_ref(),
-        _ => unreachable!(
-            "non-list array type {}: the checker types arrays as lists",
-            tail.ty
+fn temp_nest_ok(ty: &QueryType) -> bool {
+    match peel_optional(ty) {
+        QueryType::Scalar(_) => true,
+        QueryType::Tuple(tys) => tys.iter().all(temp_nest_ok),
+        QueryType::Record(RecordSource::Projection(fields)) => {
+            fields.iter().all(|field| temp_nest_ok(&field.ty))
+        }
+        QueryType::List(sub) => temp_nest_ok(sub),
+        _ => false,
+    }
+}
+
+enum BranchPlan {
+    Value { col: String, ty: ScalarType },
+    Nested { sub: QueryType },
+    Tuple(Vec<BranchPlan>),
+    Record(Vec<(String, BranchPlan)>),
+}
+
+fn branch_plan(ty: &QueryType, next_col: &mut usize) -> BranchPlan {
+    match peel_optional(ty) {
+        QueryType::Scalar(s) => {
+            let col = format!("c{next_col}");
+            *next_col += 1;
+            BranchPlan::Value { col, ty: *s }
+        }
+        QueryType::List(sub) => BranchPlan::Nested {
+            sub: sub.as_ref().clone(),
+        },
+        QueryType::Tuple(tys) => {
+            BranchPlan::Tuple(tys.iter().map(|t| branch_plan(t, next_col)).collect())
+        }
+        QueryType::Record(RecordSource::Projection(fields)) => BranchPlan::Record(
+            fields
+                .iter()
+                .map(|field| (field.name.clone(), branch_plan(&field.ty, next_col)))
+                .collect(),
         ),
-    };
-    if array_has_list_leaf(inner) {
-        todo!("M6 nested correlated array");
+        _ => unreachable!(
+            "branch layout over {ty}: validation admits scalars, tuples, records, and lists only"
+        ),
     }
-    if !matches!(
-        peel_optional(inner),
-        QueryType::Scalar(_) | QueryType::Tuple(_) | QueryType::Record(RecordSource::Projection(_))
-    ) {
-        todo!("M6 query-valued array element");
+}
+
+fn branch_nested_count(plan: &BranchPlan) -> usize {
+    match plan {
+        BranchPlan::Value { .. } => 0,
+        BranchPlan::Nested { .. } => 1,
+        BranchPlan::Tuple(ps) => ps.iter().map(branch_nested_count).sum(),
+        BranchPlan::Record(fs) => fs.iter().map(|(_, p)| branch_nested_count(p)).sum(),
     }
-    if elements.iter().any(|e| !temp_readable_element(e)) {
-        todo!("M6 correlated literal projection item");
+}
+
+fn branch_value_cols(plan: &BranchPlan, out: &mut Vec<(String, ScalarType)>) {
+    match plan {
+        BranchPlan::Value { col, ty } => out.push((col.clone(), *ty)),
+        BranchPlan::Nested { .. } => {}
+        BranchPlan::Tuple(ps) => ps.iter().for_each(|p| branch_value_cols(p, out)),
+        BranchPlan::Record(fs) => fs.iter().for_each(|(_, p)| branch_value_cols(p, out)),
     }
-    let parent_q = parent.builder.clone();
-    let temp = ctx.aliases.temp();
-    ctx.temp_collect = Some(TempCollect {
-        temp: temp.clone(),
-        child_fk: "$$key".to_string(),
-        refs: Vec::new(),
+}
+
+fn temp_leaf_tys(ty: &QueryType, out: &mut Vec<ScalarType>) {
+    match peel_optional(ty) {
+        QueryType::Scalar(s) => out.push(*s),
+        QueryType::Tuple(tys) => tys.iter().for_each(|t| temp_leaf_tys(t, out)),
+        QueryType::Record(RecordSource::Projection(fields)) => fields
+            .iter()
+            .for_each(|field| temp_leaf_tys(&field.ty, out)),
+        _ => unreachable!(
+            "leaf layout over {ty}: validation admits scalars, tuples, and records only"
+        ),
+    }
+}
+
+fn serve_branch_cells(
+    ctx: &mut Context,
+    plan: &BranchPlan,
+    elem: &TypedExpr,
+    out: &mut Vec<(SqlExpr, Option<ScalarType>)>,
+) {
+    let node = peel_some(elem);
+    if let TypedExprKind::Literal(lit) = &node.kind
+        && matches!(&lit.value, Literal::None)
+    {
+        null_branch_cells(plan, out);
+        return;
+    }
+    match (plan, &node.kind) {
+        (BranchPlan::Value { ty, .. }, _) => out.push((scalar(ctx, node), Some(*ty))),
+        (BranchPlan::Nested { .. }, _) => {}
+        (BranchPlan::Tuple(ps), TypedExprKind::Tuple { elements }) => {
+            if elements.len() != ps.len() {
+                unreachable!("tuple arity drift: the checker unifies tuple arity");
+            }
+            for (p, e) in ps.iter().zip(elements.iter()) {
+                serve_branch_cells(ctx, p, e, out);
+            }
+        }
+        (BranchPlan::Record(fs), TypedExprKind::Struct { fields }) => {
+            for (name, p) in fs {
+                let (_, e) = fields
+                    .iter()
+                    .find(|(fname, _)| fname.value == *name)
+                    .unwrap_or_else(|| {
+                        unreachable!(
+                            "record field {name} vanished after checking: unification matches field sets"
+                        )
+                    });
+                serve_branch_cells(ctx, p, e, out);
+            }
+        }
+        _ => todo!("M6 correlated literal projection item"),
+    }
+}
+
+fn null_branch_cells(plan: &BranchPlan, out: &mut Vec<(SqlExpr, Option<ScalarType>)>) {
+    match plan {
+        BranchPlan::Value { ty, .. } => out.push((SqlExpr::Param(ParamValue::Null), Some(*ty))),
+        BranchPlan::Nested { .. } => {}
+        BranchPlan::Tuple(ps) => ps.iter().for_each(|p| null_branch_cells(p, out)),
+        BranchPlan::Record(fs) => fs.iter().for_each(|(_, p)| null_branch_cells(p, out)),
+    }
+}
+
+fn collect_branch_nested<'a>(
+    plan: &BranchPlan,
+    elem: &'a TypedExpr,
+    ord: i64,
+    out: &mut Vec<(Option<i64>, &'a TypedExpr)>,
+) {
+    let node = peel_some(elem);
+    if let TypedExprKind::Literal(lit) = &node.kind
+        && matches!(&lit.value, Literal::None)
+    {
+        return;
+    }
+    match (plan, &node.kind) {
+        (BranchPlan::Value { .. }, _) => {}
+        (BranchPlan::Nested { .. }, TypedExprKind::Array { elements }) => {
+            out.extend(elements.iter().map(|e| (Some(ord), e)));
+        }
+        (BranchPlan::Tuple(ps), TypedExprKind::Tuple { elements }) => {
+            if elements.len() != ps.len() {
+                unreachable!("tuple arity drift: the checker unifies tuple arity");
+            }
+            for (p, e) in ps.iter().zip(elements.iter()) {
+                collect_branch_nested(p, e, ord, out);
+            }
+        }
+        (BranchPlan::Record(fs), TypedExprKind::Struct { fields }) => {
+            for (name, p) in fs {
+                let (_, e) = fields
+                    .iter()
+                    .find(|(fname, _)| fname.value == *name)
+                    .unwrap_or_else(|| {
+                        unreachable!(
+                            "record field {name} vanished after checking: unification matches field sets"
+                        )
+                    });
+                collect_branch_nested(p, e, ord, out);
+            }
+        }
+        _ => todo!("M6 correlated literal projection item"),
+    }
+}
+
+fn shape_branch_plan(plan: &BranchPlan, nested: Option<(&ResultShape, &ChildRef)>) -> ResultShape {
+    match plan {
+        BranchPlan::Value { col, .. } => ResultShape::Column(col.clone()),
+        BranchPlan::Nested { .. } => {
+            let (element, child) = nested.unwrap_or_else(|| {
+                unreachable!("branch shape without nested sub-shape: multi-list is gated upfront")
+            });
+            ResultShape::List {
+                element: Box::new(element.clone()),
+                child: child.clone(),
+            }
+        }
+        BranchPlan::Tuple(ps) => {
+            ResultShape::Tuple(ps.iter().map(|p| shape_branch_plan(p, nested)).collect())
+        }
+        BranchPlan::Record(fs) => ResultShape::Record(
+            fs.iter()
+                .map(|(name, p)| (name.clone(), shape_branch_plan(p, nested)))
+                .collect(),
+        ),
+    }
+}
+
+fn false_arm(columns: &[(String, Option<ScalarType>)]) -> SelectBuilder {
+    SelectBuilder {
+        select: columns
+            .iter()
+            .map(|(name, ty)| SelectItem::Expr {
+                expr: SqlExpr::Param(ParamValue::Null),
+                output: name.clone(),
+                ty: *ty,
+            })
+            .collect(),
+        from: None,
+        where_: vec![SqlExpr::Param(ParamValue::Bool(false))],
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        unions: Vec::new(),
+    }
+}
+
+fn union_builders(arms: Vec<SelectBuilder>) -> SelectBuilder {
+    let mut arms = arms.into_iter();
+    let mut first = arms.next().unwrap_or_else(|| {
+        unreachable!("union without arms: empties render an unsatisfiable arm instead")
     });
-    ctx.in_array_temp = true;
-    let mut arms: Vec<SelectBuilder> = Vec::with_capacity(elements.len());
-    for elem in elements {
+    first.unions = arms.collect();
+    first
+}
+
+fn sink_arm_temp(ctx: &mut Context, union: SelectBuilder) -> (String, usize) {
+    let temp = ctx.aliases.temp();
+    let alias = ctx.aliases.subquery();
+    let mut union = union;
+    let create_order = std::mem::take(&mut union.order_by);
+    let mut create = SelectBuilder::new();
+    create.select = vec![
+        SelectItem::AllFrom { depth: 0 },
+        SelectItem::Expr {
+            expr: SqlExpr::Window {
+                func: "ROW_NUMBER".to_string(),
+                partition: Vec::new(),
+                order: Vec::new(),
+            },
+            output: "$$key".to_string(),
+            ty: Some(ScalarType::Int),
+        },
+    ];
+    create.from = Some(FromClause::Subquery {
+        query: Box::new(union),
+        alias,
+    });
+    create.order_by = create_order;
+    let outputs = builder_output_types(&create, ctx.schema);
+    let idx = ctx.sink(
+        create,
+        StatementShape {
+            columns: shape_columns(outputs.clone(), |name| {
+                name == "c0" || name == "c1" || name == "$$key"
+            }),
+            rows: RowCount::Many,
+        },
+        StatementKind::Temp { name: temp.clone() },
+    );
+    (temp, idx)
+}
+
+fn temp_branch_arms<'a>(
+    ctx: &mut Context,
+    temp: &str,
+    refs: &[(String, Option<ScalarType>)],
+    plan: &BranchPlan,
+    value_cols: &[(String, ScalarType)],
+    items: &[(Option<i64>, &'a TypedExpr)],
+) -> (Vec<SelectBuilder>, Vec<(Option<i64>, &'a TypedExpr)>) {
+    let mut arms: Vec<SelectBuilder> = Vec::with_capacity(items.len());
+    let mut sub_items: Vec<(Option<i64>, &'a TypedExpr)> = Vec::new();
+    for (i, (filter, elem)) in items.iter().enumerate() {
+        let own = items[..i].iter().filter(|(o, _)| *o == *filter).count() as i64;
+        let mut select = vec![
+            SelectItem::Column {
+                depth: 0,
+                column: "$$key".to_string(),
+                output: "c0".to_string(),
+                ty: None,
+            },
+            SelectItem::Expr {
+                expr: SqlExpr::Param(ParamValue::Int(own)),
+                output: "c1".to_string(),
+                ty: Some(ScalarType::Int),
+            },
+        ];
         let mut cells = Vec::new();
-        temp_array_cells(ctx, elem, inner, &mut cells);
+        serve_branch_cells(ctx, plan, elem, &mut cells);
+        if cells.len() != value_cols.len() {
+            unreachable!("branch arm arity drift: cell walk and layout walk share the plan");
+        }
+        for ((expr, _), (name, ty)) in cells.into_iter().zip(value_cols.iter()) {
+            select.push(SelectItem::Expr {
+                expr,
+                output: name.clone(),
+                ty: Some(*ty),
+            });
+        }
+        for (name, ty) in refs {
+            select.push(SelectItem::Column {
+                depth: 0,
+                column: name.clone(),
+                output: name.clone(),
+                ty: *ty,
+            });
+        }
+        let mut arm = SelectBuilder {
+            select,
+            from: Some(FromClause::Table {
+                table: temp.to_string(),
+                alias: temp.to_string(),
+            }),
+            where_: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            unions: Vec::new(),
+        };
+        if let Some(ord) = filter {
+            arm.where_ = vec![SqlExpr::Binary {
+                op: SqlBinOp::Eq,
+                lhs: Box::new(SqlExpr::Column {
+                    depth: 0,
+                    column: "c1".to_string(),
+                }),
+                rhs: Box::new(SqlExpr::Param(ParamValue::Int(*ord))),
+            }];
+        }
+        arms.push(arm);
+        collect_branch_nested(plan, elem, own, &mut sub_items);
+    }
+    if arms.is_empty() {
+        let mut layout = vec![
+            ("c0".to_string(), None),
+            ("c1".to_string(), Some(ScalarType::Int)),
+        ];
+        layout.extend(
+            value_cols
+                .iter()
+                .map(|(name, ty)| (name.clone(), Some(*ty))),
+        );
+        layout.extend(refs.iter().map(|(name, ty)| (name.clone(), *ty)));
+        arms.push(false_arm(&layout));
+    }
+    (arms, sub_items)
+}
+
+enum EntryMethod<'a> {
+    TakeSkip {
+        name: String,
+        args: &'a [TypedMethodArg],
+    },
+    Sort {
+        args: &'a [TypedMethodArg],
+        default: OrderDir,
+    },
+    Filter {
+        pred: &'a TypedExpr,
+    },
+}
+
+fn apply_entry_method(
+    ctx: &mut Context,
+    method: EntryMethod,
+    union: SelectBuilder,
+    elem_ty: &QueryType,
+) -> SelectBuilder {
+    let mut level = Level {
+        builder: union,
+        element: QueryType::List(Box::new(elem_ty.clone())),
+        parent: ParentLink::Root { root_idx: 0 },
+        pending: None,
+        stmt_bound: true,
+        output_shapes: None,
+        root_parts: None,
+    };
+    let mut builder = match method {
+        EntryMethod::TakeSkip { name, args } => {
+            let wrapped = wrap_level(ctx, level);
+            window_take(ctx, wrapped, "c0", &name, args).builder
+        }
+        EntryMethod::Sort { args, default } => {
+            let mut keys = Vec::new();
+            for arg in args {
+                let dir = match &arg.direction {
+                    Some(dir) => match dir.value {
+                        SortDir::Asc => OrderDir::Asc,
+                        SortDir::Desc => OrderDir::Desc,
+                    },
+                    None => default,
+                };
+                keys.extend(sort_keys(ctx, &level, &arg.expr, dir));
+            }
+            level.builder.order_by.extend(keys);
+            level.builder
+        }
+        EntryMethod::Filter { pred } => {
+            level.builder.where_.push(scalar(ctx, pred));
+            level.builder
+        }
+    };
+    if builder.select.is_empty() {
+        builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+    }
+    builder
+}
+
+fn temp_array_level<'a>(
+    ctx: &mut Context,
+    temp: &str,
+    temp_idx: usize,
+    refs: &[(String, Option<ScalarType>)],
+    elem_ty: &QueryType,
+    items: Vec<(Option<i64>, &'a TypedExpr)>,
+    method: Option<EntryMethod<'a>>,
+) -> (ResultShape, ChildRef) {
+    if !array_has_list_leaf(elem_ty) {
+        return temp_leaf_level(ctx, temp, temp_idx, elem_ty, items, method);
+    }
+    let mut next_col = 2usize;
+    let plan = branch_plan(elem_ty, &mut next_col);
+    if branch_nested_count(&plan) > 1 {
+        todo!("M6 multi-list correlated {}", branch_kind(&plan));
+    }
+    let mut value_cols = Vec::new();
+    branch_value_cols(&plan, &mut value_cols);
+    let (arms, sub_items) = temp_branch_arms(ctx, temp, refs, &plan, &value_cols, &items);
+    let mut union = union_builders(arms);
+    if let Some(m) = method {
+        union = apply_entry_method(ctx, m, union, elem_ty);
+    }
+    let (next_temp, next_idx) = sink_arm_temp(ctx, union);
+    let sub = branch_nested_sub(&plan)
+        .unwrap_or_else(|| unreachable!("branch without nested slot: multi-list is gated upfront"));
+    let (sub_element, sub_child) =
+        temp_array_level(ctx, &next_temp, next_idx, refs, &sub, sub_items, None);
+    let element = shape_branch_plan(&plan, Some((&sub_element, &sub_child)));
+    let child = ChildRef {
+        stmt: next_idx,
+        parent: Some(ParentRef {
+            stmt: temp_idx,
+            parent_key: "$$key".to_string(),
+            child_key: "c0".to_string(),
+        }),
+        cardinality: Cardinality::Many,
+        tag: None,
+    };
+    (element, child)
+}
+
+fn temp_leaf_arms(
+    ctx: &mut Context,
+    temp: &str,
+    elem_ty: &QueryType,
+    items: &[(Option<i64>, &TypedExpr)],
+) -> Vec<SelectBuilder> {
+    let mut arms: Vec<SelectBuilder> = Vec::with_capacity(items.len());
+    for (filter, elem) in items {
+        let mut cells = Vec::new();
+        temp_array_cells(ctx, elem, elem_ty, &mut cells);
         let mut select = vec![SelectItem::Column {
             depth: 0,
             column: "$$key".to_string(),
@@ -3088,30 +3515,114 @@ fn rtemp_array_shape(
                 ty,
             });
         }
-        arms.push(SelectBuilder {
+        let mut arm = SelectBuilder {
             select,
             from: Some(FromClause::Table {
-                table: temp.clone(),
-                alias: temp.clone(),
+                table: temp.to_string(),
+                alias: temp.to_string(),
             }),
             where_: Vec::new(),
             order_by: Vec::new(),
             limit: None,
             offset: None,
             unions: Vec::new(),
-        });
+        };
+        if let Some(ord) = filter {
+            arm.where_ = vec![SqlExpr::Binary {
+                op: SqlBinOp::Eq,
+                lhs: Box::new(SqlExpr::Column {
+                    depth: 0,
+                    column: "c1".to_string(),
+                }),
+                rhs: Box::new(SqlExpr::Param(ParamValue::Int(*ord))),
+            }];
+        }
+        arms.push(arm);
     }
-    ctx.in_array_temp = false;
-    let refs = ctx
-        .temp_collect
-        .take()
-        .unwrap_or_else(|| unreachable!("temp collect vanished mid-lowering"))
-        .refs;
+    if arms.is_empty() {
+        let mut tys = Vec::new();
+        temp_leaf_tys(elem_ty, &mut tys);
+        let mut layout = vec![("c0".to_string(), None)];
+        layout.extend(
+            tys.iter()
+                .enumerate()
+                .map(|(i, ty)| (format!("c{}", i + 1), Some(*ty))),
+        );
+        arms.push(false_arm(&layout));
+    }
+    arms
+}
+
+fn temp_leaf_level(
+    ctx: &mut Context,
+    temp: &str,
+    temp_idx: usize,
+    elem_ty: &QueryType,
+    items: Vec<(Option<i64>, &TypedExpr)>,
+    method: Option<EntryMethod>,
+) -> (ResultShape, ChildRef) {
+    let arms = temp_leaf_arms(ctx, temp, elem_ty, &items);
+    let mut union = union_builders(arms);
+    if let Some(m) = method {
+        union = apply_entry_method(ctx, m, union, elem_ty);
+    }
+    let child_builder = union;
+    let outputs = builder_outputs(&child_builder, ctx.schema);
+    let shape_cols: Vec<OutputColumn> =
+        shape_columns(builder_output_types(&child_builder, ctx.schema), |name| {
+            name == "c0"
+        });
+    let element = child_element(ctx.schema, None, elem_ty, &outputs, |name| name == "c0");
+    let idx = ctx.sink(
+        child_builder,
+        StatementShape {
+            columns: shape_cols,
+            rows: RowCount::Many,
+        },
+        StatementKind::Query,
+    );
+    let child = ChildRef {
+        stmt: idx,
+        parent: Some(ParentRef {
+            stmt: temp_idx,
+            parent_key: "$$key".to_string(),
+            child_key: "c0".to_string(),
+        }),
+        cardinality: Cardinality::Many,
+        tag: None,
+    };
+    (element, child)
+}
+
+fn branch_nested_sub(plan: &BranchPlan) -> Option<QueryType> {
+    match plan {
+        BranchPlan::Value { .. } => None,
+        BranchPlan::Nested { sub } => Some(sub.clone()),
+        BranchPlan::Tuple(ps) => ps.iter().find_map(branch_nested_sub),
+        BranchPlan::Record(fs) => fs.iter().find_map(|(_, p)| branch_nested_sub(p)),
+    }
+}
+
+fn branch_kind(plan: &BranchPlan) -> &'static str {
+    match plan {
+        BranchPlan::Record(_) => "record",
+        BranchPlan::Tuple(ps) if ps.iter().any(|p| branch_kind(p) == "record") => "record",
+        _ => "tuple",
+    }
+}
+
+fn materialize_array_parent(
+    ctx: &mut Context,
+    parent: &Level,
+    refs: &[String],
+) -> (String, usize, Vec<(String, Option<ScalarType>)>) {
+    let parent_q = parent.builder.clone();
+    let temp = ctx.aliases.temp();
     let mut create_q = parent_q;
     if create_q.select.is_empty() {
         create_q.select = vec![SelectItem::AllFrom { depth: 0 }];
     }
-    for col in &refs {
+    for col in refs {
         if !available_cols(&create_q, ctx.schema).contains(col) {
             todo!("M4b key threading through subqueries");
         }
@@ -3135,10 +3646,18 @@ fn rtemp_array_shape(
         },
         StatementKind::Temp { name: temp.clone() },
     );
+    (temp, temp_idx, create_outputs)
+}
+
+fn swap_parent_to_temp(
+    parent: &mut Level,
+    temp: &str,
+    create_outputs: &[(String, Option<ScalarType>)],
+) {
     parent.builder = SelectBuilder {
         select: Vec::new(),
         from: Some(FromClause::Temp {
-            name: temp.clone(),
+            name: temp.to_string(),
             columns: create_outputs
                 .iter()
                 .map(|(name, ty)| NamedColumn {
@@ -3154,21 +3673,234 @@ fn rtemp_array_shape(
         unions: Vec::new(),
     };
     parent.stmt_bound = true;
-    let mut arms = arms.into_iter();
-    let mut child_builder = arms.next().unwrap_or_else(|| {
-        unreachable!("temp array without arms: empty arrays are untypeable upstream")
+}
+
+fn rtemp_array_shape(
+    ctx: &mut Context,
+    parent: &mut Level,
+    tail: &TypedExpr,
+) -> (ResultShape, Option<String>) {
+    let TypedExprKind::Array { elements } = &tail.kind else {
+        unreachable!("rtemp array over non-array tail: the rvalue gate admits bare arrays only")
+    };
+    let inner = match &tail.ty {
+        QueryType::List(inner) => inner.as_ref(),
+        _ => unreachable!(
+            "non-list array type {}: the checker types arrays as lists",
+            tail.ty
+        ),
+    };
+    if !temp_nest_ok(inner) {
+        todo!("M6 query-valued array element");
+    }
+    let Some(refs) = collect_temp_refs(ctx.schema, tail) else {
+        todo!("M6 correlated literal projection item");
+    };
+    if refs.iter().any(|r| r == "c0" || r == "c1" || r == "$$key") {
+        todo!("M6 correlated literal projection item");
+    }
+    let (temp, temp_idx, create_outputs) = materialize_array_parent(ctx, parent, &refs);
+    swap_parent_to_temp(parent, &temp, &create_outputs);
+    let ref_tys: Vec<(String, Option<ScalarType>)> = refs
+        .iter()
+        .map(|name| {
+            (
+                name.clone(),
+                output_ty(&parent.builder, name, ctx.schema).or(Some(ScalarType::Int)),
+            )
+        })
+        .collect();
+    ctx.temp_collect = Some(TempCollect {
+        temp: temp.clone(),
+        child_fk: "$$key".to_string(),
+        refs,
     });
-    child_builder.unions = arms.collect();
+    ctx.in_array_temp = true;
+    let items: Vec<(Option<i64>, &TypedExpr)> = elements.iter().map(|e| (None, e)).collect();
+    let (element, child) = temp_array_level(ctx, &temp, temp_idx, &ref_tys, inner, items, None);
+    ctx.in_array_temp = false;
+    ctx.temp_collect.take();
+    (
+        ResultShape::List {
+            element: Box::new(element),
+            child,
+        },
+        Some("$$key".to_string()),
+    )
+}
+
+fn rtemp_method_shape(
+    ctx: &mut Context,
+    parent: &mut Level,
+    tail: &TypedExpr,
+) -> (ResultShape, Option<String>) {
+    let TypedExprKind::Method {
+        base, name, args, ..
+    } = &tail.kind
+    else {
+        unreachable!("rtemp method over non-method tail: the rvalue gate admits method tails only")
+    };
+    let TypedExprKind::Array { elements } = &base.kind else {
+        unreachable!(
+            "rtemp method over non-array base: the rvalue gate admits methods over bare arrays only"
+        )
+    };
+    let inner = match &base.ty {
+        QueryType::List(inner) => inner.as_ref(),
+        _ => unreachable!(
+            "non-list array type {}: the checker types arrays as lists",
+            base.ty
+        ),
+    };
+    if !temp_nest_ok(inner) {
+        todo!("M6 query-valued array element");
+    }
+    let Some(refs) = collect_temp_refs(ctx.schema, tail) else {
+        todo!("M6 correlated literal projection item");
+    };
+    if refs.iter().any(|r| r == "c0" || r == "c1" || r == "$$key") {
+        todo!("M6 correlated literal projection item");
+    }
+    let (temp, temp_idx, create_outputs) = materialize_array_parent(ctx, parent, &refs);
+    swap_parent_to_temp(parent, &temp, &create_outputs);
+    let ref_tys: Vec<(String, Option<ScalarType>)> = refs
+        .iter()
+        .map(|name| {
+            (
+                name.clone(),
+                output_ty(&parent.builder, name, ctx.schema).or(Some(ScalarType::Int)),
+            )
+        })
+        .collect();
+    ctx.temp_collect = Some(TempCollect {
+        temp: temp.clone(),
+        child_fk: "$$key".to_string(),
+        refs,
+    });
+    ctx.in_array_temp = true;
+    let items: Vec<(Option<i64>, &TypedExpr)> = elements.iter().map(|e| (None, e)).collect();
+    let (element, child) = match name.value.as_str() {
+        "flatten" => temp_flatten_level(ctx, &temp, temp_idx, &ref_tys, inner, items),
+        method @ ("take" | "skip") => {
+            let entry = EntryMethod::TakeSkip {
+                name: method.to_string(),
+                args,
+            };
+            temp_array_level(ctx, &temp, temp_idx, &ref_tys, inner, items, Some(entry))
+        }
+        method @ ("sort" | "sort_asc" | "sort_desc") => {
+            let entry = EntryMethod::Sort {
+                args,
+                default: if method == "sort_desc" {
+                    OrderDir::Desc
+                } else {
+                    OrderDir::Asc
+                },
+            };
+            temp_array_level(ctx, &temp, temp_idx, &ref_tys, inner, items, Some(entry))
+        }
+        "filter" => {
+            let entry = EntryMethod::Filter {
+                pred: one_arg(args, name),
+            };
+            temp_array_level(ctx, &temp, temp_idx, &ref_tys, inner, items, Some(entry))
+        }
+        _ => unreachable!("rtemp method outside the gate allowlist: gates admit row-ops only"),
+    };
+    ctx.in_array_temp = false;
+    ctx.temp_collect.take();
+    (
+        ResultShape::List {
+            element: Box::new(element),
+            child,
+        },
+        Some("$$key".to_string()),
+    )
+}
+
+fn temp_flatten_level(
+    ctx: &mut Context,
+    temp: &str,
+    temp_idx: usize,
+    refs: &[(String, Option<ScalarType>)],
+    elem_ty: &QueryType,
+    items: Vec<(Option<i64>, &TypedExpr)>,
+) -> (ResultShape, ChildRef) {
+    let mut next_col = 2usize;
+    let plan = branch_plan(elem_ty, &mut next_col);
+    let BranchPlan::Nested { sub } = &plan else {
+        unreachable!("flatten over non-nested arrays: the checker admits doubly-nested lists only")
+    };
+    if array_has_list_leaf(sub) {
+        todo!("M6 correlated literal projection item");
+    }
+    let mut value_cols = Vec::new();
+    branch_value_cols(&plan, &mut value_cols);
+    debug_assert!(
+        value_cols.is_empty(),
+        "flatten over scalar-carrying branch: pure nesting serves keys only"
+    );
+    let (arms, sub_items) = temp_branch_arms(ctx, temp, refs, &plan, &value_cols, &items);
+    let (next_temp, _) = sink_arm_temp(ctx, union_builders(arms));
+    let mut arms: Vec<SelectBuilder> = Vec::with_capacity(sub_items.len());
+    for (filter, elem) in &sub_items {
+        let mut cells = Vec::new();
+        temp_array_cells(ctx, elem, sub, &mut cells);
+        let mut select = vec![SelectItem::Column {
+            depth: 0,
+            column: "c0".to_string(),
+            output: "c0".to_string(),
+            ty: None,
+        }];
+        for (i, (expr, ty)) in cells.into_iter().enumerate() {
+            select.push(SelectItem::Expr {
+                expr,
+                output: format!("c{}", i + 1),
+                ty,
+            });
+        }
+        let mut arm = SelectBuilder {
+            select,
+            from: Some(FromClause::Table {
+                table: next_temp.clone(),
+                alias: next_temp.clone(),
+            }),
+            where_: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            unions: Vec::new(),
+        };
+        if let Some(ord) = filter {
+            arm.where_ = vec![SqlExpr::Binary {
+                op: SqlBinOp::Eq,
+                lhs: Box::new(SqlExpr::Column {
+                    depth: 0,
+                    column: "c1".to_string(),
+                }),
+                rhs: Box::new(SqlExpr::Param(ParamValue::Int(*ord))),
+            }];
+        }
+        arms.push(arm);
+    }
+    if arms.is_empty() {
+        let mut tys = Vec::new();
+        temp_leaf_tys(sub, &mut tys);
+        let mut layout = vec![("c0".to_string(), None)];
+        layout.extend(
+            tys.iter()
+                .enumerate()
+                .map(|(i, ty)| (format!("c{}", i + 1), Some(*ty))),
+        );
+        arms.push(false_arm(&layout));
+    }
+    let child_builder = union_builders(arms);
     let outputs = builder_outputs(&child_builder, ctx.schema);
     let shape_cols: Vec<OutputColumn> =
         shape_columns(builder_output_types(&child_builder, ctx.schema), |name| {
             name == "c0"
         });
-    let item_ty = match &tail.ty {
-        QueryType::List(sub) => sub.as_ref(),
-        _ => &tail.ty,
-    };
-    let element = child_element(ctx.schema, None, item_ty, &outputs, |name| name == "c0");
+    let element = child_element(ctx.schema, None, sub, &outputs, |name| name == "c0");
     let idx = ctx.sink(
         child_builder,
         StatementShape {
@@ -3177,22 +3909,183 @@ fn rtemp_array_shape(
         },
         StatementKind::Query,
     );
-    (
-        ResultShape::List {
-            element: Box::new(element),
-            child: ChildRef {
-                stmt: idx,
-                parent: Some(ParentRef {
-                    stmt: temp_idx,
-                    parent_key: "$$key".to_string(),
-                    child_key: "c0".to_string(),
+    let child = ChildRef {
+        stmt: idx,
+        parent: Some(ParentRef {
+            stmt: temp_idx,
+            parent_key: "$$key".to_string(),
+            child_key: "c0".to_string(),
+        }),
+        cardinality: Cardinality::Many,
+        tag: None,
+    };
+    (element, child)
+}
+
+fn scalar_temp_array(
+    ctx: &mut Context,
+    parent: &mut Level,
+    prefix: &str,
+    value: &TypedExpr,
+) -> Option<(Vec<SelectItem>, ResultShape, Vec<String>)> {
+    if ctx.child.is_some()
+        || ctx.temp_collect.is_some()
+        || ctx.in_take_arg
+        || ctx.corr
+        || ctx.in_array_temp
+    {
+        return None;
+    }
+    let TypedExprKind::Method {
+        base,
+        name,
+        args,
+        optional,
+    } = &value.kind
+    else {
+        return None;
+    };
+    if *optional {
+        return None;
+    }
+    if !matches!(
+        name.value.as_str(),
+        "len" | "sum" | "avg" | "max" | "min" | "contains" | "first" | "nth"
+    ) {
+        return None;
+    }
+    let TypedExprKind::Array { elements } = &base.kind else {
+        return None;
+    };
+    let inner = match &base.ty {
+        QueryType::List(inner) => inner.as_ref(),
+        _ => return None,
+    };
+    if !matches!(peel_optional(inner), QueryType::Scalar(_)) {
+        return None;
+    }
+    if tail_uses_outer(base) {
+        return None;
+    }
+    if !has_scope_ident(base) {
+        return None;
+    }
+    if args
+        .iter()
+        .any(|arg| has_scope_ident(&arg.expr) || uses_outer(&arg.expr))
+    {
+        return None;
+    }
+    if !temp_nest_ok(inner) {
+        return None;
+    }
+    let refs = collect_temp_refs(ctx.schema, base)?;
+    if refs.iter().any(|r| r == "c0" || r == "c1" || r == "$$key") {
+        return None;
+    }
+    if name.value == "contains" && !one_arg(args, name).ty.is_scalar() {
+        todo!("comparison-overhaul: composite membership");
+    }
+    let (temp, _temp_idx, create_outputs) = materialize_array_parent(ctx, parent, &refs);
+    swap_parent_to_temp(parent, &temp, &create_outputs);
+    ctx.temp_collect = Some(TempCollect {
+        temp: temp.clone(),
+        child_fk: "$$key".to_string(),
+        refs,
+    });
+    ctx.in_array_temp = true;
+    let items: Vec<(Option<i64>, &TypedExpr)> = elements.iter().map(|e| (None, e)).collect();
+    let arms = temp_leaf_arms(ctx, &temp, inner, &items);
+    let inner_alias = ctx.aliases.subquery();
+    let inner_from = FromClause::Subquery {
+        query: Box::new(union_builders(arms)),
+        alias: inner_alias,
+    };
+    let key_pred = || SqlExpr::Binary {
+        op: SqlBinOp::Eq,
+        lhs: Box::new(SqlExpr::Column {
+            depth: 0,
+            column: "c0".to_string(),
+        }),
+        rhs: Box::new(SqlExpr::Column {
+            depth: 1,
+            column: "$$key".to_string(),
+        }),
+    };
+    let result_ty = scalar_of(&value.ty);
+    let expr = match name.value.as_str() {
+        "contains" => {
+            let needle = scalar(ctx, one_arg(args, name));
+            let mut exists = SelectBuilder::new();
+            exists.select = vec![SelectItem::AllFrom { depth: 0 }];
+            exists.from = Some(inner_from);
+            exists.where_ = vec![
+                key_pred(),
+                SqlExpr::Binary {
+                    op: SqlBinOp::Eq,
+                    lhs: Box::new(SqlExpr::Column {
+                        depth: 0,
+                        column: "c1".to_string(),
+                    }),
+                    rhs: Box::new(needle),
+                },
+            ];
+            SqlExpr::Exists(Box::new(exists))
+        }
+        "first" | "nth" => {
+            let mut middle = SelectBuilder::new();
+            middle.select = vec![SelectItem::Column {
+                depth: 0,
+                column: "c1".to_string(),
+                output: ctx.aliases.generic(),
+                ty: result_ty,
+            }];
+            middle.from = Some(inner_from);
+            middle.where_ = vec![key_pred()];
+            compose_limit(&mut middle, &name.value, args, ctx);
+            SqlExpr::Subquery {
+                query: Box::new(middle),
+            }
+        }
+        method @ ("len" | "sum" | "avg" | "max" | "min") => {
+            let agg = match method {
+                "len" => AggOp::Len,
+                "sum" => AggOp::Bare(BareAgg::Sum, inner_scalar(inner, method)),
+                "avg" => AggOp::Bare(BareAgg::Avg, inner_scalar(inner, method)),
+                "max" => AggOp::Bare(BareAgg::Max, inner_scalar(inner, method)),
+                _ => AggOp::Bare(BareAgg::Min, inner_scalar(inner, method)),
+            };
+            let mut query = SelectBuilder::new();
+            query.select = vec![SelectItem::Expr {
+                expr: agg_call(&agg, || SqlExpr::Column {
+                    depth: 0,
+                    column: "c1".to_string(),
                 }),
-                cardinality: Cardinality::Many,
-                tag: None,
-            },
-        },
-        Some("$$key".to_string()),
-    )
+                output: ctx.aliases.generic(),
+                ty: result_ty,
+            }];
+            query.from = Some(inner_from);
+            query.where_ = vec![key_pred()];
+            SqlExpr::Subquery {
+                query: Box::new(query),
+            }
+        }
+        _ => unreachable!(
+            "scalar-temp method outside the allowlist: gates admit reductions, membership, and collapses only"
+        ),
+    };
+    ctx.in_array_temp = false;
+    ctx.temp_collect.take();
+    let item = SelectItem::Expr {
+        expr,
+        output: prefix.to_string(),
+        ty: result_ty,
+    };
+    Some((
+        vec![item],
+        ResultShape::Column(prefix.to_string()),
+        vec!["$$key".to_string()],
+    ))
 }
 
 fn filter_chain_to_field_ident(mut node: &TypedExpr) -> bool {
@@ -4324,13 +5217,12 @@ enum LinkCols {
     ManyToMany,
 }
 
-fn link_cols(ctx: &Context, fid: FieldId) -> LinkCols {
-    let relation = &ctx.schema.relations[ctx
-        .schema
+fn link_cols(schema: &ValidatedSchema, fid: FieldId) -> LinkCols {
+    let relation = &schema.relations[schema
         .relation_of_field(fid)
         .unwrap_or_else(|| unreachable!("reference field without relation"))
         .index()];
-    let name = |c| ctx.schema.column_name(c).to_string();
+    let name = |c| schema.column_name(c).to_string();
     match relation {
         Relation::OneToOne {
             child_ref,
@@ -4388,7 +5280,7 @@ fn hop_shell(ctx: &mut Context, source: StructId, fid: FieldId) -> (StructId, Se
         Field::Ref { target, .. } => *target,
         _ => unreachable!("hop over non-reference field"),
     };
-    let (child_col, parent_col) = match link_cols(ctx, fid) {
+    let (child_col, parent_col) = match link_cols(ctx.schema, fid) {
         LinkCols::ParentFk {
             parent_fk,
             child_pk,
@@ -4661,6 +5553,85 @@ fn scalar_list_col(ctx: &mut Context, base: &TypedExpr) -> String {
     }
 }
 
+fn agg_call(agg: &AggOp, col: impl FnOnce() -> SqlExpr) -> SqlExpr {
+    match agg {
+        AggOp::Len => SqlExpr::Count,
+        AggOp::Bare(BareAgg::Sum, ScalarType::Int)
+        | AggOp::Bare(BareAgg::Sum, ScalarType::Float) => SqlExpr::Func {
+            name: "SUM".to_string(),
+            args: vec![col()],
+        },
+        AggOp::Bare(BareAgg::Sum, ScalarType::Dec) => SqlExpr::Func {
+            name: "$$sum_dec".to_string(),
+            args: vec![col()],
+        },
+        AggOp::Bare(BareAgg::Sum, ScalarType::Duration) => SqlExpr::Func {
+            name: "$$sum_dur".to_string(),
+            args: vec![col()],
+        },
+        AggOp::Bare(BareAgg::Avg, ScalarType::Int)
+        | AggOp::Bare(BareAgg::Avg, ScalarType::Float) => SqlExpr::Func {
+            name: "AVG".to_string(),
+            args: vec![col()],
+        },
+        AggOp::Bare(BareAgg::Avg, ScalarType::Dec) => SqlExpr::Func {
+            name: "$$avg_dec".to_string(),
+            args: vec![col()],
+        },
+        AggOp::Bare(BareAgg::Avg, ScalarType::Duration) => SqlExpr::Func {
+            name: "$$avg_dur".to_string(),
+            args: vec![col()],
+        },
+        AggOp::Bare(BareAgg::Avg, ScalarType::Instant) => SqlExpr::Func {
+            name: "$$avg_instant".to_string(),
+            args: vec![col()],
+        },
+        AggOp::Bare(BareAgg::Max, _) | AggOp::Bare(BareAgg::Min, _) => {
+            let func = match agg {
+                AggOp::Bare(BareAgg::Max, _) => "MAX",
+                _ => "MIN",
+            };
+            SqlExpr::Func {
+                name: func.to_string(),
+                args: vec![col()],
+            }
+        }
+        AggOp::Over(OverAgg::Sum, ScalarType::Int, arg)
+        | AggOp::Over(OverAgg::Sum, ScalarType::Float, arg) => SqlExpr::Func {
+            name: "SUM".to_string(),
+            args: vec![arg.clone()],
+        },
+        AggOp::Over(OverAgg::Sum, ScalarType::Dec, arg) => SqlExpr::Func {
+            name: "$$sum_dec".to_string(),
+            args: vec![arg.clone()],
+        },
+        AggOp::Over(OverAgg::Sum, ScalarType::Duration, arg) => SqlExpr::Func {
+            name: "$$sum_dur".to_string(),
+            args: vec![arg.clone()],
+        },
+        AggOp::Over(OverAgg::Avg, ScalarType::Int, arg)
+        | AggOp::Over(OverAgg::Avg, ScalarType::Float, arg) => SqlExpr::Func {
+            name: "AVG".to_string(),
+            args: vec![arg.clone()],
+        },
+        AggOp::Over(OverAgg::Avg, ScalarType::Dec, arg) => SqlExpr::Func {
+            name: "$$avg_dec".to_string(),
+            args: vec![arg.clone()],
+        },
+        AggOp::Over(OverAgg::Avg, ScalarType::Duration, arg) => SqlExpr::Func {
+            name: "$$avg_dur".to_string(),
+            args: vec![arg.clone()],
+        },
+        AggOp::Over(OverAgg::Avg, ScalarType::Instant, arg) => SqlExpr::Func {
+            name: "$$avg_instant".to_string(),
+            args: vec![arg.clone()],
+        },
+        _ => unreachable!(
+            "rejected input reaches aggregation: the checker restricts bases and inners"
+        ),
+    }
+}
+
 fn scalar_aggregate(ctx: &mut Context, base: &TypedExpr, agg: AggOp) -> SqlExpr {
     let corr = has_row_setting_ident(base) || tail_uses_outer(base);
     if corr && ctx.in_take_arg {
@@ -4722,83 +5693,10 @@ fn scalar_aggregate(ctx: &mut Context, base: &TypedExpr, agg: AggOp) -> SqlExpr 
         output: output.clone(),
         ty: result_ty,
     };
-    let col = |column: String| SqlExpr::Column { depth: 0, column };
-    let expr = match agg {
-        AggOp::Len => SqlExpr::Count,
-        AggOp::Bare(BareAgg::Sum, ScalarType::Int)
-        | AggOp::Bare(BareAgg::Sum, ScalarType::Float) => SqlExpr::Func {
-            name: "SUM".to_string(),
-            args: vec![col(scalar_list_col(ctx, base))],
-        },
-        AggOp::Bare(BareAgg::Sum, ScalarType::Dec) => SqlExpr::Func {
-            name: "$$sum_dec".to_string(),
-            args: vec![col(scalar_list_col(ctx, base))],
-        },
-        AggOp::Bare(BareAgg::Sum, ScalarType::Duration) => SqlExpr::Func {
-            name: "$$sum_dur".to_string(),
-            args: vec![col(scalar_list_col(ctx, base))],
-        },
-        AggOp::Bare(BareAgg::Avg, ScalarType::Int)
-        | AggOp::Bare(BareAgg::Avg, ScalarType::Float) => SqlExpr::Func {
-            name: "AVG".to_string(),
-            args: vec![col(scalar_list_col(ctx, base))],
-        },
-        AggOp::Bare(BareAgg::Avg, ScalarType::Dec) => SqlExpr::Func {
-            name: "$$avg_dec".to_string(),
-            args: vec![col(scalar_list_col(ctx, base))],
-        },
-        AggOp::Bare(BareAgg::Avg, ScalarType::Duration) => SqlExpr::Func {
-            name: "$$avg_dur".to_string(),
-            args: vec![col(scalar_list_col(ctx, base))],
-        },
-        AggOp::Bare(BareAgg::Avg, ScalarType::Instant) => SqlExpr::Func {
-            name: "$$avg_instant".to_string(),
-            args: vec![col(scalar_list_col(ctx, base))],
-        },
-        AggOp::Bare(BareAgg::Max, _) | AggOp::Bare(BareAgg::Min, _) => {
-            let func = match agg {
-                AggOp::Bare(BareAgg::Max, _) => "MAX",
-                _ => "MIN",
-            };
-            SqlExpr::Func {
-                name: func.to_string(),
-                args: vec![col(scalar_list_col(ctx, base))],
-            }
-        }
-        AggOp::Over(OverAgg::Sum, ScalarType::Int, arg)
-        | AggOp::Over(OverAgg::Sum, ScalarType::Float, arg) => SqlExpr::Func {
-            name: "SUM".to_string(),
-            args: vec![arg],
-        },
-        AggOp::Over(OverAgg::Sum, ScalarType::Dec, arg) => SqlExpr::Func {
-            name: "$$sum_dec".to_string(),
-            args: vec![arg],
-        },
-        AggOp::Over(OverAgg::Sum, ScalarType::Duration, arg) => SqlExpr::Func {
-            name: "$$sum_dur".to_string(),
-            args: vec![arg],
-        },
-        AggOp::Over(OverAgg::Avg, ScalarType::Int, arg)
-        | AggOp::Over(OverAgg::Avg, ScalarType::Float, arg) => SqlExpr::Func {
-            name: "AVG".to_string(),
-            args: vec![arg],
-        },
-        AggOp::Over(OverAgg::Avg, ScalarType::Dec, arg) => SqlExpr::Func {
-            name: "$$avg_dec".to_string(),
-            args: vec![arg],
-        },
-        AggOp::Over(OverAgg::Avg, ScalarType::Duration, arg) => SqlExpr::Func {
-            name: "$$avg_dur".to_string(),
-            args: vec![arg],
-        },
-        AggOp::Over(OverAgg::Avg, ScalarType::Instant, arg) => SqlExpr::Func {
-            name: "$$avg_instant".to_string(),
-            args: vec![arg],
-        },
-        _ => unreachable!(
-            "rejected input reaches aggregation: the checker restricts bases and inners"
-        ),
-    };
+    let expr = agg_call(&agg, || SqlExpr::Column {
+        depth: 0,
+        column: scalar_list_col(ctx, base),
+    });
     SqlExpr::Subquery {
         query: Box::new(SelectBuilder {
             select: vec![select(expr)],
@@ -6518,40 +7416,211 @@ fn array_has_list_leaf(ty: &QueryType) -> bool {
     }
 }
 
-fn temp_readable_element(elem: &TypedExpr) -> bool {
-    fn go(elem: &TypedExpr, under_row: bool) -> bool {
+fn link_parent_col(schema: &ValidatedSchema, fid: FieldId) -> Option<String> {
+    match link_cols(schema, fid) {
+        LinkCols::ParentFk { parent_fk, .. } => Some(parent_fk),
+        LinkCols::TargetFk { parent_pk, .. } => Some(parent_pk),
+        LinkCols::ManyToMany => None,
+    }
+}
+
+fn nav_root_fk(schema: &ValidatedSchema, elem: &TypedExpr) -> Option<String> {
+    scalar_of(&elem.ty)?;
+    let mut cursor = elem;
+    let mut first = true;
+    loop {
+        match &cursor.kind {
+            TypedExprKind::Field {
+                base, name: hop, ..
+            } => {
+                if let Some(value) = struct_field_value(base, &hop.value) {
+                    cursor = value;
+                    continue;
+                }
+                if !first {
+                    let sid = match peel_optional(&base.ty) {
+                        QueryType::Record(RecordSource::Schema(sid)) => *sid,
+                        _ => return None,
+                    };
+                    let (_, field) = schema.struct_field(sid, &hop.value)?;
+                    if !matches!(field, Field::Ref { .. }) {
+                        return None;
+                    }
+                }
+                first = false;
+                cursor = base;
+            }
+            TypedExprKind::Ident {
+                binding: IdentBinding::Field(fid),
+                depth,
+                ..
+            } => {
+                if *depth != 0 {
+                    return None;
+                }
+                let field = &schema.structs[fid.struct_id().index()].fields[fid.local()];
+                if !matches!(field, Field::Ref { .. }) {
+                    return None;
+                }
+                return link_parent_col(schema, *fid);
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn collect_temp_refs(schema: &ValidatedSchema, tail: &TypedExpr) -> Option<Vec<String>> {
+    fn go(
+        schema: &ValidatedSchema,
+        elem: &TypedExpr,
+        under_row: bool,
+        out: &mut Vec<String>,
+    ) -> bool {
         match &elem.kind {
             TypedExprKind::Ident { binding, depth, .. } => match binding {
                 IdentBinding::Root { .. } => true,
-                IdentBinding::Field(_) | IdentBinding::ProjectedField { .. } => {
-                    !under_row && *depth == 0 && scalar_of(&elem.ty).is_some()
+                IdentBinding::Field(fid) => {
+                    if under_row || *depth != 0 || scalar_of(&elem.ty).is_none() {
+                        return false;
+                    }
+                    let field = &schema.structs[fid.struct_id().index()].fields[fid.local()];
+                    match field {
+                        Field::Value { columns, .. } => match columns.as_slice() {
+                            [col] => {
+                                let name = schema.column_name(*col).to_string();
+                                if !out.contains(&name) {
+                                    out.push(name);
+                                }
+                                true
+                            }
+                            _ => false,
+                        },
+                        _ => false,
+                    }
+                }
+                IdentBinding::ProjectedField { name } => {
+                    if under_row || *depth != 0 || scalar_of(&elem.ty).is_none() {
+                        return false;
+                    }
+                    if !out.contains(name) {
+                        out.push(name.clone());
+                    }
+                    true
                 }
                 IdentBinding::Prev { .. } => false,
             },
-            TypedExprKind::Field { base, .. } => go(base, true),
-            TypedExprKind::Method { base, args, .. } => {
-                go(base, true) && args.iter().all(|arg| go(&arg.expr, true))
+            TypedExprKind::Field { base, name, .. } => {
+                if !under_row {
+                    if let Some(field) = struct_field_value(base, &name.value) {
+                        return go(schema, field, under_row, out);
+                    }
+                    if let Some(fk) = nav_root_fk(schema, elem) {
+                        if !out.contains(&fk) {
+                            out.push(fk);
+                        }
+                        return true;
+                    }
+                }
+                go(schema, base, true, out)
+            }
+            TypedExprKind::Method {
+                base, name, args, ..
+            } => {
+                let flat_args = matches!(
+                    name.value.as_str(),
+                    "sort" | "sort_asc" | "sort_desc" | "filter"
+                );
+                go(schema, base, under_row, out)
+                    && args.iter().all(|arg| {
+                        if flat_args {
+                            go_arg(schema, &arg.expr, out)
+                        } else {
+                            go(schema, &arg.expr, true, out)
+                        }
+                    })
             }
             TypedExprKind::Projection { base, items } => {
-                go(base, true) && items.iter().all(|item| go(&item.value, true))
+                go(schema, base, true, out)
+                    && items.iter().all(|item| go(schema, &item.value, true, out))
             }
             TypedExprKind::Tuple { elements } | TypedExprKind::Array { elements } => {
-                elements.iter().all(|e| go(e, under_row))
+                elements.iter().all(|e| go(schema, e, under_row, out))
             }
-            TypedExprKind::Struct { fields } => fields.iter().all(|(_, e)| go(e, under_row)),
-            TypedExprKind::Binary { lhs, rhs, .. } => go(lhs, under_row) && go(rhs, under_row),
+            TypedExprKind::Struct { fields } => {
+                fields.iter().all(|(_, e)| go(schema, e, under_row, out))
+            }
+            TypedExprKind::Binary { lhs, rhs, .. } => {
+                go(schema, lhs, under_row, out) && go(schema, rhs, under_row, out)
+            }
             TypedExprKind::Unary { expr, .. }
             | TypedExprKind::Cast { expr, .. }
-            | TypedExprKind::Some { value: expr } => go(expr, under_row),
+            | TypedExprKind::Some { value: expr } => go(schema, expr, under_row, out),
             TypedExprKind::If { arms, default } => {
-                arms.iter()
-                    .all(|(cond, then)| go(cond, under_row) && go(then, under_row))
-                    && go(default, under_row)
+                arms.iter().all(|(cond, then)| {
+                    go(schema, cond, under_row, out) && go(schema, then, under_row, out)
+                }) && go(schema, default, under_row, out)
             }
             TypedExprKind::Literal(_) | TypedExprKind::TypeConstant { .. } => true,
         }
     }
-    go(elem, false)
+    let mut out = Vec::new();
+    go(schema, tail, false, &mut out).then_some(out)
+}
+
+fn go_arg(schema: &ValidatedSchema, elem: &TypedExpr, out: &mut Vec<String>) -> bool {
+    match &elem.kind {
+        TypedExprKind::Ident { binding, depth, .. } => match binding {
+            IdentBinding::Root { .. } => true,
+            IdentBinding::Field(fid) => {
+                if *depth != 0 || scalar_of(&elem.ty).is_none() {
+                    return false;
+                }
+                let field = &schema.structs[fid.struct_id().index()].fields[fid.local()];
+                match field {
+                    Field::Value { columns, .. } => match columns.as_slice() {
+                        [col] => {
+                            let name = schema.column_name(*col).to_string();
+                            if !out.contains(&name) {
+                                out.push(name);
+                            }
+                            true
+                        }
+                        _ => false,
+                    },
+                    _ => false,
+                }
+            }
+            IdentBinding::ProjectedField { name } => {
+                if *depth != 0 || scalar_of(&elem.ty).is_none() {
+                    return false;
+                }
+                if !out.contains(name) {
+                    out.push(name.clone());
+                }
+                true
+            }
+            IdentBinding::Prev { .. } => false,
+        },
+        TypedExprKind::Field { .. }
+        | TypedExprKind::Method { .. }
+        | TypedExprKind::Projection { .. } => false,
+        TypedExprKind::Tuple { elements } | TypedExprKind::Array { elements } => {
+            elements.iter().all(|e| go_arg(schema, e, out))
+        }
+        TypedExprKind::Struct { fields } => fields.iter().all(|(_, e)| go_arg(schema, e, out)),
+        TypedExprKind::Binary { lhs, rhs, .. } => {
+            go_arg(schema, lhs, out) && go_arg(schema, rhs, out)
+        }
+        TypedExprKind::Unary { expr, .. }
+        | TypedExprKind::Cast { expr, .. }
+        | TypedExprKind::Some { value: expr } => go_arg(schema, expr, out),
+        TypedExprKind::If { arms, default } => {
+            arms.iter()
+                .all(|(cond, then)| go_arg(schema, cond, out) && go_arg(schema, then, out))
+                && go_arg(schema, default, out)
+        }
+        TypedExprKind::Literal(_) | TypedExprKind::TypeConstant { .. } => true,
+    }
 }
 
 struct IfArm {
