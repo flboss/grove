@@ -240,6 +240,106 @@ fn empty_root_list() {
     assert_eq!(value("users[age > 100] { name }"), Value::List(vec![]));
 }
 
+#[test]
+fn grandchild_under_taken_middle() {
+    assert_eq!(
+        value("users { name, o = orders.take(2) { total, i = items { sku } } }"),
+        Value::List(vec![
+            Value::Record(vec![
+                ("name".to_string(), Value::String("Ada".to_string())),
+                (
+                    "o".to_string(),
+                    Value::List(vec![
+                        Value::Record(vec![
+                            ("total".to_string(), Value::Dec(dec("10"))),
+                            (
+                                "i".to_string(),
+                                Value::List(vec![
+                                    Value::Record(vec![(
+                                        "sku".to_string(),
+                                        Value::String("a".to_string())
+                                    )]),
+                                    Value::Record(vec![(
+                                        "sku".to_string(),
+                                        Value::String("b".to_string())
+                                    )]),
+                                ])
+                            ),
+                        ]),
+                        Value::Record(vec![
+                            ("total".to_string(), Value::Dec(dec("20"))),
+                            ("i".to_string(), Value::List(vec![])),
+                        ]),
+                    ])
+                ),
+            ]),
+            Value::Record(vec![
+                ("name".to_string(), Value::String("Bob".to_string())),
+                (
+                    "o".to_string(),
+                    Value::List(vec![Value::Record(vec![
+                        ("total".to_string(), Value::Dec(dec("30"))),
+                        (
+                            "i".to_string(),
+                            Value::List(vec![Value::Record(vec![(
+                                "sku".to_string(),
+                                Value::String("c".to_string())
+                            )])])
+                        ),
+                    ])]),
+                ),
+            ]),
+        ])
+    );
+}
+
+#[test]
+fn grandchild_under_sorted_taken_middle() {
+    assert_eq!(
+        value("users { name, o = orders.sort(total).take(1) { total, i = items { sku } } }"),
+        Value::List(vec![
+            Value::Record(vec![
+                ("name".to_string(), Value::String("Ada".to_string())),
+                (
+                    "o".to_string(),
+                    Value::List(vec![Value::Record(vec![
+                        ("total".to_string(), Value::Dec(dec("10"))),
+                        (
+                            "i".to_string(),
+                            Value::List(vec![
+                                Value::Record(vec![(
+                                    "sku".to_string(),
+                                    Value::String("a".to_string())
+                                )]),
+                                Value::Record(vec![(
+                                    "sku".to_string(),
+                                    Value::String("b".to_string())
+                                )]),
+                            ])
+                        ),
+                    ])]),
+                ),
+            ]),
+            Value::Record(vec![
+                ("name".to_string(), Value::String("Bob".to_string())),
+                (
+                    "o".to_string(),
+                    Value::List(vec![Value::Record(vec![
+                        ("total".to_string(), Value::Dec(dec("30"))),
+                        (
+                            "i".to_string(),
+                            Value::List(vec![Value::Record(vec![(
+                                "sku".to_string(),
+                                Value::String("c".to_string())
+                            )])])
+                        ),
+                    ])]),
+                ),
+            ]),
+        ])
+    );
+}
+
 
 fn dummy_stmts(n: usize) -> Vec<PlannedStatement> {
     (0..n)

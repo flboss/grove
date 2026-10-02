@@ -886,7 +886,7 @@ fn rows_method(
                 let mut level = window_wrap(
                     ctx,
                     level,
-                    Some(fk.as_str()),
+                    &fk,
                     vec![OrderItem {
                         expr: order_arg,
                         dir,
@@ -1194,7 +1194,7 @@ fn window_take(
     };
     let guard = non_neg_guard(arg, method);
     let order = std::mem::take(&mut level.builder.order_by);
-    let mut level = window_wrap(ctx, level, Some(fk), order);
+    let mut level = window_wrap(ctx, level, fk, order);
     let bound = SqlExpr::Binary {
         op: match method {
             "take" => SqlBinOp::Le,
@@ -1209,7 +1209,7 @@ fn window_take(
     level.builder.where_.push(bound);
     level
 }
-fn window_wrap(ctx: &mut Context, level: Level, fk: Option<&str>, order: Vec<OrderItem>) -> Level {
+fn window_wrap(ctx: &mut Context, level: Level, fk: &str, order: Vec<OrderItem>) -> Level {
     let Level {
         mut builder,
         element,
@@ -1232,20 +1232,14 @@ fn window_wrap(ctx: &mut Context, level: Level, fk: Option<&str>, order: Vec<Ord
     if builder.select.is_empty() {
         builder.select = vec![SelectItem::AllFrom { depth: 0 }];
     }
-    let partition = match fk {
-        Some(fk) => {
-            ensure_key(&mut builder, fk, ctx.schema);
-            vec![SqlExpr::Column {
-                depth: 0,
-                column: fk.to_string(),
-            }]
-        }
-        None => Vec::new(),
-    };
+    ensure_key(&mut builder, fk, ctx.schema);
     builder.select.push(SelectItem::Expr {
         expr: SqlExpr::Window {
             func: "ROW_NUMBER".to_string(),
-            partition,
+            partition: vec![SqlExpr::Column {
+                depth: 0,
+                column: fk.to_string(),
+            }],
             order,
         },
         output: "$$rn".to_string(),
@@ -1306,7 +1300,8 @@ pub fn has_pending_parent(shape: &ResultShape) -> bool {
 
 fn nested_bulk_lane(parent: &Level, tail: &TypedExpr) -> bool {
     matches!(tail_root_ident(tail), Some(IdentBinding::Field(_)))
-        && parent.stmt_bound
+        && parent.pending.is_none()
+        && parent.builder.unions.is_empty()
         && !tail_uses_outer(tail)
         && !take_bound_ident(tail)
 }
@@ -2626,15 +2621,16 @@ fn rvalue_shape(
     let reduced_tail = beta_reduce_tail(tail);
     let tail: &TypedExpr = &reduced_tail;
     let keyed = matches!(tail_root_ident(tail), Some(IdentBinding::Field(_)));
-    if ctx.nest_depth >= 1
-        && (!keyed || !parent.stmt_bound || tail_uses_outer(tail) || take_bound_ident(tail))
-    {
+    if ctx.nest_depth >= 1 && !nested_bulk_lane(parent, tail) {
         todo!("M4b nested list item");
     }
-    if keyed && (!parent.stmt_bound || tail_uses_outer(tail) || take_bound_ident(tail)) {
+    if ctx.nest_depth < 1
+        && keyed
+        && (!parent.stmt_bound || tail_uses_outer(tail) || take_bound_ident(tail))
+    {
         return rtemp_shape(ctx, parent, tail, Cardinality::Many);
     }
-    if !keyed && tail_uses_outer(tail) {
+    if ctx.nest_depth < 1 && !keyed && tail_uses_outer(tail) {
         return rcross_shape(ctx, parent, tail, Cardinality::Many);
     }
     if array_tail_root(tail) {
@@ -2780,9 +2776,14 @@ enum CollapsePrefix<'a> {
     Skip(&'a TypedExpr),
 }
 
-fn peel_windowed_collapse(
-    tail: &TypedExpr,
-) -> Option<(&TypedExpr, CollapseKind<'_>, Option<CollapsePrefix<'_>>)> {
+struct PeeledCollapse<'a> {
+    inner: &'a TypedExpr,
+    collapse: CollapseKind<'a>,
+    prefix: Option<CollapsePrefix<'a>>,
+    keyed: bool,
+}
+
+fn peel_windowed_collapse(tail: &TypedExpr) -> Option<PeeledCollapse<'_>> {
     let (base, collapse) = match &tail.kind {
         TypedExprKind::Method { base, name, .. } if name.value == "first" => {
             if filter_chain_to_field_ident(base) || filter_chain_to_root_ident(base) {
@@ -2841,10 +2842,57 @@ fn peel_windowed_collapse(
         }
         _ => (base, None),
     };
-    if !(filter_chain_to_field_ident(inner) || filter_chain_to_root_ident(inner)) {
+    let keyed = if filter_chain_to_field_ident(inner) {
+        true
+    } else if filter_chain_to_root_ident(inner) {
+        false
+    } else {
         return None;
+    };
+    Some(PeeledCollapse {
+        inner,
+        collapse,
+        prefix,
+        keyed,
+    })
+}
+
+fn rows_collapse(ctx: &mut Context, tail: &TypedExpr) -> (ResultShape, Option<String>) {
+    let mut level = rows(ctx, tail);
+    if level.pending.is_some() {
+        todo!("M4b ordered per-parent single");
     }
-    Some((inner, collapse, prefix))
+    if level.builder.select.is_empty() {
+        level.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+    }
+    let outputs = builder_outputs(&level.builder, ctx.schema);
+    let shape_cols: Vec<OutputColumn> =
+        shape_columns(builder_output_types(&level.builder, ctx.schema), |_| false);
+    let element = child_element(
+        ctx.schema,
+        level.output_shapes.as_ref(),
+        peel_optional(&tail.ty),
+        &outputs,
+        |_| false,
+    );
+    let idx = ctx.sink(
+        level.builder,
+        StatementShape {
+            columns: shape_cols,
+            rows: RowCount::ZeroOrOne,
+        },
+        StatementKind::Query,
+    );
+    let shape = ResultShape::Single {
+        element: Box::new(element),
+        child: ChildRef {
+            stmt: idx,
+            parent: None,
+            cardinality: Cardinality::One,
+            tag: None,
+        },
+    };
+    (shape, None)
 }
 
 fn windowed_collapse(
@@ -2860,37 +2908,19 @@ fn windowed_collapse(
             let _ = parent;
             (link.child_from, link.child_col, Some(link.parent_col))
         }
-        Some(IdentBinding::Root { root_idx }) => {
-            let root = &ctx.schema.roots[*root_idx];
-            let table = ctx.schema.tables[ctx.schema.structs[root.struct_id.index()].table.index()]
-                .name
-                .clone();
-            let _ = parent;
-            (
-                FromClause::Table {
-                    table: table.clone(),
-                    alias: ctx.aliases.table(&table),
-                },
-                String::new(),
-                None,
-            )
-        }
-        _ => unreachable!("exotic windowed collapse base: peel admits field and root tails only"),
+        _ => unreachable!("exotic windowed collapse base: peel admits keyed field tails only"),
     };
-    let keyed = parent_key.is_some();
     let child_level = Level {
         builder: {
             let mut child_builder = SelectBuilder::new();
             child_builder.from = Some(child_from);
-            if keyed {
-                child_builder.where_ = vec![SqlExpr::InSubquery {
-                    expr: Box::new(SqlExpr::Column {
-                        depth: 0,
-                        column: child_col.clone(),
-                    }),
-                    query: Box::new(bulk_query()),
-                }];
-            }
+            child_builder.where_ = vec![SqlExpr::InSubquery {
+                expr: Box::new(SqlExpr::Column {
+                    depth: 0,
+                    column: child_col.clone(),
+                }),
+                query: Box::new(bulk_query()),
+            }];
             child_builder
         },
         element: base.ty.clone(),
@@ -2900,26 +2930,18 @@ fn windowed_collapse(
         output_shapes: None,
         root_parts: None,
     };
-    let mut child = lower_tail(
-        ctx,
-        base,
-        child_level,
-        keyed,
-        keyed.then(|| child_col.clone()),
-    );
+    let mut child = lower_tail(ctx, base, child_level, true, Some(child_col.clone()));
     if child.builder.select.is_empty() {
         child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
     }
-    if keyed {
-        ensure_key(&mut child.builder, &child_col, ctx.schema);
-    }
+    ensure_key(&mut child.builder, &child_col, ctx.schema);
     let mut order = Vec::new();
     if let Some(CollapsePrefix::Sort(keys)) = &prefix {
         for (expr, dir) in keys {
             order.extend(sort_keys(ctx, &child, expr, *dir));
         }
     }
-    let mut child = window_wrap(ctx, child, keyed.then(|| child_col.as_str()), order);
+    let mut child = window_wrap(ctx, child, &child_col, order);
     let rn = || SqlExpr::Column {
         depth: 0,
         column: "$$rn".to_string(),
@@ -2949,9 +2971,7 @@ fn windowed_collapse(
     if child.builder.select.is_empty() {
         child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
     }
-    if keyed {
-        ensure_key(&mut child.builder, &child_col, ctx.schema);
-    }
+    ensure_key(&mut child.builder, &child_col, ctx.schema);
     let outputs = builder_outputs(&child.builder, ctx.schema);
     let shape_cols: Vec<OutputColumn> =
         shape_columns(builder_output_types(&child.builder, ctx.schema), |name| {
@@ -3105,8 +3125,17 @@ fn rscalar_shape(
                     todo!("M6 correlated literal projection item");
                 }
                 return broadcast_first(ctx, base);
-            } else if let Some((base, collapse, prefix)) = windowed {
-                return windowed_collapse(ctx, parent, base, collapse, prefix);
+            } else if let Some(peeled) = windowed {
+                if peeled.keyed {
+                    let PeeledCollapse {
+                        inner,
+                        collapse,
+                        prefix,
+                        ..
+                    } = peeled;
+                    return windowed_collapse(ctx, parent, inner, collapse, prefix);
+                }
+                return rows_collapse(ctx, tail);
             } else {
                 todo!("M4b ordered per-parent single");
             }
@@ -3115,24 +3144,34 @@ fn rscalar_shape(
             if ["nth", "take", "skip"].contains(&name.value.as_str()) =>
         {
             if name.value == "nth"
-                && let Some((base, collapse, prefix)) = windowed
+                && let Some(peeled) = windowed
             {
-                return windowed_collapse(ctx, parent, base, collapse, prefix);
+                if peeled.keyed {
+                    let PeeledCollapse {
+                        inner,
+                        collapse,
+                        prefix,
+                        ..
+                    } = peeled;
+                    return windowed_collapse(ctx, parent, inner, collapse, prefix);
+                }
+                return rows_collapse(ctx, tail);
             }
             todo!("M4b ordered per-parent single")
         }
         _ => tail,
     };
     let keyed = matches!(tail_root_ident(eff), Some(IdentBinding::Field(_)));
-    if ctx.nest_depth >= 1
-        && (!keyed || !parent.stmt_bound || tail_uses_outer(eff) || take_bound_ident(eff))
-    {
+    if ctx.nest_depth >= 1 && !nested_bulk_lane(parent, eff) {
         todo!("M4b nested record item");
     }
-    if keyed && (!parent.stmt_bound || tail_uses_outer(eff) || take_bound_ident(eff)) {
+    if ctx.nest_depth < 1
+        && keyed
+        && (!parent.stmt_bound || tail_uses_outer(eff) || take_bound_ident(eff))
+    {
         return rtemp_shape(ctx, parent, eff, Cardinality::One);
     }
-    if !keyed && tail_uses_outer(eff) {
+    if ctx.nest_depth < 1 && !keyed && tail_uses_outer(eff) {
         return rcross_shape(ctx, parent, eff, Cardinality::One);
     }
     let (child_from, child_col, parent_key) = match tail_root_ident(eff) {
@@ -3264,6 +3303,12 @@ fn rtemp_shape(
     tail: &TypedExpr,
     cardinality: Cardinality,
 ) -> (ResultShape, Option<String>) {
+    if ctx.nest_depth >= 1 {
+        if matches!(cardinality, Cardinality::Many) {
+            todo!("M4b nested list item");
+        }
+        todo!("M4b nested record item");
+    }
     let reduced_tail = beta_reduce_tail(tail);
     let tail: &TypedExpr = &reduced_tail;
     let temp = ctx.aliases.temp();
