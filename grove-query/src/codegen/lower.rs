@@ -5941,13 +5941,6 @@ fn scalar_method(
             unreachable!("no methods take bare record bases: the checker rejects them")
         }
         QueryType::Tuple(_) => match name.value.as_str() {
-            "contains" => {
-                let against = scalar(ctx, one_arg(args, name));
-                SqlExpr::In {
-                    expr: Box::new(against),
-                    items: tuple_elements(ctx, base),
-                }
-            }
             other => unreachable!("unknown tuple method {other}: the checker rejects it"),
         },
         QueryType::Void | QueryType::Unknown => {
@@ -6107,15 +6100,6 @@ fn contains_exists(ctx: &mut Context, base: &TypedExpr, needle: &TypedExpr) -> S
         },
     ];
     SqlExpr::Exists(Box::new(query))
-}
-
-fn tuple_elements(ctx: &mut Context, base: &TypedExpr) -> Vec<SqlExpr> {
-    match &base.kind {
-        TypedExprKind::Tuple { elements } => elements.iter().map(|e| scalar(ctx, e)).collect(),
-        _ => unreachable!(
-            "tuple method on non-tuple base: the checker resolves methods on inner types"
-        ),
-    }
 }
 
 fn apply_scalar_method(
