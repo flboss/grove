@@ -3418,6 +3418,7 @@ fn peel_row_ops<'a>(mut node: &'a TypedExpr) -> Option<(&'a TypedExpr, Vec<Entry
                             } else {
                                 OrderDir::Asc
                             },
+                            wrap: false,
                         }
                     }
                     "filter" => {
@@ -3448,6 +3449,7 @@ enum EntryMethod<'a> {
     Sort {
         args: &'a [TypedMethodArg],
         default: OrderDir,
+        wrap: bool,
     },
     Filter {
         pred: &'a TypedExpr,
@@ -3460,7 +3462,7 @@ fn apply_entry_method(
     union: SelectBuilder,
     elem_ty: &QueryType,
 ) -> SelectBuilder {
-    let mut level = Level {
+    let level = Level {
         builder: union,
         element: QueryType::List(Box::new(elem_ty.clone())),
         parent: ParentLink::Root { root_idx: 0 },
@@ -3474,7 +3476,15 @@ fn apply_entry_method(
             let wrapped = wrap_level(ctx, level);
             window_take(ctx, wrapped, "c0", &name, args).builder
         }
-        EntryMethod::Sort { args, default } => {
+        EntryMethod::Sort {
+            args,
+            default,
+            wrap,
+        } => {
+            let mut level = level;
+            if wrap {
+                level = wrap_level(ctx, level);
+            }
             let mut keys = Vec::new();
             for arg in args {
                 let dir = match &arg.direction {
@@ -3490,8 +3500,9 @@ fn apply_entry_method(
             level.builder
         }
         EntryMethod::Filter { pred } => {
-            level.builder.where_.push(scalar(ctx, pred));
-            level.builder
+            let mut wrapped = wrap_level(ctx, level);
+            wrapped.builder.where_.push(scalar(ctx, pred));
+            wrapped.builder
         }
     };
     if builder.select.is_empty() {
@@ -3548,6 +3559,7 @@ fn temp_leaf_arms(
     temp: &str,
     elem_ty: &QueryType,
     items: &[(Option<i64>, &TypedExpr)],
+    key_col: &str,
 ) -> Vec<SelectBuilder> {
     let mut arms: Vec<SelectBuilder> = Vec::with_capacity(items.len());
     for (filter, elem) in items {
@@ -3555,7 +3567,7 @@ fn temp_leaf_arms(
         temp_array_cells(ctx, elem, elem_ty, &mut cells);
         let mut select = vec![SelectItem::Column {
             depth: 0,
-            column: "$$key".to_string(),
+            column: key_col.to_string(),
             output: "c0".to_string(),
             ty: None,
         }];
@@ -3612,7 +3624,7 @@ fn temp_leaf_level(
     items: Vec<(Option<i64>, &TypedExpr)>,
     methods: Vec<EntryMethod>,
 ) -> (ResultShape, ChildRef) {
-    let arms = temp_leaf_arms(ctx, temp, elem_ty, &items);
+    let arms = temp_leaf_arms(ctx, temp, elem_ty, &items, "$$key");
     let mut union = union_builders(arms);
     for m in methods {
         union = apply_entry_method(ctx, m, union, elem_ty);
@@ -3700,6 +3712,21 @@ fn materialize_array_parent(
     (temp, temp_idx, create_outputs)
 }
 
+fn resolve_ref_tys(
+    ctx: &Context,
+    parent: &Level,
+    refs: &[String],
+) -> Vec<(String, Option<ScalarType>)> {
+    refs.iter()
+        .map(|name| {
+            (
+                name.clone(),
+                output_ty(&parent.builder, name, ctx.schema).or(Some(ScalarType::Int)),
+            )
+        })
+        .collect()
+}
+
 fn swap_parent_to_temp(
     parent: &mut Level,
     temp: &str,
@@ -3744,7 +3771,7 @@ fn rtemp_array_shape(
     if !temp_nest_ok(inner) {
         todo!("M6 query-valued array element");
     }
-    let Some(refs) = collect_temp_refs(ctx.schema, tail) else {
+    let Some(refs) = collect_temp_refs(ctx.schema, tail, &[]) else {
         todo!("M6 correlated literal projection item");
     };
     if refs.iter().any(|r| r == "c0" || r == "c1" || r == "$$key") {
@@ -3752,15 +3779,7 @@ fn rtemp_array_shape(
     }
     let (temp, temp_idx, create_outputs) = materialize_array_parent(ctx, parent, &refs);
     swap_parent_to_temp(parent, &temp, &create_outputs);
-    let ref_tys: Vec<(String, Option<ScalarType>)> = refs
-        .iter()
-        .map(|name| {
-            (
-                name.clone(),
-                output_ty(&parent.builder, name, ctx.schema).or(Some(ScalarType::Int)),
-            )
-        })
-        .collect();
+    let ref_tys = resolve_ref_tys(ctx, parent, &refs);
     ctx.temp_collect = Some(TempCollect {
         temp: temp.clone(),
         child_fk: "$$key".to_string(),
@@ -3786,19 +3805,19 @@ fn rtemp_method_shape(
     parent: &mut Level,
     tail: &TypedExpr,
 ) -> (ResultShape, Option<String>) {
-    let (array, methods): (&TypedExpr, Vec<EntryMethod>) = match &tail.kind {
+    let array: &TypedExpr = match &tail.kind {
         TypedExprKind::Method { base, name, .. } if name.value == "flatten" => {
             let TypedExprKind::Array { .. } = &base.kind else {
                 todo!("M6 correlated literal projection item");
             };
-            (base.as_ref(), Vec::new())
+            base.as_ref()
         }
         _ => match peel_row_ops(tail) {
-            Some((array, methods)) if !methods.is_empty() => (array, methods),
+            Some((array, _)) => array,
             _ => todo!("M6 correlated literal projection item"),
         },
     };
-    let TypedExprKind::Array { elements } = &array.kind else {
+    let TypedExprKind::Array { .. } = &array.kind else {
         unreachable!("peeled chain bottom is always the bare array")
     };
     let inner = match &array.ty {
@@ -3811,7 +3830,79 @@ fn rtemp_method_shape(
     if !temp_nest_ok(inner) {
         todo!("M6 query-valued array element");
     }
-    let Some(refs) = collect_temp_refs(ctx.schema, tail) else {
+    let fieldmap = element_field_cols(inner).unwrap_or_default();
+    if fieldmap
+        .iter()
+        .any(|(field, _)| field == "c0" || field == "c1" || field == "$$key")
+        || tail_scope_named(tail, &["c0", "c1", "$$key"])
+    {
+        todo!("M6 correlated literal projection item");
+    }
+    let mut rewritten;
+    let tail: &TypedExpr = if fieldmap.is_empty() {
+        tail
+    } else {
+        rewritten = tail.clone();
+        rewrite_tail_args(&mut rewritten, &fieldmap);
+        &rewritten
+    };
+    let (array, mut methods): (&TypedExpr, Vec<EntryMethod>) = match &tail.kind {
+        TypedExprKind::Method { base, name, .. } if name.value == "flatten" => {
+            let TypedExprKind::Array { .. } = &base.kind else {
+                todo!("M6 correlated literal projection item");
+            };
+            (base.as_ref(), Vec::new())
+        }
+        _ => match peel_row_ops(tail) {
+            Some((array, methods)) if !methods.is_empty() => (array, methods),
+            _ => todo!("M6 correlated literal projection item"),
+        },
+    };
+    let rewritten_cols: Vec<&str> = fieldmap.iter().map(|(_, col)| col.as_str()).collect();
+    for m in &mut methods {
+        let EntryMethod::Sort { args, wrap, .. } = m else {
+            continue;
+        };
+        let mut rewritten = false;
+        let mut scope = false;
+        for arg in *args {
+            any_ident(&arg.expr, &mut |e| match &e.kind {
+                TypedExprKind::Ident {
+                    binding: IdentBinding::ProjectedField { name },
+                    depth: 0,
+                    ..
+                } if rewritten_cols.iter().any(|c| *c == name) => {
+                    rewritten = true;
+                    false
+                }
+                TypedExprKind::Ident {
+                    binding: IdentBinding::Field(_) | IdentBinding::ProjectedField { .. },
+                    depth: 0,
+                    ..
+                } => {
+                    scope = true;
+                    false
+                }
+                _ => false,
+            });
+        }
+        if rewritten && scope {
+            todo!("M6 correlated literal projection item");
+        }
+        *wrap = rewritten;
+    }
+    let TypedExprKind::Array { elements } = &array.kind else {
+        unreachable!("peeled chain bottom is always the bare array")
+    };
+    let inner = match &array.ty {
+        QueryType::List(inner) => inner.as_ref(),
+        _ => unreachable!(
+            "non-list array type {}: the checker types arrays as lists",
+            array.ty
+        ),
+    };
+    let skip: Vec<String> = fieldmap.iter().map(|(_, col)| col.clone()).collect();
+    let Some(refs) = collect_temp_refs(ctx.schema, tail, &skip) else {
         todo!("M6 correlated literal projection item");
     };
     if refs.iter().any(|r| r == "c0" || r == "c1" || r == "$$key") {
@@ -3819,15 +3910,7 @@ fn rtemp_method_shape(
     }
     let (temp, temp_idx, create_outputs) = materialize_array_parent(ctx, parent, &refs);
     swap_parent_to_temp(parent, &temp, &create_outputs);
-    let ref_tys: Vec<(String, Option<ScalarType>)> = refs
-        .iter()
-        .map(|name| {
-            (
-                name.clone(),
-                output_ty(&parent.builder, name, ctx.schema).or(Some(ScalarType::Int)),
-            )
-        })
-        .collect();
+    let ref_tys = resolve_ref_tys(ctx, parent, &refs);
     ctx.temp_collect = Some(TempCollect {
         temp: temp.clone(),
         child_fk: "$$key".to_string(),
@@ -3875,58 +3958,7 @@ fn temp_flatten_level(
     );
     let (arms, sub_items) = temp_branch_arms(ctx, temp, refs, &plan, &value_cols, &items);
     let (next_temp, _) = sink_arm_temp(ctx, union_builders(arms));
-    let mut arms: Vec<SelectBuilder> = Vec::with_capacity(sub_items.len());
-    for (filter, elem) in &sub_items {
-        let mut cells = Vec::new();
-        temp_array_cells(ctx, elem, sub, &mut cells);
-        let mut select = vec![SelectItem::Column {
-            depth: 0,
-            column: "c0".to_string(),
-            output: "c0".to_string(),
-            ty: None,
-        }];
-        for (i, (expr, ty)) in cells.into_iter().enumerate() {
-            select.push(SelectItem::Expr {
-                expr,
-                output: format!("c{}", i + 1),
-                ty,
-            });
-        }
-        let mut arm = SelectBuilder {
-            select,
-            from: Some(FromClause::Table {
-                table: next_temp.clone(),
-                alias: next_temp.clone(),
-            }),
-            where_: Vec::new(),
-            order_by: Vec::new(),
-            limit: None,
-            offset: None,
-            unions: Vec::new(),
-        };
-        if let Some(ord) = filter {
-            arm.where_ = vec![SqlExpr::Binary {
-                op: SqlBinOp::Eq,
-                lhs: Box::new(SqlExpr::Column {
-                    depth: 0,
-                    column: "c1".to_string(),
-                }),
-                rhs: Box::new(SqlExpr::Param(ParamValue::Int(*ord))),
-            }];
-        }
-        arms.push(arm);
-    }
-    if arms.is_empty() {
-        let mut tys = Vec::new();
-        temp_leaf_tys(sub, &mut tys);
-        let mut layout = vec![("c0".to_string(), None)];
-        layout.extend(
-            tys.iter()
-                .enumerate()
-                .map(|(i, ty)| (format!("c{}", i + 1), Some(*ty))),
-        );
-        arms.push(false_arm(&layout));
-    }
+    let arms = temp_leaf_arms(ctx, &next_temp, sub, &sub_items, "c0");
     let child_builder = union_builders(arms);
     let outputs = builder_outputs(&child_builder, ctx.schema);
     let shape_cols: Vec<OutputColumn> =
@@ -4010,7 +4042,12 @@ fn scalar_temp_array(
     if !has_scope_ident(base) {
         return None;
     }
-    if args
+    if name.value == "contains" {
+        let needle = one_arg(args, name);
+        if (has_scope_ident(needle) || uses_outer(needle)) && !shiftable_needle(needle) {
+            return None;
+        }
+    } else if args
         .iter()
         .any(|arg| has_scope_ident(&arg.expr) || uses_outer(&arg.expr))
     {
@@ -4019,7 +4056,7 @@ fn scalar_temp_array(
     if !temp_nest_ok(inner) {
         return None;
     }
-    let refs = collect_temp_refs(ctx.schema, base)?;
+    let refs = collect_temp_refs(ctx.schema, base, &[])?;
     if refs.iter().any(|r| r == "c0" || r == "c1" || r == "$$key") {
         return None;
     }
@@ -4035,7 +4072,7 @@ fn scalar_temp_array(
     });
     ctx.in_array_temp = true;
     let items: Vec<(Option<i64>, &TypedExpr)> = elements.iter().map(|e| (None, e)).collect();
-    let arms = temp_leaf_arms(ctx, &temp, inner, &items);
+    let arms = temp_leaf_arms(ctx, &temp, inner, &items, "$$key");
     let mut union = union_builders(arms);
     for m in methods {
         union = apply_entry_method(ctx, m, union, inner);
@@ -4059,7 +4096,15 @@ fn scalar_temp_array(
     let result_ty = scalar_of(&value.ty);
     let expr = match name.value.as_str() {
         "contains" => {
-            let needle = scalar(ctx, one_arg(args, name));
+            let needle_node = one_arg(args, name);
+            let needle = if has_scope_ident(needle_node) || uses_outer(needle_node) {
+                if !shiftable_needle(needle_node) {
+                    todo!("M6 correlated literal outside temp lane");
+                }
+                shift_depths(scalar(ctx, needle_node), 1)
+            } else {
+                scalar(ctx, needle_node)
+            };
             let mut exists = SelectBuilder::new();
             exists.select = vec![SelectItem::AllFrom { depth: 0 }];
             exists.from = Some(inner_from);
@@ -7513,12 +7558,145 @@ fn nav_root_fk(schema: &ValidatedSchema, elem: &TypedExpr) -> Option<String> {
     }
 }
 
-fn collect_temp_refs(schema: &ValidatedSchema, tail: &TypedExpr) -> Option<Vec<String>> {
+fn element_field_cols(inner: &QueryType) -> Option<Vec<(String, String)>> {
+    fn leaves(ty: &QueryType, col: &mut usize, out: &mut Vec<(String, String)>) -> bool {
+        match peel_optional(ty) {
+            QueryType::Scalar(_) => {
+                *col += 1;
+                true
+            }
+            QueryType::Tuple(tys) => tys.iter().all(|t| leaves(t, col, out)),
+            QueryType::Record(RecordSource::Projection(fields)) => fields.iter().all(|field| {
+                if scalar_of(&field.ty).is_some() {
+                    out.push((field.name.clone(), format!("c{col}")));
+                    *col += 1;
+                    true
+                } else {
+                    let len = out.len();
+                    let ok = leaves(&field.ty, col, out);
+                    out.truncate(len);
+                    ok
+                }
+            }),
+            _ => false,
+        }
+    }
+    match peel_optional(inner) {
+        QueryType::Record(RecordSource::Projection(_)) => {
+            let mut out = Vec::new();
+            let mut col = 1usize;
+            leaves(inner, &mut col, &mut out).then_some(out)
+        }
+        _ => Some(Vec::new()),
+    }
+}
+fn rewrite_element_fields(node: &mut TypedExpr, map: &[(String, String)]) {
+    match &mut node.kind {
+        TypedExprKind::Ident { binding, depth, .. } => {
+            if *depth == 0
+                && let IdentBinding::ProjectedField { name } = binding
+                && let Some((_, col)) = map.iter().find(|(field, _)| field == name)
+            {
+                *binding = IdentBinding::ProjectedField { name: col.clone() };
+            }
+        }
+        TypedExprKind::Field { .. }
+        | TypedExprKind::Method { .. }
+        | TypedExprKind::Projection { .. } => {}
+        TypedExprKind::Binary { lhs, rhs, .. } => {
+            rewrite_element_fields(lhs, map);
+            rewrite_element_fields(rhs, map);
+        }
+        TypedExprKind::Unary { expr, .. }
+        | TypedExprKind::Cast { expr, .. }
+        | TypedExprKind::Some { value: expr } => rewrite_element_fields(expr, map),
+        TypedExprKind::If { arms, default } => {
+            for (cond, then) in arms {
+                rewrite_element_fields(cond, map);
+                rewrite_element_fields(then, map);
+            }
+            rewrite_element_fields(default, map);
+        }
+        TypedExprKind::Tuple { elements } | TypedExprKind::Array { elements } => {
+            for e in elements {
+                rewrite_element_fields(e, map);
+            }
+        }
+        TypedExprKind::Struct { fields } => {
+            for (_, e) in fields {
+                rewrite_element_fields(e, map);
+            }
+        }
+        TypedExprKind::Literal(_) | TypedExprKind::TypeConstant { .. } => {}
+    }
+}
+
+fn tail_scope_named(tail: &TypedExpr, names: &[&str]) -> bool {
+    let mut hit = false;
+    any_ident(tail, &mut |e| {
+        let is_hit = matches!(
+            &e.kind,
+            TypedExprKind::Ident {
+                name,
+                binding: IdentBinding::Field(_) | IdentBinding::ProjectedField { .. },
+                ..
+            } if names.contains(&name.value.as_str())
+        );
+        hit = hit || is_hit;
+        is_hit
+    });
+    hit
+}
+
+fn rewrite_tail_args(tail: &mut TypedExpr, map: &[(String, String)]) {
+    if let TypedExprKind::Method {
+        base, name, args, ..
+    } = &mut tail.kind
+    {
+        rewrite_tail_args(base, map);
+        if matches!(
+            name.value.as_str(),
+            "sort" | "sort_asc" | "sort_desc" | "filter"
+        ) {
+            for arg in args {
+                rewrite_element_fields(&mut arg.expr, map);
+            }
+        }
+    }
+}
+
+fn shiftable_needle(elem: &TypedExpr) -> bool {
+    match &elem.kind {
+        TypedExprKind::Ident {
+            binding: IdentBinding::Field(_) | IdentBinding::ProjectedField { .. },
+            depth,
+            ..
+        } => *depth == 0 && scalar_of(&elem.ty).is_some(),
+        TypedExprKind::Literal(_) | TypedExprKind::TypeConstant { .. } => true,
+        TypedExprKind::Binary { lhs, rhs, .. } => shiftable_needle(lhs) && shiftable_needle(rhs),
+        TypedExprKind::Unary { expr, .. }
+        | TypedExprKind::Cast { expr, .. }
+        | TypedExprKind::Some { value: expr } => shiftable_needle(expr),
+        TypedExprKind::If { arms, default } => {
+            arms.iter()
+                .all(|(cond, then)| shiftable_needle(cond) && shiftable_needle(then))
+                && shiftable_needle(default)
+        }
+        _ => false,
+    }
+}
+
+fn collect_temp_refs(
+    schema: &ValidatedSchema,
+    tail: &TypedExpr,
+    skip: &[String],
+) -> Option<Vec<String>> {
     fn go(
         schema: &ValidatedSchema,
         elem: &TypedExpr,
         under_row: bool,
         out: &mut Vec<String>,
+        skip: &[String],
     ) -> bool {
         match &elem.kind {
             TypedExprKind::Ident { binding, depth, .. } => match binding {
@@ -7546,6 +7724,9 @@ fn collect_temp_refs(schema: &ValidatedSchema, tail: &TypedExpr) -> Option<Vec<S
                     if under_row || *depth != 0 || scalar_of(&elem.ty).is_none() {
                         return false;
                     }
+                    if skip.contains(name) {
+                        return true;
+                    }
                     if !out.contains(name) {
                         out.push(name.clone());
                     }
@@ -7556,7 +7737,7 @@ fn collect_temp_refs(schema: &ValidatedSchema, tail: &TypedExpr) -> Option<Vec<S
             TypedExprKind::Field { base, name, .. } => {
                 if !under_row {
                     if let Some(field) = struct_field_value(base, &name.value) {
-                        return go(schema, field, under_row, out);
+                        return go(schema, field, under_row, out, skip);
                     }
                     if let Some(fk) = nav_root_fk(schema, elem) {
                         if !out.contains(&fk) {
@@ -7565,7 +7746,7 @@ fn collect_temp_refs(schema: &ValidatedSchema, tail: &TypedExpr) -> Option<Vec<S
                         return true;
                     }
                 }
-                go(schema, base, true, out)
+                go(schema, base, true, out, skip)
             }
             TypedExprKind::Method {
                 base, name, args, ..
@@ -7574,44 +7755,51 @@ fn collect_temp_refs(schema: &ValidatedSchema, tail: &TypedExpr) -> Option<Vec<S
                     name.value.as_str(),
                     "sort" | "sort_asc" | "sort_desc" | "filter"
                 );
-                go(schema, base, under_row, out)
+                go(schema, base, under_row, out, skip)
                     && args.iter().all(|arg| {
                         if flat_args {
-                            go_arg(schema, &arg.expr, out)
+                            go_arg(schema, &arg.expr, out, skip)
                         } else {
-                            go(schema, &arg.expr, true, out)
+                            go(schema, &arg.expr, true, out, skip)
                         }
                     })
             }
             TypedExprKind::Projection { base, items } => {
-                go(schema, base, true, out)
-                    && items.iter().all(|item| go(schema, &item.value, true, out))
+                go(schema, base, true, out, skip)
+                    && items
+                        .iter()
+                        .all(|item| go(schema, &item.value, true, out, skip))
             }
             TypedExprKind::Tuple { elements } | TypedExprKind::Array { elements } => {
-                elements.iter().all(|e| go(schema, e, under_row, out))
+                elements.iter().all(|e| go(schema, e, under_row, out, skip))
             }
-            TypedExprKind::Struct { fields } => {
-                fields.iter().all(|(_, e)| go(schema, e, under_row, out))
-            }
+            TypedExprKind::Struct { fields } => fields
+                .iter()
+                .all(|(_, e)| go(schema, e, under_row, out, skip)),
             TypedExprKind::Binary { lhs, rhs, .. } => {
-                go(schema, lhs, under_row, out) && go(schema, rhs, under_row, out)
+                go(schema, lhs, under_row, out, skip) && go(schema, rhs, under_row, out, skip)
             }
             TypedExprKind::Unary { expr, .. }
             | TypedExprKind::Cast { expr, .. }
-            | TypedExprKind::Some { value: expr } => go(schema, expr, under_row, out),
+            | TypedExprKind::Some { value: expr } => go(schema, expr, under_row, out, skip),
             TypedExprKind::If { arms, default } => {
                 arms.iter().all(|(cond, then)| {
-                    go(schema, cond, under_row, out) && go(schema, then, under_row, out)
-                }) && go(schema, default, under_row, out)
+                    go(schema, cond, under_row, out, skip) && go(schema, then, under_row, out, skip)
+                }) && go(schema, default, under_row, out, skip)
             }
             TypedExprKind::Literal(_) | TypedExprKind::TypeConstant { .. } => true,
         }
     }
     let mut out = Vec::new();
-    go(schema, tail, false, &mut out).then_some(out)
+    go(schema, tail, false, &mut out, skip).then_some(out)
 }
 
-fn go_arg(schema: &ValidatedSchema, elem: &TypedExpr, out: &mut Vec<String>) -> bool {
+fn go_arg(
+    schema: &ValidatedSchema,
+    elem: &TypedExpr,
+    out: &mut Vec<String>,
+    skip: &[String],
+) -> bool {
     match &elem.kind {
         TypedExprKind::Ident { binding, depth, .. } => match binding {
             IdentBinding::Root { .. } => true,
@@ -7638,6 +7826,9 @@ fn go_arg(schema: &ValidatedSchema, elem: &TypedExpr, out: &mut Vec<String>) -> 
                 if *depth != 0 || scalar_of(&elem.ty).is_none() {
                     return false;
                 }
+                if skip.contains(name) {
+                    return true;
+                }
                 if !out.contains(name) {
                     out.push(name.clone());
                 }
@@ -7649,19 +7840,21 @@ fn go_arg(schema: &ValidatedSchema, elem: &TypedExpr, out: &mut Vec<String>) -> 
         | TypedExprKind::Method { .. }
         | TypedExprKind::Projection { .. } => false,
         TypedExprKind::Tuple { elements } | TypedExprKind::Array { elements } => {
-            elements.iter().all(|e| go_arg(schema, e, out))
+            elements.iter().all(|e| go_arg(schema, e, out, skip))
         }
-        TypedExprKind::Struct { fields } => fields.iter().all(|(_, e)| go_arg(schema, e, out)),
+        TypedExprKind::Struct { fields } => {
+            fields.iter().all(|(_, e)| go_arg(schema, e, out, skip))
+        }
         TypedExprKind::Binary { lhs, rhs, .. } => {
-            go_arg(schema, lhs, out) && go_arg(schema, rhs, out)
+            go_arg(schema, lhs, out, skip) && go_arg(schema, rhs, out, skip)
         }
         TypedExprKind::Unary { expr, .. }
         | TypedExprKind::Cast { expr, .. }
-        | TypedExprKind::Some { value: expr } => go_arg(schema, expr, out),
+        | TypedExprKind::Some { value: expr } => go_arg(schema, expr, out, skip),
         TypedExprKind::If { arms, default } => {
-            arms.iter()
-                .all(|(cond, then)| go_arg(schema, cond, out) && go_arg(schema, then, out))
-                && go_arg(schema, default, out)
+            arms.iter().all(|(cond, then)| {
+                go_arg(schema, cond, out, skip) && go_arg(schema, then, out, skip)
+            }) && go_arg(schema, default, out, skip)
         }
         TypedExprKind::Literal(_) | TypedExprKind::TypeConstant { .. } => true,
     }

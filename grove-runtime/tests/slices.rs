@@ -1197,6 +1197,98 @@ fn slice_chained_scalar_temp() {
 }
 
 #[test]
+fn slice_temp_element_filter() {
+    assert_eq!(
+        value("users { x = [{a = age}, {a = age + 1}].filter(a > 30) }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![rec(&[("a", Value::Int(31))])]))]),
+            rec(&[(
+                "x",
+                Value::List(vec![
+                    rec(&[("a", Value::Int(40))]),
+                    rec(&[("a", Value::Int(41))]),
+                ]),
+            )]),
+            rec(&[(
+                "x",
+                Value::List(vec![
+                    rec(&[("a", Value::Int(50))]),
+                    rec(&[("a", Value::Int(51))]),
+                ]),
+            )]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [{a = age, b = age + 10}].filter(b > 40) }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![]))]),
+            rec(&[(
+                "x",
+                Value::List(vec![rec(&[("a", Value::Int(40)), ("b", Value::Int(50))])]),
+            )]),
+            rec(&[(
+                "x",
+                Value::List(vec![rec(&[("a", Value::Int(50)), ("b", Value::Int(60))])]),
+            )]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [{a = age + 1}, {a = age}].sort_asc(a) }"),
+        Value::List(vec![
+            rec(&[(
+                "x",
+                Value::List(vec![
+                    rec(&[("a", Value::Int(30))]),
+                    rec(&[("a", Value::Int(31))]),
+                ]),
+            )]),
+            rec(&[(
+                "x",
+                Value::List(vec![
+                    rec(&[("a", Value::Int(40))]),
+                    rec(&[("a", Value::Int(41))]),
+                ]),
+            )]),
+            rec(&[(
+                "x",
+                Value::List(vec![
+                    rec(&[("a", Value::Int(50))]),
+                    rec(&[("a", Value::Int(51))]),
+                ]),
+            )]),
+        ])
+    );
+}
+
+#[test]
+fn slice_temp_scope_needles() {
+    assert_eq!(
+        value("users { x = [age, age + 1].contains(age + 1) }"),
+        Value::List(vec![
+            rec(&[("x", Value::Bool(true))]),
+            rec(&[("x", Value::Bool(true))]),
+            rec(&[("x", Value::Bool(true))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [age, age + 1].contains(40) }"),
+        Value::List(vec![
+            rec(&[("x", Value::Bool(false))]),
+            rec(&[("x", Value::Bool(true))]),
+            rec(&[("x", Value::Bool(false))]),
+        ])
+    );
+    assert_eq!(
+        value("users { n = age } { x = [n, n + 1].contains(n) }"),
+        Value::List(vec![
+            rec(&[("x", Value::Bool(true))]),
+            rec(&[("x", Value::Bool(true))]),
+            rec(&[("x", Value::Bool(true))]),
+        ])
+    );
+}
+
+#[test]
 fn slice_composite_roots() {
     assert_eq!(
         value("{ xs = [[1]] }"),
