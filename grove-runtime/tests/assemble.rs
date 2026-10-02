@@ -122,6 +122,82 @@ fn broadcast_literal_field() {
 }
 
 #[test]
+fn grandchild_tree_pairs_transitively() {
+    assert_eq!(
+        value("users { name, o = orders { total, i = items { sku } } }"),
+        Value::List(vec![
+            Value::Record(vec![
+                ("name".to_string(), Value::String("Ada".to_string())),
+                (
+                    "o".to_string(),
+                    Value::List(vec![
+                        Value::Record(vec![
+                            ("total".to_string(), Value::Dec(dec("10"))),
+                            (
+                                "i".to_string(),
+                                Value::List(vec![
+                                    Value::Record(vec![(
+                                        "sku".to_string(),
+                                        Value::String("a".to_string())
+                                    )]),
+                                    Value::Record(vec![(
+                                        "sku".to_string(),
+                                        Value::String("b".to_string())
+                                    )]),
+                                ])
+                            ),
+                        ]),
+                        Value::Record(vec![
+                            ("total".to_string(), Value::Dec(dec("20"))),
+                            ("i".to_string(), Value::List(vec![])),
+                        ]),
+                    ])
+                ),
+            ]),
+            Value::Record(vec![
+                ("name".to_string(), Value::String("Bob".to_string())),
+                (
+                    "o".to_string(),
+                    Value::List(vec![Value::Record(vec![
+                        ("total".to_string(), Value::Dec(dec("30"))),
+                        (
+                            "i".to_string(),
+                            Value::List(vec![Value::Record(vec![(
+                                "sku".to_string(),
+                                Value::String("c".to_string())
+                            )])])
+                        ),
+                    ])]),
+                ),
+            ]),
+        ])
+    );
+}
+
+#[test]
+fn grandchild_single_pairs_per_middle_row() {
+    assert_eq!(
+        value("users { o = orders { c = items.first()?.sku } }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "o".to_string(),
+                Value::List(vec![
+                    Value::Record(vec![("c".to_string(), Value::String("a".to_string()))]),
+                    Value::Record(vec![("c".to_string(), Value::Null)]),
+                ])
+            )]),
+            Value::Record(vec![(
+                "o".to_string(),
+                Value::List(vec![Value::Record(vec![(
+                    "c".to_string(),
+                    Value::String("c".to_string())
+                )])])
+            )]),
+        ])
+    );
+}
+
+#[test]
 fn empty_root_list() {
     assert_eq!(value("users[age > 100] { name }"), Value::List(vec![]));
 }

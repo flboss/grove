@@ -27,6 +27,7 @@ pub struct Context<'s> {
     pub in_take_arg: bool,
     pub corr: bool,
     pub child: Option<ChildCtx>,
+    pub nest_depth: usize,
     pub temp_collect: Option<TempCollect>,
     pub in_array_temp: bool,
 }
@@ -54,6 +55,7 @@ impl<'s> Context<'s> {
             in_take_arg: false,
             corr: false,
             child: None,
+            nest_depth: 0,
             temp_collect: None,
             in_array_temp: false,
         }
@@ -1255,6 +1257,54 @@ fn window_wrap(ctx: &mut Context, level: Level, fk: &str, order: Vec<OrderItem>)
     wrap_level(ctx, level)
 }
 
+const PENDING_PARENT_STMT: usize = usize::MAX;
+
+fn patch_pending_parents(shape: &mut ResultShape, stmt: usize) {
+    match shape {
+        ResultShape::Column(_) => {}
+        ResultShape::Tuple(elements) => {
+            for e in elements {
+                patch_pending_parents(e, stmt);
+            }
+        }
+        ResultShape::Record(fields) => {
+            for (_, e) in fields {
+                patch_pending_parents(e, stmt);
+            }
+        }
+        ResultShape::List { element, child } | ResultShape::Single { element, child } => {
+            patch_pending_parents(element, stmt);
+            if let Some(parent) = child.parent.as_mut()
+                && parent.stmt == PENDING_PARENT_STMT
+            {
+                parent.stmt = stmt;
+            }
+        }
+    }
+}
+
+pub fn has_pending_parent(shape: &ResultShape) -> bool {
+    match shape {
+        ResultShape::Column(_) => false,
+        ResultShape::Tuple(elements) => elements.iter().any(has_pending_parent),
+        ResultShape::Record(fields) => fields.iter().any(|(_, e)| has_pending_parent(e)),
+        ResultShape::List { element, child } | ResultShape::Single { element, child } => {
+            has_pending_parent(element)
+                || child
+                    .parent
+                    .as_ref()
+                    .is_some_and(|p| p.stmt == PENDING_PARENT_STMT)
+        }
+    }
+}
+
+fn nested_bulk_lane(parent: &Level, tail: &TypedExpr) -> bool {
+    matches!(tail_root_ident(tail), Some(IdentBinding::Field(_)))
+        && parent.stmt_bound
+        && !tail_uses_outer(tail)
+        && !take_bound_ident(tail)
+}
+
 fn lower_value(
     ctx: &mut Context,
     parent: &mut Level,
@@ -1308,14 +1358,28 @@ fn lower_value(
     match &value.ty {
         QueryType::List(_) => {
             if ctx.child.is_some() {
-                todo!("M4b nested list item");
+                if ctx.nest_depth >= 1 || !nested_bulk_lane(parent, value) {
+                    todo!("M4b nested list item");
+                }
+                ctx.nest_depth += 1;
+                let result = rvalue_shape(ctx, parent, value);
+                ctx.nest_depth -= 1;
+                let (shape, parent_key) = result;
+                return (Vec::new(), shape, parent_key.into_iter().collect());
             }
             let (shape, parent_key) = rvalue_shape(ctx, parent, value);
             (Vec::new(), shape, parent_key.into_iter().collect())
         }
         QueryType::Record(_) => {
             if ctx.child.is_some() {
-                todo!("M4b nested record item");
+                if ctx.nest_depth >= 1 || !nested_bulk_lane(parent, value) {
+                    todo!("M4b nested record item");
+                }
+                ctx.nest_depth += 1;
+                let result = rscalar_shape(ctx, parent, value);
+                ctx.nest_depth -= 1;
+                let (shape, parent_key) = result;
+                return (Vec::new(), shape, parent_key.into_iter().collect());
             }
             if matches!(value.kind, TypedExprKind::If { .. }) {
                 todo!("M7 If over records");
@@ -1326,7 +1390,14 @@ fn lower_value(
         QueryType::Optional(inner) => match inner.as_ref() {
             QueryType::Record(_) => {
                 if ctx.child.is_some() {
-                    todo!("M4b nested record item");
+                    if ctx.nest_depth >= 1 || !nested_bulk_lane(parent, value) {
+                        todo!("M4b nested record item");
+                    }
+                    ctx.nest_depth += 1;
+                    let result = rscalar_shape(ctx, parent, value);
+                    ctx.nest_depth -= 1;
+                    let (shape, parent_key) = result;
+                    return (Vec::new(), shape, parent_key.into_iter().collect());
                 }
                 if matches!(value.kind, TypedExprKind::If { .. }) {
                     todo!("M7 If over records");
@@ -2549,6 +2620,11 @@ fn rvalue_shape(
     let reduced_tail = beta_reduce_tail(tail);
     let tail: &TypedExpr = &reduced_tail;
     let keyed = matches!(tail_root_ident(tail), Some(IdentBinding::Field(_)));
+    if ctx.nest_depth >= 1
+        && (!keyed || !parent.stmt_bound || tail_uses_outer(tail) || take_bound_ident(tail))
+    {
+        todo!("M4b nested list item");
+    }
     if keyed && (!parent.stmt_bound || tail_uses_outer(tail) || take_bound_ident(tail)) {
         return rtemp_shape(ctx, parent, tail, Cardinality::Many);
     }
@@ -2651,7 +2727,7 @@ fn rvalue_shape(
         QueryType::List(sub) => sub.as_ref(),
         _ => &tail.ty,
     };
-    let element = child_element(
+    let mut element = child_element(
         ctx.schema,
         child.output_shapes.as_ref(),
         item_ty,
@@ -2666,12 +2742,17 @@ fn rvalue_shape(
         },
         StatementKind::Query,
     );
+    patch_pending_parents(&mut element, idx);
     let shape = ResultShape::List {
         element: Box::new(element),
         child: ChildRef {
             stmt: idx,
             parent: parent_key.clone().map(|parent_key| ParentRef {
-                stmt: 0,
+                stmt: if ctx.nest_depth >= 1 {
+                    PENDING_PARENT_STMT
+                } else {
+                    0
+                },
                 parent_key,
                 child_key: child_col,
             }),
@@ -2682,6 +2763,219 @@ fn rvalue_shape(
     (shape, parent_key)
 }
 
+enum CollapseKind<'a> {
+    First,
+    Nth(&'a TypedExpr),
+}
+
+enum CollapsePrefix<'a> {
+    Sort(Vec<(&'a TypedExpr, OrderDir)>),
+    Take(&'a TypedExpr),
+    Skip(&'a TypedExpr),
+}
+
+fn peel_windowed_collapse(
+    tail: &TypedExpr,
+) -> Option<(&TypedExpr, CollapseKind<'_>, Option<CollapsePrefix<'_>>)> {
+    let (base, collapse) = match &tail.kind {
+        TypedExprKind::Method { base, name, .. } if name.value == "first" => {
+            if filter_chain_to_field_ident(base) || filter_chain_to_root_ident(base) {
+                return None;
+            }
+            (base.as_ref(), CollapseKind::First)
+        }
+        TypedExprKind::Method {
+            base, name, args, ..
+        } if name.value == "nth" => (base.as_ref(), CollapseKind::Nth(one_arg(args, name))),
+        _ => return None,
+    };
+    let (inner, prefix) = match &base.kind {
+        TypedExprKind::Method {
+            base: inner,
+            name,
+            args,
+            ..
+        } if ["sort", "sort_asc", "sort_desc"].contains(&name.value.as_str()) => {
+            if args.iter().any(|a| uses_outer(&a.expr)) {
+                return None;
+            }
+            let default = match name.value.as_str() {
+                "sort_desc" => OrderDir::Desc,
+                _ => OrderDir::Asc,
+            };
+            let mut keys = Vec::with_capacity(args.len());
+            for arg in args {
+                let dir = match &arg.direction {
+                    Some(dir) => match dir.value {
+                        SortDir::Asc => OrderDir::Asc,
+                        SortDir::Desc => OrderDir::Desc,
+                    },
+                    None => default,
+                };
+                keys.push((&arg.expr, dir));
+            }
+            (inner.as_ref(), Some(CollapsePrefix::Sort(keys)))
+        }
+        TypedExprKind::Method {
+            base: inner,
+            name,
+            args,
+            ..
+        } if ["take", "skip"].contains(&name.value.as_str()) => {
+            let arg = one_arg(args, name);
+            if uses_outer(arg) {
+                return None;
+            }
+            let prefix = if name.value == "take" {
+                CollapsePrefix::Take(arg)
+            } else {
+                CollapsePrefix::Skip(arg)
+            };
+            (inner.as_ref(), Some(prefix))
+        }
+        _ => (base, None),
+    };
+    if !filter_chain_to_field_ident(inner) {
+        return None;
+    }
+    Some((inner, collapse, prefix))
+}
+
+fn windowed_collapse(
+    ctx: &mut Context,
+    parent: &mut Level,
+    base: &TypedExpr,
+    collapse: CollapseKind<'_>,
+    prefix: Option<CollapsePrefix<'_>>,
+) -> (ResultShape, Option<String>) {
+    let (child_from, child_col, parent_key) = match tail_root_ident(base) {
+        Some(IdentBinding::Field(fid)) => {
+            let link = resolve_tail_link(ctx, *fid);
+            let _ = parent;
+            (link.child_from, link.child_col, Some(link.parent_col))
+        }
+        _ => unreachable!("unkeyed windowed collapse: peel admits keyed field roots only"),
+    };
+    let child_level = Level {
+        builder: {
+            let mut child_builder = SelectBuilder::new();
+            child_builder.from = Some(child_from);
+            child_builder.where_ = vec![SqlExpr::InSubquery {
+                expr: Box::new(SqlExpr::Column {
+                    depth: 0,
+                    column: child_col.clone(),
+                }),
+                query: Box::new(bulk_query()),
+            }];
+            child_builder
+        },
+        element: base.ty.clone(),
+        parent: ParentLink::Root { root_idx: 0 },
+        pending: None,
+        stmt_bound: true,
+        output_shapes: None,
+        root_parts: None,
+    };
+    let mut child = lower_tail(ctx, base, child_level, true, Some(child_col.clone()));
+    if child.builder.select.is_empty() {
+        child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+    }
+    ensure_key(&mut child.builder, &child_col, ctx.schema);
+    let mut order = Vec::new();
+    if let Some(CollapsePrefix::Sort(keys)) = &prefix {
+        for (expr, dir) in keys {
+            order.extend(sort_keys(ctx, &child, expr, *dir));
+        }
+    }
+    let mut child = window_wrap(ctx, child, &child_col, order);
+    let rn = || SqlExpr::Column {
+        depth: 0,
+        column: "$$rn".to_string(),
+    };
+    let mut bound = |op: SqlBinOp, rhs: SqlExpr| {
+        child.builder.where_.push(SqlExpr::Binary {
+            op,
+            lhs: Box::new(rn()),
+            rhs: Box::new(rhs),
+        });
+    };
+    if let Some(prefix) = &prefix {
+        match prefix {
+            CollapsePrefix::Sort(_) => {}
+            CollapsePrefix::Take(arg) => {
+                bound(SqlBinOp::Le, non_neg_guard(scalar(ctx, arg), "take"))
+            }
+            CollapsePrefix::Skip(arg) => {
+                bound(SqlBinOp::Gt, non_neg_guard(scalar(ctx, arg), "skip"))
+            }
+        }
+    }
+    match collapse {
+        CollapseKind::First => bound(SqlBinOp::Le, SqlExpr::Param(ParamValue::Int(1))),
+        CollapseKind::Nth(arg) => bound(SqlBinOp::Eq, collapse_index(ctx, arg)),
+    }
+    if child.builder.select.is_empty() {
+        child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+    }
+    ensure_key(&mut child.builder, &child_col, ctx.schema);
+    let outputs = builder_outputs(&child.builder, ctx.schema);
+    let shape_cols: Vec<OutputColumn> =
+        shape_columns(builder_output_types(&child.builder, ctx.schema), |name| {
+            name == child_col
+        });
+    let item_ty = match &base.ty {
+        QueryType::List(sub) => sub.as_ref(),
+        _ => &base.ty,
+    };
+    let mut element = child_element(
+        ctx.schema,
+        child.output_shapes.as_ref(),
+        item_ty,
+        &outputs,
+        |name| name == child_col,
+    );
+    let idx = ctx.sink(
+        child.builder,
+        StatementShape {
+            columns: shape_cols,
+            rows: RowCount::Many,
+        },
+        StatementKind::Query,
+    );
+    patch_pending_parents(&mut element, idx);
+    let shape = ResultShape::Single {
+        element: Box::new(element),
+        child: ChildRef {
+            stmt: idx,
+            parent: parent_key.clone().map(|parent_key| ParentRef {
+                stmt: if ctx.nest_depth >= 1 {
+                    PENDING_PARENT_STMT
+                } else {
+                    0
+                },
+                parent_key,
+                child_key: child_col,
+            }),
+            cardinality: Cardinality::One,
+            tag: None,
+        },
+    };
+    (shape, parent_key)
+}
+
+fn collapse_index(ctx: &mut Context, arg: &TypedExpr) -> SqlExpr {
+    match scalar(ctx, arg) {
+        SqlExpr::Param(ParamValue::Int(n)) => SqlExpr::Param(ParamValue::Int(n.saturating_add(1))),
+        guard => SqlExpr::Func {
+            name: "$$add".to_string(),
+            args: vec![
+                non_neg_guard(guard, "nth"),
+                SqlExpr::Param(ParamValue::Int(1)),
+            ],
+        },
+    }
+}
+
 fn rscalar_shape(
     ctx: &mut Context,
     parent: &mut Level,
@@ -2689,10 +2983,17 @@ fn rscalar_shape(
 ) -> (ResultShape, Option<String>) {
     let reduced_tail = beta_reduce_tail(tail);
     let tail: &TypedExpr = &reduced_tail;
+    let windowed = if parent.stmt_bound && !tail_uses_outer(tail) && !take_bound_ident(tail) {
+        peel_windowed_collapse(tail)
+    } else {
+        None
+    };
     let eff = match &tail.kind {
         TypedExprKind::Method { base, name, .. } if name.value == "first" => {
             if filter_chain_to_field_ident(base) || filter_chain_to_root_ident(base) {
                 base.as_ref()
+            } else if let Some((base, collapse, prefix)) = windowed {
+                return windowed_collapse(ctx, parent, base, collapse, prefix);
             } else {
                 todo!("M4b ordered per-parent single");
             }
@@ -2700,11 +3001,21 @@ fn rscalar_shape(
         TypedExprKind::Method { name, .. }
             if ["nth", "take", "skip"].contains(&name.value.as_str()) =>
         {
+            if name.value == "nth"
+                && let Some((base, collapse, prefix)) = windowed
+            {
+                return windowed_collapse(ctx, parent, base, collapse, prefix);
+            }
             todo!("M4b ordered per-parent single")
         }
         _ => tail,
     };
     let keyed = matches!(tail_root_ident(eff), Some(IdentBinding::Field(_)));
+    if ctx.nest_depth >= 1
+        && (!keyed || !parent.stmt_bound || tail_uses_outer(eff) || take_bound_ident(eff))
+    {
+        todo!("M4b nested record item");
+    }
     if keyed && (!parent.stmt_bound || tail_uses_outer(eff) || take_bound_ident(eff)) {
         return rtemp_shape(ctx, parent, eff, Cardinality::One);
     }
@@ -2778,7 +3089,7 @@ fn rscalar_shape(
         QueryType::List(sub) => sub.as_ref(),
         _ => &eff.ty,
     };
-    let element = child_element(
+    let mut element = child_element(
         ctx.schema,
         child.output_shapes.as_ref(),
         item_ty,
@@ -2793,12 +3104,17 @@ fn rscalar_shape(
         },
         StatementKind::Query,
     );
+    patch_pending_parents(&mut element, idx);
     let shape = ResultShape::Single {
         element: Box::new(element),
         child: ChildRef {
             stmt: idx,
             parent: parent_key.clone().map(|parent_key| ParentRef {
-                stmt: 0,
+                stmt: if ctx.nest_depth >= 1 {
+                    PENDING_PARENT_STMT
+                } else {
+                    0
+                },
                 parent_key,
                 child_key: child_col,
             }),

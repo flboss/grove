@@ -19,6 +19,10 @@ pub fn codegen(file: &TypedQueryFile, schema: &ValidatedSchema) -> CompiledQuery
         }
     }
     let root = lower::lower_query(&mut ctx, &file.result);
+    debug_assert!(
+        !lower::has_pending_parent(&root.result),
+        "pending grandchild pairing leaked to emission"
+    );
     let root_rendered = render_one(&root.builder);
     let mut rendered: Vec<PlannedStatement> = Vec::with_capacity(ctx.statements.len());
     for sunk in &ctx.statements {

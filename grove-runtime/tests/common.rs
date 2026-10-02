@@ -20,8 +20,14 @@ pub const SCHEMA_SRC: &str = r#"
     struct Order {
         total: Dec,
         user: &User,
+        items: List<Item>,
+    }
+    struct Item {
+        sku: String,
+        order: &Order,
     }
     rel Order.user <<-> User.orders (orders.user_id -> users.id);
+    rel Item.order <<-> Order.items (items.order_id -> orders.id);
 "#;
 
 pub fn compile(query: &str) -> CompiledQuery {
@@ -60,7 +66,8 @@ pub fn fixture() -> Runtime {
     rt.conn()
         .execute_batch(
             "CREATE TABLE users(id INTEGER, name TEXT, age INTEGER, balance BLOB, active INTEGER, created BLOB, ttl BLOB);
-             CREATE TABLE orders(id INTEGER, total BLOB, user_id INTEGER);",
+             CREATE TABLE orders(id INTEGER, total BLOB, user_id INTEGER);
+             CREATE TABLE items(sku TEXT, order_id INTEGER);",
         )
         .unwrap();
     let created = encode_instant(&DateTime::from_timestamp(1_700_000_000, 0).unwrap());
@@ -89,6 +96,15 @@ pub fn fixture() -> Runtime {
             .execute(
                 "INSERT INTO orders(id, total, user_id) VALUES (?, ?, ?)",
                 rusqlite::params![id, encode_dec(&dec(total)).to_vec(), user_id],
+            )
+            .unwrap();
+    }
+    let items: &[(&str, i64)] = &[("a", 10), ("b", 10), ("c", 12)];
+    for (sku, order_id) in items {
+        rt.conn()
+            .execute(
+                "INSERT INTO items(sku, order_id) VALUES (?, ?)",
+                rusqlite::params![sku, order_id],
             )
             .unwrap();
     }
