@@ -241,6 +241,109 @@ fn empty_root_list() {
 }
 
 #[test]
+fn optional_list_chain_nones_vs_empties() {
+    assert_eq!(
+        value("users { name, o = orders.sort(total).first()?.items }"),
+        Value::List(vec![
+            Value::Record(vec![
+                ("name".to_string(), Value::String("Ada".to_string())),
+                (
+                    "o".to_string(),
+                    Value::List(vec![
+                        Value::Record(vec![("sku".to_string(), Value::String("a".to_string()))]),
+                        Value::Record(vec![("sku".to_string(), Value::String("b".to_string()))]),
+                    ])
+                ),
+            ]),
+            Value::Record(vec![
+                ("name".to_string(), Value::String("Bob".to_string())),
+                (
+                    "o".to_string(),
+                    Value::List(vec![Value::Record(vec![(
+                        "sku".to_string(),
+                        Value::String("c".to_string())
+                    )])])
+                ),
+            ]),
+        ])
+    );
+}
+
+#[test]
+fn optional_list_literal_present_vs_empty() {
+    assert_eq!(
+        value("users.take(1) { t = [[1]].first() }"),
+        Value::List(vec![Value::Record(vec![(
+            "t".to_string(),
+            Value::List(vec![Value::Int(1)])
+        )])])
+    );
+    assert_eq!(
+        value("users.take(1) { e = [[], [1]].first() }"),
+        Value::List(vec![Value::Record(vec![(
+            "e".to_string(),
+            Value::List(vec![])
+        )])])
+    );
+}
+
+#[test]
+fn unwrap_row_asserts_value() {
+    assert_eq!(
+        value("users[age > 30].first().unwrap() { name }"),
+        Value::List(vec![Value::Record(vec![(
+            "name".to_string(),
+            Value::String("Bob".to_string())
+        )])])
+    );
+    assert_eq!(
+        value("[[1]].first().unwrap()"),
+        Value::List(vec![Value::List(vec![Value::Int(1)])])
+    );
+}
+
+#[test]
+fn unwrap_row_empty_aborts() {
+    let mut rt = fixture();
+    let compiled = compile("users[age > 100].first().unwrap() { name }");
+    let err = rt.execute_value(&compiled).unwrap_err();
+    assert!(
+        matches!(err, RuntimeError::Aborted(_)),
+        "expected abort, got {err:?}"
+    );
+}
+
+#[test]
+fn collapse_is_some_is_none_values() {
+    assert_eq!(
+        value("users { name, h = orders.first().is_some() }"),
+        Value::List(vec![
+            Value::Record(vec![
+                ("name".to_string(), Value::String("Ada".to_string())),
+                ("h".to_string(), Value::Bool(true)),
+            ]),
+            Value::Record(vec![
+                ("name".to_string(), Value::String("Bob".to_string())),
+                ("h".to_string(), Value::Bool(true)),
+            ]),
+        ])
+    );
+    assert_eq!(
+        value("users { name, h = orders.first().is_none() }"),
+        Value::List(vec![
+            Value::Record(vec![
+                ("name".to_string(), Value::String("Ada".to_string())),
+                ("h".to_string(), Value::Bool(false)),
+            ]),
+            Value::Record(vec![
+                ("name".to_string(), Value::String("Bob".to_string())),
+                ("h".to_string(), Value::Bool(false)),
+            ]),
+        ])
+    );
+}
+
+#[test]
 fn grandchild_under_taken_middle() {
     assert_eq!(
         value("users { name, o = orders.take(2) { total, i = items { sku } } }"),

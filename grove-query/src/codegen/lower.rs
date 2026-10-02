@@ -241,7 +241,11 @@ pub fn rows(ctx: &mut Context, expr: &TypedExpr) -> Level {
         TypedExprKind::Struct { .. } => unreachable!(
             "struct-literal node in row demand: row slots admit lists/records only — Struct-kind nodes infer Record types, which no row-slot signature admits (struct literals route via lower_struct_result)"
         ),
-        TypedExprKind::Some { .. } => todo!("M4b presence: some() in row demand"),
+        TypedExprKind::Some { value } => {
+            let mut level = rows(ctx, value);
+            level.element = value.ty.clone();
+            return level;
+        }
         TypedExprKind::Literal(_)
         | TypedExprKind::TypeConstant { .. }
         | TypedExprKind::Binary { .. }
@@ -917,10 +921,13 @@ fn rows_method(
             compose_limit(&mut level.builder, "first", &[], ctx);
             level
         }
-        "unwrap" | "unwrap_or" if matches!(peel_optional(&level.element), QueryType::Record(_)) => {
+        "unwrap_or" if matches!(peel_optional(&level.element), QueryType::Record(_)) => {
             todo!("M4 presence-directed unwrap over records")
         }
-        "unwrap" | "unwrap_or" => {
+        "unwrap" => {
+            return assert_present_rows(ctx, level, "unwrap failed: value was none".to_string());
+        }
+        "unwrap_or" => {
             todo!("M4b presence: unwrap over list in row demand")
         }
         _ => unreachable!(
@@ -1306,6 +1313,403 @@ fn nested_bulk_lane(parent: &Level, tail: &TypedExpr) -> bool {
         && !take_bound_ident(tail)
 }
 
+fn b1_optional_list(
+    ctx: &mut Context,
+    parent: &mut Level,
+    value: &TypedExpr,
+) -> (Vec<SelectItem>, ResultShape, Vec<String>) {
+    if matches!(&value.kind, TypedExprKind::Field { optional: true, .. }) {
+        return b1_chained(ctx, parent, value);
+    }
+    if let TypedExprKind::Method { base, name, .. } = &value.kind
+        && (name.value == "first" || name.value == "nth")
+        && matches!(&base.kind, TypedExprKind::Array { .. })
+    {
+        if has_scope_ident(base) {
+            todo!("M4b presence: optional list item");
+        }
+        return b1_literal(ctx, value);
+    }
+    if let TypedExprKind::Some { value: inner } = &value.kind {
+        if matches!(inner.ty, QueryType::Optional(_)) {
+            todo!("M4b presence: optional list item");
+        }
+        let (shape, parent_key) = rvalue_shape(ctx, parent, inner);
+        return (Vec::new(), shape, parent_key.into_iter().collect());
+    }
+    todo!("M4b presence: optional list item")
+}
+
+fn b1_literal(ctx: &mut Context, value: &TypedExpr) -> (Vec<SelectItem>, ResultShape, Vec<String>) {
+    let mut root = rows(ctx, value);
+    let hops = root.pending.take().map(drain_pending).unwrap_or_default();
+    if hops.is_empty() {
+        todo!("M4b presence: optional list item");
+    }
+    if root.builder.select.is_empty() {
+        root.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+    }
+    let shape_cols: Vec<OutputColumn> =
+        shape_columns(builder_output_types(&root.builder, ctx.schema), |_| false);
+    let root_creation = ctx.statements.len() + hops.len() + 1;
+    let layers = sink_chain(ctx, &hops, root_creation);
+    let inner = nest_layers(
+        ctx.schema,
+        layers,
+        &value.ty,
+        false,
+        root.root_parts.clone(),
+        root_creation,
+    );
+    let actual = ctx.sink(
+        root.builder,
+        StatementShape {
+            columns: shape_cols,
+            rows: RowCount::ZeroOrOne,
+        },
+        StatementKind::Query,
+    );
+    debug_assert_eq!(
+        actual, root_creation,
+        "collapse root sank at an unexpected index: sink order changed"
+    );
+    let shape = ResultShape::Single {
+        element: Box::new(inner),
+        child: ChildRef {
+            stmt: root_creation,
+            parent: None,
+            cardinality: Cardinality::One,
+            tag: None,
+        },
+    };
+    (Vec::new(), shape, Vec::new())
+}
+
+fn b1_chained(
+    ctx: &mut Context,
+    parent: &mut Level,
+    value: &TypedExpr,
+) -> (Vec<SelectItem>, ResultShape, Vec<String>) {
+    let _ = parent;
+    if !matches!(parent.element, QueryType::List(_))
+        || parent.pending.is_some()
+        || tail_uses_outer(value)
+        || take_bound_ident(value)
+    {
+        todo!("M4b presence: optional list item");
+    }
+    let Some((rewritten, collapse, tail_fid)) = split_opt_chain(ctx, value) else {
+        todo!("M4b presence: optional list item");
+    };
+    let Some(peeled) = peel_windowed_collapse(collapse, false) else {
+        todo!("M4b presence: optional list item");
+    };
+    if !peeled.keyed {
+        todo!("M4b presence: optional list item");
+    }
+    let tail_link = resolve_tail_link(ctx, tail_fid);
+    let (outer_level, outer_parent_key, outer_child_col) = build_capped_level(ctx, peeled);
+    let mut inner_builder = SelectBuilder::new();
+    inner_builder.from = Some(tail_link.child_from);
+    inner_builder.where_ = vec![SqlExpr::InSubquery {
+        expr: Box::new(SqlExpr::Column {
+            depth: 0,
+            column: tail_link.child_col.clone(),
+        }),
+        query: Box::new(bulk_query()),
+    }];
+    let inner_level = Level {
+        builder: inner_builder,
+        element: peel_optional(&value.ty).clone(),
+        parent: ParentLink::Root { root_idx: 0 },
+        pending: None,
+        stmt_bound: true,
+        output_shapes: None,
+        root_parts: None,
+    };
+    let mut inner = lower_tail(
+        ctx,
+        &rewritten,
+        inner_level,
+        true,
+        Some(tail_link.child_col.clone()),
+    );
+    if inner.builder.select.is_empty() {
+        inner.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+    }
+    ensure_key(&mut inner.builder, &tail_link.child_col, ctx.schema);
+    let outputs = builder_outputs(&inner.builder, ctx.schema);
+    let shape_cols: Vec<OutputColumn> =
+        shape_columns(builder_output_types(&inner.builder, ctx.schema), |name| {
+            name == tail_link.child_col
+        });
+    let item_ty = match peel_optional(&value.ty) {
+        QueryType::List(sub) => sub.as_ref(),
+        _ => peel_optional(&value.ty),
+    };
+    let mut element = child_element(
+        ctx.schema,
+        inner.output_shapes.as_ref(),
+        item_ty,
+        &outputs,
+        |name| name == tail_link.child_col,
+    );
+    let idx_inner = ctx.sink(
+        inner.builder,
+        StatementShape {
+            columns: shape_cols,
+            rows: RowCount::Many,
+        },
+        StatementKind::Query,
+    );
+    patch_pending_parents(&mut element, idx_inner);
+    let mut outer = outer_level;
+    if outer.builder.select.is_empty() {
+        outer.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+    }
+    let outer_shape = StatementShape {
+        columns: shape_columns(builder_output_types(&outer.builder, ctx.schema), |name| {
+            name == outer_child_col
+        }),
+        rows: RowCount::Many,
+    };
+    let idx_outer = ctx.sink(outer.builder, outer_shape, StatementKind::Query);
+    let inner_list = ResultShape::List {
+        element: Box::new(element),
+        child: ChildRef {
+            stmt: idx_inner,
+            parent: Some(ParentRef {
+                stmt: idx_outer,
+                parent_key: tail_link.parent_col.clone(),
+                child_key: tail_link.child_col.clone(),
+            }),
+            cardinality: Cardinality::Many,
+            tag: None,
+        },
+    };
+    let shape = ResultShape::Single {
+        element: Box::new(inner_list),
+        child: ChildRef {
+            stmt: idx_outer,
+            parent: outer_parent_key.clone().map(|parent_key| ParentRef {
+                stmt: 0,
+                parent_key,
+                child_key: outer_child_col,
+            }),
+            cardinality: Cardinality::One,
+            tag: None,
+        },
+    };
+    (Vec::new(), shape, outer_parent_key.into_iter().collect())
+}
+
+fn split_opt_chain<'a>(
+    ctx: &mut Context,
+    value: &'a TypedExpr,
+) -> Option<(TypedExpr, &'a TypedExpr, FieldId)> {
+    fn is_collapse(node: &TypedExpr) -> bool {
+        matches!(
+            &node.kind,
+            TypedExprKind::Method { name, .. }
+                if name.value == "first" || name.value == "nth"
+        )
+    }
+    fn contains_opt_collapse(node: &TypedExpr) -> bool {
+        match &node.kind {
+            TypedExprKind::Field {
+                base,
+                optional: true,
+                ..
+            } if is_collapse(base) => true,
+            TypedExprKind::Field { base, .. }
+            | TypedExprKind::Method { base, .. }
+            | TypedExprKind::Projection { base, .. } => contains_opt_collapse(base),
+            _ => false,
+        }
+    }
+    fn go<'a>(
+        ctx: &mut Context,
+        node: &'a TypedExpr,
+        list_ty: &QueryType,
+        span: grove_types::Span,
+    ) -> Option<(TypedExpr, &'a TypedExpr, FieldId)> {
+        match &node.kind {
+            TypedExprKind::Field {
+                base,
+                name,
+                optional: true,
+            } if is_collapse(base) => {
+                if contains_opt_collapse(base) {
+                    return None;
+                }
+                let sid = match peel_optional(&base.ty) {
+                    QueryType::Record(RecordSource::Schema(sid)) => *sid,
+                    _ => return None,
+                };
+                let (fid, _) = ctx.schema.struct_field(sid, &name.value)?;
+                let dummy = TypedExpr {
+                    kind: TypedExprKind::Ident {
+                        name: grove_types::Spanned {
+                            span,
+                            value: name.value.clone(),
+                        },
+                        binding: IdentBinding::Field(fid),
+                        depth: 0,
+                    },
+                    ty: list_ty.clone(),
+                    span,
+                };
+                Some((dummy, base.as_ref(), fid))
+            }
+            TypedExprKind::Field {
+                base,
+                name,
+                optional,
+            } => {
+                let (rw, collapse, fid) = go(ctx, base, list_ty, span)?;
+                Some((
+                    TypedExpr {
+                        kind: TypedExprKind::Field {
+                            base: Box::new(rw),
+                            name: name.clone(),
+                            optional: *optional,
+                        },
+                        ty: node.ty.clone(),
+                        span: node.span,
+                    },
+                    collapse,
+                    fid,
+                ))
+            }
+            TypedExprKind::Method {
+                base,
+                name,
+                args,
+                optional,
+            } => {
+                let (rw, collapse, fid) = go(ctx, base, list_ty, span)?;
+                Some((
+                    TypedExpr {
+                        kind: TypedExprKind::Method {
+                            base: Box::new(rw),
+                            name: name.clone(),
+                            args: args.clone(),
+                            optional: *optional,
+                        },
+                        ty: node.ty.clone(),
+                        span: node.span,
+                    },
+                    collapse,
+                    fid,
+                ))
+            }
+            TypedExprKind::Projection { base, items } => {
+                let (rw, collapse, fid) = go(ctx, base, list_ty, span)?;
+                Some((
+                    TypedExpr {
+                        kind: TypedExprKind::Projection {
+                            base: Box::new(rw),
+                            items: items.clone(),
+                        },
+                        ty: node.ty.clone(),
+                        span: node.span,
+                    },
+                    collapse,
+                    fid,
+                ))
+            }
+            _ => None,
+        }
+    }
+    let list_ty = match peel_optional(&value.ty) {
+        QueryType::List(_) => peel_optional(&value.ty).clone(),
+        _ => return None,
+    };
+    go(ctx, value, &list_ty, value.span)
+}
+
+fn assert_present_rows(ctx: &mut Context, level: Level, msg: String) -> Level {
+    let Level {
+        mut builder,
+        element,
+        parent,
+        pending,
+        stmt_bound,
+        output_shapes,
+        root_parts,
+    } = level;
+    if builder.select.is_empty() {
+        builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+    }
+    let mut base_inner = SelectBuilder::new();
+    base_inner.from = Some(FromClause::Subquery {
+        query: Box::new(builder),
+        alias: ctx.aliases.subquery(),
+    });
+    base_inner.select = vec![SelectItem::AllFrom { depth: 0 }];
+    let ncols = builder_outputs(&base_inner, ctx.schema).len();
+    let guard_base = base_inner.clone();
+    base_inner.select.push(SelectItem::Expr {
+        expr: SqlExpr::Param(ParamValue::Null),
+        output: "$$abort".to_string(),
+        ty: Some(ScalarType::Int),
+    });
+    builder = base_inner;
+    let mut arm = SelectBuilder::new();
+    arm.select = (0..ncols)
+        .map(|i| SelectItem::Expr {
+            expr: SqlExpr::Param(ParamValue::Null),
+            output: format!("c{i}"),
+            ty: None,
+        })
+        .chain(std::iter::once(SelectItem::Expr {
+            expr: SqlExpr::Param(ParamValue::Null),
+            output: "$$abort".to_string(),
+            ty: Some(ScalarType::Int),
+        }))
+        .collect();
+    let probe = {
+        let mut probe = SelectBuilder::new();
+        probe.select = vec![SelectItem::Expr {
+            expr: SqlExpr::Param(ParamValue::Int(1)),
+            output: "c0".to_string(),
+            ty: Some(ScalarType::Int),
+        }];
+        probe.from = Some(FromClause::Subquery {
+            query: Box::new(guard_base),
+            alias: ctx.aliases.subquery(),
+        });
+        probe
+    };
+    arm.where_ = vec![SqlExpr::Binary {
+        op: SqlBinOp::IsNot,
+        lhs: Box::new(SqlExpr::Case {
+            arms: vec![(
+                SqlExpr::Not(Box::new(SqlExpr::Exists(Box::new(probe)))),
+                SqlExpr::Func {
+                    name: "$$panic".to_string(),
+                    args: vec![SqlExpr::Param(ParamValue::String(msg))],
+                },
+            )],
+            else_: Box::new(SqlExpr::Param(ParamValue::Null)),
+        }),
+        rhs: Box::new(SqlExpr::Param(ParamValue::Null)),
+    }];
+    builder.unions.push(arm);
+    wrap_level(
+        ctx,
+        Level {
+            builder,
+            element,
+            parent,
+            pending,
+            stmt_bound,
+            output_shapes,
+            root_parts,
+        },
+    )
+}
+
 fn lower_value(
     ctx: &mut Context,
     parent: &mut Level,
@@ -1406,7 +1810,12 @@ fn lower_value(
                 let (shape, parent_key) = rscalar_shape(ctx, parent, value);
                 (Vec::new(), shape, parent_key.into_iter().collect())
             }
-            QueryType::List(_) => todo!("M4b presence: optional list item"),
+            QueryType::List(_) => {
+                if ctx.child.is_some() {
+                    todo!("M4b presence: optional list item");
+                }
+                return b1_optional_list(ctx, parent, value);
+            }
             QueryType::Tuple(_) => unreachable!(
                 "optional-tuple value: Optional(Tuple) node types never arise — wrap_optional maps tuples element-wise, Some-of-tuple is rejected by the final check (QT0027)"
             ),
@@ -2783,10 +3192,10 @@ struct PeeledCollapse<'a> {
     keyed: bool,
 }
 
-fn peel_windowed_collapse(tail: &TypedExpr) -> Option<PeeledCollapse<'_>> {
+fn peel_windowed_collapse(tail: &TypedExpr, strip: bool) -> Option<PeeledCollapse<'_>> {
     let (base, collapse) = match &tail.kind {
         TypedExprKind::Method { base, name, .. } if name.value == "first" => {
-            if filter_chain_to_field_ident(base) || filter_chain_to_root_ident(base) {
+            if strip && (filter_chain_to_field_ident(base) || filter_chain_to_root_ident(base)) {
                 return None;
             }
             (base.as_ref(), CollapseKind::First)
@@ -2895,17 +3304,19 @@ fn rows_collapse(ctx: &mut Context, tail: &TypedExpr) -> (ResultShape, Option<St
     (shape, None)
 }
 
-fn windowed_collapse(
+fn build_capped_level(
     ctx: &mut Context,
-    parent: &mut Level,
-    base: &TypedExpr,
-    collapse: CollapseKind<'_>,
-    prefix: Option<CollapsePrefix<'_>>,
-) -> (ResultShape, Option<String>) {
+    peeled: PeeledCollapse<'_>,
+) -> (Level, Option<String>, String) {
+    let PeeledCollapse {
+        inner: base,
+        collapse,
+        prefix,
+        ..
+    } = peeled;
     let (child_from, child_col, parent_key) = match tail_root_ident(base) {
         Some(IdentBinding::Field(fid)) => {
             let link = resolve_tail_link(ctx, *fid);
-            let _ = parent;
             (link.child_from, link.child_col, Some(link.parent_col))
         }
         _ => unreachable!("exotic windowed collapse base: peel admits keyed field tails only"),
@@ -2968,6 +3379,26 @@ fn windowed_collapse(
         CollapseKind::First => bound(SqlBinOp::Le, SqlExpr::Param(ParamValue::Int(1))),
         CollapseKind::Nth(arg) => bound(SqlBinOp::Eq, collapse_index(ctx, arg)),
     }
+    (child, parent_key, child_col)
+}
+
+fn windowed_collapse(
+    ctx: &mut Context,
+    parent: &mut Level,
+    base: &TypedExpr,
+    collapse: CollapseKind<'_>,
+    prefix: Option<CollapsePrefix<'_>>,
+) -> (ResultShape, Option<String>) {
+    let _ = parent;
+    let (mut child, parent_key, child_col) = build_capped_level(
+        ctx,
+        PeeledCollapse {
+            inner: base,
+            collapse,
+            prefix,
+            keyed: true,
+        },
+    );
     if child.builder.select.is_empty() {
         child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
     }
@@ -3112,7 +3543,7 @@ fn rscalar_shape(
     let reduced_tail = beta_reduce_tail(tail);
     let tail: &TypedExpr = &reduced_tail;
     let windowed = if parent.stmt_bound && !tail_uses_outer(tail) && !take_bound_ident(tail) {
-        peel_windowed_collapse(tail)
+        peel_windowed_collapse(tail, true)
     } else {
         None
     };
@@ -5298,6 +5729,7 @@ fn child_element(
         .iter()
         .filter(|name| {
             name.as_str() != "$$rn"
+                && name.as_str() != "$$abort"
                 && match declared {
                     Some(sid) => struct_declares_column(schema, sid, name),
                     None => !is_key(name),
@@ -6026,6 +6458,31 @@ fn scalar_ident(ctx: &mut Context, binding: &IdentBinding, depth: usize) -> SqlE
     }
 }
 
+fn collapse_parks_split(mut node: &TypedExpr) -> bool {
+    loop {
+        match &node.kind {
+            TypedExprKind::Method { base, name, .. }
+                if [
+                    "first",
+                    "nth",
+                    "take",
+                    "skip",
+                    "sort",
+                    "sort_asc",
+                    "sort_desc",
+                    "filter",
+                    "flatten",
+                ]
+                .contains(&name.value.as_str()) =>
+            {
+                node = base;
+            }
+            _ => break,
+        }
+    }
+    matches!(&node.ty, QueryType::List(inner) if matches!(inner.as_ref(), QueryType::List(_)))
+}
+
 enum AggOp {
     Len,
     Bare(BareAgg, ScalarType),
@@ -6364,6 +6821,26 @@ fn scalar_method(
             QueryType::List(inner) => match name.value.as_str() {
                 "contains" if matches!(inner.as_ref(), QueryType::List(_)) => {
                     todo!("H1 QT0028: membership over nested lists")
+                }
+                "is_some" => {
+                    if collapse_parks_split(base) {
+                        todo!("M4 list-optional mechanics");
+                    }
+                    SqlExpr::Exists(Box::new(single_row_query(
+                        ctx,
+                        base,
+                        vec![SelectItem::AllFrom { depth: 0 }],
+                    )))
+                }
+                "is_none" => {
+                    if collapse_parks_split(base) {
+                        todo!("M4 list-optional mechanics");
+                    }
+                    SqlExpr::Not(Box::new(SqlExpr::Exists(Box::new(single_row_query(
+                        ctx,
+                        base,
+                        vec![SelectItem::AllFrom { depth: 0 }],
+                    )))))
                 }
                 _ => todo!("M4 list-optional mechanics"),
             },
@@ -8819,6 +9296,14 @@ fn root_composite_element(
             (select, ResultShape::Tuple(shapes))
         }
         QueryType::Optional(inner) if matches!(inner.as_ref(), QueryType::List(_)) => {
+            if let TypedExprKind::Method { base, name, .. } = &elem.kind
+                && (name.value == "first" || name.value == "nth")
+                && matches!(&base.kind, TypedExprKind::Array { .. })
+                && !has_scope_ident(base)
+            {
+                let (_, shape, _) = b1_literal(ctx, elem);
+                return (Vec::new(), shape);
+            }
             todo!("M4b presence: optional list tuple element")
         }
         _ => todo!("M7 exotic {kind}"),
