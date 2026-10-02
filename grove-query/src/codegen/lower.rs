@@ -11,8 +11,8 @@ use super::model::{
 };
 use crate::ast::{BinaryOp, ConstantName, Literal, SortDir, TypeName, UnaryOp};
 use crate::typecheck::types::{
-    IdentBinding, QueryType, RecordSource, TypedExpr, TypedExprKind, TypedMethodArg,
-    TypedProjectionItem,
+    IdentBinding, ProjectionField, QueryType, RecordSource, TypedExpr, TypedExprKind,
+    TypedMethodArg, TypedProjectionItem,
 };
 use grove_schema::validated::{
     Field, FieldId, Relation, ScalarType, StructId, ValidatedSchema, ValueType,
@@ -886,7 +886,7 @@ fn rows_method(
                 let mut level = window_wrap(
                     ctx,
                     level,
-                    &fk,
+                    Some(fk.as_str()),
                     vec![OrderItem {
                         expr: order_arg,
                         dir,
@@ -1194,7 +1194,7 @@ fn window_take(
     };
     let guard = non_neg_guard(arg, method);
     let order = std::mem::take(&mut level.builder.order_by);
-    let mut level = window_wrap(ctx, level, fk, order);
+    let mut level = window_wrap(ctx, level, Some(fk), order);
     let bound = SqlExpr::Binary {
         op: match method {
             "take" => SqlBinOp::Le,
@@ -1209,7 +1209,7 @@ fn window_take(
     level.builder.where_.push(bound);
     level
 }
-fn window_wrap(ctx: &mut Context, level: Level, fk: &str, order: Vec<OrderItem>) -> Level {
+fn window_wrap(ctx: &mut Context, level: Level, fk: Option<&str>, order: Vec<OrderItem>) -> Level {
     let Level {
         mut builder,
         element,
@@ -1232,14 +1232,20 @@ fn window_wrap(ctx: &mut Context, level: Level, fk: &str, order: Vec<OrderItem>)
     if builder.select.is_empty() {
         builder.select = vec![SelectItem::AllFrom { depth: 0 }];
     }
-    ensure_key(&mut builder, fk, ctx.schema);
+    let partition = match fk {
+        Some(fk) => {
+            ensure_key(&mut builder, fk, ctx.schema);
+            vec![SqlExpr::Column {
+                depth: 0,
+                column: fk.to_string(),
+            }]
+        }
+        None => Vec::new(),
+    };
     builder.select.push(SelectItem::Expr {
         expr: SqlExpr::Window {
             func: "ROW_NUMBER".to_string(),
-            partition: vec![SqlExpr::Column {
-                depth: 0,
-                column: fk.to_string(),
-            }],
+            partition,
             order,
         },
         output: "$$rn".to_string(),
@@ -1358,7 +1364,7 @@ fn lower_value(
     match &value.ty {
         QueryType::List(_) => {
             if ctx.child.is_some() {
-                if ctx.nest_depth >= 1 || !nested_bulk_lane(parent, value) {
+                if !nested_bulk_lane(parent, value) {
                     todo!("M4b nested list item");
                 }
                 ctx.nest_depth += 1;
@@ -1372,7 +1378,7 @@ fn lower_value(
         }
         QueryType::Record(_) => {
             if ctx.child.is_some() {
-                if ctx.nest_depth >= 1 || !nested_bulk_lane(parent, value) {
+                if !nested_bulk_lane(parent, value) {
                     todo!("M4b nested record item");
                 }
                 ctx.nest_depth += 1;
@@ -1390,7 +1396,7 @@ fn lower_value(
         QueryType::Optional(inner) => match inner.as_ref() {
             QueryType::Record(_) => {
                 if ctx.child.is_some() {
-                    if ctx.nest_depth >= 1 || !nested_bulk_lane(parent, value) {
+                    if !nested_bulk_lane(parent, value) {
                         todo!("M4b nested record item");
                     }
                     ctx.nest_depth += 1;
@@ -2835,7 +2841,7 @@ fn peel_windowed_collapse(
         }
         _ => (base, None),
     };
-    if !filter_chain_to_field_ident(inner) {
+    if !(filter_chain_to_field_ident(inner) || filter_chain_to_root_ident(inner)) {
         return None;
     }
     Some((inner, collapse, prefix))
@@ -2854,19 +2860,37 @@ fn windowed_collapse(
             let _ = parent;
             (link.child_from, link.child_col, Some(link.parent_col))
         }
-        _ => unreachable!("unkeyed windowed collapse: peel admits keyed field roots only"),
+        Some(IdentBinding::Root { root_idx }) => {
+            let root = &ctx.schema.roots[*root_idx];
+            let table = ctx.schema.tables[ctx.schema.structs[root.struct_id.index()].table.index()]
+                .name
+                .clone();
+            let _ = parent;
+            (
+                FromClause::Table {
+                    table: table.clone(),
+                    alias: ctx.aliases.table(&table),
+                },
+                String::new(),
+                None,
+            )
+        }
+        _ => unreachable!("exotic windowed collapse base: peel admits field and root tails only"),
     };
+    let keyed = parent_key.is_some();
     let child_level = Level {
         builder: {
             let mut child_builder = SelectBuilder::new();
             child_builder.from = Some(child_from);
-            child_builder.where_ = vec![SqlExpr::InSubquery {
-                expr: Box::new(SqlExpr::Column {
-                    depth: 0,
-                    column: child_col.clone(),
-                }),
-                query: Box::new(bulk_query()),
-            }];
+            if keyed {
+                child_builder.where_ = vec![SqlExpr::InSubquery {
+                    expr: Box::new(SqlExpr::Column {
+                        depth: 0,
+                        column: child_col.clone(),
+                    }),
+                    query: Box::new(bulk_query()),
+                }];
+            }
             child_builder
         },
         element: base.ty.clone(),
@@ -2876,18 +2900,26 @@ fn windowed_collapse(
         output_shapes: None,
         root_parts: None,
     };
-    let mut child = lower_tail(ctx, base, child_level, true, Some(child_col.clone()));
+    let mut child = lower_tail(
+        ctx,
+        base,
+        child_level,
+        keyed,
+        keyed.then(|| child_col.clone()),
+    );
     if child.builder.select.is_empty() {
         child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
     }
-    ensure_key(&mut child.builder, &child_col, ctx.schema);
+    if keyed {
+        ensure_key(&mut child.builder, &child_col, ctx.schema);
+    }
     let mut order = Vec::new();
     if let Some(CollapsePrefix::Sort(keys)) = &prefix {
         for (expr, dir) in keys {
             order.extend(sort_keys(ctx, &child, expr, *dir));
         }
     }
-    let mut child = window_wrap(ctx, child, &child_col, order);
+    let mut child = window_wrap(ctx, child, keyed.then(|| child_col.as_str()), order);
     let rn = || SqlExpr::Column {
         depth: 0,
         column: "$$rn".to_string(),
@@ -2917,7 +2949,9 @@ fn windowed_collapse(
     if child.builder.select.is_empty() {
         child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
     }
-    ensure_key(&mut child.builder, &child_col, ctx.schema);
+    if keyed {
+        ensure_key(&mut child.builder, &child_col, ctx.schema);
+    }
     let outputs = builder_outputs(&child.builder, ctx.schema);
     let shape_cols: Vec<OutputColumn> =
         shape_columns(builder_output_types(&child.builder, ctx.schema), |name| {
@@ -2976,6 +3010,80 @@ fn collapse_index(ctx: &mut Context, arg: &TypedExpr) -> SqlExpr {
     }
 }
 
+fn literal_field_col(served: &[String], fields: &[ProjectionField], name: &str) -> String {
+    let positional: Vec<String> = (0..fields.len()).map(|i| format!("c{i}")).collect();
+    if served == positional {
+        fields
+            .iter()
+            .position(|f| f.name == name)
+            .map(|i| format!("c{i}"))
+            .unwrap_or_else(|| unreachable!("literal field {name} missing from its own layout"))
+    } else {
+        name.to_string()
+    }
+}
+
+fn broadcast_first(ctx: &mut Context, base: &TypedExpr) -> (ResultShape, Option<String>) {
+    let mut level = rows(ctx, base);
+    if level.pending.is_some() {
+        todo!("M6 correlated literal projection item");
+    }
+    let item_ty = match &base.ty {
+        QueryType::List(sub) => sub.as_ref(),
+        _ => &base.ty,
+    };
+    if let QueryType::Record(RecordSource::Projection(fields)) = peel_optional(item_ty) {
+        if level.builder.select.is_empty() {
+            level.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+        }
+        let served = builder_outputs(&level.builder, ctx.schema);
+        let positional: Vec<String> = (0..fields.len()).map(|i| format!("c{i}")).collect();
+        if served == positional {
+            level.builder.select = fields
+                .iter()
+                .map(|field| SelectItem::Column {
+                    depth: 0,
+                    column: literal_field_col(&served, fields, &field.name),
+                    output: field.name.clone(),
+                    ty: scalar_of(&field.ty),
+                })
+                .collect();
+        }
+    }
+    compose_limit(&mut level.builder, "first", &[], ctx);
+    if level.builder.select.is_empty() {
+        level.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+    }
+    let outputs = builder_outputs(&level.builder, ctx.schema);
+    let shape_cols: Vec<OutputColumn> =
+        shape_columns(builder_output_types(&level.builder, ctx.schema), |_| false);
+    let element = child_element(
+        ctx.schema,
+        level.output_shapes.as_ref(),
+        item_ty,
+        &outputs,
+        |_| false,
+    );
+    let idx = ctx.sink(
+        level.builder,
+        StatementShape {
+            columns: shape_cols,
+            rows: RowCount::ZeroOrOne,
+        },
+        StatementKind::Query,
+    );
+    let shape = ResultShape::Single {
+        element: Box::new(element),
+        child: ChildRef {
+            stmt: idx,
+            parent: None,
+            cardinality: Cardinality::One,
+            tag: None,
+        },
+    };
+    (shape, None)
+}
+
 fn rscalar_shape(
     ctx: &mut Context,
     parent: &mut Level,
@@ -2992,6 +3100,11 @@ fn rscalar_shape(
         TypedExprKind::Method { base, name, .. } if name.value == "first" => {
             if filter_chain_to_field_ident(base) || filter_chain_to_root_ident(base) {
                 base.as_ref()
+            } else if matches!(&base.kind, TypedExprKind::Array { .. }) {
+                if has_scope_ident(base) {
+                    todo!("M6 correlated literal projection item");
+                }
+                return broadcast_first(ctx, base);
             } else if let Some((base, collapse, prefix)) = windowed {
                 return windowed_collapse(ctx, parent, base, collapse, prefix);
             } else {
@@ -5388,6 +5501,38 @@ fn single_hop_over_collapsed(
             todo!("M4b temp-bound per-row limit");
         }
         return scalar_field(ctx, inner, name);
+    }
+    if let TypedExprKind::Method {
+        base: inner,
+        name: m,
+        ..
+    } = &base.kind
+        && m.value == "first"
+        && matches!(&inner.kind, TypedExprKind::Array { .. })
+        && !has_scope_ident(inner)
+        && let QueryType::Optional(o) = &base.ty
+        && let QueryType::Record(RecordSource::Projection(fields)) = peel_optional(o)
+    {
+        let mut level = rows(ctx, inner);
+        if level.pending.is_some() {
+            todo!("M6 correlated literal projection item");
+        }
+        let served = from_columns(&level.builder.from, ctx.schema);
+        let column = literal_field_col(&served, fields, &name.value);
+        let column_ty = record_column_ty(ctx, &base.ty, &name.value);
+        if !level.builder.select.is_empty() || !level.builder.unions.is_empty() {
+            level = wrap_level(ctx, level);
+        }
+        level.builder.select = vec![SelectItem::Column {
+            depth: 0,
+            column: column.clone(),
+            output: column,
+            ty: column_ty,
+        }];
+        compose_limit(&mut level.builder, "first", &[], ctx);
+        return SqlExpr::Subquery {
+            query: Box::new(level.builder),
+        };
     }
     let column = record_column(ctx, &base.ty, &name.value);
     let column_ty = record_column_ty(ctx, &base.ty, &name.value);

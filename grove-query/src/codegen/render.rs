@@ -289,7 +289,10 @@ fn render_expr(
                 }
             }
             if !order.is_empty() {
-                sql.push_str(" ORDER BY ");
+                if !partition.is_empty() {
+                    sql.push(' ');
+                }
+                sql.push_str("ORDER BY ");
                 for (i, item) in order.iter().enumerate() {
                     if i > 0 {
                         sql.push_str(", ");

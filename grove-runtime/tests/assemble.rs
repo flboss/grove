@@ -198,6 +198,44 @@ fn grandchild_single_pairs_per_middle_row() {
 }
 
 #[test]
+fn depth_three_single_pairs_transitively() {
+    assert_eq!(
+        value("users { o = orders { i = items { w = order } } }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "o".to_string(),
+                Value::List(vec![
+                    Value::Record(vec![(
+                        "i".to_string(),
+                        Value::List(vec![
+                            Value::Record(vec![(
+                                "w".to_string(),
+                                Value::Record(vec![("total".to_string(), Value::Dec(dec("10")))]),
+                            )]),
+                            Value::Record(vec![(
+                                "w".to_string(),
+                                Value::Record(vec![("total".to_string(), Value::Dec(dec("10")))]),
+                            )]),
+                        ])
+                    )]),
+                    Value::Record(vec![("i".to_string(), Value::List(vec![]),)]),
+                ])
+            )]),
+            Value::Record(vec![(
+                "o".to_string(),
+                Value::List(vec![Value::Record(vec![(
+                    "i".to_string(),
+                    Value::List(vec![Value::Record(vec![(
+                        "w".to_string(),
+                        Value::Record(vec![("total".to_string(), Value::Dec(dec("30")))]),
+                    )])])
+                ),])]),
+            )]),
+        ])
+    );
+}
+
+#[test]
 fn empty_root_list() {
     assert_eq!(value("users[age > 100] { name }"), Value::List(vec![]));
 }
