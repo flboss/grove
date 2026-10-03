@@ -820,6 +820,18 @@ fn cross_root_agg_in_child_tail() {
     );
 }
 
+#[test]
+fn cross_nested_collection_agg_in_child_tail() {
+    let s = |n: i64| Value::Record(vec![("s".to_string(), Value::Int(n))]);
+    assert_eq!(
+        value("users { o = orders { s = subordinates.len() } }"),
+        Value::List(vec![
+            Value::Record(vec![("o".to_string(), Value::List(vec![s(1), s(1)]))]),
+            Value::Record(vec![("o".to_string(), Value::List(vec![s(1)]))]),
+        ])
+    );
+}
+
 
 fn dummy_stmts(n: usize) -> Vec<PlannedStatement> {
     (0..n)

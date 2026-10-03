@@ -36,6 +36,30 @@ pub struct ChildCtx {
     pub base: Option<Level>,
     pub per_row: bool,
     pub partition: Option<String>,
+    pub anchor: Option<StructId>,
+}
+
+fn row_struct(ty: &QueryType) -> Option<StructId> {
+    match peel_optional(ty) {
+        QueryType::List(inner) => match peel_optional(inner) {
+            QueryType::Record(RecordSource::Schema(sid)) => Some(*sid),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn tail_row_struct(ctx: &Context, tail: &TypedExpr) -> Option<StructId> {
+    match tail_root_ident(tail)? {
+        IdentBinding::Field(fid) => {
+            match &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()] {
+                Field::Ref { target, .. } => Some(*target),
+                _ => None,
+            }
+        }
+        IdentBinding::Root { root_idx } => Some(ctx.schema.roots[*root_idx].struct_id),
+        _ => None,
+    }
 }
 
 pub struct TempCollect {
@@ -2242,10 +2266,12 @@ fn lower_tail(
     per_row: bool,
     partition: Option<String>,
 ) -> Level {
+    let anchor = tail_row_struct(ctx, tail);
     let was_child = ctx.child.replace(ChildCtx {
         base: Some(child_level),
         per_row,
         partition,
+        anchor,
     });
     let was_outer = std::mem::replace(&mut ctx.no_outer, true);
     let child = rows(ctx, tail);
@@ -3120,10 +3146,12 @@ fn rcross_shape(
         output_shapes: None,
         root_parts: None,
     };
+    let anchor = tail_row_struct(ctx, tail);
     let was_child = ctx.child.replace(ChildCtx {
         base: Some(child_level),
         per_row: false,
         partition: None,
+        anchor,
     });
     let was_outer = std::mem::replace(&mut ctx.no_outer, true);
     let mut child = rows(ctx, &local_tail);
@@ -3363,10 +3391,12 @@ fn cross_cartesian(
         output_shapes: None,
         root_parts: None,
     };
+    let anchor = tail_row_struct(ctx, peeled);
     let was_child = ctx.child.replace(ChildCtx {
         base: Some(child_level),
         per_row: false,
         partition: None,
+        anchor,
     });
     let was_outer = std::mem::replace(&mut ctx.no_outer, true);
     let mut child = rows(ctx, peeled);
@@ -7061,7 +7091,14 @@ fn single_row_query(ctx: &mut Context, base: &TypedExpr, select: Vec<SelectItem>
     }
     let was_corr = std::mem::replace(&mut ctx.corr, corr);
     let was_outer = std::mem::replace(&mut ctx.no_outer, !corr);
-    let mut level = rows(ctx, base);
+    let mut level = if corr {
+        match reanchored_level(ctx, base) {
+            Some(level) => level,
+            None => rows(ctx, base),
+        }
+    } else {
+        rows(ctx, base)
+    };
     ctx.corr = was_corr;
     ctx.no_outer = was_outer;
     level.stmt_bound = false;
@@ -7581,6 +7618,83 @@ fn agg_call(agg: &AggOp, col: impl FnOnce() -> SqlExpr) -> SqlExpr {
     }
 }
 
+fn reanchored_level(ctx: &mut Context, base: &TypedExpr) -> Option<Level> {
+    let tail = ctx.child.as_ref()?;
+    if tail.base.is_some() {
+        return None;
+    }
+    let anchor = tail.anchor?;
+    let cfid = match &base.kind {
+        TypedExprKind::Ident {
+            binding: IdentBinding::Field(fid),
+            depth,
+            ..
+        } if *depth > 0 => *fid,
+        _ => return None,
+    };
+    let outer = row_struct(&base.ty)?;
+    let rel_id = ctx.schema.relation_of_field(cfid)?;
+    let relation = &ctx.schema.relations[rel_id.index()];
+    let (c_table, c_col, pk) = match relation {
+        Relation::OneToOne { fk, pk, .. }
+        | Relation::ManyToOne { fk, pk, .. }
+        | Relation::OneToMany { fk, pk, .. } => (
+            ctx.schema.tables[fk.table_id().index()].name.clone(),
+            ctx.schema.column_name(*fk).to_string(),
+            *pk,
+        ),
+        Relation::ManyToMany { .. } => return None,
+    };
+    let parent_col = if anchor == outer {
+        ctx.schema.column_name(pk).to_string()
+    } else {
+        let mut refs = ctx.schema.structs[anchor.index()]
+            .fields
+            .iter()
+            .enumerate()
+            .filter_map(|(local, f)| match f {
+                Field::Ref {
+                    target, is_list, ..
+                } if *target == outer && !is_list => Some(FieldId::new(anchor, local)),
+                _ => None,
+            });
+        let unique = match (refs.next(), refs.next()) {
+            (Some(fid), None) => fid,
+            _ => return None,
+        };
+        match link_cols(ctx.schema, unique) {
+            LinkCols::ParentFk { parent_fk, .. } => parent_fk,
+            _ => return None,
+        }
+    };
+    let data_alias = ctx.aliases.table(&c_table);
+    let mut builder = SelectBuilder::new();
+    builder.from = Some(FromClause::Table {
+        table: c_table,
+        alias: data_alias,
+    });
+    builder.where_ = vec![SqlExpr::Binary {
+        op: SqlBinOp::Eq,
+        lhs: Box::new(SqlExpr::Column {
+            depth: 0,
+            column: c_col,
+        }),
+        rhs: Box::new(SqlExpr::Column {
+            depth: 1,
+            column: parent_col,
+        }),
+    }];
+    Some(Level {
+        builder,
+        element: base.ty.clone(),
+        parent: ParentLink::Root { root_idx: 0 },
+        pending: None,
+        stmt_bound: true,
+        output_shapes: None,
+        root_parts: None,
+    })
+}
+
 fn scalar_aggregate(ctx: &mut Context, base: &TypedExpr, agg: AggOp) -> SqlExpr {
     let corr = has_row_setting_ident(base) || tail_uses_outer(base);
     if corr && ctx.in_take_arg {
@@ -7588,11 +7702,17 @@ fn scalar_aggregate(ctx: &mut Context, base: &TypedExpr, agg: AggOp) -> SqlExpr 
     }
     let was_corr = std::mem::replace(&mut ctx.corr, corr);
     let was_outer = std::mem::replace(&mut ctx.no_outer, !corr);
-    let was_child = if corr { None } else { ctx.child.take() };
-    let mut level = rows(ctx, base);
-    if !corr {
+    let mut level = if corr {
+        match reanchored_level(ctx, base) {
+            Some(level) => level,
+            None => rows(ctx, base),
+        }
+    } else {
+        let was_child = ctx.child.take();
+        let level = rows(ctx, base);
         ctx.child = was_child;
-    }
+        level
+    };
     ctx.corr = was_corr;
     ctx.no_outer = was_outer;
     if let Some(pending) = level.pending {
