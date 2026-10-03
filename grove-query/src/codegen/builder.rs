@@ -86,6 +86,10 @@ pub enum FromClause {
         columns: Vec<NamedColumn>,
         middle_parts: Option<Vec<MiddlePart>>,
     },
+    Join {
+        left: Box<FromClause>,
+        right: Box<FromClause>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -113,6 +117,9 @@ impl FromClause {
             FromClause::TableFunction { name } => name,
             FromClause::Temp { name, .. } => name,
             FromClause::Literal { id, .. } => id,
+            FromClause::Join { .. } => {
+                unreachable!("single alias of a join: render pushes both sides")
+            }
         }
     }
 }

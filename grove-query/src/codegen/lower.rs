@@ -1185,12 +1185,12 @@ fn non_neg_guard(expr: SqlExpr, method: &str) -> SqlExpr {
 
 fn window_take(
     ctx: &mut Context,
-    mut level: Level,
+    level: Level,
     fk: &str,
     method: &str,
     args: &[TypedMethodArg],
 ) -> Level {
-    let arg = match args {
+    let bound = match args {
         [arg] => {
             let was = std::mem::replace(&mut ctx.in_take_arg, true);
             let lowered = scalar(ctx, &arg.expr);
@@ -1199,7 +1199,17 @@ fn window_take(
         }
         _ => unreachable!("wrong arity for {method}: the checker enforces Fixed arg counts"),
     };
-    let guard = non_neg_guard(arg, method);
+    window_take_bound(ctx, level, fk, method, bound)
+}
+
+fn window_take_bound(
+    ctx: &mut Context,
+    mut level: Level,
+    fk: &str,
+    method: &str,
+    bound: SqlExpr,
+) -> Level {
+    let guard = non_neg_guard(bound, method);
     let order = std::mem::take(&mut level.builder.order_by);
     let mut level = window_wrap(ctx, level, fk, order);
     let bound = SqlExpr::Binary {
@@ -2361,28 +2371,36 @@ fn shift_builder(mut builder: SelectBuilder, by: usize) -> SelectBuilder {
         .map(|arm| shift_builder(arm, by))
         .collect();
     if let Some(from) = builder.from.take() {
-        builder.from = Some(match from {
-            FromClause::Table { .. } | FromClause::TableFunction { .. } => from,
-            FromClause::Temp { .. } => from,
-            FromClause::Literal { .. } => from,
-            FromClause::Subquery { query, alias } => FromClause::Subquery {
-                query: Box::new(shift_builder(*query, by)),
-                alias,
-            },
-            FromClause::Computed {
-                query,
-                alias,
-                columns,
-                middle_parts,
-            } => FromClause::Computed {
-                query: Box::new(shift_builder(*query, by)),
-                alias,
-                columns,
-                middle_parts,
-            },
-        });
+        builder.from = Some(shift_from(from, by));
     }
     builder
+}
+
+fn shift_from(from: FromClause, by: usize) -> FromClause {
+    match from {
+        FromClause::Table { .. } | FromClause::TableFunction { .. } => from,
+        FromClause::Temp { .. } => from,
+        FromClause::Literal { .. } => from,
+        FromClause::Join { left, right } => FromClause::Join {
+            left: Box::new(shift_from(*left, by)),
+            right: Box::new(shift_from(*right, by)),
+        },
+        FromClause::Subquery { query, alias } => FromClause::Subquery {
+            query: Box::new(shift_builder(*query, by)),
+            alias,
+        },
+        FromClause::Computed {
+            query,
+            alias,
+            columns,
+            middle_parts,
+        } => FromClause::Computed {
+            query: Box::new(shift_builder(*query, by)),
+            alias,
+            columns,
+            middle_parts,
+        },
+    }
 }
 fn bulk_query() -> SelectBuilder {
     SelectBuilder {
@@ -2412,24 +2430,7 @@ fn available_cols(builder: &SelectBuilder, schema: &ValidatedSchema) -> Vec<Stri
         .iter()
         .any(|item| matches!(item, SelectItem::AllFrom { .. }))
     {
-        return match &builder.from {
-            Some(FromClause::Table { table, .. }) => schema
-                .tables
-                .iter()
-                .find(|t| &t.name == table)
-                .map(|t| t.columns.iter().map(|c| c.name.clone()).collect())
-                .unwrap_or_default(),
-            Some(FromClause::Subquery { query, .. }) => available_cols(query, schema),
-            Some(FromClause::Temp { columns, .. }) => {
-                columns.iter().map(|c| c.name.clone()).collect()
-            }
-            Some(FromClause::Literal { columns, .. })
-            | Some(FromClause::Computed { columns, .. }) => {
-                columns.iter().map(|c| c.name.clone()).collect()
-            }
-            Some(FromClause::TableFunction { .. }) => vec!["value".to_string()],
-            None => Vec::new(),
-        };
+        return available_from_cols(&builder.from, schema);
     }
     builder
         .select
@@ -2441,6 +2442,29 @@ fn available_cols(builder: &SelectBuilder, schema: &ValidatedSchema) -> Vec<Stri
             }
         })
         .collect()
+}
+
+fn available_from_cols(from: &Option<FromClause>, schema: &ValidatedSchema) -> Vec<String> {
+    match from {
+        Some(FromClause::Table { table, .. }) => schema
+            .tables
+            .iter()
+            .find(|t| &t.name == table)
+            .map(|t| t.columns.iter().map(|c| c.name.clone()).collect())
+            .unwrap_or_default(),
+        Some(FromClause::Subquery { query, .. }) => available_cols(query, schema),
+        Some(FromClause::Temp { columns, .. }) => columns.iter().map(|c| c.name.clone()).collect(),
+        Some(FromClause::Literal { columns, .. }) | Some(FromClause::Computed { columns, .. }) => {
+            columns.iter().map(|c| c.name.clone()).collect()
+        }
+        Some(FromClause::TableFunction { .. }) => vec!["value".to_string()],
+        Some(FromClause::Join { left, right }) => {
+            let mut cols = available_from_cols(&Some((**left).clone()), schema);
+            cols.extend(available_from_cols(&Some((**right).clone()), schema));
+            cols
+        }
+        None => Vec::new(),
+    }
 }
 
 struct CorrCond {
@@ -2541,6 +2565,7 @@ fn prune_cross_filters(
 fn peel_cross_window(
     node: &TypedExpr,
     suffix: &mut Vec<(String, Vec<TypedMethodArg>)>,
+    outer_bounds: bool,
 ) -> TypedExpr {
     match &node.kind {
         TypedExprKind::Method {
@@ -2549,17 +2574,20 @@ fn peel_cross_window(
             args,
             optional,
         } if ["take", "skip"].contains(&name.value.as_str()) && !optional => {
-            for arg in args {
-                if uses_outer(&arg.expr) {
-                    todo!("M4b temp-bound per-row limit");
+            if !outer_bounds {
+                for arg in args {
+                    if uses_outer(&arg.expr) {
+                        todo!("M4b temp-bound per-row limit");
+                    }
                 }
             }
             suffix.push((name.value.clone(), args.clone()));
-            peel_cross_window(base, suffix)
+            peel_cross_window(base, suffix, outer_bounds)
         }
-        TypedExprKind::Method { .. } | TypedExprKind::Projection { .. } => {
-            rebuild_same(node, peel_cross_window(tail_base(node), suffix))
-        }
+        TypedExprKind::Method { .. } | TypedExprKind::Projection { .. } => rebuild_same(
+            node,
+            peel_cross_window(tail_base(node), suffix, outer_bounds),
+        ),
         _ => node.clone(),
     }
 }
@@ -2804,7 +2832,7 @@ fn rcross_shape(
     }
     let corr = &correlated[0];
     let mut suffix: Vec<(String, Vec<TypedMethodArg>)> = Vec::new();
-    let local_tail = peel_cross_window(&local_tail, &mut suffix);
+    let local_tail = peel_cross_window(&local_tail, &mut suffix, false);
     if suffix.len() > 1 || (!suffix.is_empty() && !broadcast.is_empty()) {
         todo!("M4b cross tail shape");
     }
@@ -2831,46 +2859,7 @@ fn rcross_shape(
             },
             StatementKind::Temp { name: temp.clone() },
         );
-        let readback_cols = {
-            let probe = SelectBuilder {
-                select: vec![SelectItem::AllFrom { depth: 0 }],
-                from: Some(FromClause::Temp {
-                    name: temp.clone(),
-                    columns: create_outputs
-                        .iter()
-                        .map(|(name, ty)| NamedColumn {
-                            name: name.clone(),
-                            ty: *ty,
-                        })
-                        .collect(),
-                }),
-                where_: Vec::new(),
-                order_by: Vec::new(),
-                limit: None,
-                offset: None,
-                unions: Vec::new(),
-            };
-            builder_output_types(&probe, ctx.schema)
-        };
-        parent.builder = SelectBuilder {
-            select: Vec::new(),
-            from: Some(FromClause::Temp {
-                name: temp.clone(),
-                columns: readback_cols
-                    .iter()
-                    .map(|(name, ty)| NamedColumn {
-                        name: name.clone(),
-                        ty: *ty,
-                    })
-                    .collect(),
-            }),
-            where_: Vec::new(),
-            order_by: Vec::new(),
-            limit: None,
-            offset: None,
-            unions: Vec::new(),
-        };
-        parent.stmt_bound = true;
+        swap_parent_to_temp(parent, &temp, &create_outputs);
         (temp, Some(idx))
     };
     let mut child_builder = SelectBuilder::new();
@@ -3010,6 +2999,242 @@ fn rcross_shape(
         },
     };
     (shape, Some(corr.outer_col.clone()))
+}
+
+fn per_row_take_op(tail: &TypedExpr) -> Option<(String, TypedExpr, TypedExpr)> {
+    let mut suffix = Vec::new();
+    let peeled = peel_cross_window(tail, &mut suffix, true);
+    let [(method, args)] = suffix.as_slice() else {
+        return None;
+    };
+    let [arg] = args.as_slice() else {
+        return None;
+    };
+    match &arg.expr.kind {
+        TypedExprKind::Ident {
+            binding: IdentBinding::Field(_) | IdentBinding::ProjectedField { .. },
+            ..
+        } => Some((method.clone(), arg.expr.clone(), peeled)),
+        _ => None,
+    }
+}
+
+fn expand_join_stars(builder: &mut SelectBuilder, schema: &ValidatedSchema) {
+    let from = builder.from.clone();
+    let mut expanded = Vec::new();
+    for item in std::mem::take(&mut builder.select) {
+        match item {
+            SelectItem::AllFrom { depth } => {
+                let side = match &from {
+                    Some(FromClause::Join { left, right }) => {
+                        if depth == 0 {
+                            right
+                        } else if depth == 1 {
+                            left
+                        } else {
+                            unreachable!("star depth under a join: lowering emits depth-0 stars")
+                        }
+                    }
+                    _ => unreachable!("star expansion outside a join: lanes select explicitly"),
+                };
+                for (name, ty) in from_columns_typed(&Some((**side).clone()), schema) {
+                    expanded.push(SelectItem::Column {
+                        depth,
+                        column: name.clone(),
+                        output: name,
+                        ty,
+                    });
+                }
+            }
+            other => expanded.push(other),
+        }
+    }
+    builder.select = expanded;
+}
+
+fn per_row_take_shape(
+    ctx: &mut Context,
+    parent: &mut Level,
+    method: &str,
+    bound: &TypedExpr,
+    peeled: &TypedExpr,
+) -> (ResultShape, Option<String>) {
+    let bound_name = match &bound.kind {
+        TypedExprKind::Ident {
+            binding: IdentBinding::Field(fid),
+            ..
+        } => {
+            let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
+            match field {
+                Field::Value { columns, .. } => match columns.as_slice() {
+                    [col] => ctx.schema.column_name(*col).to_string(),
+                    _ => todo!("M4b temp-bound per-row limit"),
+                },
+                _ => todo!("M4b temp-bound per-row limit"),
+            }
+        }
+        TypedExprKind::Ident {
+            binding: IdentBinding::ProjectedField { name },
+            ..
+        } => name.clone(),
+        _ => todo!("M4b temp-bound per-row limit"),
+    };
+    let bound_ty = output_ty(&parent.builder, &bound_name, ctx.schema).unwrap_or_else(|| {
+        todo!("M4b temp-bound per-row limit");
+    });
+    let temp = ctx.aliases.temp();
+    let mut create_q = parent.builder.clone();
+    if create_q.select.is_empty() {
+        create_q.select = vec![SelectItem::AllFrom { depth: 0 }];
+    }
+    if !available_cols(&create_q, ctx.schema).contains(&bound_name) {
+        create_q.select.push(SelectItem::Column {
+            depth: 0,
+            column: bound_name.clone(),
+            output: bound_name.clone(),
+            ty: Some(bound_ty),
+        });
+    }
+    create_q.select.push(SelectItem::Expr {
+        expr: SqlExpr::Window {
+            func: "ROW_NUMBER".to_string(),
+            partition: Vec::new(),
+            order: Vec::new(),
+        },
+        output: "$$key".to_string(),
+        ty: Some(ScalarType::Int),
+    });
+    let create_outputs = builder_output_types(&create_q, ctx.schema);
+    let temp_idx = ctx.sink(
+        create_q,
+        StatementShape {
+            columns: shape_columns(create_outputs.clone(), |name| name == "$$key"),
+            rows: RowCount::Many,
+        },
+        StatementKind::Temp { name: temp.clone() },
+    );
+    swap_parent_to_temp(parent, &temp, &create_outputs);
+    let data_from = cross_root_scan(ctx, peeled);
+    let mut child_builder = SelectBuilder::new();
+    child_builder.from = Some(FromClause::Join {
+        left: Box::new(FromClause::Temp {
+            name: temp.clone(),
+            columns: create_outputs
+                .iter()
+                .map(|(name, ty)| NamedColumn {
+                    name: name.clone(),
+                    ty: *ty,
+                })
+                .collect(),
+        }),
+        right: Box::new(data_from),
+    });
+    let child_level = Level {
+        builder: child_builder,
+        element: peeled.ty.clone(),
+        parent: ParentLink::Root { root_idx: 0 },
+        pending: None,
+        stmt_bound: true,
+        output_shapes: None,
+        root_parts: None,
+    };
+    let was_child = ctx.child.replace(ChildCtx {
+        base: Some(child_level),
+        per_row: false,
+        partition: None,
+    });
+    let was_outer = std::mem::replace(&mut ctx.no_outer, true);
+    let mut child = rows(ctx, peeled);
+    ctx.child = was_child;
+    ctx.no_outer = was_outer;
+    if child.pending.is_some() {
+        todo!("M4b nested collection inside cross child");
+    }
+    expand_join_stars(&mut child.builder, ctx.schema);
+    if child.builder.select.is_empty() {
+        if let Some(FromClause::Join { right, .. }) = &child.builder.from {
+            for (name, ty) in from_columns_typed(&Some((**right).clone()), ctx.schema) {
+                child.builder.select.push(SelectItem::Column {
+                    depth: 0,
+                    column: name.clone(),
+                    output: name,
+                    ty,
+                });
+            }
+        }
+    }
+    if child.builder.select.is_empty() {
+        todo!("M4b cross tail shape");
+    }
+    child.builder.select.push(SelectItem::Expr {
+        expr: SqlExpr::Column {
+            depth: 1,
+            column: "$$key".to_string(),
+        },
+        output: "$$pkey".to_string(),
+        ty: None,
+    });
+    child.builder.select.push(SelectItem::Expr {
+        expr: SqlExpr::Column {
+            depth: 1,
+            column: bound_name.clone(),
+        },
+        output: "$$tbound".to_string(),
+        ty: Some(bound_ty),
+    });
+    let order = std::mem::take(&mut child.builder.order_by);
+    let mut wrapped = wrap_level(ctx, child);
+    wrapped.builder.order_by = order;
+    let mut child = window_take_bound(
+        ctx,
+        wrapped,
+        "$$pkey",
+        method,
+        SqlExpr::Column {
+            depth: 0,
+            column: "$$tbound".to_string(),
+        },
+    );
+    if child.builder.select.is_empty() {
+        child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+    }
+    let outputs = builder_outputs(&child.builder, ctx.schema);
+    let is_pairing = |name: &str| name == "$$pkey";
+    let shape_cols: Vec<OutputColumn> =
+        shape_columns(builder_output_types(&child.builder, ctx.schema), is_pairing);
+    let item_ty = match &peeled.ty {
+        QueryType::List(sub) => sub.as_ref(),
+        _ => &peeled.ty,
+    };
+    let element = child_element(
+        ctx.schema,
+        child.output_shapes.as_ref(),
+        item_ty,
+        &outputs,
+        is_pairing,
+    );
+    let idx = ctx.sink(
+        child.builder,
+        StatementShape {
+            columns: shape_cols,
+            rows: RowCount::Many,
+        },
+        StatementKind::Query,
+    );
+    let shape = ResultShape::List {
+        element: Box::new(element),
+        child: ChildRef {
+            stmt: idx,
+            parent: Some(ParentRef {
+                stmt: temp_idx,
+                parent_key: "$$key".to_string(),
+                child_key: "$$pkey".to_string(),
+            }),
+            cardinality: Cardinality::Many,
+            tag: None,
+        },
+    };
+    (shape, Some("$$key".to_string()))
 }
 
 fn cross_root_scan(ctx: &mut Context, tail: &TypedExpr) -> FromClause {
@@ -3249,6 +3474,12 @@ fn rvalue_shape(
     }
     if matches!(tail.kind, TypedExprKind::If { .. }) {
         todo!("M7 correlated If item");
+    }
+    if matches!(tail_root_ident(tail), Some(IdentBinding::Root { .. }))
+        && ctx.temp_collect.is_none()
+        && let Some((method, bound, peeled)) = per_row_take_op(tail)
+    {
+        return per_row_take_shape(ctx, parent, &method, &bound, &peeled);
     }
     let (child_from, child_col, parent_key) = match tail_root_ident(tail) {
         Some(IdentBinding::Field(fid)) => {
@@ -3990,25 +4221,7 @@ fn rtemp_shape(
         },
         StatementKind::Temp { name: temp.clone() },
     );
-    parent.builder = SelectBuilder {
-        select: Vec::new(),
-        from: Some(FromClause::Temp {
-            name: temp.clone(),
-            columns: create_outputs
-                .iter()
-                .map(|(name, ty)| NamedColumn {
-                    name: name.clone(),
-                    ty: *ty,
-                })
-                .collect(),
-        }),
-        where_: Vec::new(),
-        order_by: Vec::new(),
-        limit: None,
-        offset: None,
-        unions: Vec::new(),
-    };
-    parent.stmt_bound = true;
+    swap_parent_to_temp(parent, &temp, &create_outputs);
     let outputs = builder_outputs(&child.builder, ctx.schema);
     let shape_cols: Vec<OutputColumn> =
         shape_columns(builder_output_types(&child.builder, ctx.schema), |name| {
@@ -5787,6 +6000,9 @@ fn from_columns(from: &Option<FromClause>, schema: &ValidatedSchema) -> Vec<Stri
         Some(FromClause::Literal { columns, .. }) | Some(FromClause::Computed { columns, .. }) => {
             columns.iter().map(|c| c.name.clone()).collect()
         }
+        Some(FromClause::Join { .. }) => {
+            unreachable!("star expansion under a join: lanes select explicitly")
+        }
         None => unreachable!("row pipeline without FROM"),
     }
 }
@@ -5864,6 +6080,9 @@ fn from_columns_typed(
         }
         Some(FromClause::Literal { columns, .. }) | Some(FromClause::Computed { columns, .. }) => {
             columns.iter().map(|c| (c.name.clone(), c.ty)).collect()
+        }
+        Some(FromClause::Join { .. }) => {
+            unreachable!("star expansion under a join: lanes select explicitly")
         }
         None => unreachable!("row pipeline without FROM"),
     }

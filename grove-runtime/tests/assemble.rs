@@ -592,6 +592,100 @@ fn cross_proj_corr_bare_temp_pairs() {
     );
 }
 
+#[test]
+fn cross_per_row_take_all() {
+    let all = vec![
+        cfg("n1", "a@x"),
+        cfg("n2", "zzz"),
+        cfg("n3", "b@x"),
+        cfg("b@x", "zzz"),
+        cfg("a@x", "a@x"),
+        cfg("n1", "zzz"),
+    ];
+    assert_eq!(
+        value("users { x = configs.take(age) }"),
+        Value::List(vec![
+            Value::Record(vec![("x".to_string(), Value::List(all.clone()))]),
+            Value::Record(vec![("x".to_string(), Value::List(all))]),
+        ])
+    );
+}
+
+#[test]
+fn cross_per_row_skip_all() {
+    assert_eq!(
+        value("users { x = configs.skip(age) }"),
+        Value::List(vec![
+            Value::Record(vec![("x".to_string(), Value::List(vec![]))]),
+            Value::Record(vec![("x".to_string(), Value::List(vec![]))]),
+        ])
+    );
+}
+
+#[test]
+fn cross_per_row_narrow_parent() {
+    let all = vec![
+        cfg("n1", "a@x"),
+        cfg("n2", "zzz"),
+        cfg("n3", "b@x"),
+        cfg("b@x", "zzz"),
+        cfg("a@x", "a@x"),
+        cfg("n1", "zzz"),
+    ];
+    assert_eq!(
+        value("users { name, x = configs.take(age) }"),
+        Value::List(vec![
+            Value::Record(vec![
+                ("name".to_string(), Value::String("Ada".to_string())),
+                ("x".to_string(), Value::List(all.clone())),
+            ]),
+            Value::Record(vec![
+                ("name".to_string(), Value::String("Bob".to_string())),
+                ("x".to_string(), Value::List(all)),
+            ]),
+        ])
+    );
+}
+
+#[test]
+fn cross_per_row_projected_bound() {
+    let all = vec![
+        cfg("n1", "a@x"),
+        cfg("n2", "zzz"),
+        cfg("n3", "b@x"),
+        cfg("b@x", "zzz"),
+        cfg("a@x", "a@x"),
+        cfg("n1", "zzz"),
+    ];
+    assert_eq!(
+        value("users { a = age } { x = configs.take(a) }"),
+        Value::List(vec![
+            Value::Record(vec![("x".to_string(), Value::List(all.clone()))]),
+            Value::Record(vec![("x".to_string(), Value::List(all))]),
+        ])
+    );
+}
+
+#[test]
+fn cross_per_row_local_filter() {
+    let both = vec![cfg("n1", "a@x"), cfg("n1", "zzz")];
+    assert_eq!(
+        value(r#"users { x = configs.filter(name == "n1").take(age) }"#),
+        Value::List(vec![
+            Value::Record(vec![("x".to_string(), Value::List(both.clone()))]),
+            Value::Record(vec![("x".to_string(), Value::List(both))]),
+        ])
+    );
+}
+
+#[test]
+fn cross_per_row_empty_parents() {
+    assert_eq!(
+        value("users.filter(age > 100) { x = configs.take(age) }"),
+        Value::List(vec![])
+    );
+}
+
 
 fn dummy_stmts(n: usize) -> Vec<PlannedStatement> {
     (0..n)

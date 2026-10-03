@@ -7,11 +7,17 @@ pub fn render_select(
     sql: &mut String,
     params: &mut Vec<Param>,
 ) {
-    let pushed = if let Some(from) = &builder.from {
-        stack.push(from.alias().to_string());
-        true
-    } else {
-        false
+    let pushed = match &builder.from {
+        Some(FromClause::Join { left, right }) => {
+            stack.push(left.alias().to_string());
+            stack.push(right.alias().to_string());
+            2
+        }
+        Some(from) => {
+            stack.push(from.alias().to_string());
+            1
+        }
+        None => 0,
     };
     sql.push_str("SELECT ");
     for (i, item) in builder.select.iter().enumerate() {
@@ -89,7 +95,7 @@ pub fn render_select(
         }
         (None, None) => {}
     }
-    if pushed {
+    for _ in 0..pushed {
         let _ = stack.pop();
     }
 }
@@ -137,6 +143,11 @@ fn render_from(
             render_select(query, stack, sql, params);
             sql.push_str(") AS ");
             sql.push_str(&quote(alias));
+        }
+        FromClause::Join { left, right } => {
+            render_from(left, stack, sql, params);
+            sql.push_str(", ");
+            render_from(right, stack, sql, params);
         }
     }
 }
