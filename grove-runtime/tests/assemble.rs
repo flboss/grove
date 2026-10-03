@@ -443,6 +443,69 @@ fn grandchild_under_sorted_taken_middle() {
     );
 }
 
+fn cfg(name: &str, owner: &str) -> Value {
+    Value::Record(vec![
+        ("name".to_string(), Value::String(name.to_string())),
+        ("owner".to_string(), Value::String(owner.to_string())),
+    ])
+}
+
+#[test]
+fn cross_disjunctive_pairs_and_broadcasts() {
+    assert_eq!(
+        value(r#"users { x = configs.filter(owner == email || name == "n1") }"#),
+        Value::List(vec![
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![cfg("a@x", "a@x"), cfg("n1", "a@x"), cfg("n1", "zzz")])
+            )]),
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![cfg("n3", "b@x"), cfg("n1", "a@x"), cfg("n1", "zzz")])
+            )]),
+        ])
+    );
+}
+
+#[test]
+fn cross_disjunctive_shared_column_pairs_once() {
+    assert_eq!(
+        value("users { x = configs.filter(owner == email || name == email) }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![cfg("n1", "a@x"), cfg("a@x", "a@x")])
+            )]),
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![cfg("n3", "b@x"), cfg("b@x", "zzz")])
+            )]),
+        ])
+    );
+}
+
+#[test]
+fn cross_disjunctive_single_prefers_keyed() {
+    assert_eq!(
+        value(r#"users { x = configs.filter(owner == email || name == "n1").first() }"#),
+        Value::List(vec![
+            Value::Record(vec![("x".to_string(), cfg("a@x", "a@x"))]),
+            Value::Record(vec![("x".to_string(), cfg("n3", "b@x"))]),
+        ])
+    );
+}
+
+#[test]
+fn cross_disjunctive_temp_parent() {
+    assert_eq!(
+        value(r#"users.filter(age > 30) { x = configs.filter(owner == email || name == "n1") }"#),
+        Value::List(vec![Value::Record(vec![(
+            "x".to_string(),
+            Value::List(vec![cfg("n3", "b@x"), cfg("n1", "a@x"), cfg("n1", "zzz")])
+        )])])
+    );
+}
+
 
 fn dummy_stmts(n: usize) -> Vec<PlannedStatement> {
     (0..n)
@@ -515,6 +578,35 @@ fn single_keyed_hit_miss_and_null() {
         child: keyed(1, 0, "id", "fk"),
     };
     assert_eq!(synth(shape, vec![parents, children]).unwrap(), Value::Null);
+}
+
+#[test]
+fn single_keyed_falls_back_to_broadcast() {
+    let shape = ResultShape::Single {
+        element: Box::new(int_col("v")),
+        child: keyed(1, 0, "id", "fk"),
+    };
+    let parents = StatementOutput {
+        rows: vec![row(&[("id", Value::Int(1))]), row(&[("id", Value::Int(2))])],
+    };
+    let children = StatementOutput {
+        rows: vec![
+            row(&[
+                ("v", Value::Int(10)),
+                ("fk", Value::Int(2)),
+                ("$$ptag", Value::Int(0)),
+            ]),
+            row(&[
+                ("v", Value::Int(99)),
+                ("fk", Value::Null),
+                ("$$ptag", Value::Int(1)),
+            ]),
+        ],
+    };
+    assert_eq!(
+        synth(shape, vec![parents, children]).unwrap(),
+        Value::Int(99)
+    );
 }
 
 #[test]

@@ -113,3 +113,5 @@ pub enum Cardinality {
     One,
     Many,
 }
+
+pub const CROSS_PAIR_TAG: &str = "$$ptag";

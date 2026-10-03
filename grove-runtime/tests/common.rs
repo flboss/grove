@@ -8,14 +8,20 @@ use std::str::FromStr;
 
 pub const SCHEMA_SRC: &str = r#"
     root users: User;
+    root configs: Config;
     struct User {
         name: String,
+        email: String,
         age: Int,
         balance: Dec,
         active: Bool,
         created: Instant,
         ttl: Duration,
         orders: List<Order>,
+    }
+    struct Config {
+        name: String,
+        owner: String,
     }
     struct Order {
         total: Dec,
@@ -65,28 +71,48 @@ pub fn fixture() -> Runtime {
     let rt = Runtime::open_in_memory().unwrap();
     rt.conn()
         .execute_batch(
-            "CREATE TABLE users(id INTEGER, name TEXT, age INTEGER, balance BLOB, active INTEGER, created BLOB, ttl BLOB);
+            "CREATE TABLE users(id INTEGER, name TEXT, email TEXT, age INTEGER, balance BLOB, active INTEGER, created BLOB, ttl BLOB);
+             CREATE TABLE configs(name TEXT, owner TEXT);
              CREATE TABLE orders(id INTEGER, total BLOB, user_id INTEGER);
              CREATE TABLE items(sku TEXT, order_id INTEGER);",
         )
         .unwrap();
     let created = encode_instant(&DateTime::from_timestamp(1_700_000_000, 0).unwrap());
     let ttl = encode_duration(&TimeDelta::seconds(3600));
-    let users: &[(i64, &str, i64, &str, i64)] =
-        &[(1, "Ada", 30, "100.50", 1), (2, "Bob", 40, "200.25", 0)];
-    for (id, name, age, balance, active) in users {
+    let users: &[(i64, &str, &str, i64, &str, i64)] = &[
+        (1, "Ada", "a@x", 30, "100.50", 1),
+        (2, "Bob", "b@x", 40, "200.25", 0),
+    ];
+    for (id, name, email, age, balance, active) in users {
         rt.conn()
             .execute(
-                "INSERT INTO users(id, name, age, balance, active, created, ttl) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO users(id, name, email, age, balance, active, created, ttl) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 rusqlite::params![
                     id,
                     name,
+                    email,
                     age,
                     encode_dec(&dec(balance)).to_vec(),
                     active,
                     created.to_vec(),
                     ttl.to_vec(),
                 ],
+            )
+            .unwrap();
+    }
+    let configs: &[(&str, &str)] = &[
+        ("n1", "a@x"),
+        ("n2", "zzz"),
+        ("n3", "b@x"),
+        ("b@x", "zzz"),
+        ("a@x", "a@x"),
+        ("n1", "zzz"),
+    ];
+    for (name, owner) in configs {
+        rt.conn()
+            .execute(
+                "INSERT INTO configs(name, owner) VALUES (?, ?)",
+                rusqlite::params![name, owner],
             )
             .unwrap();
     }

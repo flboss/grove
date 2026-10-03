@@ -4,7 +4,7 @@ use std::hash::Hash;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use grove_query::codegen::model::{
-    Cardinality, ChildRef, CompiledQuery, ResultShape, StatementKind,
+    CROSS_PAIR_TAG, Cardinality, ChildRef, CompiledQuery, ResultShape, StatementKind,
 };
 use rust_decimal::Decimal;
 
@@ -110,13 +110,24 @@ fn assemble_shape(
     }
 }
 
-fn group_by(
-    rows: &[Row],
-    key_col: &str,
-    child_stmt: usize,
-) -> Result<HashMap<Key, Vec<usize>>, RuntimeError> {
+type GroupedRows = (HashMap<Key, Vec<usize>>, Vec<usize>);
+
+fn group_by(rows: &[Row], key_col: &str, child_stmt: usize) -> Result<GroupedRows, RuntimeError> {
     let mut groups: HashMap<Key, Vec<usize>> = HashMap::new();
+    let mut broadcast: Vec<usize> = Vec::new();
     for (i, row) in rows.iter().enumerate() {
+        match row.get(CROSS_PAIR_TAG) {
+            Some(&Value::Int(1)) => {
+                broadcast.push(i);
+                continue;
+            }
+            Some(&Value::Int(0)) | None => {}
+            Some(other) => {
+                return Err(RuntimeError::Contract(format!(
+                    "statement {child_stmt}: pair tag holds {other:?}, want 0 or 1"
+                )));
+            }
+        }
         let value = row.get(key_col).ok_or_else(|| {
             RuntimeError::Contract(format!(
                 "statement {child_stmt}: key column {key_col} missing"
@@ -126,7 +137,7 @@ fn group_by(
             groups.entry(key).or_default().push(i);
         }
     }
-    Ok(groups)
+    Ok((groups, broadcast))
 }
 
 fn check_tag(child: &ChildRef) -> Result<(), RuntimeError> {
@@ -165,13 +176,14 @@ fn assemble_list(
             .collect::<Result<Vec<_>, _>>()
             .map(Value::List),
         Some(pref) => {
-            let groups = group_by(rows, &pref.child_key, child.stmt)?;
+            let (groups, broadcast) = group_by(rows, &pref.child_key, child.stmt)?;
             let one = matches!(child.cardinality, Cardinality::One);
             let matched = |key: &Value| -> Result<Vec<Value>, RuntimeError> {
                 let Some(key) = key_of(key)? else {
                     return Ok(Vec::new());
                 };
                 let mut hits = groups.get(&key).cloned().unwrap_or_default();
+                hits.extend(broadcast.iter().cloned());
                 if one {
                     hits.truncate(1);
                 }
@@ -238,12 +250,16 @@ fn assemble_single(
             None => Ok(Value::Null),
         },
         Some(pref) => {
-            let groups = group_by(rows, &pref.child_key, child.stmt)?;
+            let (groups, broadcast) = group_by(rows, &pref.child_key, child.stmt)?;
             let lookup = |key: &Value| -> Result<Value, RuntimeError> {
                 let Some(key) = key_of(key)? else {
                     return Ok(Value::Null);
                 };
-                match groups.get(&key).and_then(|hits| hits.first()) {
+                match groups
+                    .get(&key)
+                    .and_then(|hits| hits.first())
+                    .or_else(|| broadcast.first())
+                {
                     Some(&i) => first(i),
                     None => Ok(Value::Null),
                 }

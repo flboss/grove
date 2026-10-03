@@ -6,8 +6,8 @@ use super::builder::{
     SqlBinOp, SqlExpr,
 };
 use super::model::{
-    Cardinality, ChildRef, ColumnRole, OutputColumn, ParamValue, ParentRef, ResultShape, RowCount,
-    StatementKind, StatementShape, SunkStatement,
+    CROSS_PAIR_TAG, Cardinality, ChildRef, ColumnRole, OutputColumn, ParamValue, ParentRef,
+    ResultShape, RowCount, StatementKind, StatementShape, SunkStatement,
 };
 use crate::ast::{BinaryOp, ConstantName, Literal, SortDir, TypeName, UnaryOp};
 use crate::typecheck::types::{
@@ -2459,16 +2459,18 @@ fn split_cross_tail(
     ctx: &mut Context,
     tail: &TypedExpr,
     temp_form: bool,
-) -> (TypedExpr, Vec<CorrCond>) {
+) -> (TypedExpr, Vec<CorrCond>, Vec<TypedExpr>) {
     let mut correlated: Vec<CorrCond> = Vec::new();
-    let pruned = prune_cross_filters(ctx, tail, &mut correlated, temp_form);
-    (pruned, correlated)
+    let mut broadcast: Vec<TypedExpr> = Vec::new();
+    let pruned = prune_cross_filters(ctx, tail, &mut correlated, &mut broadcast, temp_form);
+    (pruned, correlated, broadcast)
 }
 
 fn prune_cross_filters(
     ctx: &mut Context,
     node: &TypedExpr,
     correlated: &mut Vec<CorrCond>,
+    broadcast: &mut Vec<TypedExpr>,
     temp_form: bool,
 ) -> TypedExpr {
     match &node.kind {
@@ -2482,12 +2484,19 @@ fn prune_cross_filters(
             let mut locals: Vec<TypedExpr> = Vec::new();
             for conjunct in split_and(arg) {
                 if uses_outer(&conjunct) {
-                    correlated.push(check_corr(ctx, &conjunct, temp_form));
+                    if matches!(&conjunct.kind, TypedExprKind::Binary { op, .. } if op.value == BinaryOp::Or)
+                    {
+                        let (conds, arms) = split_disjuncts(ctx, &conjunct, temp_form);
+                        correlated.extend(conds);
+                        broadcast.extend(arms);
+                    } else {
+                        correlated.push(check_corr(ctx, &conjunct, temp_form));
+                    }
                 } else {
                     locals.push(conjunct);
                 }
             }
-            let pruned_base = prune_cross_filters(ctx, base, correlated, temp_form);
+            let pruned_base = prune_cross_filters(ctx, base, correlated, broadcast, temp_form);
             match locals.as_slice() {
                 [] => pruned_base,
                 [single] => rebuild_filter(node, pruned_base, single.clone()),
@@ -2503,7 +2512,7 @@ fn prune_cross_filters(
         TypedExprKind::Method { base, name, .. }
             if ["sort", "sort_asc", "sort_desc"].contains(&name.value.as_str()) =>
         {
-            let pruned_base = prune_cross_filters(ctx, base, correlated, temp_form);
+            let pruned_base = prune_cross_filters(ctx, base, correlated, broadcast, temp_form);
             rebuild_same(node, pruned_base)
         }
         TypedExprKind::Projection { base, items } => {
@@ -2515,12 +2524,40 @@ fn prune_cross_filters(
                     todo!("M4b cross projection correlation");
                 }
             }
-            let pruned_base = prune_cross_filters(ctx, base, correlated, temp_form);
+            let pruned_base = prune_cross_filters(ctx, base, correlated, broadcast, temp_form);
             rebuild_same(node, pruned_base)
         }
         TypedExprKind::Ident { .. } => node.clone(),
         _ => todo!("M4b cross tail shape"),
     }
+}
+
+fn split_or(expr: &TypedExpr) -> Vec<TypedExpr> {
+    match &expr.kind {
+        TypedExprKind::Binary { op, lhs, rhs } if op.value == BinaryOp::Or => {
+            let mut out = split_or(lhs);
+            out.extend(split_or(rhs));
+            out
+        }
+        _ => vec![expr.clone()],
+    }
+}
+
+fn split_disjuncts(
+    ctx: &mut Context,
+    conjunct: &TypedExpr,
+    temp_form: bool,
+) -> (Vec<CorrCond>, Vec<TypedExpr>) {
+    let mut conds = Vec::new();
+    let mut locals = Vec::new();
+    for disjunct in split_or(conjunct) {
+        if uses_outer(&disjunct) {
+            conds.push(check_corr(ctx, &disjunct, temp_form));
+        } else {
+            locals.push(disjunct);
+        }
+    }
+    (conds, locals)
 }
 
 fn split_and(expr: &TypedExpr) -> Vec<TypedExpr> {
@@ -2634,6 +2671,69 @@ fn and_expr(lhs: &TypedExpr, rhs: &TypedExpr) -> TypedExpr {
     }
 }
 
+fn pkey_arm_cond(ctx: &mut Context, corr: &CorrCond) -> SqlExpr {
+    let was_outer = std::mem::replace(&mut ctx.no_outer, true);
+    let child_frag = shift_depths(scalar(ctx, &corr.child), 1);
+    ctx.no_outer = was_outer;
+    SqlExpr::Binary {
+        op: corr.op,
+        lhs: Box::new(SqlExpr::Column {
+            depth: 0,
+            column: corr.outer_col.clone(),
+        }),
+        rhs: Box::new(child_frag),
+    }
+}
+
+fn exclude_broadcast(ctx: &mut Context, cond: SqlExpr, broadcast: &[TypedExpr]) -> SqlExpr {
+    let was_outer = std::mem::replace(&mut ctx.no_outer, true);
+    let mut preds = broadcast.iter();
+    let first = shift_depths(scalar(ctx, preds.next().expect("broadcast nonempty")), 1);
+    let or_pred = preds.fold(first, |acc, pred| SqlExpr::Binary {
+        op: SqlBinOp::Or,
+        lhs: Box::new(acc),
+        rhs: Box::new(shift_depths(scalar(ctx, pred), 1)),
+    });
+    ctx.no_outer = was_outer;
+    SqlExpr::Binary {
+        op: SqlBinOp::And,
+        lhs: Box::new(cond),
+        rhs: Box::new(SqlExpr::Not(Box::new(or_pred))),
+    }
+}
+
+fn pkey_query(
+    ctx: &mut Context,
+    source_name: &str,
+    temp_idx: Option<usize>,
+    outer_col: &str,
+    cond: SqlExpr,
+) -> SelectBuilder {
+    let mut pkey_q = SelectBuilder::new();
+    let pkey_inner_ty = if temp_idx.is_some() {
+        temp_column_ty(ctx, source_name, outer_col)
+    } else {
+        table_column_ty(ctx.schema, source_name, outer_col)
+    };
+    pkey_q.select = vec![SelectItem::Column {
+        depth: 0,
+        column: outer_col.to_string(),
+        output: outer_col.to_string(),
+        ty: pkey_inner_ty,
+    }];
+    let pkey_alias = if temp_idx.is_some() {
+        source_name.to_string()
+    } else {
+        ctx.aliases.table(source_name)
+    };
+    pkey_q.from = Some(FromClause::Table {
+        table: source_name.to_string(),
+        alias: pkey_alias,
+    });
+    pkey_q.where_ = vec![cond];
+    pkey_q
+}
+
 fn rcross_shape(
     ctx: &mut Context,
     parent: &mut Level,
@@ -2651,9 +2751,16 @@ fn rcross_shape(
         }
         _ => false,
     };
-    let (local_tail, correlated) = split_cross_tail(ctx, tail, !bare);
-    if correlated.len() != 1 {
+    let (local_tail, correlated, broadcast) = split_cross_tail(ctx, tail, !bare);
+    if correlated.is_empty() {
         todo!("M4b composite cross-root correlation");
+    }
+    if correlated.len() > 1
+        && correlated.iter().any(|c| {
+            c.outer_col != correlated[0].outer_col || c.outer_struct != correlated[0].outer_struct
+        })
+    {
+        todo!("M4b complex cross-root correlation");
     }
     let corr = &correlated[0];
     let (source_name, temp_idx): (String, Option<usize>) = if bare {
@@ -2747,38 +2854,28 @@ fn rcross_shape(
     if child.builder.select.is_empty() {
         child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
     }
-    let was_outer2 = std::mem::replace(&mut ctx.no_outer, true);
-    let child_frag = shift_depths(scalar(ctx, &corr.child), 1);
-    ctx.no_outer = was_outer2;
-    let mut pkey_q = SelectBuilder::new();
-    let pkey_inner_ty = if temp_idx.is_some() {
-        temp_column_ty(ctx, &source_name, &corr.outer_col)
+    let pkey_where = if correlated.len() > 1 {
+        let mut conds = correlated.iter();
+        let first = pkey_arm_cond(ctx, conds.next().expect("correlated nonempty"));
+        conds.fold(first, |acc, extra| SqlExpr::Binary {
+            op: SqlBinOp::Or,
+            lhs: Box::new(acc),
+            rhs: Box::new(pkey_arm_cond(ctx, extra)),
+        })
     } else {
-        table_column_ty(ctx.schema, &source_name, &corr.outer_col)
+        pkey_arm_cond(ctx, corr)
     };
-    pkey_q.select = vec![SelectItem::Column {
-        depth: 0,
-        column: corr.outer_col.clone(),
-        output: corr.outer_col.clone(),
-        ty: pkey_inner_ty,
-    }];
-    let pkey_alias = if temp_idx.is_some() {
-        source_name.clone()
+    let pkey_where = if broadcast.is_empty() {
+        pkey_where
     } else {
-        ctx.aliases.table(&source_name)
+        exclude_broadcast(ctx, pkey_where, &broadcast)
     };
-    pkey_q.from = Some(FromClause::Table {
-        table: source_name,
-        alias: pkey_alias,
-    });
-    pkey_q.where_ = vec![SqlExpr::Binary {
-        op: corr.op,
-        lhs: Box::new(SqlExpr::Column {
-            depth: 0,
-            column: corr.outer_col.clone(),
-        }),
-        rhs: Box::new(child_frag),
-    }];
+    let scan_template = if broadcast.is_empty() {
+        None
+    } else {
+        Some(child.builder.clone())
+    };
+    let pkey_q = pkey_query(ctx, &source_name, temp_idx, &corr.outer_col, pkey_where);
     child.builder.select.push(SelectItem::Expr {
         expr: SqlExpr::Subquery {
             query: Box::new(pkey_q),
@@ -2786,11 +2883,39 @@ fn rcross_shape(
         output: "$$pkey".to_string(),
         ty: scalar_of(&corr.child.ty),
     });
-    let outputs = builder_outputs(&child.builder, ctx.schema);
-    let shape_cols: Vec<OutputColumn> =
-        shape_columns(builder_output_types(&child.builder, ctx.schema), |name| {
-            name == "$$pkey"
+    if !broadcast.is_empty() {
+        child.builder.select.push(SelectItem::Expr {
+            expr: SqlExpr::Param(ParamValue::Int(0)),
+            output: CROSS_PAIR_TAG.to_string(),
+            ty: Some(ScalarType::Int),
         });
+        let mut arm = scan_template.expect("scan template for broadcast arm");
+        let was_outer = std::mem::replace(&mut ctx.no_outer, true);
+        let mut preds = broadcast.iter();
+        let first = scalar(ctx, preds.next().expect("broadcast nonempty"));
+        let or_pred = preds.fold(first, |acc, pred| SqlExpr::Binary {
+            op: SqlBinOp::Or,
+            lhs: Box::new(acc),
+            rhs: Box::new(scalar(ctx, pred)),
+        });
+        ctx.no_outer = was_outer;
+        arm.where_.push(or_pred);
+        arm.select.push(SelectItem::Expr {
+            expr: SqlExpr::Param(ParamValue::Null),
+            output: "$$pkey".to_string(),
+            ty: None,
+        });
+        arm.select.push(SelectItem::Expr {
+            expr: SqlExpr::Param(ParamValue::Int(1)),
+            output: CROSS_PAIR_TAG.to_string(),
+            ty: Some(ScalarType::Int),
+        });
+        child.builder.unions.push(arm);
+    }
+    let outputs = builder_outputs(&child.builder, ctx.schema);
+    let is_pairing = |name: &str| name == "$$pkey" || name == CROSS_PAIR_TAG;
+    let shape_cols: Vec<OutputColumn> =
+        shape_columns(builder_output_types(&child.builder, ctx.schema), is_pairing);
     let item_ty = match &local_tail.ty {
         QueryType::List(sub) => sub.as_ref(),
         _ => &local_tail.ty,
@@ -2800,7 +2925,7 @@ fn rcross_shape(
         child.output_shapes.as_ref(),
         item_ty,
         &outputs,
-        |name| name == "$$pkey",
+        is_pairing,
     );
     let idx = ctx.sink(
         child.builder,
@@ -5730,6 +5855,7 @@ fn child_element(
         .filter(|name| {
             name.as_str() != "$$rn"
                 && name.as_str() != "$$abort"
+                && name.as_str() != CROSS_PAIR_TAG
                 && match declared {
                     Some(sid) => struct_declares_column(schema, sid, name),
                     None => !is_key(name),
