@@ -2887,10 +2887,21 @@ fn check_corr(ctx: &mut Context, conjunct: &TypedExpr, temp_form: bool) -> CorrC
                 BinaryOp::Ge => SqlBinOp::Ge,
                 _ => todo!("M4b complex cross-root correlation"),
             };
-            let (outer_side, child_side) = match (uses_outer(lhs), uses_outer(rhs)) {
-                (true, false) => (lhs.as_ref(), rhs.as_ref()),
-                (false, true) => (rhs.as_ref(), lhs.as_ref()),
+            let (outer_side, child_side, swapped) = match (uses_outer(lhs), uses_outer(rhs)) {
+                (true, false) => (lhs.as_ref(), rhs.as_ref(), false),
+                (false, true) => (rhs.as_ref(), lhs.as_ref(), true),
                 _ => todo!("M4b complex cross-root correlation"),
+            };
+            let sql_op = if swapped {
+                match sql_op {
+                    SqlBinOp::Lt => SqlBinOp::Gt,
+                    SqlBinOp::Gt => SqlBinOp::Lt,
+                    SqlBinOp::Le => SqlBinOp::Ge,
+                    SqlBinOp::Ge => SqlBinOp::Le,
+                    symmetric => symmetric,
+                }
+            } else {
+                sql_op
             };
             if uses_outer(child_side) {
                 todo!("M4b nested cross-root correlation");
@@ -3558,20 +3569,6 @@ fn sortable_cross_tail(ctx: &Context, parent: &Level, tail: &TypedExpr) -> Optio
     let peeled = peel_cross_sorts(tail, &mut sorts);
     if sorts.is_empty() {
         return None;
-    }
-    for (_, args) in &sorts {
-        let mut child_part = false;
-        let mut outer_part = false;
-        for arg in args {
-            child_part |= any_ident(
-                &arg.expr,
-                &mut |e| matches!(&e.kind, TypedExprKind::Ident { depth, .. } if *depth == 0),
-            );
-            outer_part |= uses_outer(&arg.expr);
-        }
-        if !child_part || !outer_part {
-            return None;
-        }
     }
     if sorts_left_with_outer(&peeled) {
         return None;

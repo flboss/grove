@@ -832,6 +832,54 @@ fn cross_nested_collection_agg_in_child_tail() {
     );
 }
 
+#[test]
+fn cross_sort_pure_outer_broadcasts_order() {
+    let all = vec![
+        cfg("n1", "a@x"),
+        cfg("n2", "zzz"),
+        cfg("n3", "b@x"),
+        cfg("b@x", "zzz"),
+        cfg("a@x", "a@x"),
+        cfg("n1", "zzz"),
+    ];
+    assert_eq!(
+        value("users { x = configs.sort(email) }"),
+        Value::List(vec![
+            Value::Record(vec![("x".to_string(), Value::List(all.clone()))]),
+            Value::Record(vec![("x".to_string(), Value::List(all))]),
+        ])
+    );
+}
+
+#[test]
+fn cross_range_pairs_direction_correctly() {
+    assert_eq!(
+        value("users { x = configs.filter(owner > email) }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![
+                    cfg("n2", "zzz"),
+                    cfg("n3", "b@x"),
+                    cfg("b@x", "zzz"),
+                    cfg("n1", "zzz"),
+                ])
+            )]),
+            Value::Record(vec![("x".to_string(), Value::List(vec![]))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = configs.filter(email > owner) }"),
+        Value::List(vec![
+            Value::Record(vec![("x".to_string(), Value::List(vec![]))]),
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![cfg("n1", "a@x"), cfg("a@x", "a@x")])
+            )]),
+        ])
+    );
+}
+
 
 fn dummy_stmts(n: usize) -> Vec<PlannedStatement> {
     (0..n)
