@@ -2515,6 +2515,12 @@ fn prune_cross_filters(
             let pruned_base = prune_cross_filters(ctx, base, correlated, broadcast, temp_form);
             rebuild_same(node, pruned_base)
         }
+        TypedExprKind::Method { base, name, .. }
+            if ["take", "skip"].contains(&name.value.as_str()) =>
+        {
+            let pruned_base = prune_cross_filters(ctx, base, correlated, broadcast, temp_form);
+            rebuild_same(node, pruned_base)
+        }
         TypedExprKind::Projection { base, items } => {
             for item in items {
                 if !item.value.ty.is_scalar() {
@@ -2529,6 +2535,39 @@ fn prune_cross_filters(
         }
         TypedExprKind::Ident { .. } => node.clone(),
         _ => todo!("M4b cross tail shape"),
+    }
+}
+
+fn peel_cross_window(
+    node: &TypedExpr,
+    suffix: &mut Vec<(String, Vec<TypedMethodArg>)>,
+) -> TypedExpr {
+    match &node.kind {
+        TypedExprKind::Method {
+            base,
+            name,
+            args,
+            optional,
+        } if ["take", "skip"].contains(&name.value.as_str()) && !optional => {
+            for arg in args {
+                if uses_outer(&arg.expr) {
+                    todo!("M4b temp-bound per-row limit");
+                }
+            }
+            suffix.push((name.value.clone(), args.clone()));
+            peel_cross_window(base, suffix)
+        }
+        TypedExprKind::Method { .. } | TypedExprKind::Projection { .. } => {
+            rebuild_same(node, peel_cross_window(tail_base(node), suffix))
+        }
+        _ => node.clone(),
+    }
+}
+
+fn tail_base(node: &TypedExpr) -> &TypedExpr {
+    match &node.kind {
+        TypedExprKind::Method { base, .. } | TypedExprKind::Projection { base, .. } => base,
+        _ => unreachable!("tail_base below spine hops: prune admits no such tails"),
     }
 }
 
@@ -2748,6 +2787,7 @@ fn rcross_shape(
                 && parent.builder.order_by.is_empty()
                 && parent.builder.limit.is_none()
                 && parent.builder.offset.is_none()
+                && !tail_uses_projected_outer(tail)
         }
         _ => false,
     };
@@ -2763,6 +2803,11 @@ fn rcross_shape(
         todo!("M4b complex cross-root correlation");
     }
     let corr = &correlated[0];
+    let mut suffix: Vec<(String, Vec<TypedMethodArg>)> = Vec::new();
+    let local_tail = peel_cross_window(&local_tail, &mut suffix);
+    if suffix.len() > 1 || (!suffix.is_empty() && !broadcast.is_empty()) {
+        todo!("M4b cross tail shape");
+    }
     let (source_name, temp_idx): (String, Option<usize>) = if bare {
         let table = ctx.schema.tables[ctx.schema.structs[corr.outer_struct.index()].table.index()]
             .name
@@ -2911,6 +2956,15 @@ fn rcross_shape(
             ty: Some(ScalarType::Int),
         });
         child.builder.unions.push(arm);
+    }
+    for (method, args) in suffix.iter().rev() {
+        let order = std::mem::take(&mut child.builder.order_by);
+        let mut wrapped = wrap_level(ctx, child);
+        wrapped.builder.order_by = order;
+        child = window_take(ctx, wrapped, "$$pkey", method, args);
+    }
+    if child.builder.select.is_empty() {
+        child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
     }
     let outputs = builder_outputs(&child.builder, ctx.schema);
     let is_pairing = |name: &str| name == "$$pkey" || name == CROSS_PAIR_TAG;
@@ -6232,6 +6286,19 @@ fn uses_outer(expr: &TypedExpr) -> bool {
         expr,
         &mut |e| matches!(&e.kind, TypedExprKind::Ident { depth, .. } if *depth > 0),
     )
+}
+
+fn tail_uses_projected_outer(tail: &TypedExpr) -> bool {
+    any_ident(tail, &mut |e| {
+        matches!(
+            &e.kind,
+            TypedExprKind::Ident {
+                binding: IdentBinding::ProjectedField { .. },
+                depth,
+                ..
+            } if *depth > 0
+        )
+    })
 }
 
 fn tail_uses_outer(tail: &TypedExpr) -> bool {
