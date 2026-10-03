@@ -224,6 +224,10 @@ impl AliasGen {
         self.generate("split")
     }
 
+    pub fn nav(&mut self) -> String {
+        self.generate("nav")
+    }
+
     pub fn literal(&mut self) -> String {
         let id = format!("lit{}", self.next);
         self.next += 1;

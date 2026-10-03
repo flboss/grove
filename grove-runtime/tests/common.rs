@@ -18,6 +18,8 @@ pub const SCHEMA_SRC: &str = r#"
         created: Instant,
         ttl: Duration,
         orders: List<Order>,
+        manager: &User,
+        subordinates: &List<User>,
     }
     struct Config {
         name: String,
@@ -33,6 +35,7 @@ pub const SCHEMA_SRC: &str = r#"
         order: &Order,
     }
     rel Order.user <<-> User.orders (orders.user_id -> users.id);
+    rel User.manager <<-> User.subordinates (users.manager_id -> users.id);
     rel Item.order <<-> Order.items (items.order_id -> orders.id);
 "#;
 
@@ -67,11 +70,21 @@ pub fn blob12(bytes: &[u8; 12]) -> Vec<u8> {
     bytes.to_vec()
 }
 
+type FixtureUser = (
+    i64,
+    &'static str,
+    &'static str,
+    i64,
+    &'static str,
+    i64,
+    Option<i64>,
+);
+
 pub fn fixture() -> Runtime {
     let rt = Runtime::open_in_memory().unwrap();
     rt.conn()
         .execute_batch(
-            "CREATE TABLE users(id INTEGER, name TEXT, email TEXT, age INTEGER, balance BLOB, active INTEGER, created BLOB, ttl BLOB);
+            "CREATE TABLE users(id INTEGER, name TEXT, email TEXT, age INTEGER, balance BLOB, active INTEGER, created BLOB, ttl BLOB, manager_id INTEGER);
              CREATE TABLE configs(name TEXT, owner TEXT);
              CREATE TABLE orders(id INTEGER, total BLOB, user_id INTEGER);
              CREATE TABLE items(sku TEXT, order_id INTEGER);",
@@ -79,14 +92,14 @@ pub fn fixture() -> Runtime {
         .unwrap();
     let created = encode_instant(&DateTime::from_timestamp(1_700_000_000, 0).unwrap());
     let ttl = encode_duration(&TimeDelta::seconds(3600));
-    let users: &[(i64, &str, &str, i64, &str, i64)] = &[
-        (1, "Ada", "a@x", 30, "100.50", 1),
-        (2, "Bob", "b@x", 40, "200.25", 0),
+    let users: &[FixtureUser] = &[
+        (1, "Ada", "a@x", 30, "100.50", 1, Some(2)),
+        (2, "Bob", "b@x", 40, "200.25", 0, Some(1)),
     ];
-    for (id, name, email, age, balance, active) in users {
+    for (id, name, email, age, balance, active, manager_id) in users {
         rt.conn()
             .execute(
-                "INSERT INTO users(id, name, email, age, balance, active, created, ttl) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO users(id, name, email, age, balance, active, created, ttl, manager_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 rusqlite::params![
                     id,
                     name,
@@ -96,6 +109,7 @@ pub fn fixture() -> Runtime {
                     active,
                     created.to_vec(),
                     ttl.to_vec(),
+                    manager_id,
                 ],
             )
             .unwrap();

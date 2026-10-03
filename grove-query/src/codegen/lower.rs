@@ -2472,11 +2472,22 @@ struct CorrCond {
     outer_struct: StructId,
     op: SqlBinOp,
     child: TypedExpr,
+    nav: Option<NavCarry>,
+}
+
+struct NavCarry {
+    carry: String,
+    target: StructId,
+    parent_col: String,
+    target_col: String,
+    endpoint: String,
+    endpoint_ty: ScalarType,
 }
 
 enum OuterRef {
     Field(FieldId),
     Projected(String),
+    Nav(NavCarry),
 }
 
 fn split_cross_tail(
@@ -2599,6 +2610,77 @@ fn tail_base(node: &TypedExpr) -> &TypedExpr {
     }
 }
 
+fn peel_cross_sorts(node: &TypedExpr, sorts: &mut Vec<(String, Vec<TypedMethodArg>)>) -> TypedExpr {
+    match &node.kind {
+        TypedExprKind::Method {
+            base,
+            name,
+            args,
+            optional,
+        } if ["sort", "sort_asc", "sort_desc"].contains(&name.value.as_str()) && !optional => {
+            if args.iter().any(|a| uses_outer(&a.expr)) {
+                sorts.push((name.value.clone(), args.clone()));
+                return peel_cross_sorts(base, sorts);
+            }
+            rebuild_same(node, peel_cross_sorts(base, sorts))
+        }
+        TypedExprKind::Method { .. } | TypedExprKind::Projection { .. } => {
+            rebuild_same(node, peel_cross_sorts(tail_base(node), sorts))
+        }
+        _ => node.clone(),
+    }
+}
+
+fn tail_has_limit_op(tail: &TypedExpr) -> bool {
+    match &tail.kind {
+        TypedExprKind::Method {
+            base, name, args, ..
+        } if ["take", "skip", "nth"].contains(&name.value.as_str()) => true,
+        TypedExprKind::Method { base, args, .. } => {
+            tail_has_limit_op(base) || args.iter().any(|a| tail_has_limit_op(&a.expr))
+        }
+        TypedExprKind::Projection { base, items } => {
+            tail_has_limit_op(base) || items.iter().any(|i| tail_has_limit_op(&i.value))
+        }
+        TypedExprKind::Field { base, .. } => tail_has_limit_op(base),
+        TypedExprKind::Binary { lhs, rhs, .. } => tail_has_limit_op(lhs) || tail_has_limit_op(rhs),
+        TypedExprKind::Unary { expr, .. } | TypedExprKind::Cast { expr, .. } => {
+            tail_has_limit_op(expr)
+        }
+        TypedExprKind::If { arms, default } => {
+            arms.iter()
+                .any(|(c, t)| tail_has_limit_op(c) || tail_has_limit_op(t))
+                || tail_has_limit_op(default)
+        }
+        _ => false,
+    }
+}
+
+fn sort_key_divertible(key: &TypedExpr) -> bool {
+    match &key.kind {
+        TypedExprKind::Ident {
+            binding: IdentBinding::Field(_),
+            ..
+        } => true,
+        TypedExprKind::Ident { .. } => !uses_outer(key),
+        TypedExprKind::Field { base, .. }
+        | TypedExprKind::Method { base, .. }
+        | TypedExprKind::Projection { base, .. } => !uses_outer(key) && sort_key_divertible(base),
+        TypedExprKind::Binary { lhs, rhs, .. } => {
+            sort_key_divertible(lhs) && sort_key_divertible(rhs)
+        }
+        TypedExprKind::Unary { expr, .. } | TypedExprKind::Cast { expr, .. } => {
+            sort_key_divertible(expr)
+        }
+        TypedExprKind::If { arms, default } => {
+            arms.iter()
+                .all(|(c, t)| sort_key_divertible(c) && sort_key_divertible(t))
+                && sort_key_divertible(default)
+        }
+        _ => !uses_outer(key),
+    }
+}
+
 fn split_or(expr: &TypedExpr) -> Vec<TypedExpr> {
     match &expr.kind {
         TypedExprKind::Binary { op, lhs, rhs } if op.value == BinaryOp::Or => {
@@ -2638,6 +2720,136 @@ fn split_and(expr: &TypedExpr) -> Vec<TypedExpr> {
     }
 }
 
+fn nav_carry(ctx: &mut Context, outer_side: &TypedExpr) -> NavCarry {
+    let (base, endpoint) = match &outer_side.kind {
+        TypedExprKind::Field { base, name, .. } => (base.as_ref(), name.value.clone()),
+        _ => todo!("M4b complex cross-root correlation"),
+    };
+    let ref_fid = match &base.kind {
+        TypedExprKind::Ident {
+            binding: IdentBinding::Field(fid),
+            depth,
+            ..
+        } if *depth > 0 => match &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()] {
+            Field::Ref { .. } => *fid,
+            _ => todo!("M4b complex cross-root correlation"),
+        },
+        _ => todo!("M4b complex cross-root correlation"),
+    };
+    let target = match &ctx.schema.structs[ref_fid.struct_id().index()].fields[ref_fid.local()] {
+        Field::Ref { target, .. } => *target,
+        _ => unreachable!("nav root re-resolved non-Ref: checked above"),
+    };
+    let (parent_col, target_col) = match link_cols(ctx.schema, ref_fid) {
+        LinkCols::ParentFk {
+            parent_fk,
+            child_pk,
+        } => (parent_fk, child_pk),
+        LinkCols::TargetFk {
+            child_fk,
+            parent_pk,
+        } => (parent_pk, child_fk),
+        LinkCols::ManyToMany => todo!("M4b complex cross-root correlation"),
+    };
+    let (endpoint_col, endpoint_ty) = match ctx.schema.struct_field(target, &endpoint) {
+        Some((_, Field::Value { ty, columns, .. })) => match columns.as_slice() {
+            [col] => match value_scalar(ty) {
+                Some(scalar) => (ctx.schema.column_name(*col).to_string(), scalar),
+                None => todo!("M4b complex cross-root correlation"),
+            },
+            _ => todo!("M4b complex cross-root correlation"),
+        },
+        _ => todo!("M4b complex cross-root correlation"),
+    };
+    NavCarry {
+        carry: ctx.aliases.nav(),
+        target,
+        parent_col,
+        target_col,
+        endpoint: endpoint_col,
+        endpoint_ty,
+    }
+}
+
+fn tail_uses_nav_outer(ctx: &Context, tail: &TypedExpr) -> bool {
+    match &tail.kind {
+        TypedExprKind::Field { base, .. } => {
+            if let TypedExprKind::Ident {
+                binding: IdentBinding::Field(fid),
+                depth,
+                ..
+            } = &base.kind
+                && *depth > 0
+                && let Field::Ref { .. } =
+                    &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()]
+            {
+                return true;
+            }
+            tail_uses_nav_outer(ctx, base)
+        }
+        TypedExprKind::Method { base, args, .. } => {
+            tail_uses_nav_outer(ctx, base) || args.iter().any(|a| tail_uses_nav_outer(ctx, &a.expr))
+        }
+        TypedExprKind::Binary { lhs, rhs, .. } => {
+            tail_uses_nav_outer(ctx, lhs) || tail_uses_nav_outer(ctx, rhs)
+        }
+        TypedExprKind::Unary { expr, .. } | TypedExprKind::Cast { expr, .. } => {
+            tail_uses_nav_outer(ctx, expr)
+        }
+        TypedExprKind::If { arms, default } => {
+            arms.iter()
+                .any(|(c, t)| tail_uses_nav_outer(ctx, c) || tail_uses_nav_outer(ctx, t))
+                || tail_uses_nav_outer(ctx, default)
+        }
+        TypedExprKind::Projection { base, items } => {
+            tail_uses_nav_outer(ctx, base)
+                || items.iter().any(|i| tail_uses_nav_outer(ctx, &i.value))
+        }
+        TypedExprKind::Some { value } => tail_uses_nav_outer(ctx, value),
+        TypedExprKind::Tuple { elements } | TypedExprKind::Array { elements } => {
+            elements.iter().any(|e| tail_uses_nav_outer(ctx, e))
+        }
+        TypedExprKind::Struct { fields } => fields.iter().any(|(_, e)| tail_uses_nav_outer(ctx, e)),
+        _ => false,
+    }
+}
+
+fn nav_carry_item(ctx: &mut Context, nav: &NavCarry) -> SelectItem {
+    let target_table = ctx.schema.tables[ctx.schema.structs[nav.target.index()].table.index()]
+        .name
+        .clone();
+    let target_alias = ctx.aliases.table(&target_table);
+    let mut nav_q = SelectBuilder::new();
+    nav_q.select = vec![SelectItem::Column {
+        depth: 0,
+        column: nav.endpoint.clone(),
+        output: nav.endpoint.clone(),
+        ty: Some(nav.endpoint_ty),
+    }];
+    nav_q.from = Some(FromClause::Table {
+        table: target_table,
+        alias: target_alias,
+    });
+    nav_q.where_ = vec![SqlExpr::Binary {
+        op: SqlBinOp::Eq,
+        lhs: Box::new(SqlExpr::Column {
+            depth: 0,
+            column: nav.target_col.clone(),
+        }),
+        rhs: Box::new(SqlExpr::Column {
+            depth: 1,
+            column: nav.parent_col.clone(),
+        }),
+    }];
+    SelectItem::Expr {
+        expr: SqlExpr::Subquery {
+            query: Box::new(nav_q),
+        },
+        output: nav.carry.clone(),
+        ty: Some(nav.endpoint_ty),
+    }
+}
+
 fn check_corr(ctx: &mut Context, conjunct: &TypedExpr, temp_form: bool) -> CorrCond {
     match &conjunct.kind {
         TypedExprKind::Binary { op, lhs, rhs } => {
@@ -2666,21 +2878,44 @@ fn check_corr(ctx: &mut Context, conjunct: &TypedExpr, temp_form: bool) -> CorrC
                     binding: IdentBinding::ProjectedField { name },
                     ..
                 } if temp_form => OuterRef::Projected(name.clone()),
+                TypedExprKind::Field { base, name, .. }
+                    if matches!(
+                        &base.kind,
+                        TypedExprKind::Ident {
+                            binding: IdentBinding::Field(_),
+                            depth,
+                            ..
+                        } if *depth > 0
+                    ) =>
+                {
+                    if !temp_form {
+                        todo!("M4b complex cross-root correlation");
+                    }
+                    OuterRef::Nav(nav_carry(ctx, outer_side))
+                }
                 _ => todo!("M4b complex cross-root correlation"),
             };
-            let (outer_struct, outer_col) = match &outer_ref {
+            let (outer_struct, outer_col, nav) = match outer_ref {
                 OuterRef::Field(fid) => {
                     let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
                     match field {
                         Field::Value { columns, .. } => match columns.as_slice() {
-                            [col] => (fid.struct_id(), ctx.schema.column_name(*col).to_string()),
+                            [col] => (
+                                fid.struct_id(),
+                                ctx.schema.column_name(*col).to_string(),
+                                None,
+                            ),
                             _ => todo!("M4b complex cross-root correlation"),
                         },
                         _ => todo!("M4b complex cross-root correlation"),
                     }
                 }
                 OuterRef::Projected(name) => {
-                    (StructId::new(0), name.clone())
+                    (StructId::new(0), name, None)
+                }
+                OuterRef::Nav(carry) => {
+                    let outer_col = carry.carry.clone();
+                    (StructId::new(0), outer_col, Some(carry))
                 }
             };
             CorrCond {
@@ -2688,6 +2923,7 @@ fn check_corr(ctx: &mut Context, conjunct: &TypedExpr, temp_form: bool) -> CorrC
                 outer_col,
                 op: sql_op,
                 child: child_side.clone(),
+                nav,
             }
         }
         _ => todo!("M4b complex cross-root correlation"),
@@ -2816,11 +3052,17 @@ fn rcross_shape(
                 && parent.builder.limit.is_none()
                 && parent.builder.offset.is_none()
                 && !tail_uses_projected_outer(tail)
+                && !tail_uses_nav_outer(ctx, tail)
         }
         _ => false,
     };
     let (local_tail, correlated, broadcast) = split_cross_tail(ctx, tail, !bare);
     if correlated.is_empty() {
+        if broadcast.is_empty()
+            && let Some(lane) = sortable_cross_tail(ctx, parent, &local_tail)
+        {
+            return sorted_cross_shape(ctx, parent, lane, cardinality);
+        }
         todo!("M4b composite cross-root correlation");
     }
     if correlated.len() > 1
@@ -2847,7 +3089,12 @@ fn rcross_shape(
         if create_q.select.is_empty() {
             create_q.select = vec![SelectItem::AllFrom { depth: 0 }];
         }
-        if !available_cols(&create_q, ctx.schema).contains(&corr.outer_col) {
+        for corr in &correlated {
+            if let Some(nav) = &corr.nav {
+                create_q.select.push(nav_carry_item(ctx, nav));
+            }
+        }
+        if corr.nav.is_none() && !available_cols(&create_q, ctx.schema).contains(&corr.outer_col) {
             todo!("M4b key threading through subqueries");
         }
         let create_outputs = builder_output_types(&create_q, ctx.schema);
@@ -3052,48 +3299,26 @@ fn expand_join_stars(builder: &mut SelectBuilder, schema: &ValidatedSchema) {
     builder.select = expanded;
 }
 
-fn per_row_take_shape(
+fn cross_cartesian(
     ctx: &mut Context,
     parent: &mut Level,
-    method: &str,
-    bound: &TypedExpr,
     peeled: &TypedExpr,
-) -> (ResultShape, Option<String>) {
-    let bound_name = match &bound.kind {
-        TypedExprKind::Ident {
-            binding: IdentBinding::Field(fid),
-            ..
-        } => {
-            let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
-            match field {
-                Field::Value { columns, .. } => match columns.as_slice() {
-                    [col] => ctx.schema.column_name(*col).to_string(),
-                    _ => todo!("M4b temp-bound per-row limit"),
-                },
-                _ => todo!("M4b temp-bound per-row limit"),
-            }
-        }
-        TypedExprKind::Ident {
-            binding: IdentBinding::ProjectedField { name },
-            ..
-        } => name.clone(),
-        _ => todo!("M4b temp-bound per-row limit"),
-    };
-    let bound_ty = output_ty(&parent.builder, &bound_name, ctx.schema).unwrap_or_else(|| {
-        todo!("M4b temp-bound per-row limit");
-    });
+    extra: &[(String, ScalarType)],
+) -> (usize, Vec<(String, Option<ScalarType>)>, Level) {
     let temp = ctx.aliases.temp();
     let mut create_q = parent.builder.clone();
     if create_q.select.is_empty() {
         create_q.select = vec![SelectItem::AllFrom { depth: 0 }];
     }
-    if !available_cols(&create_q, ctx.schema).contains(&bound_name) {
-        create_q.select.push(SelectItem::Column {
-            depth: 0,
-            column: bound_name.clone(),
-            output: bound_name.clone(),
-            ty: Some(bound_ty),
-        });
+    for (name, ty) in extra {
+        if !available_cols(&create_q, ctx.schema).contains(name) {
+            create_q.select.push(SelectItem::Column {
+                depth: 0,
+                column: name.clone(),
+                output: name.clone(),
+                ty: Some(*ty),
+            });
+        }
     }
     create_q.select.push(SelectItem::Expr {
         expr: SqlExpr::Window {
@@ -3174,6 +3399,94 @@ fn per_row_take_shape(
         output: "$$pkey".to_string(),
         ty: None,
     });
+    (temp_idx, create_outputs, child)
+}
+
+fn sink_cross_child(
+    ctx: &mut Context,
+    child: Level,
+    temp_idx: usize,
+    peeled_ty: &QueryType,
+    cardinality: Cardinality,
+) -> (ResultShape, Option<String>) {
+    let outputs = builder_outputs(&child.builder, ctx.schema);
+    let is_pairing = |name: &str| name == "$$pkey";
+    let shape_cols: Vec<OutputColumn> =
+        shape_columns(builder_output_types(&child.builder, ctx.schema), is_pairing);
+    let item_ty = match peeled_ty {
+        QueryType::List(sub) => sub.as_ref(),
+        _ => peeled_ty,
+    };
+    let element = child_element(
+        ctx.schema,
+        child.output_shapes.as_ref(),
+        item_ty,
+        &outputs,
+        is_pairing,
+    );
+    let idx = ctx.sink(
+        child.builder,
+        StatementShape {
+            columns: shape_cols,
+            rows: RowCount::Many,
+        },
+        StatementKind::Query,
+    );
+    let child_ref = ChildRef {
+        stmt: idx,
+        parent: Some(ParentRef {
+            stmt: temp_idx,
+            parent_key: "$$key".to_string(),
+            child_key: "$$pkey".to_string(),
+        }),
+        cardinality,
+        tag: None,
+    };
+    let shape = match cardinality {
+        Cardinality::Many => ResultShape::List {
+            element: Box::new(element),
+            child: child_ref,
+        },
+        Cardinality::One => ResultShape::Single {
+            element: Box::new(element),
+            child: child_ref,
+        },
+    };
+    (shape, Some("$$key".to_string()))
+}
+
+fn per_row_take_shape(
+    ctx: &mut Context,
+    parent: &mut Level,
+    method: &str,
+    bound: &TypedExpr,
+    peeled: &TypedExpr,
+) -> (ResultShape, Option<String>) {
+    let bound_name = match &bound.kind {
+        TypedExprKind::Ident {
+            binding: IdentBinding::Field(fid),
+            ..
+        } => {
+            let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
+            match field {
+                Field::Value { columns, .. } => match columns.as_slice() {
+                    [col] => ctx.schema.column_name(*col).to_string(),
+                    _ => todo!("M4b temp-bound per-row limit"),
+                },
+                _ => todo!("M4b temp-bound per-row limit"),
+            }
+        }
+        TypedExprKind::Ident {
+            binding: IdentBinding::ProjectedField { name },
+            ..
+        } => name.clone(),
+        _ => todo!("M4b temp-bound per-row limit"),
+    };
+    let bound_ty = output_ty(&parent.builder, &bound_name, ctx.schema).unwrap_or_else(|| {
+        todo!("M4b temp-bound per-row limit");
+    });
+    let (temp_idx, _, mut child) =
+        cross_cartesian(ctx, parent, peeled, &[(bound_name.clone(), bound_ty)]);
     child.builder.select.push(SelectItem::Expr {
         expr: SqlExpr::Column {
             depth: 1,
@@ -3198,43 +3511,215 @@ fn per_row_take_shape(
     if child.builder.select.is_empty() {
         child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
     }
-    let outputs = builder_outputs(&child.builder, ctx.schema);
-    let is_pairing = |name: &str| name == "$$pkey";
-    let shape_cols: Vec<OutputColumn> =
-        shape_columns(builder_output_types(&child.builder, ctx.schema), is_pairing);
-    let item_ty = match &peeled.ty {
-        QueryType::List(sub) => sub.as_ref(),
-        _ => &peeled.ty,
-    };
-    let element = child_element(
-        ctx.schema,
-        child.output_shapes.as_ref(),
-        item_ty,
-        &outputs,
-        is_pairing,
-    );
-    let idx = ctx.sink(
-        child.builder,
-        StatementShape {
-            columns: shape_cols,
-            rows: RowCount::Many,
-        },
-        StatementKind::Query,
-    );
-    let shape = ResultShape::List {
-        element: Box::new(element),
-        child: ChildRef {
-            stmt: idx,
-            parent: Some(ParentRef {
-                stmt: temp_idx,
-                parent_key: "$$key".to_string(),
-                child_key: "$$pkey".to_string(),
-            }),
-            cardinality: Cardinality::Many,
-            tag: None,
-        },
-    };
-    (shape, Some("$$key".to_string()))
+    sink_cross_child(ctx, child, temp_idx, &peeled.ty, Cardinality::Many)
+}
+
+struct SortLane {
+    peeled: TypedExpr,
+    sorts: Vec<(String, Vec<TypedMethodArg>)>,
+    carries: Vec<(String, ScalarType)>,
+}
+
+fn sortable_cross_tail(ctx: &Context, parent: &Level, tail: &TypedExpr) -> Option<SortLane> {
+    if tail_has_limit_op(tail) {
+        return None;
+    }
+    let mut sorts = Vec::new();
+    let peeled = peel_cross_sorts(tail, &mut sorts);
+    if sorts.is_empty() {
+        return None;
+    }
+    for (_, args) in &sorts {
+        let mut child_part = false;
+        let mut outer_part = false;
+        for arg in args {
+            child_part |= any_ident(
+                &arg.expr,
+                &mut |e| matches!(&e.kind, TypedExprKind::Ident { depth, .. } if *depth == 0),
+            );
+            outer_part |= uses_outer(&arg.expr);
+        }
+        if !child_part || !outer_part {
+            return None;
+        }
+    }
+    if sorts_left_with_outer(&peeled) {
+        return None;
+    }
+    for (_, args) in &sorts {
+        for arg in args {
+            if !sort_key_divertible(&arg.expr) {
+                return None;
+            }
+        }
+    }
+    let mut carries: Vec<(String, ScalarType)> = Vec::new();
+    for (_, args) in &sorts {
+        for arg in args {
+            let mut fids = Vec::new();
+            any_ident(&arg.expr, &mut |e| {
+                if let TypedExprKind::Ident {
+                    binding: IdentBinding::Field(fid),
+                    depth,
+                    ..
+                } = &e.kind
+                    && *depth > 0
+                {
+                    fids.push(*fid);
+                }
+                false
+            });
+            for fid in fids {
+                let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
+                let col = match field {
+                    Field::Value { columns, .. } => match columns.as_slice() {
+                        [col] => ctx.schema.column_name(*col).to_string(),
+                        _ => return None,
+                    },
+                    _ => return None,
+                };
+                let ty = output_ty(&parent.builder, &col, ctx.schema)?;
+                if !carries.iter().any(|(c, _)| c == &col) {
+                    carries.push((col, ty));
+                }
+            }
+        }
+    }
+    Some(SortLane {
+        peeled,
+        sorts,
+        carries,
+    })
+}
+
+fn sorts_left_with_outer(node: &TypedExpr) -> bool {
+    match &node.kind {
+        TypedExprKind::Method {
+            base, name, args, ..
+        } if ["sort", "sort_asc", "sort_desc"].contains(&name.value.as_str()) => {
+            args.iter().any(|a| uses_outer(&a.expr)) || sorts_left_with_outer(base)
+        }
+        TypedExprKind::Method { base, .. } | TypedExprKind::Projection { base, .. } => {
+            sorts_left_with_outer(base)
+        }
+        _ => false,
+    }
+}
+
+fn sorted_cross_shape(
+    ctx: &mut Context,
+    parent: &mut Level,
+    lane: SortLane,
+    cardinality: Cardinality,
+) -> (ResultShape, Option<String>) {
+    let (temp_idx, _, mut child) = cross_cartesian(ctx, parent, &lane.peeled, &lane.carries);
+    let was_outer = std::mem::replace(&mut ctx.no_outer, false);
+    let mut order = Vec::new();
+    for (method, args) in &lane.sorts {
+        let default = if method == "sort_desc" {
+            OrderDir::Desc
+        } else {
+            OrderDir::Asc
+        };
+        for arg in args {
+            let dir = match &arg.direction {
+                Some(dir) => match dir.value {
+                    SortDir::Asc => OrderDir::Asc,
+                    SortDir::Desc => OrderDir::Desc,
+                },
+                None => default,
+            };
+            order.extend(sort_keys(ctx, &child, &arg.expr, dir));
+        }
+    }
+    ctx.no_outer = was_outer;
+    let order = order
+        .into_iter()
+        .map(|item| OrderItem {
+            expr: inline_order_aliases(&child.builder.select, item.expr),
+            dir: item.dir,
+        })
+        .collect();
+    child.builder.order_by = order;
+    sink_cross_child(ctx, child, temp_idx, &lane.peeled.ty, cardinality)
+}
+
+fn inline_order_aliases(items: &[SelectItem], expr: SqlExpr) -> SqlExpr {
+    fn inline(items: &[SelectItem], expr: SqlExpr, seen: &mut Vec<String>) -> SqlExpr {
+        match expr {
+            SqlExpr::Column { depth, column } => {
+                if depth == 0
+                    && !seen.iter().any(|s| s == &column)
+                    && let Some(def) = items.iter().find_map(|item| match item {
+                        SelectItem::Column {
+                            output,
+                            column: def,
+                            ..
+                        } if output == &column && def != &column => Some(SqlExpr::Column {
+                            depth,
+                            column: def.clone(),
+                        }),
+                        SelectItem::Expr { output, expr, .. } if output == &column => {
+                            Some(expr.clone())
+                        }
+                        _ => None,
+                    })
+                {
+                    seen.push(column);
+                    return inline(items, def, seen);
+                }
+                SqlExpr::Column { depth, column }
+            }
+            SqlExpr::Binary { op, lhs, rhs } => SqlExpr::Binary {
+                op,
+                lhs: Box::new(inline(items, *lhs, seen)),
+                rhs: Box::new(inline(items, *rhs, seen)),
+            },
+            SqlExpr::Not(x) => SqlExpr::Not(Box::new(inline(items, *x, seen))),
+            SqlExpr::Func { name, args } => SqlExpr::Func {
+                name,
+                args: args.into_iter().map(|a| inline(items, a, seen)).collect(),
+            },
+            SqlExpr::Case { arms, else_ } => SqlExpr::Case {
+                arms: arms
+                    .into_iter()
+                    .map(|(c, t)| (inline(items, c, seen), inline(items, t, seen)))
+                    .collect(),
+                else_: Box::new(inline(items, *else_, seen)),
+            },
+            SqlExpr::In { expr, items: set } => SqlExpr::In {
+                expr: Box::new(inline(items, *expr, seen)),
+                items: set.into_iter().map(|i| inline(items, i, seen)).collect(),
+            },
+            SqlExpr::Coalesce(args) => {
+                SqlExpr::Coalesce(args.into_iter().map(|a| inline(items, a, seen)).collect())
+            }
+            SqlExpr::Cast { expr, target } => SqlExpr::Cast {
+                expr: Box::new(inline(items, *expr, seen)),
+                target,
+            },
+            SqlExpr::Window {
+                func,
+                partition,
+                order,
+            } => SqlExpr::Window {
+                func,
+                partition: partition
+                    .into_iter()
+                    .map(|p| inline(items, p, seen))
+                    .collect(),
+                order: order
+                    .into_iter()
+                    .map(|OrderItem { expr: e, dir: d }| OrderItem {
+                        expr: inline(items, e, seen),
+                        dir: d,
+                    })
+                    .collect(),
+            },
+            other => other,
+        }
+    }
+    inline(items, expr, &mut Vec::new())
 }
 
 fn cross_root_scan(ctx: &mut Context, tail: &TypedExpr) -> FromClause {

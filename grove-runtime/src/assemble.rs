@@ -179,10 +179,10 @@ fn assemble_list(
             let (groups, broadcast) = group_by(rows, &pref.child_key, child.stmt)?;
             let one = matches!(child.cardinality, Cardinality::One);
             let matched = |key: &Value| -> Result<Vec<Value>, RuntimeError> {
-                let Some(key) = key_of(key)? else {
-                    return Ok(Vec::new());
+                let mut hits = match key_of(key)? {
+                    Some(key) => groups.get(&key).cloned().unwrap_or_default(),
+                    None => Vec::new(),
                 };
-                let mut hits = groups.get(&key).cloned().unwrap_or_default();
                 hits.extend(broadcast.iter().cloned());
                 if one {
                     hits.truncate(1);
@@ -252,14 +252,11 @@ fn assemble_single(
         Some(pref) => {
             let (groups, broadcast) = group_by(rows, &pref.child_key, child.stmt)?;
             let lookup = |key: &Value| -> Result<Value, RuntimeError> {
-                let Some(key) = key_of(key)? else {
-                    return Ok(Value::Null);
+                let keyed = match key_of(key)? {
+                    Some(key) => groups.get(&key).and_then(|hits| hits.first()),
+                    None => None,
                 };
-                match groups
-                    .get(&key)
-                    .and_then(|hits| hits.first())
-                    .or_else(|| broadcast.first())
-                {
+                match keyed.or_else(|| broadcast.first()) {
                     Some(&i) => first(i),
                     None => Ok(Value::Null),
                 }

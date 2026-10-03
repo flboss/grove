@@ -686,6 +686,128 @@ fn cross_per_row_empty_parents() {
     );
 }
 
+#[test]
+fn cross_nav_outer_pairs_by_carried_endpoint() {
+    assert_eq!(
+        value("users { x = configs.filter(owner == manager.email) }"),
+        Value::List(vec![
+            Value::Record(vec![("x".to_string(), Value::List(vec![cfg("n3", "b@x")]))]),
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![cfg("n1", "a@x"), cfg("a@x", "a@x")])
+            )]),
+        ])
+    );
+}
+
+#[test]
+fn cross_nav_outer_name_matches_nothing() {
+    assert_eq!(
+        value("users { x = configs.filter(owner == manager.name) }"),
+        Value::List(vec![
+            Value::Record(vec![("x".to_string(), Value::List(vec![]))]),
+            Value::Record(vec![("x".to_string(), Value::List(vec![]))]),
+        ])
+    );
+}
+
+#[test]
+fn cross_nav_outer_with_broadcast() {
+    assert_eq!(
+        value(r#"users { x = configs.filter(owner == manager.email || name == "n1") }"#),
+        Value::List(vec![
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![cfg("n3", "b@x"), cfg("n1", "a@x"), cfg("n1", "zzz")])
+            )]),
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![cfg("a@x", "a@x"), cfg("n1", "a@x"), cfg("n1", "zzz")])
+            )]),
+        ])
+    );
+}
+
+#[test]
+fn cross_sort_mixed_orders_per_parent() {
+    assert_eq!(
+        value("users { x = configs.sort(name == email, name) }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![
+                    cfg("b@x", "zzz"),
+                    cfg("n1", "a@x"),
+                    cfg("n1", "zzz"),
+                    cfg("n2", "zzz"),
+                    cfg("n3", "b@x"),
+                    cfg("a@x", "a@x"),
+                ])
+            )]),
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![
+                    cfg("a@x", "a@x"),
+                    cfg("n1", "a@x"),
+                    cfg("n1", "zzz"),
+                    cfg("n2", "zzz"),
+                    cfg("n3", "b@x"),
+                    cfg("b@x", "zzz"),
+                ])
+            )]),
+        ])
+    );
+}
+
+#[test]
+fn cross_sort_mixed_desc() {
+    assert_eq!(
+        value("users { x = configs.sort_desc(name == email, name) }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![
+                    cfg("a@x", "a@x"),
+                    cfg("n3", "b@x"),
+                    cfg("n2", "zzz"),
+                    cfg("n1", "a@x"),
+                    cfg("n1", "zzz"),
+                    cfg("b@x", "zzz"),
+                ])
+            )]),
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![
+                    cfg("b@x", "zzz"),
+                    cfg("n3", "b@x"),
+                    cfg("n2", "zzz"),
+                    cfg("n1", "a@x"),
+                    cfg("n1", "zzz"),
+                    cfg("a@x", "a@x"),
+                ])
+            )]),
+        ])
+    );
+}
+
+#[test]
+fn cross_sort_mixed_over_projection() {
+    let m = |name: &str| Value::Record(vec![("m".to_string(), Value::String(name.to_string()))]);
+    assert_eq!(
+        value(r#"users { x = configs { m = name }.sort(m == email, m) }"#),
+        Value::List(vec![
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![m("b@x"), m("n1"), m("n1"), m("n2"), m("n3"), m("a@x"),])
+            )]),
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![m("a@x"), m("n1"), m("n1"), m("n2"), m("n3"), m("b@x"),])
+            )]),
+        ])
+    );
+}
+
 
 fn dummy_stmts(n: usize) -> Vec<PlannedStatement> {
     (0..n)
@@ -767,7 +889,11 @@ fn single_keyed_falls_back_to_broadcast() {
         child: keyed(1, 0, "id", "fk"),
     };
     let parents = StatementOutput {
-        rows: vec![row(&[("id", Value::Int(1))]), row(&[("id", Value::Int(2))])],
+        rows: vec![
+            row(&[("id", Value::Null)]),
+            row(&[("id", Value::Int(1))]),
+            row(&[("id", Value::Int(2))]),
+        ],
     };
     let children = StatementOutput {
         rows: vec![
@@ -786,6 +912,35 @@ fn single_keyed_falls_back_to_broadcast() {
     assert_eq!(
         synth(shape, vec![parents, children]).unwrap(),
         Value::Int(99)
+    );
+}
+
+#[test]
+fn list_null_key_still_broadcasts() {
+    let shape = ResultShape::List {
+        element: Box::new(int_col("v")),
+        child: keyed(1, 0, "id", "fk"),
+    };
+    let parents = StatementOutput {
+        rows: vec![row(&[("id", Value::Null)]), row(&[("id", Value::Int(2))])],
+    };
+    let children = StatementOutput {
+        rows: vec![
+            row(&[
+                ("v", Value::Int(10)),
+                ("fk", Value::Int(2)),
+                ("$$ptag", Value::Int(0)),
+            ]),
+            row(&[
+                ("v", Value::Int(99)),
+                ("fk", Value::Null),
+                ("$$ptag", Value::Int(1)),
+            ]),
+        ],
+    };
+    assert_eq!(
+        synth(shape, vec![parents, children]).unwrap(),
+        Value::List(vec![Value::Int(99), Value::Int(10), Value::Int(99)])
     );
 }
 
