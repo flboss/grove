@@ -808,6 +808,18 @@ fn cross_sort_mixed_over_projection() {
     );
 }
 
+#[test]
+fn cross_root_agg_in_child_tail() {
+    let s = |n: i64| Value::Record(vec![("s".to_string(), Value::Int(n))]);
+    assert_eq!(
+        value("users { o = orders { s = configs.len() } }"),
+        Value::List(vec![
+            Value::Record(vec![("o".to_string(), Value::List(vec![s(6), s(6)]))]),
+            Value::Record(vec![("o".to_string(), Value::List(vec![s(6)]))]),
+        ])
+    );
+}
+
 
 fn dummy_stmts(n: usize) -> Vec<PlannedStatement> {
     (0..n)

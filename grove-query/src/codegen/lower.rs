@@ -7588,7 +7588,11 @@ fn scalar_aggregate(ctx: &mut Context, base: &TypedExpr, agg: AggOp) -> SqlExpr 
     }
     let was_corr = std::mem::replace(&mut ctx.corr, corr);
     let was_outer = std::mem::replace(&mut ctx.no_outer, !corr);
+    let was_child = if corr { None } else { ctx.child.take() };
     let mut level = rows(ctx, base);
+    if !corr {
+        ctx.child = was_child;
+    }
     ctx.corr = was_corr;
     ctx.no_outer = was_outer;
     if let Some(pending) = level.pending {
