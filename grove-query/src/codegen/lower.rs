@@ -7761,7 +7761,9 @@ fn over_arg(
         _ => unreachable!("summable scoped arg is scalar: the checker enforces it"),
     };
     if has_field_node(arg) {
-        todo!("M4b scoped navigation");
+        if uses_outer(arg) {
+            todo!("M4b scoped navigation");
+        }
     }
     (ty, scalar(ctx, arg))
 }

@@ -757,6 +757,17 @@ fn single_base_nav_chains_exec() {
 }
 
 #[test]
+fn agg_scoped_nav_element_rooted_exec() {
+    assert_eq!(
+        value("users { s = orders.sum_over(user.age) }"),
+        Value::List(vec![
+            Value::Record(vec![("s".to_string(), Value::Int(60))]),
+            Value::Record(vec![("s".to_string(), Value::Int(40))]),
+        ])
+    );
+}
+
+#[test]
 fn cross_proj_take_temp_pairs() {
     let Value::List(rows) = value("users { e = email } { x = configs.filter(owner == e).take(1) }")
     else {
