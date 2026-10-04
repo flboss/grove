@@ -554,6 +554,53 @@ fn cross_sorted_take_is_deterministic() {
 }
 
 #[test]
+fn cross_take_under_filter_applies_before_pairing() {
+    let Value::List(rows) = value("users { x = configs.take(1).filter(owner == email) }") else {
+        panic!("root list");
+    };
+    assert_eq!(rows.len(), 2);
+    let emails = ["a@x", "b@x"];
+    let mut total = 0;
+    for (row, email) in rows.iter().zip(emails) {
+        match row {
+            Value::Record(fields) => match &fields[..] {
+                [(_, Value::List(items))] => {
+                    total += items.len();
+                    for item in items {
+                        match item {
+                            Value::Record(fields) => match &fields[..] {
+                                [(_, Value::String(_)), (_, Value::String(owner))] => {
+                                    assert_eq!(owner, email)
+                                }
+                                _ => panic!("config record"),
+                            },
+                            _ => panic!("config item"),
+                        }
+                    }
+                }
+                _ => panic!("x list"),
+            },
+            _ => panic!("parent record"),
+        }
+    }
+    assert!(total <= 1);
+}
+
+#[test]
+fn cross_sorted_global_take_pairs_first_alphabetically() {
+    assert_eq!(
+        value("users { x = configs.sort(name).take(1).filter(owner == email) }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![cfg("a@x", "a@x")])
+            )]),
+            Value::Record(vec![("x".to_string(), Value::List(vec![]))]),
+        ])
+    );
+}
+
+#[test]
 fn cross_proj_take_temp_pairs() {
     let Value::List(rows) = value("users { e = email } { x = configs.filter(owner == e).take(1) }")
     else {

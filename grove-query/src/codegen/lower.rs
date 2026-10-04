@@ -2636,6 +2636,33 @@ fn tail_base(node: &TypedExpr) -> &TypedExpr {
     }
 }
 
+fn cross_take_trailing(tail: &TypedExpr) -> bool {
+    let mut node = tail;
+    let mut above = false;
+    loop {
+        match &node.kind {
+            TypedExprKind::Method {
+                base,
+                name,
+                optional,
+                ..
+            } => {
+                if (name.value == "take" || name.value == "skip") && !optional {
+                    return !above;
+                }
+                if name.value != "take" && name.value != "skip" {
+                    above = true;
+                }
+                node = base;
+            }
+            TypedExprKind::Projection { .. } => {
+                node = tail_base(node);
+            }
+            _ => return true,
+        }
+    }
+}
+
 fn peel_cross_sorts(node: &TypedExpr, sorts: &mut Vec<(String, Vec<TypedMethodArg>)>) -> TypedExpr {
     match &node.kind {
         TypedExprKind::Method {
@@ -3111,10 +3138,16 @@ fn rcross_shape(
     }
     let corr = &correlated[0];
     let mut suffix: Vec<(String, Vec<TypedMethodArg>)> = Vec::new();
-    let local_tail = peel_cross_window(&local_tail, &mut suffix, false);
+    let peeled_tail = peel_cross_window(&local_tail, &mut suffix, false);
     if suffix.len() > 1 || (!suffix.is_empty() && !broadcast.is_empty()) {
         todo!("M4b cross tail shape");
     }
+    let global_take = suffix.len() == 1 && !cross_take_trailing(tail);
+    let lowering_tail = if global_take {
+        &local_tail
+    } else {
+        &peeled_tail
+    };
     let (source_name, temp_idx): (String, Option<usize>) = if bare {
         let table = ctx.schema.tables[ctx.schema.structs[corr.outer_struct.index()].table.index()]
             .name
@@ -3165,7 +3198,7 @@ fn rcross_shape(
         anchor,
     });
     let was_outer = std::mem::replace(&mut ctx.no_outer, true);
-    let mut child = rows(ctx, &local_tail);
+    let mut child = rows(ctx, lowering_tail);
     ctx.child = was_child;
     ctx.no_outer = was_outer;
     if child.pending.is_some() {
@@ -3232,11 +3265,13 @@ fn rcross_shape(
         });
         child.builder.unions.push(arm);
     }
-    for (method, args) in suffix.iter().rev() {
-        let order = std::mem::take(&mut child.builder.order_by);
-        let mut wrapped = wrap_level(ctx, child);
-        wrapped.builder.order_by = order;
-        child = window_take(ctx, wrapped, "$$pkey", method, args);
+    if !global_take {
+        for (method, args) in suffix.iter().rev() {
+            let order = std::mem::take(&mut child.builder.order_by);
+            let mut wrapped = wrap_level(ctx, child);
+            wrapped.builder.order_by = order;
+            child = window_take(ctx, wrapped, "$$pkey", method, args);
+        }
     }
     if child.builder.select.is_empty() {
         child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
