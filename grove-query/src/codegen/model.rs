@@ -106,6 +106,7 @@ pub struct ParentRef {
     pub stmt: usize,
     pub parent_key: String,
     pub child_key: String,
+    pub negated: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

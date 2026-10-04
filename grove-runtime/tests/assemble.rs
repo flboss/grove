@@ -47,6 +47,7 @@ fn keyed(stmt: usize, parent: usize, parent_key: &str, child_key: &str) -> Child
             stmt: parent,
             parent_key: parent_key.to_string(),
             child_key: child_key.to_string(),
+            negated: false,
         }),
         cardinality: Cardinality::Many,
         tag: None,
@@ -642,6 +643,34 @@ fn cross_projection_outer_consts_keep_siblings() {
 }
 
 #[test]
+fn cross_inequality_pairs_complement() {
+    assert_eq!(
+        value("users { x = configs.filter(owner != email) }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![
+                    cfg("n2", "zzz"),
+                    cfg("n3", "b@x"),
+                    cfg("b@x", "zzz"),
+                    cfg("n1", "zzz"),
+                ])
+            )]),
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![
+                    cfg("n1", "a@x"),
+                    cfg("n2", "zzz"),
+                    cfg("b@x", "zzz"),
+                    cfg("a@x", "a@x"),
+                    cfg("n1", "zzz"),
+                ])
+            )]),
+        ])
+    );
+}
+
+#[test]
 fn cross_proj_take_temp_pairs() {
     let Value::List(rows) = value("users { e = email } { x = configs.filter(owner == e).take(1) }")
     else {
@@ -1138,6 +1167,7 @@ fn list_keyed_cardinality_one_truncates() {
                 stmt: 0,
                 parent_key: "id".to_string(),
                 child_key: "fk".to_string(),
+                negated: false,
             }),
             cardinality: Cardinality::One,
             tag: None,

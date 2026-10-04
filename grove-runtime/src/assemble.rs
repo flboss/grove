@@ -179,9 +179,34 @@ fn assemble_list(
             let (groups, broadcast) = group_by(rows, &pref.child_key, child.stmt)?;
             let one = matches!(child.cardinality, Cardinality::One);
             let matched = |key: &Value| -> Result<Vec<Value>, RuntimeError> {
-                let mut hits = match key_of(key)? {
-                    Some(key) => groups.get(&key).cloned().unwrap_or_default(),
-                    None => Vec::new(),
+                let mut hits = if pref.negated {
+                    let own = key_of(key)?;
+                    let mut hits = Vec::new();
+                    for (i, row) in rows.iter().enumerate() {
+                        if row.get(CROSS_PAIR_TAG) == Some(&Value::Int(1)) {
+                            continue;
+                        }
+                        let value = row.get(&pref.child_key).ok_or_else(|| {
+                            RuntimeError::Contract(format!(
+                                "statement {}: key column {} missing",
+                                child.stmt, pref.child_key
+                            ))
+                        })?;
+                        match key_of(value)? {
+                            Some(k) => {
+                                if Some(&k) != own.as_ref() {
+                                    hits.push(i);
+                                }
+                            }
+                            None => hits.push(i),
+                        }
+                    }
+                    hits
+                } else {
+                    match key_of(key)? {
+                        Some(key) => groups.get(&key).cloned().unwrap_or_default(),
+                        None => Vec::new(),
+                    }
                 };
                 hits.extend(broadcast.iter().cloned());
                 if one {
@@ -252,6 +277,31 @@ fn assemble_single(
         Some(pref) => {
             let (groups, broadcast) = group_by(rows, &pref.child_key, child.stmt)?;
             let lookup = |key: &Value| -> Result<Value, RuntimeError> {
+                if pref.negated {
+                    let own = key_of(key)?;
+                    for (i, row) in rows.iter().enumerate() {
+                        if row.get(CROSS_PAIR_TAG) == Some(&Value::Int(1)) {
+                            continue;
+                        }
+                        let value = row.get(&pref.child_key).ok_or_else(|| {
+                            RuntimeError::Contract(format!(
+                                "statement {}: key column {} missing",
+                                child.stmt, pref.child_key
+                            ))
+                        })?;
+                        let keep = match key_of(value)? {
+                            Some(k) => Some(&k) != own.as_ref(),
+                            None => true,
+                        };
+                        if keep {
+                            return first(i);
+                        }
+                    }
+                    return match broadcast.first() {
+                        Some(&i) => first(i),
+                        None => Ok(Value::Null),
+                    };
+                }
                 let keyed = match key_of(key)? {
                     Some(key) => groups.get(&key).and_then(|hits| hits.first()),
                     None => None,

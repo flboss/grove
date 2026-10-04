@@ -1516,6 +1516,7 @@ fn b1_chained(
                 stmt: idx_outer,
                 parent_key: tail_link.parent_col.clone(),
                 child_key: tail_link.child_col.clone(),
+                negated: false,
             }),
             cardinality: Cardinality::Many,
             tag: None,
@@ -1529,6 +1530,7 @@ fn b1_chained(
                 stmt: 0,
                 parent_key,
                 child_key: outer_child_col,
+                negated: false,
             }),
             cardinality: Cardinality::One,
             tag: None,
@@ -2908,6 +2910,7 @@ fn check_corr(ctx: &mut Context, conjunct: &TypedExpr, temp_form: bool) -> CorrC
         TypedExprKind::Binary { op, lhs, rhs } => {
             let sql_op = match op.value {
                 BinaryOp::Eq => SqlBinOp::Eq,
+                BinaryOp::Ne => SqlBinOp::Ne,
                 BinaryOp::Lt => SqlBinOp::Lt,
                 BinaryOp::Gt => SqlBinOp::Gt,
                 BinaryOp::Le => SqlBinOp::Le,
@@ -3042,8 +3045,12 @@ fn pkey_arm_cond(ctx: &mut Context, corr: &CorrCond) -> SqlExpr {
     let was_outer = std::mem::replace(&mut ctx.no_outer, true);
     let child_frag = shift_depths(scalar(ctx, &corr.child), 1);
     ctx.no_outer = was_outer;
+    let op = match corr.op {
+        SqlBinOp::Ne => SqlBinOp::Eq,
+        op => op,
+    };
     SqlExpr::Binary {
-        op: corr.op,
+        op,
         lhs: Box::new(SqlExpr::Column {
             depth: 0,
             column: corr.outer_col.clone(),
@@ -3144,6 +3151,14 @@ fn rcross_shape(
     let peeled_tail = peel_cross_window(&local_tail, &mut suffix, false);
     if suffix.len() > 1 || (!suffix.is_empty() && !broadcast.is_empty()) {
         todo!("M4b cross tail shape");
+    }
+    if correlated.iter().any(|c| c.op == SqlBinOp::Ne)
+        && (correlated.len() > 1
+            || !broadcast.is_empty()
+            || !suffix.is_empty()
+            || cardinality != Cardinality::Many)
+    {
+        todo!("M4b complex cross-root correlation");
     }
     let global_take = suffix.len() == 1 && !cross_take_trailing(tail);
     let lowering_tail = if global_take {
@@ -3308,6 +3323,7 @@ fn rcross_shape(
             stmt: temp_idx.unwrap_or(0),
             parent_key: corr.outer_col.clone(),
             child_key: "$$pkey".to_string(),
+            negated: corr.op == SqlBinOp::Ne,
         }),
         cardinality,
         tag: None,
@@ -3518,6 +3534,7 @@ fn sink_cross_child(
             stmt: temp_idx,
             parent_key: "$$key".to_string(),
             child_key: "$$pkey".to_string(),
+            negated: false,
         }),
         cardinality,
         tag: None,
@@ -4199,6 +4216,7 @@ fn rvalue_shape(
                 },
                 parent_key,
                 child_key: child_col,
+                negated: false,
             }),
             cardinality: Cardinality::Many,
             tag: None,
@@ -4473,6 +4491,7 @@ fn windowed_collapse(
                 },
                 parent_key,
                 child_key: child_col,
+                negated: false,
             }),
             cardinality: Cardinality::One,
             tag: None,
@@ -4733,6 +4752,7 @@ fn rscalar_shape(
                 },
                 parent_key,
                 child_key: child_col,
+                negated: false,
             }),
             cardinality: Cardinality::One,
             tag: None,
@@ -4878,6 +4898,7 @@ fn rtemp_shape(
                     stmt: temp_idx,
                     parent_key: "$$key".to_string(),
                     child_key: child_col,
+                    negated: false,
                 }),
                 cardinality: Cardinality::Many,
                 tag: None,
@@ -4891,6 +4912,7 @@ fn rtemp_shape(
                     stmt: temp_idx,
                     parent_key: "$$key".to_string(),
                     child_key: child_col,
+                    negated: false,
                 }),
                 cardinality: Cardinality::One,
                 tag: None,
@@ -5467,6 +5489,7 @@ fn temp_array_level<'a>(
             stmt: temp_idx,
             parent_key: "$$key".to_string(),
             child_key: "c0".to_string(),
+            negated: false,
         }),
         cardinality: Cardinality::Many,
         tag: None,
@@ -5570,6 +5593,7 @@ fn temp_leaf_level(
             stmt: temp_idx,
             parent_key: "$$key".to_string(),
             child_key: "c0".to_string(),
+            negated: false,
         }),
         cardinality: Cardinality::Many,
         tag: None,
@@ -5900,6 +5924,7 @@ fn temp_flatten_level(
             stmt: temp_idx,
             parent_key: "$$key".to_string(),
             child_key: "c0".to_string(),
+            negated: false,
         }),
         cardinality: Cardinality::Many,
         tag: None,
@@ -6316,6 +6341,7 @@ fn sink_chain(ctx: &mut Context, hops: &[PendingSplit], root_creation: usize) ->
                 },
                 parent_key: hop.parent_col.clone(),
                 child_key: hop.child_col.clone(),
+                negated: false,
             },
             outputs: std::mem::take(&mut outputs[i]),
             middle: hop.middle_parts.clone(),
