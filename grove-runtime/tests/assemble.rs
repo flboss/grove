@@ -733,6 +733,30 @@ fn unwrap_or_rows_falls_back() {
 }
 
 #[test]
+fn single_base_nav_chains_exec() {
+    let Value::List(rows) = value("users { t = manager.orders.first()?.total }") else {
+        panic!("root list");
+    };
+    assert_eq!(rows.len(), 2);
+    let totals: Vec<Value> = rows
+        .iter()
+        .map(|r| match r {
+            Value::Record(fields) => match &fields[..] {
+                [(_, total)] => total.clone(),
+                _ => panic!("t field"),
+            },
+            _ => panic!("parent record"),
+        })
+        .collect();
+    assert_eq!(totals[0], Value::Dec(dec("30")));
+    assert!(
+        totals[1] == Value::Dec(dec("10")) || totals[1] == Value::Dec(dec("20")),
+        "bag-pick, got {:?}",
+        totals[1]
+    );
+}
+
+#[test]
 fn cross_proj_take_temp_pairs() {
     let Value::List(rows) = value("users { e = email } { x = configs.filter(owner == e).take(1) }")
     else {

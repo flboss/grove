@@ -7054,7 +7054,10 @@ fn scalar_field(
                     cursor = value;
                     continue;
                 }
-                let sid = record_struct(&cursor.ty);
+                let sid = match &cursor.ty {
+                    QueryType::List(_) => record_struct(&next.ty),
+                    _ => record_struct(&cursor.ty),
+                };
                 let (fid, field) = ctx.schema.struct_field(sid, &hop.value).unwrap_or_else(|| {
                     unreachable!("resolved field {} vanished from the schema", hop.value)
                 });
@@ -7186,11 +7189,12 @@ fn single_hop_over_collapsed(
         ..
     } = &base.kind
         && m.value == "first"
-        && let TypedExprKind::Ident {
+        && (matches!(&inner.kind, TypedExprKind::Ident {
             binding: IdentBinding::Field(fid),
             ..
-        } = &inner.kind
-        && is_collection_field(ctx, *fid)
+        } if is_collection_field(ctx, *fid))
+            || (matches!(&inner.kind, TypedExprKind::Field { .. })
+                && matches!(&inner.ty, QueryType::List(_))))
     {
         if ctx.in_take_arg {
             todo!("M4b temp-bound per-row limit");
