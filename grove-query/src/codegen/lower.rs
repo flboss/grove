@@ -3109,6 +3109,9 @@ fn rcross_shape(
 ) -> (ResultShape, Option<String>) {
     let reduced_tail = beta_reduce_tail(tail);
     let tail: &TypedExpr = &reduced_tail;
+    if let Some((shape, key)) = const_proj_cross_shape(ctx, parent, tail, cardinality) {
+        return (shape, key);
+    }
     let bare = match &parent.builder.from {
         Some(FromClause::Table { .. }) => {
             parent.builder.where_.is_empty()
@@ -3378,6 +3381,7 @@ fn cross_cartesian(
     parent: &mut Level,
     peeled: &TypedExpr,
     extra: &[(String, ScalarType)],
+    outer_scope: bool,
 ) -> (usize, Vec<(String, Option<ScalarType>)>, Level) {
     let temp = ctx.aliases.temp();
     let mut create_q = parent.builder.clone();
@@ -3444,7 +3448,7 @@ fn cross_cartesian(
         partition: None,
         anchor,
     });
-    let was_outer = std::mem::replace(&mut ctx.no_outer, true);
+    let was_outer = std::mem::replace(&mut ctx.no_outer, !outer_scope);
     let mut child = rows(ctx, peeled);
     ctx.child = was_child;
     ctx.no_outer = was_outer;
@@ -3531,6 +3535,73 @@ fn sink_cross_child(
     (shape, Some("$$key".to_string()))
 }
 
+fn const_proj_cross_shape(
+    ctx: &mut Context,
+    parent: &mut Level,
+    tail: &TypedExpr,
+    cardinality: Cardinality,
+) -> Option<(ResultShape, Option<String>)> {
+    let TypedExprKind::Projection { base, items } = &tail.kind else {
+        return None;
+    };
+    if !matches!(
+        &base.kind,
+        TypedExprKind::Ident {
+            binding: IdentBinding::Root { .. },
+            ..
+        }
+    ) {
+        return None;
+    }
+    if items.iter().any(|item| !item.value.ty.is_scalar()) {
+        return None;
+    }
+    if items.iter().all(|item| !uses_outer(&item.value)) {
+        return None;
+    }
+    let mut carries: Vec<(String, ScalarType)> = Vec::new();
+    for item in items {
+        let mut fids = Vec::new();
+        let mut foreign = false;
+        any_ident(&item.value, &mut |e| {
+            if let TypedExprKind::Ident { binding, depth, .. } = &e.kind
+                && *depth > 0
+            {
+                match binding {
+                    IdentBinding::Field(fid) if *depth == 1 => fids.push(*fid),
+                    _ => foreign = true,
+                }
+            }
+            false
+        });
+        if foreign {
+            return None;
+        }
+        for fid in fids {
+            let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
+            let col = match field {
+                Field::Value { columns, .. } => match columns.as_slice() {
+                    [col] => ctx.schema.column_name(*col).to_string(),
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            let ty = output_ty(&parent.builder, &col, ctx.schema)?;
+            if !carries.iter().any(|(c, _)| c == &col) {
+                carries.push((col, ty));
+            }
+        }
+    }
+    let (temp_idx, _, child) = cross_cartesian(ctx, parent, tail, &carries, true);
+    Some(sink_cross_child(
+        ctx,
+        child,
+        temp_idx,
+        &tail.ty,
+        cardinality,
+    ))
+}
+
 fn per_row_take_shape(
     ctx: &mut Context,
     parent: &mut Level,
@@ -3561,8 +3632,13 @@ fn per_row_take_shape(
     let bound_ty = output_ty(&parent.builder, &bound_name, ctx.schema).unwrap_or_else(|| {
         todo!("M4b temp-bound per-row limit");
     });
-    let (temp_idx, _, mut child) =
-        cross_cartesian(ctx, parent, peeled, &[(bound_name.clone(), bound_ty)]);
+    let (temp_idx, _, mut child) = cross_cartesian(
+        ctx,
+        parent,
+        peeled,
+        &[(bound_name.clone(), bound_ty)],
+        false,
+    );
     child.builder.select.push(SelectItem::Expr {
         expr: SqlExpr::Column {
             depth: 1,
@@ -3674,7 +3750,7 @@ fn sorted_cross_shape(
     lane: SortLane,
     cardinality: Cardinality,
 ) -> (ResultShape, Option<String>) {
-    let (temp_idx, _, mut child) = cross_cartesian(ctx, parent, &lane.peeled, &lane.carries);
+    let (temp_idx, _, mut child) = cross_cartesian(ctx, parent, &lane.peeled, &lane.carries, false);
     let was_outer = std::mem::replace(&mut ctx.no_outer, false);
     let mut order = Vec::new();
     for (method, args) in &lane.sorts {

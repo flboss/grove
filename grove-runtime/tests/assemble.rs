@@ -600,6 +600,47 @@ fn cross_sorted_global_take_pairs_first_alphabetically() {
     );
 }
 
+fn u_consts(owner: &str) -> Value {
+    let rec = || Value::Record(vec![("n".to_string(), Value::String(owner.to_string()))]);
+    Value::List(vec![rec(), rec()])
+}
+
+#[test]
+fn cross_projection_outer_consts_pair_full_set() {
+    assert_eq!(
+        value("configs { u = users { n = owner } }"),
+        Value::List(
+            ["a@x", "zzz", "b@x", "zzz", "a@x", "zzz"]
+                .iter()
+                .map(|o| Value::Record(vec![("u".to_string(), u_consts(o))]))
+                .collect()
+        )
+    );
+}
+
+#[test]
+fn cross_projection_outer_consts_keep_siblings() {
+    assert_eq!(
+        value(r#"configs { name, u = users { n = owner } }"#),
+        Value::List(
+            [
+                ("n1", "a@x"),
+                ("n2", "zzz"),
+                ("n3", "b@x"),
+                ("b@x", "zzz"),
+                ("a@x", "a@x"),
+                ("n1", "zzz"),
+            ]
+            .iter()
+            .map(|(name, o)| Value::Record(vec![
+                ("name".to_string(), Value::String(name.to_string())),
+                ("u".to_string(), u_consts(o)),
+            ]))
+            .collect()
+        )
+    );
+}
+
 #[test]
 fn cross_proj_take_temp_pairs() {
     let Value::List(rows) = value("users { e = email } { x = configs.filter(owner == e).take(1) }")
