@@ -952,7 +952,44 @@ fn rows_method(
             return assert_present_rows(ctx, level, "unwrap failed: value was none".to_string());
         }
         "unwrap_or" => {
-            todo!("M4b presence: unwrap over list in row demand")
+            match peel_optional(&level.element) {
+                QueryType::List(_) => {
+                    let (level, probe_from) = match &level.pending {
+                        Some(_) => match fold_literal_pick(base) {
+                            Some(Some(picked)) => {
+                                let values = rows(ctx, &picked);
+                                if values.pending.is_some() {
+                                    todo!("M4b presence: unwrap over list in row demand")
+                                }
+                                let outer = SelectBuilder {
+                                    select: vec![SelectItem::AllFrom { depth: 0 }],
+                                    from: level.builder.from.clone(),
+                                    where_: level.builder.where_.clone(),
+                                    order_by: Vec::new(),
+                                    limit: level.builder.limit.clone(),
+                                    offset: level.builder.offset.clone(),
+                                    unions: Vec::new(),
+                                };
+                                (
+                                    values,
+                                    Some(FromClause::Subquery {
+                                        query: Box::new(outer),
+                                        alias: ctx.aliases.subquery(),
+                                    }),
+                                )
+                            }
+                            Some(None) => return rows(ctx, one_arg(args, name)),
+                            None => todo!("M4b presence: unwrap over list in row demand"),
+                        },
+                        None => (level, None),
+                    };
+                    unwrap_or_rows(ctx, level, one_arg(args, name), probe_from)
+                }
+                QueryType::Record(_) => {
+                    todo!("M4 presence-directed unwrap over records")
+                }
+                _ => todo!("M4b presence: unwrap over list in row demand"),
+            }
         }
         _ => unreachable!(
             "method {} in row demand: no other value method returns row types",
@@ -1527,7 +1564,11 @@ fn b1_chained(
         child: ChildRef {
             stmt: idx_outer,
             parent: outer_parent_key.clone().map(|parent_key| ParentRef {
-                stmt: 0,
+                stmt: if ctx.child.is_some() {
+                    PENDING_PARENT_STMT
+                } else {
+                    0
+                },
                 parent_key,
                 child_key: outer_child_col,
                 negated: false,
@@ -1746,6 +1787,117 @@ fn assert_present_rows(ctx: &mut Context, level: Level, msg: String) -> Level {
     )
 }
 
+fn fold_literal_pick(base: &TypedExpr) -> Option<Option<TypedExpr>> {
+    let TypedExprKind::Method {
+        base: arr,
+        name,
+        args,
+        ..
+    } = &base.kind
+    else {
+        return None;
+    };
+    if name.value != "first" && name.value != "nth" {
+        return None;
+    }
+    let TypedExprKind::Array { elements } = &arr.kind else {
+        return None;
+    };
+    if has_scope_ident(base) || uses_outer(base) || take_bound_ident(base) {
+        return None;
+    }
+    let idx = if name.value == "first" {
+        0
+    } else {
+        let [arg] = args.as_slice() else {
+            return None;
+        };
+        match &arg.expr.kind {
+            TypedExprKind::Literal(lit) => match &lit.value {
+                crate::ast::Literal::Int(n) if *n >= 0 => *n as usize,
+                _ => return None,
+            },
+            _ => return None,
+        }
+    };
+    let Some(elem) = elements.get(idx) else {
+        return Some(None);
+    };
+    if !matches!(&elem.ty, QueryType::List(inner) if matches!(inner.as_ref(), QueryType::Scalar(_)))
+    {
+        return None;
+    }
+    Some(Some(elem.clone()))
+}
+
+fn unwrap_or_rows(
+    ctx: &mut Context,
+    level: Level,
+    default: &TypedExpr,
+    probe_from: Option<FromClause>,
+) -> Level {
+    if uses_outer(default) || has_scope_ident(default) || take_bound_ident(default) {
+        todo!("M4b presence: unwrap over list in row demand");
+    }
+    let Level {
+        mut builder,
+        element,
+        parent,
+        pending,
+        stmt_bound,
+        output_shapes,
+        root_parts,
+    } = level;
+    let _ = pending;
+    if builder.select.is_empty() {
+        builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+    }
+    let mut base_inner = SelectBuilder::new();
+    base_inner.from = Some(FromClause::Subquery {
+        query: Box::new(builder),
+        alias: ctx.aliases.subquery(),
+    });
+    base_inner.select = vec![SelectItem::AllFrom { depth: 0 }];
+    let guard_base = base_inner.clone();
+    builder = base_inner;
+    let default_level = rows(ctx, default);
+    if default_level.pending.is_some() || !default_level.builder.unions.is_empty() {
+        todo!("M4b presence: unwrap over list in row demand");
+    }
+    let mut probe = SelectBuilder::new();
+    probe.select = vec![SelectItem::Expr {
+        expr: SqlExpr::Param(ParamValue::Int(1)),
+        output: "c0".to_string(),
+        ty: Some(ScalarType::Int),
+    }];
+    probe.from = Some(match probe_from {
+        Some(from) => from,
+        None => FromClause::Subquery {
+            query: Box::new(guard_base),
+            alias: ctx.aliases.subquery(),
+        },
+    });
+    let mut arm = default_level.builder;
+    if arm.select.is_empty() {
+        arm.select = vec![SelectItem::AllFrom { depth: 0 }];
+    }
+    arm.where_
+        .push(SqlExpr::Not(Box::new(SqlExpr::Exists(Box::new(probe)))));
+    builder.unions.push(arm);
+    wrap_level(
+        ctx,
+        Level {
+            builder,
+            element,
+            parent,
+            pending: None,
+            stmt_bound,
+            output_shapes,
+            root_parts,
+        },
+    )
+}
+
 fn lower_value(
     ctx: &mut Context,
     parent: &mut Level,
@@ -1848,7 +2000,25 @@ fn lower_value(
             }
             QueryType::List(_) => {
                 if ctx.child.is_some() {
-                    todo!("M4b presence: optional list item");
+                    if let TypedExprKind::Method { base, name, .. } = &value.kind
+                        && (name.value == "first" || name.value == "nth")
+                        && matches!(&base.kind, TypedExprKind::Array { .. })
+                        && !has_scope_ident(value)
+                        && !uses_outer(value)
+                    {
+                        let was_child = ctx.child.take();
+                        let result = b1_literal(ctx, value);
+                        ctx.child = was_child;
+                        return result;
+                    }
+                    let bulk_middle = ctx.child.as_ref().is_some_and(|tail| tail.per_row);
+                    if !bulk_middle || matches!(&value.kind, TypedExprKind::Some { .. }) {
+                        todo!("M4b presence: optional list item");
+                    }
+                    ctx.nest_depth += 1;
+                    let result = b1_optional_list(ctx, parent, value);
+                    ctx.nest_depth -= 1;
+                    return result;
                 }
                 return b1_optional_list(ctx, parent, value);
             }

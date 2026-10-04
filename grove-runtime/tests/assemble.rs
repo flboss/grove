@@ -671,6 +671,68 @@ fn cross_inequality_pairs_complement() {
 }
 
 #[test]
+fn middle_scoped_literal_collapse_exec() {
+    let one = || Value::Record(vec![("t".to_string(), Value::List(vec![Value::Int(1)]))]);
+    assert_eq!(
+        value("users { o = orders { t = [[1]].first() } }"),
+        Value::List(vec![
+            Value::Record(vec![("o".to_string(), Value::List(vec![one(), one()]))]),
+            Value::Record(vec![("o".to_string(), Value::List(vec![one()]))]),
+        ])
+    );
+}
+
+#[test]
+fn middle_scoped_storage_chain_exec() {
+    let sku = |s: &str| Value::Record(vec![("sku".to_string(), Value::String(s.to_string()))]);
+    assert_eq!(
+        value("users { o = subordinates { t = orders.sort(total).first()?.items } }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "o".to_string(),
+                Value::List(vec![Value::Record(vec![(
+                    "t".to_string(),
+                    Value::List(vec![sku("c")]),
+                )])])
+            )]),
+            Value::Record(vec![(
+                "o".to_string(),
+                Value::List(vec![Value::Record(vec![(
+                    "t".to_string(),
+                    Value::List(vec![sku("a"), sku("b")]),
+                )])])
+            )]),
+        ])
+    );
+}
+
+#[test]
+fn unwrap_or_rows_falls_back() {
+    let one = || Value::List(vec![Value::Int(1)]);
+    assert_eq!(
+        value("users { o = [[1]].first().unwrap_or([2]) }"),
+        Value::List(vec![
+            Value::Record(vec![("o".to_string(), one())]),
+            Value::Record(vec![("o".to_string(), one())]),
+        ])
+    );
+    assert_eq!(
+        value("users { o = [[], [1]].first().unwrap_or([9]) }"),
+        Value::List(vec![
+            Value::Record(vec![("o".to_string(), Value::List(vec![]))]),
+            Value::Record(vec![("o".to_string(), Value::List(vec![]))]),
+        ])
+    );
+    assert_eq!(
+        value("users { o = [[1]].nth(5).unwrap_or([9]) }"),
+        Value::List(vec![
+            Value::Record(vec![("o".to_string(), Value::List(vec![Value::Int(9)]))]),
+            Value::Record(vec![("o".to_string(), Value::List(vec![Value::Int(9)]))]),
+        ])
+    );
+}
+
+#[test]
 fn cross_proj_take_temp_pairs() {
     let Value::List(rows) = value("users { e = email } { x = configs.filter(owner == e).take(1) }")
     else {
