@@ -2352,6 +2352,9 @@ fn lower_value(
         return lower_value(ctx, parent, prefix, field);
     }
     if value.ty.is_scalar() {
+        if let Some((select, shape, keys)) = scalar_temp_take_agg(ctx, parent, &prefix, value) {
+            return (select, shape, keys);
+        }
         if let Some((select, shape, keys)) = scalar_temp_array(ctx, parent, &prefix, value) {
             return (select, shape, keys);
         }
@@ -6992,6 +6995,48 @@ fn temp_key_query(temp: &str) -> SelectBuilder {
     temp_col_query(temp, "$$key", Some(ScalarType::Int))
 }
 
+fn freeze_parent_temp(
+    ctx: &mut Context,
+    parent: &mut Level,
+    temp: &str,
+    key_col: &str,
+    refs: &[String],
+    extra_keys: &[String],
+) -> usize {
+    let mut create_q = parent.builder.clone();
+    if create_q.select.is_empty() {
+        create_q.select = vec![SelectItem::AllFrom { depth: 0 }];
+    }
+    for col in refs {
+        if !available_cols(&create_q, ctx.schema).contains(col) {
+            todo!("M4b key threading through subqueries");
+        }
+        ensure_key(&mut create_q, col, ctx.schema);
+    }
+    for key in extra_keys {
+        ensure_key(&mut create_q, key, ctx.schema);
+    }
+    create_q.select.push(SelectItem::Column {
+        depth: 0,
+        column: key_col.to_string(),
+        output: "$$key".to_string(),
+        ty: Some(ScalarType::Int),
+    });
+    let create_outputs = builder_output_types(&create_q, ctx.schema);
+    let temp_idx = ctx.sink(
+        create_q,
+        StatementShape {
+            columns: shape_columns(create_outputs.clone(), |name| name == "$$key"),
+            rows: RowCount::Many,
+        },
+        StatementKind::Temp {
+            name: temp.to_string(),
+        },
+    );
+    swap_parent_to_temp(parent, temp, &create_outputs);
+    temp_idx
+}
+
 fn temp_col_query(temp: &str, column: &str, ty: Option<ScalarType>) -> SelectBuilder {
     SelectBuilder {
         select: vec![SelectItem::Column {
@@ -7010,6 +7055,131 @@ fn temp_col_query(temp: &str, column: &str, ty: Option<ScalarType>) -> SelectBui
         offset: None,
         unions: Vec::new(),
     }
+}
+
+fn scalar_temp_take_agg(
+    ctx: &mut Context,
+    parent: &mut Level,
+    prefix: &str,
+    value: &TypedExpr,
+) -> Option<(Vec<SelectItem>, ResultShape, Vec<String>)> {
+    let TypedExprKind::Method {
+        base,
+        name,
+        args,
+        optional,
+    } = &value.kind
+    else {
+        return None;
+    };
+    if *optional {
+        return None;
+    }
+    if ctx.child.is_some() || ctx.temp_collect.is_some() || ctx.in_take_arg {
+        return None;
+    }
+    if ctx.nest_depth >= 1 {
+        return None;
+    }
+    let over = matches!(name.value.as_str(), "sum_over" | "avg_over");
+    let bare = matches!(name.value.as_str(), "len" | "sum" | "avg" | "max" | "min");
+    if !over && !bare {
+        return None;
+    }
+    let QueryType::List(_) = &base.ty else {
+        return None;
+    };
+    let fid = match tail_root_ident(base) {
+        Some(IdentBinding::Field(fid)) => *fid,
+        _ => return None,
+    };
+    if !take_bound_ident(base) {
+        return None;
+    }
+    let link = resolve_tail_link(ctx, fid);
+    if link.m2m_join.is_some() {
+        return None;
+    }
+    let (child_from, child_col, key_col) = (link.child_from, link.child_col, link.parent_col);
+    let temp = ctx.aliases.temp();
+    ctx.temp_collect = Some(TempCollect {
+        temp: temp.clone(),
+        key_col: "$$key".to_string(),
+        child_fk: child_col.clone(),
+        refs: Vec::new(),
+    });
+    let agg = if over {
+        let op = if name.value == "sum_over" {
+            OverAgg::Sum
+        } else {
+            OverAgg::Avg
+        };
+        let (ty, arg) = over_arg_agg(ctx, base, args, name);
+        AggOp::Over(op, ty, arg)
+    } else {
+        let QueryType::List(inner) = &base.ty else {
+            unreachable!("reduction base is List: gated above")
+        };
+        match name.value.as_str() {
+            "len" => AggOp::Len,
+            "sum" => AggOp::Bare(BareAgg::Sum, inner_scalar(inner, &name.value)),
+            "avg" => AggOp::Bare(BareAgg::Avg, inner_scalar(inner, &name.value)),
+            "max" => AggOp::Bare(BareAgg::Max, inner_scalar(inner, &name.value)),
+            "min" => AggOp::Bare(BareAgg::Min, inner_scalar(inner, &name.value)),
+            _ => unreachable!("reduction method: gated above"),
+        }
+    };
+    let mut child_builder = SelectBuilder::new();
+    child_builder.from = Some(child_from);
+    child_builder.where_ = vec![SqlExpr::InSubquery {
+        expr: Box::new(SqlExpr::Column {
+            depth: 0,
+            column: child_col.clone(),
+        }),
+        query: Box::new(temp_key_query(&temp)),
+    }];
+    let child_level = Level {
+        builder: child_builder,
+        element: base.ty.clone(),
+        parent: ParentLink::Root { root_idx: 0 },
+        pending: None,
+        stmt_bound: true,
+        output_shapes: None,
+        root_parts: None,
+    };
+    let mut child = lower_tail(ctx, base, child_level, true, Some(child_col.clone()), false);
+    let refs = ctx
+        .temp_collect
+        .take()
+        .unwrap_or_else(|| unreachable!("temp collect vanished mid-lowering"))
+        .refs;
+    if child.builder.select.is_empty() {
+        child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+    }
+    ensure_key(&mut child.builder, &child_col, ctx.schema);
+    let _temp_idx = freeze_parent_temp(ctx, parent, &temp, &key_col, &refs, &[]);
+    child.builder.where_.push(SqlExpr::Binary {
+        op: SqlBinOp::Eq,
+        lhs: Box::new(SqlExpr::Column {
+            depth: 0,
+            column: child_col,
+        }),
+        rhs: Box::new(SqlExpr::Column {
+            depth: 1,
+            column: "$$key".to_string(),
+        }),
+    });
+    let subquery = finish_scalar_aggregate(ctx, base, child, agg);
+    let item = SelectItem::Expr {
+        expr: subquery,
+        output: prefix.to_string(),
+        ty: scalar_of(&value.ty),
+    };
+    Some((
+        vec![item],
+        ResultShape::Column(prefix.to_string()),
+        Vec::new(),
+    ))
 }
 
 fn rtemp_shape(
@@ -7041,7 +7211,6 @@ fn rtemp_shape(
             "exotic temp tail root: temp tails bottom at Field idents (single-spine tails admit one root); remaining kinds infer non-List types, contradicting the List-only callers"
         ),
     };
-    let parent_q = parent.builder.clone();
     let mut child_builder = SelectBuilder::new();
     child_builder.from = Some(child_from);
     let pair_col = if m2m_join.is_some() {
@@ -7112,35 +7281,11 @@ fn rtemp_shape(
         child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
     }
     ensure_key(&mut child.builder, &child_col, ctx.schema);
-    let mut create_q = parent_q;
-    if create_q.select.is_empty() {
-        create_q.select = vec![SelectItem::AllFrom { depth: 0 }];
-    }
-    for col in &refs {
-        if !available_cols(&create_q, ctx.schema).contains(col) {
-            todo!("M4b key threading through subqueries");
-        }
-        ensure_key(&mut create_q, col, ctx.schema);
-    }
-    if m2m_join.is_some() {
-        ensure_key(&mut create_q, &key_col, ctx.schema);
-    }
-    create_q.select.push(SelectItem::Column {
-        depth: 0,
-        column: key_col,
-        output: "$$key".to_string(),
-        ty: Some(ScalarType::Int),
-    });
-    let create_outputs = builder_output_types(&create_q, ctx.schema);
-    let temp_idx = ctx.sink(
-        create_q,
-        StatementShape {
-            columns: shape_columns(create_outputs.clone(), |name| name == "$$key"),
-            rows: RowCount::Many,
-        },
-        StatementKind::Temp { name: temp.clone() },
-    );
-    swap_parent_to_temp(parent, &temp, &create_outputs);
+    let extra_keys = match &m2m_join {
+        Some(_) => vec![key_col.clone()],
+        None => Vec::new(),
+    };
+    let temp_idx = freeze_parent_temp(ctx, parent, &temp, &key_col, &refs, &extra_keys);
     let outputs = builder_outputs(&child.builder, ctx.schema);
     let shape_cols: Vec<OutputColumn> =
         shape_columns(builder_output_types(&child.builder, ctx.schema), |name| {
@@ -11132,7 +11277,7 @@ fn scalar_aggregate(ctx: &mut Context, base: &TypedExpr, agg: AggOp) -> SqlExpr 
     }
     let was_corr = std::mem::replace(&mut ctx.corr, corr);
     let was_outer = std::mem::replace(&mut ctx.no_outer, !corr);
-    let mut level = if corr {
+    let level = if corr {
         match reanchored_level(ctx, base) {
             Some(level) => level,
             None => rows(ctx, base),
@@ -11145,6 +11290,15 @@ fn scalar_aggregate(ctx: &mut Context, base: &TypedExpr, agg: AggOp) -> SqlExpr 
     };
     ctx.corr = was_corr;
     ctx.no_outer = was_outer;
+    finish_scalar_aggregate(ctx, base, level, agg)
+}
+
+fn finish_scalar_aggregate(
+    ctx: &mut Context,
+    base: &TypedExpr,
+    mut level: Level,
+    agg: AggOp,
+) -> SqlExpr {
     if let Some(pending) = level.pending {
         let _ = pending;
         match agg {

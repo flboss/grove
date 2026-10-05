@@ -2496,6 +2496,61 @@ fn sum_over_method_mixed_values() {
 }
 
 #[test]
+fn temp_take_sum_over_values() {
+    assert_eq!(
+        value("users { s = orders.take(age).sum_over(total) }"),
+        Value::List(vec![
+            Value::Record(vec![("s".to_string(), Value::Dec(dec("30")))]),
+            Value::Record(vec![("s".to_string(), Value::Dec(dec("30")))]),
+        ])
+    );
+}
+
+#[test]
+fn temp_take_sum_over_cut_values() {
+    assert_eq!(
+        value("users { s = orders.take(age - 29).sum_over(total) }"),
+        Value::List(vec![
+            Value::Record(vec![("s".to_string(), Value::Dec(dec("10")))]),
+            Value::Record(vec![("s".to_string(), Value::Dec(dec("30")))]),
+        ])
+    );
+}
+
+#[test]
+fn temp_take_sum_over_outer_values() {
+    assert_eq!(
+        value("users { s = orders.take(age).sum_over(manager.age) }"),
+        Value::List(vec![
+            Value::Record(vec![("s".to_string(), Value::Int(80))]),
+            Value::Record(vec![("s".to_string(), Value::Int(30))]),
+        ])
+    );
+}
+
+#[test]
+fn temp_take_len_values() {
+    assert_eq!(
+        value("users { t = orders.take(age).len() }"),
+        Value::List(vec![
+            Value::Record(vec![("t".to_string(), Value::Int(2))]),
+            Value::Record(vec![("t".to_string(), Value::Int(1))]),
+        ])
+    );
+}
+
+#[test]
+fn temp_take_negative_bound_aborts() {
+    let mut rt = fixture();
+    let compiled = compile("users { s = orders.take(age - 31).sum_over(total) }");
+    let err = rt.execute_value(&compiled).unwrap_err();
+    assert!(
+        matches!(err, RuntimeError::Aborted(_)),
+        "expected abort, got {err:?}"
+    );
+}
+
+#[test]
 fn single_hop_values() {
     assert_eq!(
         value("users { o = manager.orders }"),
