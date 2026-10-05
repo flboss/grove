@@ -2874,6 +2874,116 @@ fn temp_lookup_at(
     }
 }
 
+fn free_columns(expr: &SqlExpr, level: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    free_columns_into(expr, level, &mut out);
+    out
+}
+
+fn free_columns_into(expr: &SqlExpr, level: usize, out: &mut Vec<String>) {
+    match expr {
+        SqlExpr::Column { depth, column } => {
+            if *depth == level && !out.iter().any(|c| c == column) {
+                out.push(column.clone());
+            }
+        }
+        SqlExpr::Param(_) | SqlExpr::Count => {}
+        SqlExpr::Binary { lhs, rhs, .. } => {
+            free_columns_into(lhs, level, out);
+            free_columns_into(rhs, level, out);
+        }
+        SqlExpr::Not(inner) | SqlExpr::Cast { expr: inner, .. } => {
+            free_columns_into(inner, level, out)
+        }
+        SqlExpr::Func { args, .. } => {
+            for arg in args {
+                free_columns_into(arg, level, out);
+            }
+        }
+        SqlExpr::Case { arms, else_ } => {
+            for (cond, then) in arms {
+                free_columns_into(cond, level, out);
+                free_columns_into(then, level, out);
+            }
+            free_columns_into(else_, level, out);
+        }
+        SqlExpr::In { expr, items } => {
+            free_columns_into(expr, level, out);
+            for item in items {
+                free_columns_into(item, level, out);
+            }
+        }
+        SqlExpr::Coalesce(items) => {
+            for item in items {
+                free_columns_into(item, level, out);
+            }
+        }
+        SqlExpr::InSubquery { expr, query } => {
+            free_columns_into(expr, level, out);
+            free_builder_columns(query, level + 1, out);
+        }
+        SqlExpr::Subquery { query } | SqlExpr::Exists(query) => {
+            free_builder_columns(query, level + 1, out)
+        }
+        SqlExpr::Window {
+            partition, order, ..
+        } => {
+            for part in partition {
+                free_columns_into(part, level, out);
+            }
+            for item in order {
+                free_columns_into(&item.expr, level, out);
+            }
+        }
+    }
+}
+
+fn free_builder_columns(builder: &SelectBuilder, level: usize, out: &mut Vec<String>) {
+    for item in &builder.select {
+        match item {
+            SelectItem::AllFrom { .. } => {}
+            SelectItem::Column { depth, column, .. } => {
+                if *depth == level && !out.iter().any(|c| c == column) {
+                    out.push(column.clone());
+                }
+            }
+            SelectItem::Expr { expr, .. } => free_columns_into(expr, level, out),
+        }
+    }
+    free_from_columns(&builder.from, level, out);
+    for cond in &builder.where_ {
+        free_columns_into(cond, level, out);
+    }
+    for item in &builder.order_by {
+        free_columns_into(&item.expr, level, out);
+    }
+    if let Some(limit) = &builder.limit {
+        free_columns_into(limit, level, out);
+    }
+    if let Some(offset) = &builder.offset {
+        free_columns_into(offset, level, out);
+    }
+    for arm in &builder.unions {
+        free_builder_columns(arm, level, out);
+    }
+}
+
+fn free_from_columns(from: &Option<FromClause>, level: usize, out: &mut Vec<String>) {
+    match from {
+        None
+        | Some(FromClause::Table { .. })
+        | Some(FromClause::Temp { .. })
+        | Some(FromClause::Literal { .. })
+        | Some(FromClause::TableFunction { .. }) => {}
+        Some(FromClause::Subquery { query, .. }) => free_builder_columns(query, level + 1, out),
+        Some(FromClause::Computed { query, .. }) => free_builder_columns(query, level + 1, out),
+        Some(FromClause::Join { left, right }) => {
+            free_from_columns(&Some((**left).clone()), level, out);
+            free_from_columns(&Some((**right).clone()), level, out);
+        }
+    }
+}
+
 fn lower_tail(
     ctx: &mut Context,
     tail: &TypedExpr,
@@ -4490,12 +4600,36 @@ fn per_row_take_op(tail: &TypedExpr) -> Option<(String, TypedExpr, TypedExpr)> {
     let [arg] = args.as_slice() else {
         return None;
     };
-    match &arg.expr.kind {
-        TypedExprKind::Ident {
-            binding: IdentBinding::Field(_) | IdentBinding::ProjectedField { .. },
-            ..
-        } => Some((method.clone(), arg.expr.clone(), peeled)),
-        _ => None,
+    if !matches!(&arg.expr.ty, QueryType::Scalar(ScalarType::Int)) {
+        return None;
+    }
+    if !has_scope_ident(&arg.expr) || uses_outer(&arg.expr) {
+        return None;
+    }
+    if !bound_lang_ok(&arg.expr) {
+        return None;
+    }
+    Some((method.clone(), arg.expr.clone(), peeled))
+}
+
+fn bound_lang_ok(expr: &TypedExpr) -> bool {
+    match &expr.kind {
+        TypedExprKind::Literal(_) | TypedExprKind::TypeConstant { .. } => true,
+        TypedExprKind::Ident { depth, .. } => *depth == 0,
+        TypedExprKind::Field { base, .. } => bound_lang_ok(base),
+        TypedExprKind::Binary { lhs, rhs, .. } => bound_lang_ok(lhs) && bound_lang_ok(rhs),
+        TypedExprKind::Unary { expr, .. } | TypedExprKind::Cast { expr, .. } => bound_lang_ok(expr),
+        TypedExprKind::If { arms, default } => {
+            arms.iter()
+                .all(|(c, t)| bound_lang_ok(c) && bound_lang_ok(t))
+                && bound_lang_ok(default)
+        }
+        TypedExprKind::Method { .. }
+        | TypedExprKind::Some { .. }
+        | TypedExprKind::Tuple { .. }
+        | TypedExprKind::Array { .. }
+        | TypedExprKind::Struct { .. }
+        | TypedExprKind::Projection { .. } => false,
     }
 }
 
@@ -4537,6 +4671,7 @@ fn cross_cartesian(
     parent: &mut Level,
     peeled: &TypedExpr,
     extra: &[(String, ScalarType)],
+    extra_computed: &[(String, SqlExpr, ScalarType)],
     outer_scope: bool,
 ) -> (usize, Vec<(String, Option<ScalarType>)>, Level) {
     let temp = ctx.aliases.temp();
@@ -4553,6 +4688,13 @@ fn cross_cartesian(
                 ty: Some(*ty),
             });
         }
+    }
+    for (name, expr, ty) in extra_computed {
+        create_q.select.push(SelectItem::Expr {
+            expr: expr.clone(),
+            output: name.clone(),
+            ty: Some(*ty),
+        });
     }
     create_q.select.push(SelectItem::Expr {
         expr: SqlExpr::Window {
@@ -4749,7 +4891,7 @@ fn const_proj_cross_shape(
             }
         }
     }
-    let (temp_idx, _, child) = cross_cartesian(ctx, parent, tail, &carries, true);
+    let (temp_idx, _, child) = cross_cartesian(ctx, parent, tail, &carries, &[], true);
     Some(sink_cross_child(
         ctx,
         child,
@@ -4766,7 +4908,11 @@ fn per_row_take_shape(
     bound: &TypedExpr,
     peeled: &TypedExpr,
 ) -> (ResultShape, Option<String>) {
-    let bound_name = match &bound.kind {
+    enum BoundCarry {
+        Column(String),
+        Computed(SqlExpr),
+    }
+    let carry = match &bound.kind {
         TypedExprKind::Ident {
             binding: IdentBinding::Field(fid),
             ..
@@ -4774,7 +4920,7 @@ fn per_row_take_shape(
             let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
             match field {
                 Field::Value { columns, .. } => match columns.as_slice() {
-                    [col] => ctx.schema.column_name(*col).to_string(),
+                    [col] => BoundCarry::Column(ctx.schema.column_name(*col).to_string()),
                     _ => todo!("M4b temp-bound per-row limit"),
                 },
                 _ => todo!("M4b temp-bound per-row limit"),
@@ -4783,19 +4929,41 @@ fn per_row_take_shape(
         TypedExprKind::Ident {
             binding: IdentBinding::ProjectedField { name },
             ..
-        } => name.clone(),
-        _ => todo!("M4b temp-bound per-row limit"),
+        } => BoundCarry::Column(name.clone()),
+        _ => {
+            let was_take = std::mem::replace(&mut ctx.in_take_arg, false);
+            let lowered = scalar(ctx, bound);
+            ctx.in_take_arg = was_take;
+            if free_columns(&lowered, 0)
+                .iter()
+                .any(|c| output_ty(&parent.builder, c, ctx.schema).is_none())
+            {
+                todo!("M4b temp-bound per-row limit");
+            }
+            BoundCarry::Computed(lowered)
+        }
     };
-    let bound_ty = output_ty(&parent.builder, &bound_name, ctx.schema).unwrap_or_else(|| {
-        todo!("M4b temp-bound per-row limit");
-    });
-    let (temp_idx, _, mut child) = cross_cartesian(
-        ctx,
-        parent,
-        peeled,
-        &[(bound_name.clone(), bound_ty)],
-        false,
-    );
+    let (bound_name, bound_ty, carries, computed): (
+        String,
+        ScalarType,
+        Vec<(String, ScalarType)>,
+        Vec<(String, SqlExpr, ScalarType)>,
+    ) = match carry {
+        BoundCarry::Column(name) => {
+            let ty = output_ty(&parent.builder, &name, ctx.schema).unwrap_or_else(|| {
+                todo!("M4b temp-bound per-row limit");
+            });
+            let carries = vec![(name.clone(), ty)];
+            (name, ty, carries, Vec::new())
+        }
+        BoundCarry::Computed(lowered) => (
+            "$$tbound".to_string(),
+            ScalarType::Int,
+            Vec::new(),
+            vec![("$$tbound".to_string(), lowered, ScalarType::Int)],
+        ),
+    };
+    let (temp_idx, _, mut child) = cross_cartesian(ctx, parent, peeled, &carries, &computed, false);
     child.builder.select.push(SelectItem::Expr {
         expr: SqlExpr::Column {
             depth: 1,
@@ -4847,7 +5015,7 @@ fn predicate_join_shape(
         trunc,
         cardinality,
     } = lane;
-    let (temp_idx, _, mut child) = cross_cartesian(ctx, parent, peeled, &carries, true);
+    let (temp_idx, _, mut child) = cross_cartesian(ctx, parent, peeled, &carries, &[], true);
     let mut pred: Option<SqlExpr> = None;
     for corr in conds {
         let was_outer = std::mem::replace(&mut ctx.no_outer, true);
@@ -5061,7 +5229,8 @@ fn sorted_cross_shape(
     lane: SortLane,
     cardinality: Cardinality,
 ) -> (ResultShape, Option<String>) {
-    let (temp_idx, _, mut child) = cross_cartesian(ctx, parent, &lane.peeled, &lane.carries, false);
+    let (temp_idx, _, mut child) =
+        cross_cartesian(ctx, parent, &lane.peeled, &lane.carries, &[], false);
     let was_outer = std::mem::replace(&mut ctx.no_outer, false);
     let mut order = Vec::new();
     for (method, args) in &lane.sorts {
@@ -9028,7 +9197,6 @@ fn hop_shell_on(
     ctx: &mut Context,
     target: StructId,
 ) -> SelectBuilder {
-
     let table = ctx.schema.tables[ctx.schema.structs[target.index()].table.index()]
         .name
         .clone();

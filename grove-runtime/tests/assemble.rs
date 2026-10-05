@@ -2143,3 +2143,47 @@ fn multi_ne_with_local_stays_scalar() {
         ])
     );
 }
+
+#[test]
+fn per_row_take_computed_bound_values() {
+    assert_eq!(
+        value("users { x = configs.take(age - 28) }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![cfg("n1", "a@x"), cfg("n2", "zzz")])
+            )]),
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![
+                    cfg("n1", "a@x"),
+                    cfg("n2", "zzz"),
+                    cfg("n3", "b@x"),
+                    cfg("b@x", "zzz"),
+                    cfg("a@x", "a@x"),
+                    cfg("n1", "zzz"),
+                ])
+            )]),
+        ])
+    );
+}
+
+#[test]
+fn per_row_skip_computed_bound_values() {
+    assert_eq!(
+        value("users { x = configs.skip(age - 29) }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![
+                    cfg("n2", "zzz"),
+                    cfg("n3", "b@x"),
+                    cfg("b@x", "zzz"),
+                    cfg("a@x", "a@x"),
+                    cfg("n1", "zzz"),
+                ])
+            )]),
+            Value::Record(vec![("x".to_string(), Value::List(vec![]))]),
+        ])
+    );
+}
