@@ -2837,6 +2837,16 @@ fn record_temp_ref(ctx: &mut Context, column: &str) {
 }
 
 fn temp_lookup(ctx: &Context, temp: &str, column: &str, child_fk: &str) -> SqlExpr {
+    temp_lookup_at(ctx, temp, column, child_fk, 1)
+}
+
+fn temp_lookup_at(
+    ctx: &Context,
+    temp: &str,
+    column: &str,
+    child_fk: &str,
+    fk_depth: usize,
+) -> SqlExpr {
     let mut query = SelectBuilder::new();
     query.select = vec![SelectItem::Column {
         depth: 0,
@@ -2855,7 +2865,7 @@ fn temp_lookup(ctx: &Context, temp: &str, column: &str, child_fk: &str) -> SqlEx
             column: "$$key".to_string(),
         }),
         rhs: Box::new(SqlExpr::Column {
-            depth: 1,
+            depth: fk_depth,
             column: child_fk.to_string(),
         }),
     }];
@@ -8535,6 +8545,9 @@ fn scalar_field(
     let (_, first_fid) = hops[0];
     let (next_source, first_shell) = match global_parent {
         Some(parent) => global_first_hop(ctx, *parent, source, first_fid),
+        None if ctx.temp_collect.is_some() && !ctx.in_array_temp => {
+            temp_first_hop(ctx, source, first_fid)
+        }
         None => hop_shell(ctx, source, first_fid),
     };
     source = next_source;
@@ -8969,7 +8982,33 @@ fn hop_shell(ctx: &mut Context, source: StructId, fid: FieldId) -> (StructId, Se
         Field::Ref { target, .. } => *target,
         _ => unreachable!("hop over non-reference field"),
     };
-    let (child_col, parent_col) = match link_cols(ctx.schema, fid) {
+    let (child_col, parent_col) = hop_link_cols(ctx.schema, fid);
+    let parent_rhs = SqlExpr::Column {
+        depth: 1,
+        column: parent_col,
+    };
+    (target, hop_shell_on(child_col, parent_rhs, ctx, target))
+}
+
+fn temp_first_hop(ctx: &mut Context, source: StructId, fid: FieldId) -> (StructId, SelectBuilder) {
+    let field = &ctx.schema.structs[source.index()].fields[fid.local()];
+    let target = match field {
+        Field::Ref { target, .. } => *target,
+        _ => unreachable!("hop over non-reference field"),
+    };
+    let (temp, child_fk) = ctx
+        .temp_collect
+        .as_ref()
+        .map(|c| (c.temp.clone(), c.child_fk.clone()))
+        .unwrap_or_else(|| unreachable!("temp first hop outside temp mode"));
+    let (child_col, parent_col) = hop_link_cols(ctx.schema, fid);
+    record_temp_ref(ctx, &parent_col);
+    let parent_rhs = temp_lookup_at(ctx, &temp, &parent_col, &child_fk, 2);
+    (target, hop_shell_on(child_col, parent_rhs, ctx, target))
+}
+
+fn hop_link_cols(schema: &ValidatedSchema, fid: FieldId) -> (String, String) {
+    match link_cols(schema, fid) {
         LinkCols::ParentFk {
             parent_fk,
             child_pk,
@@ -8981,7 +9020,15 @@ fn hop_shell(ctx: &mut Context, source: StructId, fid: FieldId) -> (StructId, Se
         LinkCols::ManyToMany => {
             todo!("M4 many-to-many navigation");
         }
-    };
+    }
+}
+fn hop_shell_on(
+    child_col: String,
+    parent_rhs: SqlExpr,
+    ctx: &mut Context,
+    target: StructId,
+) -> SelectBuilder {
+
     let table = ctx.schema.tables[ctx.schema.structs[target.index()].table.index()]
         .name
         .clone();
@@ -8996,12 +9043,9 @@ fn hop_shell(ctx: &mut Context, source: StructId, fid: FieldId) -> (StructId, Se
             depth: 0,
             column: child_col,
         }),
-        rhs: Box::new(SqlExpr::Column {
-            depth: 1,
-            column: parent_col,
-        }),
+        rhs: Box::new(parent_rhs),
     }];
-    (target, shell)
+    shell
 }
 
 fn scalar_literal(lit: &Literal) -> SqlExpr {

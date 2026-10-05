@@ -1937,6 +1937,40 @@ fn stacked_per_parent_skip_take_folds_values() {
 }
 
 #[test]
+fn nav_bound_take_values() {
+    assert_eq!(
+        value("users { o = orders.take(manager.age) { total } }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "o".to_string(),
+                Value::List(vec![
+                    Value::Record(vec![("total".to_string(), Value::Dec(dec("10")))]),
+                    Value::Record(vec![("total".to_string(), Value::Dec(dec("20")))]),
+                ])
+            )]),
+            Value::Record(vec![(
+                "o".to_string(),
+                Value::List(vec![Value::Record(vec![(
+                    "total".to_string(),
+                    Value::Dec(dec("30"))
+                )]),])
+            )]),
+        ])
+    );
+}
+
+#[test]
+fn nav_bound_skip_values() {
+    assert_eq!(
+        value("users { o = orders.skip(manager.age) { total } }"),
+        Value::List(vec![
+            Value::Record(vec![("o".to_string(), Value::List(vec![]))]),
+            Value::Record(vec![("o".to_string(), Value::List(vec![]))]),
+        ])
+    );
+}
+
+#[test]
 fn stacked_cross_take_folds_values() {
     assert_eq!(
         value(
