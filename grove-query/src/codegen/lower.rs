@@ -10145,6 +10145,14 @@ fn spine_root_field(mut node: &TypedExpr) -> Option<FieldId> {
     }
 }
 
+fn method_same_level(ty: &QueryType) -> bool {
+    match ty {
+        QueryType::Scalar(_) => true,
+        QueryType::Optional(inner) => matches!(inner.as_ref(), QueryType::Scalar(_)),
+        _ => false,
+    }
+}
+
 fn collect_over_chains(
     expr: &TypedExpr,
     nested: bool,
@@ -10181,12 +10189,17 @@ fn collect_over_chains(
             ok
         }
         TypedExprKind::Method { base, args, .. } => {
+            let inner_nested = if method_same_level(&base.ty) {
+                nested
+            } else {
+                true
+            };
             path.push(0);
-            let mut ok = collect_over_chains(base, true, path, out);
+            let mut ok = collect_over_chains(base, inner_nested, path, out);
             path.pop();
             for (i, arg) in args.iter().enumerate() {
                 path.push(i + 1);
-                ok = collect_over_chains(&arg.expr, true, path, out) && ok;
+                ok = collect_over_chains(&arg.expr, inner_nested, path, out) && ok;
                 path.pop();
             }
             ok

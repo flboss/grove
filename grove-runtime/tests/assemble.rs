@@ -2474,6 +2474,28 @@ fn sum_over_same_chain_twice_values() {
 }
 
 #[test]
+fn sum_over_method_outer_values() {
+    assert_eq!(
+        value("users { s = orders.sum_over(manager.name.len()) }"),
+        Value::List(vec![
+            Value::Record(vec![("s".to_string(), Value::Int(6))]),
+            Value::Record(vec![("s".to_string(), Value::Int(3))]),
+        ])
+    );
+}
+
+#[test]
+fn sum_over_method_mixed_values() {
+    assert_eq!(
+        value("users { s = orders.sum_over(manager.name.len() + age) }"),
+        Value::List(vec![
+            Value::Record(vec![("s".to_string(), Value::Int(66))]),
+            Value::Record(vec![("s".to_string(), Value::Int(43))]),
+        ])
+    );
+}
+
+#[test]
 fn single_hop_values() {
     assert_eq!(
         value("users { o = manager.orders }"),
