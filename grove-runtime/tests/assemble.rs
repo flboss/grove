@@ -1531,3 +1531,141 @@ fn agg_navigation_derived_base() {
         ])
     );
 }
+
+#[test]
+fn nested_collection_child_pairs_transitively() {
+    assert_eq!(
+        value("users { o = subordinates.orders }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "o".to_string(),
+                Value::List(vec![Value::List(vec![Value::Record(vec![(
+                    "total".to_string(),
+                    Value::Dec(dec("30"))
+                )]),])])
+            )]),
+            Value::Record(vec![(
+                "o".to_string(),
+                Value::List(vec![Value::List(vec![
+                    Value::Record(vec![("total".to_string(), Value::Dec(dec("10")))]),
+                    Value::Record(vec![("total".to_string(), Value::Dec(dec("20")))]),
+                ])])
+            )]),
+        ])
+    );
+}
+
+#[test]
+fn window_pending_caps_outer_rows() {
+    assert_eq!(
+        value("users { o = subordinates.orders.take(1) }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "o".to_string(),
+                Value::List(vec![Value::List(vec![Value::Record(vec![(
+                    "total".to_string(),
+                    Value::Dec(dec("30"))
+                )]),])])
+            )]),
+            Value::Record(vec![(
+                "o".to_string(),
+                Value::List(vec![Value::List(vec![
+                    Value::Record(vec![("total".to_string(), Value::Dec(dec("10")))]),
+                    Value::Record(vec![("total".to_string(), Value::Dec(dec("20")))]),
+                ])])
+            )]),
+        ])
+    );
+}
+#[test]
+fn nested_child_first_collapse_values() {
+    assert_eq!(
+        value("users { o = subordinates.orders.first() }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "o".to_string(),
+                Value::List(vec![Value::Record(vec![(
+                    "total".to_string(),
+                    Value::Dec(dec("30"))
+                )]),])
+            )]),
+            Value::Record(vec![(
+                "o".to_string(),
+                Value::List(vec![
+                    Value::Record(vec![("total".to_string(), Value::Dec(dec("10")))]),
+                    Value::Record(vec![("total".to_string(), Value::Dec(dec("20")))]),
+                ])
+            )]),
+        ])
+    );
+}
+
+#[test]
+fn optchain_is_some_split_merged_values() {
+    assert_eq!(
+        value("users { h = orders.filter(total == 10.00).first()?.items.is_some() }"),
+        Value::List(vec![
+            Value::Record(vec![("h".to_string(), Value::Bool(true))]),
+            Value::Record(vec![("h".to_string(), Value::Bool(false))]),
+        ])
+    );
+}
+
+#[test]
+fn nested_flatten_pairs_flat() {
+    assert_eq!(
+        value("users { o = subordinates.orders.flatten() }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "o".to_string(),
+                Value::List(vec![Value::Record(vec![(
+                    "total".to_string(),
+                    Value::Dec(dec("30"))
+                )]),])
+            )]),
+            Value::Record(vec![(
+                "o".to_string(),
+                Value::List(vec![
+                    Value::Record(vec![("total".to_string(), Value::Dec(dec("10")))]),
+                    Value::Record(vec![("total".to_string(), Value::Dec(dec("20")))]),
+                ])
+            )]),
+        ])
+    );
+}
+
+#[test]
+fn nested_flatten_take_picks_per_user() {
+    let rows = match value("users { o = subordinates.orders.flatten().take(1) }") {
+        Value::List(rows) => rows,
+        other => panic!("root list, got {other:?}"),
+    };
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0],
+        Value::Record(vec![(
+            "o".to_string(),
+            Value::List(vec![Value::Record(vec![(
+                "total".to_string(),
+                Value::Dec(dec("30"))
+            )]),])
+        )])
+    );
+    let pick = match &rows[1] {
+        Value::Record(fields) => match &fields[..] {
+            [(o, Value::List(pick))] => {
+                assert_eq!(o, "o");
+                pick.clone()
+            }
+            _ => panic!("o field"),
+        },
+        _ => panic!("parent record"),
+    };
+    assert_eq!(pick.len(), 1);
+    assert!(
+        pick[0] == Value::Record(vec![("total".to_string(), Value::Dec(dec("10")))])
+            || pick[0] == Value::Record(vec![("total".to_string(), Value::Dec(dec("20")))]),
+        "bag-pick, got {:?}",
+        pick[0]
+    );
+}

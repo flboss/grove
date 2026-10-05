@@ -891,7 +891,73 @@ fn rows_method(
                     ..
                 } = pending;
                 level.element = narrow_element(level.element);
-                let mut level = merge_navigate(ctx, child_from, child_col, level, parent_col);
+                let carry = match ctx.child.as_ref().filter(|tail| tail.per_row) {
+                    Some(tail) => tail.partition.clone(),
+                    None => None,
+                };
+                let single_source = !matches!(level.builder.from, Some(FromClause::Join { .. }));
+                let carry = carry.filter(|_| single_source);
+                let mid_from = carry.as_ref().and_then(|_| level.builder.from.clone());
+                let mid_ty = match (&carry, &mid_from) {
+                    (Some(fk), Some(mid_from)) => {
+                        from_columns_typed(&Some(mid_from.clone()), ctx.schema)
+                            .into_iter()
+                            .find(|(name, _)| name == fk)
+                            .and_then(|(_, ty)| ty)
+                    }
+                    _ => None,
+                };
+                let mut level = merge_navigate(
+                    ctx,
+                    child_from,
+                    child_col.clone(),
+                    level,
+                    parent_col.clone(),
+                );
+                if let (Some(fk), Some(mid_from), Some(mid_ty)) = (carry, mid_from, mid_ty) {
+                    let served = level.builder.select.iter().any(|item| match item {
+                        SelectItem::Column { output, .. } | SelectItem::Expr { output, .. } => {
+                            output == &fk
+                        }
+                        SelectItem::AllFrom { .. } => false,
+                    });
+                    if !served {
+                        if level.builder.select.is_empty() {
+                            level.builder.select.push(SelectItem::AllFrom { depth: 0 });
+                        }
+                        level.builder.select.push(SelectItem::Expr {
+                            expr: SqlExpr::Subquery {
+                                query: Box::new(SelectBuilder {
+                                    select: vec![SelectItem::Column {
+                                        depth: 0,
+                                        column: fk.clone(),
+                                        output: fk.clone(),
+                                        ty: Some(mid_ty),
+                                    }],
+                                    from: Some(mid_from),
+                                    where_: vec![SqlExpr::Binary {
+                                        op: SqlBinOp::Eq,
+                                        lhs: Box::new(SqlExpr::Column {
+                                            depth: 0,
+                                            column: parent_col.clone(),
+                                        }),
+                                        rhs: Box::new(SqlExpr::Column {
+                                            depth: 1,
+                                            column: child_col.clone(),
+                                        }),
+                                    }],
+                                    order_by: Vec::new(),
+                                    limit: None,
+                                    offset: None,
+                                    unions: Vec::new(),
+                                }),
+                            },
+                            output: fk,
+                            ty: Some(mid_ty),
+                        });
+                        level = wrap_level(ctx, level);
+                    }
+                }
                 level.pending = next.map(|boxed| *boxed);
                 level
             }
@@ -1298,9 +1364,6 @@ fn window_wrap(ctx: &mut Context, level: Level, fk: &str, order: Vec<OrderItem>)
         output_shapes,
         root_parts,
     } = level;
-    if pending.is_some() {
-        todo!("M4b window over split-pending child");
-    }
     if builder
         .select
         .iter()
@@ -1328,7 +1391,7 @@ fn window_wrap(ctx: &mut Context, level: Level, fk: &str, order: Vec<OrderItem>)
         builder,
         element,
         parent,
-        pending: None,
+        pending,
         stmt_bound,
         output_shapes,
         root_parts,
@@ -1408,6 +1471,24 @@ fn b1_optional_list(
         }
         let (shape, parent_key) = rvalue_shape(ctx, parent, inner);
         return (Vec::new(), shape, parent_key.into_iter().collect());
+    }
+    if let TypedExprKind::Method {
+        base: inner,
+        name,
+        args,
+        ..
+    } = &value.kind
+        && (name.value == "first" || name.value == "nth")
+        && matches!(&inner.kind, TypedExprKind::Field { .. })
+        && matches!(tail_root_ident(inner), Some(IdentBinding::Field(_)))
+        && !tail_uses_outer(value)
+    {
+        let collapse = if name.value == "first" {
+            CollapseKind::First
+        } else {
+            CollapseKind::Nth(one_arg(args, name))
+        };
+        return b1_nested_collapse(ctx, value, inner, collapse);
     }
     todo!("M4b presence: optional list item")
 }
@@ -1508,6 +1589,7 @@ fn b1_chained(
         inner_level,
         true,
         Some(tail_link.child_col.clone()),
+        false,
     );
     if inner.builder.select.is_empty() {
         inner.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
@@ -1582,6 +1664,108 @@ fn b1_chained(
         },
     };
     (Vec::new(), shape, outer_parent_key.into_iter().collect())
+}
+
+fn b1_nested_collapse(
+    ctx: &mut Context,
+    value: &TypedExpr,
+    inner: &TypedExpr,
+    collapse: CollapseKind<'_>,
+) -> (Vec<SelectItem>, ResultShape, Vec<String>) {
+    let (child_from, child_col, parent_key) = match tail_root_ident(inner) {
+        Some(IdentBinding::Field(fid)) => {
+            let link = resolve_tail_link(ctx, *fid);
+            if link.m2m_join.is_some() {
+                todo!("M4 many-to-many navigation");
+            }
+            (link.child_from, link.child_col, Some(link.parent_col))
+        }
+        _ => unreachable!("exotic nested collapse base: the b1 arm admits keyed field tails only"),
+    };
+    let child_level = Level {
+        builder: {
+            let mut child_builder = SelectBuilder::new();
+            child_builder.from = Some(child_from);
+            child_builder.where_ = vec![SqlExpr::InSubquery {
+                expr: Box::new(SqlExpr::Column {
+                    depth: 0,
+                    column: child_col.clone(),
+                }),
+                query: Box::new(bulk_query()),
+            }];
+            child_builder
+        },
+        element: inner.ty.clone(),
+        parent: ParentLink::Root { root_idx: 0 },
+        pending: None,
+        stmt_bound: true,
+        output_shapes: None,
+        root_parts: None,
+    };
+    let mut child = lower_tail(ctx, inner, child_level, true, Some(child_col.clone()), true);
+    if child.builder.select.is_empty() {
+        child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+    }
+    ensure_key(&mut child.builder, &child_col, ctx.schema);
+    let mut child = window_wrap(ctx, child, &child_col, Vec::new());
+    let rn = || SqlExpr::Column {
+        depth: 0,
+        column: "$$rn".to_string(),
+    };
+    match collapse {
+        CollapseKind::First => child.builder.where_.push(SqlExpr::Binary {
+            op: SqlBinOp::Le,
+            lhs: Box::new(rn()),
+            rhs: Box::new(SqlExpr::Param(ParamValue::Int(1))),
+        }),
+        CollapseKind::Nth(arg) => child.builder.where_.push(SqlExpr::Binary {
+            op: SqlBinOp::Eq,
+            lhs: Box::new(rn()),
+            rhs: Box::new(collapse_index(ctx, arg)),
+        }),
+    }
+    let Some(pending) = child.pending.take() else {
+        todo!("M4b presence: optional list item");
+    };
+    let (inner_nest, child_idx) = drain_pending_chain(ctx, pending, &value.ty);
+    if child.builder.select.is_empty() {
+        child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+    }
+    let shape_cols: Vec<OutputColumn> =
+        shape_columns(builder_output_types(&child.builder, ctx.schema), |name| {
+            name == child_col
+        });
+    let idx_outer = ctx.sink(
+        child.builder,
+        StatementShape {
+            columns: shape_cols,
+            rows: RowCount::Many,
+        },
+        StatementKind::Query,
+    );
+    debug_assert_eq!(
+        idx_outer, child_idx,
+        "nested collapse sank at an unexpected index: sink order changed"
+    );
+    let shape = ResultShape::Single {
+        element: Box::new(inner_nest),
+        child: ChildRef {
+            stmt: idx_outer,
+            parent: parent_key.clone().map(|parent_key| ParentRef {
+                stmt: if ctx.child.is_some() {
+                    PENDING_PARENT_STMT
+                } else {
+                    0
+                },
+                parent_key,
+                child_key: child_col,
+                negated: false,
+            }),
+            cardinality: Cardinality::One,
+            tag: None,
+        },
+    };
+    (Vec::new(), shape, parent_key.into_iter().collect())
 }
 
 fn split_opt_chain<'a>(
@@ -2524,6 +2708,7 @@ fn lower_tail(
     child_level: Level,
     per_row: bool,
     partition: Option<String>,
+    allow_pending: bool,
 ) -> Level {
     let anchor = tail_row_struct(ctx, tail);
     let was_child = ctx.child.replace(ChildCtx {
@@ -2536,7 +2721,7 @@ fn lower_tail(
     let child = rows(ctx, tail);
     ctx.child = was_child;
     ctx.no_outer = was_outer;
-    if child.pending.is_some() {
+    if child.pending.is_some() && !allow_pending {
         todo!("M4b nested collection inside child");
     }
     child
@@ -4790,7 +4975,15 @@ fn rvalue_shape(
         child_level,
         keyed,
         keyed.then(|| child_col.clone()),
+        true,
     );
+    let mut nested: Option<ResultShape> = None;
+    let mut nested_child_idx = 0;
+    if let Some(pending) = child.pending.take() {
+        let (inner, child_idx) = drain_pending_chain(ctx, pending, &tail.ty);
+        nested = Some(inner);
+        nested_child_idx = child_idx;
+    }
     if child.builder.select.is_empty() && m2m_join.is_none() {
         child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
     }
@@ -4846,13 +5039,16 @@ fn rvalue_shape(
         QueryType::List(sub) => sub.as_ref(),
         _ => &tail.ty,
     };
-    let mut element = child_element(
-        ctx.schema,
-        child.output_shapes.as_ref(),
-        item_ty,
-        &outputs,
-        |name| keyed && name == child_col,
-    );
+    let mut element = match nested {
+        Some(inner) => inner,
+        None => child_element(
+            ctx.schema,
+            child.output_shapes.as_ref(),
+            item_ty,
+            &outputs,
+            |name| keyed && name == child_col,
+        ),
+    };
     let idx = ctx.sink(
         child.builder,
         StatementShape {
@@ -4861,6 +5057,12 @@ fn rvalue_shape(
         },
         StatementKind::Query,
     );
+    if nested_child_idx != 0 {
+        debug_assert_eq!(
+            idx, nested_child_idx,
+            "nested child sank at an unexpected index: sink order changed"
+        );
+    }
     patch_pending_parents(&mut element, idx);
     let shape = ResultShape::List {
         element: Box::new(element),
@@ -5053,7 +5255,7 @@ fn build_capped_level(
         output_shapes: None,
         root_parts: None,
     };
-    let mut child = lower_tail(ctx, base, child_level, true, Some(child_col.clone()));
+    let mut child = lower_tail(ctx, base, child_level, true, Some(child_col.clone()), false);
     if child.builder.select.is_empty() {
         child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
     }
@@ -5372,6 +5574,7 @@ fn rscalar_shape(
         child_level,
         keyed,
         keyed.then(|| child_col.clone()),
+        false,
     );
     if child.builder.select.is_empty() {
         child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
@@ -5496,7 +5699,7 @@ fn rtemp_shape(
         child_fk: child_col.clone(),
         refs: Vec::new(),
     });
-    let mut child = lower_tail(ctx, tail, child_level, true, Some(child_col.clone()));
+    let mut child = lower_tail(ctx, tail, child_level, true, Some(child_col.clone()), false);
     let refs = ctx
         .temp_collect
         .take()
@@ -7128,6 +7331,20 @@ fn nest_layers(
     }
 }
 
+fn drain_pending_chain(
+    ctx: &mut Context,
+    pending: PendingSplit,
+    tail_ty: &QueryType,
+) -> (ResultShape, usize) {
+    let hops = drain_pending(pending);
+    let child_idx = ctx.statements.len() + hops.len() + 1;
+    let layers = sink_chain(ctx, &hops, child_idx);
+    (
+        nest_layers(ctx.schema, layers, tail_ty, false, None, 0),
+        child_idx,
+    )
+}
+
 fn middle_tuple(parts: &[MiddlePart], sub: Option<ResultShape>) -> ResultShape {
     if parts.iter().any(|part| middle_name(part).is_some()) {
         ResultShape::Record(
@@ -7924,8 +8141,18 @@ fn single_row_query(ctx: &mut Context, base: &TypedExpr, select: Vec<SelectItem>
     ctx.corr = was_corr;
     ctx.no_outer = was_outer;
     level.stmt_bound = false;
-    if level.pending.is_some() {
-        todo!("M4 single-row query over split-pending base");
+    while let Some(pending) = level.pending.take() {
+        let PendingSplit {
+            child_from,
+            child_col,
+            parent_col,
+            next,
+            ..
+        } = pending;
+        let floor = nest_floor(&level.builder.from);
+        level.builder = shift_nest_builder(level.builder, floor);
+        level = merge_navigate(ctx, child_from, child_col, level, parent_col);
+        level.pending = next.map(|boxed| *boxed);
     }
     if !level.builder.select.is_empty() || !level.builder.unions.is_empty() {
         level = wrap_level(ctx, level);
