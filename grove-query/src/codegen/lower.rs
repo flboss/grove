@@ -951,9 +951,7 @@ fn rows_method(
         "unwrap_or" if matches!(peel_optional(&level.element), QueryType::Record(_)) => {
             todo!("M4 presence-directed unwrap over records")
         }
-        "unwrap" => {
-            return assert_present_rows(ctx, level, "unwrap failed: value was none".to_string());
-        }
+        "unwrap" => assert_present_rows(ctx, level, "unwrap failed: value was none".to_string()),
         "unwrap_or" => {
             match peel_optional(&level.element) {
                 QueryType::List(_) => {
@@ -2028,7 +2026,7 @@ fn lower_value(
                     ctx.nest_depth -= 1;
                     return result;
                 }
-                return b1_optional_list(ctx, parent, value);
+                b1_optional_list(ctx, parent, value)
             }
             QueryType::Tuple(_) => unreachable!(
                 "optional-tuple value: Optional(Tuple) node types never arise — wrap_optional maps tuples element-wise, Some-of-tuple is rejected by the final check (QT0027)"
@@ -8625,9 +8623,10 @@ fn scalar_method(
         QueryType::Record(_) => {
             unreachable!("no methods take bare record bases: the checker rejects them")
         }
-        QueryType::Tuple(_) => match name.value.as_str() {
-            other => unreachable!("unknown tuple method {other}: the checker rejects it"),
-        },
+        QueryType::Tuple(_) => unreachable!(
+            "unknown tuple method {}: the checker rejects it",
+            name.value.as_str()
+        ),
         QueryType::Void | QueryType::Unknown => {
             unreachable!("checker never emits Void/Unknown method bases")
         }
