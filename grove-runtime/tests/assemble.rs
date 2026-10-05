@@ -1496,3 +1496,38 @@ fn key_failures_are_contract_errors() {
         RuntimeError::Contract(_)
     ));
 }
+
+#[test]
+fn contains_other_root_list() {
+    fn names(v: Value) -> Vec<String> {
+        match v {
+            Value::List(rows) => rows
+                .into_iter()
+                .map(|r| match r {
+                    Value::Record(fields) => match fields.iter().find(|(n, _)| n == "name") {
+                        Some((_, Value::String(n))) => n.clone(),
+                        other => panic!("name field, got {other:?}"),
+                    },
+                    other => panic!("user record, got {other:?}"),
+                })
+                .collect(),
+            other => panic!("root list, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        names(value(r#"users.filter(configs.name.contains("n1"))"#)),
+        vec!["Ada".to_string(), "Bob".to_string()]
+    );
+    assert!(names(value(r#"users.filter(configs.name.contains("zzz"))"#)).is_empty());
+}
+
+#[test]
+fn agg_navigation_derived_base() {
+    assert_eq!(
+        value("users { s = orders.total.sum() }"),
+        Value::List(vec![
+            Value::Record(vec![("s".to_string(), Value::Dec(dec("30")))]),
+            Value::Record(vec![("s".to_string(), Value::Dec(dec("30")))]),
+        ])
+    );
+}

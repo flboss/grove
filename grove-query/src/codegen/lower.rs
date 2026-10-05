@@ -1017,6 +1017,8 @@ fn wrap_level(ctx: &mut Context, level: Level) -> Level {
     if builder.select.is_empty() {
         builder.select = vec![SelectItem::AllFrom { depth: 0 }];
     }
+    let floor = nest_floor(&builder.from);
+    builder = shift_nest_builder(builder, floor);
     let alias = ctx.aliases.subquery();
     let mut outer = SelectBuilder::new();
     outer.from = Some(FromClause::Subquery {
@@ -2734,6 +2736,156 @@ fn shift_outer_builder(mut builder: SelectBuilder, by: usize) -> SelectBuilder {
         builder.from = Some(shift_outer_from(from, by));
     }
     builder
+}
+
+fn shift_nest_expr(expr: SqlExpr, floor: usize) -> SqlExpr {
+    match expr {
+        SqlExpr::Column { depth, column } if depth > floor => SqlExpr::Column {
+            depth: depth + 1,
+            column,
+        },
+        SqlExpr::InSubquery { expr, query } => SqlExpr::InSubquery {
+            expr: Box::new(shift_nest_expr(*expr, floor)),
+            query: Box::new(shift_nest_builder(*query, floor + 1)),
+        },
+        SqlExpr::Subquery { query } => SqlExpr::Subquery {
+            query: Box::new(shift_nest_builder(*query, floor + 1)),
+        },
+        SqlExpr::Exists(query) => SqlExpr::Exists(Box::new(shift_nest_builder(*query, floor + 1))),
+        SqlExpr::Binary { op, lhs, rhs } => SqlExpr::Binary {
+            op,
+            lhs: Box::new(shift_nest_expr(*lhs, floor)),
+            rhs: Box::new(shift_nest_expr(*rhs, floor)),
+        },
+        SqlExpr::Not(x) => SqlExpr::Not(Box::new(shift_nest_expr(*x, floor))),
+        SqlExpr::Func { name, args } => SqlExpr::Func {
+            name,
+            args: args
+                .into_iter()
+                .map(|a| shift_nest_expr(a, floor))
+                .collect(),
+        },
+        SqlExpr::Case { arms, else_ } => SqlExpr::Case {
+            arms: arms
+                .into_iter()
+                .map(|(c, t)| (shift_nest_expr(c, floor), shift_nest_expr(t, floor)))
+                .collect(),
+            else_: Box::new(shift_nest_expr(*else_, floor)),
+        },
+        SqlExpr::In { expr, items } => SqlExpr::In {
+            expr: Box::new(shift_nest_expr(*expr, floor)),
+            items: items
+                .into_iter()
+                .map(|i| shift_nest_expr(i, floor))
+                .collect(),
+        },
+        SqlExpr::Cast { expr, target } => SqlExpr::Cast {
+            expr: Box::new(shift_nest_expr(*expr, floor)),
+            target,
+        },
+        SqlExpr::Coalesce(values) => SqlExpr::Coalesce(
+            values
+                .into_iter()
+                .map(|v| shift_nest_expr(v, floor))
+                .collect(),
+        ),
+        SqlExpr::Window {
+            func,
+            partition,
+            order,
+        } => SqlExpr::Window {
+            func,
+            partition: partition
+                .into_iter()
+                .map(|p| shift_nest_expr(p, floor))
+                .collect(),
+            order: order
+                .into_iter()
+                .map(|item| OrderItem {
+                    expr: shift_nest_expr(item.expr, floor),
+                    dir: item.dir,
+                })
+                .collect(),
+        },
+        other => other,
+    }
+}
+
+fn nest_floor(from: &Option<FromClause>) -> usize {
+    match from {
+        Some(FromClause::Join { .. }) => 1,
+        _ => 0,
+    }
+}
+
+fn shift_nest_builder(mut builder: SelectBuilder, floor: usize) -> SelectBuilder {
+    builder.select = builder
+        .select
+        .into_iter()
+        .map(|item| match item {
+            SelectItem::AllFrom { depth } if depth > floor => {
+                SelectItem::AllFrom { depth: depth + 1 }
+            }
+            SelectItem::Column {
+                depth,
+                column,
+                output,
+                ty,
+            } if depth > floor => SelectItem::Column {
+                depth: depth + 1,
+                column,
+                output,
+                ty,
+            },
+            SelectItem::Expr { expr, output, ty } => SelectItem::Expr {
+                expr: shift_nest_expr(expr, floor),
+                output,
+                ty,
+            },
+            item => item,
+        })
+        .collect();
+    builder.where_ = builder
+        .where_
+        .into_iter()
+        .map(|w| shift_nest_expr(w, floor))
+        .collect();
+    builder.order_by = builder
+        .order_by
+        .into_iter()
+        .map(|item| OrderItem {
+            expr: shift_nest_expr(item.expr, floor),
+            dir: item.dir,
+        })
+        .collect();
+    if let Some(limit) = builder.limit.take() {
+        builder.limit = Some(shift_nest_expr(limit, floor));
+    }
+    if let Some(offset) = builder.offset.take() {
+        builder.offset = Some(shift_nest_expr(offset, floor));
+    }
+    builder.unions = builder
+        .unions
+        .into_iter()
+        .map(|arm| {
+            let floor = nest_floor(&arm.from);
+            shift_nest_builder(arm, floor)
+        })
+        .collect();
+    if let Some(from) = builder.from.take() {
+        builder.from = Some(shift_nest_from(from));
+    }
+    builder
+}
+
+fn shift_nest_from(from: FromClause) -> FromClause {
+    match from {
+        FromClause::Join { left, right } => FromClause::Join {
+            left: Box::new(shift_nest_from(*left)),
+            right: Box::new(shift_nest_from(*right)),
+        },
+        from => from,
+    }
 }
 
 fn shift_outer_from(from: FromClause, by: usize) -> FromClause {
@@ -7584,9 +7736,6 @@ fn single_hop_over_collapsed(
         let served = from_columns(&level.builder.from, ctx.schema);
         let column = literal_field_col(&served, fields, &name.value);
         let column_ty = record_column_ty(ctx, &base.ty, &name.value);
-        if !level.builder.select.is_empty() || !level.builder.unions.is_empty() {
-            level = wrap_level(ctx, level);
-        }
         level.builder.select = vec![SelectItem::Column {
             depth: 0,
             column: column.clone(),
@@ -8189,6 +8338,28 @@ fn scalar_list_col(ctx: &mut Context, base: &TypedExpr) -> String {
                 _ => unreachable!("reference ident in scalar aggregation: records aren't summable"),
             }
         }
+        TypedExprKind::Field { base, name, .. } => match &base.ty {
+            QueryType::List(inner) => match inner.as_ref() {
+                QueryType::Record(RecordSource::Schema(struct_id)) => {
+                    match ctx.schema.struct_field(*struct_id, &name.value) {
+                        Some((_, Field::Value { columns, .. }))
+                            if matches!(columns.as_slice(), [_]) =>
+                        {
+                            name.value.clone()
+                        }
+                        _ => todo!("M4b scalar aggregation over derived rows"),
+                    }
+                }
+                QueryType::Record(RecordSource::Projection(fields)) => {
+                    match fields.iter().find(|f| f.name == name.value) {
+                        Some(field) if field.ty.is_scalar() => name.value.clone(),
+                        _ => todo!("M4b scalar aggregation over derived rows"),
+                    }
+                }
+                _ => todo!("M4b scalar aggregation over derived rows"),
+            },
+            _ => todo!("M4b scalar aggregation over derived rows"),
+        },
         TypedExprKind::Method { base, name, .. }
             if ["take", "skip", "sort", "sort_asc", "sort_desc"].contains(&name.value.as_str()) =>
         {
@@ -8639,6 +8810,29 @@ fn one_arg<'a>(args: &'a [TypedMethodArg], name: &grove_types::Spanned<String>) 
     }
 }
 
+fn derived_contains_exists(ctx: &mut Context, base: &TypedExpr, needle: &TypedExpr) -> SqlExpr {
+    let value_col = scalar_list_col(ctx, base);
+    let mut level = rows(ctx, base);
+    if level.pending.is_some() {
+        todo!("M4b contains over derived collection");
+    }
+    if !level.builder.select.is_empty() || !level.builder.unions.is_empty() {
+        level = wrap_level(ctx, level);
+    }
+    if level.builder.select.is_empty() {
+        level.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+    }
+    level.builder.where_.push(SqlExpr::Binary {
+        op: SqlBinOp::Eq,
+        lhs: Box::new(SqlExpr::Column {
+            depth: 0,
+            column: value_col,
+        }),
+        rhs: Box::new(scalar(ctx, needle)),
+    });
+    SqlExpr::Exists(Box::new(level.builder))
+}
+
 fn contains_exists(ctx: &mut Context, base: &TypedExpr, needle: &TypedExpr) -> SqlExpr {
     if !needle.ty.is_scalar() {
         todo!("comparison-overhaul: composite membership");
@@ -8698,26 +8892,10 @@ fn contains_exists(ctx: &mut Context, base: &TypedExpr, needle: &TypedExpr) -> S
             if ["take", "skip", "sort", "sort_asc", "sort_desc", "flatten"]
                 .contains(&name.value.as_str()) =>
         {
-            let value_col = scalar_list_col(ctx, base);
-            let mut level = rows(ctx, base);
-            if level.pending.is_some() {
-                todo!("M4b contains over derived collection");
-            }
-            if !level.builder.select.is_empty() || !level.builder.unions.is_empty() {
-                level = wrap_level(ctx, level);
-            }
-            if level.builder.select.is_empty() {
-                level.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
-            }
-            level.builder.where_.push(SqlExpr::Binary {
-                op: SqlBinOp::Eq,
-                lhs: Box::new(SqlExpr::Column {
-                    depth: 0,
-                    column: value_col,
-                }),
-                rhs: Box::new(scalar(ctx, needle)),
-            });
-            return SqlExpr::Exists(Box::new(level.builder));
+            return derived_contains_exists(ctx, base, needle);
+        }
+        TypedExprKind::Field { .. } => {
+            return derived_contains_exists(ctx, base, needle);
         }
         TypedExprKind::Ident {
             binding: IdentBinding::Field(fid),
