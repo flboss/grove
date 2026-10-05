@@ -857,6 +857,39 @@ fn chained_over_collapsed_exec() {
 }
 
 #[test]
+fn unwrap_nav_field_aborts_on_missing() {
+    let mut rt = fixture();
+    let compiled = compile("users { m = mentor.unwrap().name }");
+    let err = rt.execute_value(&compiled).unwrap_err();
+    assert!(
+        matches!(err, RuntimeError::Aborted(_)),
+        "expected abort, got {err:?}"
+    );
+}
+
+#[test]
+fn unwrap_nav_field_present_values() {
+    assert_eq!(
+        value("users.filter(age > 30) { m = mentor.unwrap().name }"),
+        Value::List(vec![Value::Record(vec![(
+            "m".to_string(),
+            Value::String("Ada".to_string())
+        )])])
+    );
+}
+
+#[test]
+fn unwrap_nav_field_filter_aborts() {
+    let mut rt = fixture();
+    let compiled = compile("users.filter(mentor.unwrap().age > 20)");
+    let err = rt.execute_value(&compiled).unwrap_err();
+    assert!(
+        matches!(err, RuntimeError::Aborted(_)),
+        "expected abort, got {err:?}"
+    );
+}
+
+#[test]
 fn cross_proj_take_temp_pairs() {
     let Value::List(rows) = value("users { e = email } { x = configs.filter(owner == e).take(1) }")
     else {

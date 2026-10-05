@@ -1731,7 +1731,8 @@ fn assert_present_rows(ctx: &mut Context, level: Level, msg: String) -> Level {
     });
     base_inner.select = vec![SelectItem::AllFrom { depth: 0 }];
     let ncols = builder_outputs(&base_inner, ctx.schema).len();
-    let guard_base = base_inner.clone();
+    let mut base_inner = shift_outer_builder(base_inner, 2);
+    let guard_base = shift_outer_builder(base_inner.clone(), 2);
     base_inner.select.push(SelectItem::Expr {
         expr: SqlExpr::Param(ParamValue::Null),
         output: "$$abort".to_string(),
@@ -1864,7 +1865,8 @@ fn unwrap_or_rows(
         alias: ctx.aliases.subquery(),
     });
     base_inner.select = vec![SelectItem::AllFrom { depth: 0 }];
-    let guard_base = base_inner.clone();
+    let base_inner = shift_outer_builder(base_inner, 2);
+    let guard_base = shift_outer_builder(base_inner.clone(), 2);
     builder = base_inner;
     let default_level = rows(ctx, default);
     if default_level.pending.is_some() || !default_level.builder.unions.is_empty() {
@@ -2604,6 +2606,162 @@ fn shift_depths(expr: SqlExpr, by: usize) -> SqlExpr {
                 })
                 .collect(),
         },
+    }
+}
+
+fn shift_outer_depths(expr: SqlExpr, by: usize) -> SqlExpr {
+    if by == 0 {
+        return expr;
+    }
+    match expr {
+        SqlExpr::Column { depth, column } if depth > 0 => SqlExpr::Column {
+            depth: depth + by,
+            column,
+        },
+        SqlExpr::InSubquery { expr, query } => SqlExpr::InSubquery {
+            expr: Box::new(shift_outer_depths(*expr, by)),
+            query: Box::new(shift_outer_builder(*query, by)),
+        },
+        SqlExpr::Subquery { query } => SqlExpr::Subquery {
+            query: Box::new(shift_outer_builder(*query, by)),
+        },
+        SqlExpr::Exists(query) => SqlExpr::Exists(Box::new(shift_outer_builder(*query, by))),
+        SqlExpr::Binary { op, lhs, rhs } => SqlExpr::Binary {
+            op,
+            lhs: Box::new(shift_outer_depths(*lhs, by)),
+            rhs: Box::new(shift_outer_depths(*rhs, by)),
+        },
+        SqlExpr::Not(x) => SqlExpr::Not(Box::new(shift_outer_depths(*x, by))),
+        SqlExpr::Func { name, args } => SqlExpr::Func {
+            name,
+            args: args
+                .into_iter()
+                .map(|a| shift_outer_depths(a, by))
+                .collect(),
+        },
+        SqlExpr::Case { arms, else_ } => SqlExpr::Case {
+            arms: arms
+                .into_iter()
+                .map(|(c, t)| (shift_outer_depths(c, by), shift_outer_depths(t, by)))
+                .collect(),
+            else_: Box::new(shift_outer_depths(*else_, by)),
+        },
+        SqlExpr::In { expr, items } => SqlExpr::In {
+            expr: Box::new(shift_outer_depths(*expr, by)),
+            items: items
+                .into_iter()
+                .map(|i| shift_outer_depths(i, by))
+                .collect(),
+        },
+        SqlExpr::Cast { expr, target } => SqlExpr::Cast {
+            expr: Box::new(shift_outer_depths(*expr, by)),
+            target,
+        },
+        SqlExpr::Coalesce(values) => SqlExpr::Coalesce(
+            values
+                .into_iter()
+                .map(|v| shift_outer_depths(v, by))
+                .collect(),
+        ),
+        SqlExpr::Window {
+            func,
+            partition,
+            order,
+        } => SqlExpr::Window {
+            func,
+            partition: partition
+                .into_iter()
+                .map(|p| shift_outer_depths(p, by))
+                .collect(),
+            order: order
+                .into_iter()
+                .map(|item| OrderItem {
+                    expr: shift_outer_depths(item.expr, by),
+                    dir: item.dir,
+                })
+                .collect(),
+        },
+        other => other,
+    }
+}
+
+fn shift_outer_builder(mut builder: SelectBuilder, by: usize) -> SelectBuilder {
+    builder.select = builder
+        .select
+        .into_iter()
+        .map(|item| match item {
+            SelectItem::AllFrom { depth } if depth > 0 => SelectItem::AllFrom { depth: depth + by },
+            SelectItem::Column {
+                depth,
+                column,
+                output,
+                ty,
+            } if depth > 0 => SelectItem::Column {
+                depth: depth + by,
+                column,
+                output,
+                ty,
+            },
+            SelectItem::Expr { expr, output, ty } => SelectItem::Expr {
+                expr: shift_outer_depths(expr, by),
+                output,
+                ty,
+            },
+            item => item,
+        })
+        .collect();
+    builder.where_ = builder
+        .where_
+        .into_iter()
+        .map(|w| shift_outer_depths(w, by))
+        .collect();
+    builder.order_by = builder
+        .order_by
+        .into_iter()
+        .map(|item| OrderItem {
+            expr: shift_outer_depths(item.expr, by),
+            dir: item.dir,
+        })
+        .collect();
+    if let Some(limit) = builder.limit.take() {
+        builder.limit = Some(shift_outer_depths(limit, by));
+    }
+    if let Some(offset) = builder.offset.take() {
+        builder.offset = Some(shift_outer_depths(offset, by));
+    }
+    builder.unions = builder
+        .unions
+        .into_iter()
+        .map(|arm| shift_outer_builder(arm, by))
+        .collect();
+    if let Some(from) = builder.from.take() {
+        builder.from = Some(shift_outer_from(from, by));
+    }
+    builder
+}
+
+fn shift_outer_from(from: FromClause, by: usize) -> FromClause {
+    match from {
+        FromClause::Join { left, right } => FromClause::Join {
+            left: Box::new(shift_outer_from(*left, by)),
+            right: Box::new(shift_outer_from(*right, by)),
+        },
+        FromClause::Subquery { query, alias } => FromClause::Subquery {
+            query: Box::new(shift_outer_builder(*query, by)),
+            alias,
+        },
+        FromClause::Computed {
+            query,
+            alias,
+            columns,
+            middle_parts,
+        } => FromClause::Computed {
+            query: Box::new(shift_outer_builder(*query, by)),
+            alias,
+            columns,
+            middle_parts,
+        },
+        from => from,
     }
 }
 
