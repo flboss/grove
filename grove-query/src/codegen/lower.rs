@@ -920,6 +920,10 @@ fn rows_method(
                 if name.value == "take" || name.value == "skip" {
                     return window_take(ctx, level, &fk, &name.value, args);
                 }
+                if name.value == "first" || name.value == "nth" {
+                    let bound = lower_collapse_bound(ctx, &name.value, args);
+                    return window_take_bound(ctx, level, &fk, &name.value, bound);
+                }
                 todo!("M4b per-parent collapse inside child tail");
             }
             if level.pending.is_some() && !matches!(level.element, QueryType::List(_)) {
@@ -1394,6 +1398,19 @@ fn lower_take_bound(ctx: &mut Context, method: &str, args: &[TypedMethodArg]) ->
     };
     let was = std::mem::replace(&mut ctx.in_take_arg, true);
     let lowered = scalar(ctx, &arg.expr);
+    ctx.in_take_arg = was;
+    lowered
+}
+
+fn lower_collapse_bound(ctx: &mut Context, method: &str, args: &[TypedMethodArg]) -> SqlExpr {
+    if method == "first" {
+        return SqlExpr::Param(ParamValue::Int(1));
+    }
+    let [arg] = args else {
+        unreachable!("wrong arity for {method}: the checker enforces Fixed arg counts")
+    };
+    let was = std::mem::replace(&mut ctx.in_take_arg, true);
+    let lowered = collapse_index(ctx, &arg.expr);
     ctx.in_take_arg = was;
     lowered
 }
@@ -6270,7 +6287,10 @@ fn rscalar_shape(
                 }
                 return rows_collapse(ctx, tail);
             }
-            todo!("M4b ordered per-parent single")
+            if name.value != "nth" || !nth_temp_routable(tail) {
+                todo!("M4b ordered per-parent single")
+            }
+            tail
         }
         _ => tail,
     };
@@ -8920,6 +8940,37 @@ fn take_bound_ident(tail: &TypedExpr) -> bool {
         | TypedExprKind::Literal(_)
         | TypedExprKind::TypeConstant { .. } => false,
     }
+}
+
+fn nth_temp_routable(tail: &TypedExpr) -> bool {
+    let TypedExprKind::Method {
+        base, name, args, ..
+    } = &tail.kind
+    else {
+        return false;
+    };
+    if name.value != "nth" {
+        return false;
+    }
+    if !matches!(
+        &base.kind,
+        TypedExprKind::Ident {
+            binding: IdentBinding::Field(_),
+            ..
+        }
+    ) {
+        return false;
+    }
+    let [arg] = args.as_slice() else {
+        return false;
+    };
+    if !matches!(&arg.expr.ty, QueryType::Scalar(ScalarType::Int)) {
+        return false;
+    }
+    !any_ident(
+        &arg.expr,
+        &mut |e| matches!(&e.kind, TypedExprKind::Ident { depth, .. } if *depth > 1),
+    )
 }
 
 fn has_scope_ident(expr: &TypedExpr) -> bool {

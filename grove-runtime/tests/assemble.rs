@@ -2227,3 +2227,39 @@ fn per_row_skip_take_stack_values() {
         ])
     );
 }
+
+#[test]
+fn nth_temp_bound_values() {
+    assert_eq!(
+        value("users { o = orders.nth(age - age) }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "o".to_string(),
+                Value::Record(vec![("total".to_string(), Value::Dec(dec("10")))]),
+            )]),
+            Value::Record(vec![(
+                "o".to_string(),
+                Value::Record(vec![("total".to_string(), Value::Dec(dec("30")))]),
+            )]),
+            Value::Record(vec![("o".to_string(), Value::Null)]),
+        ])
+    );
+}
+
+#[test]
+fn nth_nav_bound_values() {
+    assert_eq!(
+        value("users { o = orders.nth(manager.age - manager.age) }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "o".to_string(),
+                Value::Record(vec![("total".to_string(), Value::Dec(dec("10")))]),
+            )]),
+            Value::Record(vec![(
+                "o".to_string(),
+                Value::Record(vec![("total".to_string(), Value::Dec(dec("30")))]),
+            )]),
+            Value::Record(vec![("o".to_string(), Value::Null)]),
+        ])
+    );
+}
