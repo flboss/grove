@@ -4790,6 +4790,57 @@ fn per_row_take_op(tail: &TypedExpr) -> Option<(Vec<(String, TypedExpr)>, TypedE
     Some((ops, peeled))
 }
 
+enum PerRowCollapse {
+    First,
+    Nth(TypedExpr),
+}
+
+type PerRowSingle = (Vec<(String, TypedExpr)>, TypedExpr, PerRowCollapse);
+
+fn per_row_single_op(tail: &TypedExpr) -> Option<PerRowSingle> {
+    let TypedExprKind::Method {
+        base,
+        name,
+        args,
+        optional,
+    } = &tail.kind
+    else {
+        return None;
+    };
+    if *optional {
+        return None;
+    }
+    let collapse = if name.value == "first" {
+        if !args.is_empty() {
+            return None;
+        }
+        PerRowCollapse::First
+    } else if name.value == "nth" {
+        let [arg] = args.as_slice() else {
+            return None;
+        };
+        if !matches!(&arg.expr.ty, QueryType::Scalar(ScalarType::Int)) {
+            return None;
+        }
+        if uses_outer(&arg.expr) || !bound_lang_ok(&arg.expr) {
+            return None;
+        }
+        PerRowCollapse::Nth(arg.expr.clone())
+    } else {
+        return None;
+    };
+    if !matches!(tail_root_ident(base), Some(IdentBinding::Root { .. })) {
+        return None;
+    }
+    if let Some((ops, peeled)) = per_row_take_op(base) {
+        return Some((ops, peeled, collapse));
+    }
+    if matches!(&collapse, PerRowCollapse::Nth(idx) if has_scope_ident(idx)) {
+        return Some((Vec::new(), base.as_ref().clone(), collapse));
+    }
+    None
+}
+
 fn bound_lang_ok(expr: &TypedExpr) -> bool {
     match &expr.kind {
         TypedExprKind::Literal(_) | TypedExprKind::TypeConstant { .. } => true,
@@ -5080,77 +5131,110 @@ fn const_proj_cross_shape(
     ))
 }
 
+fn carry_per_row_bound(
+    ctx: &mut Context,
+    parent: &mut Level,
+    bound: &TypedExpr,
+    i: usize,
+    carries: &mut Vec<(String, Option<ScalarType>)>,
+    computed: &mut Vec<(String, SqlExpr, ScalarType)>,
+) -> (String, String, ScalarType) {
+    enum BoundCarry {
+        Column(String),
+        Computed(SqlExpr),
+    }
+    let tbound = if i == 0 {
+        "$$tbound".to_string()
+    } else {
+        format!("$$tbound{i}")
+    };
+    let carry = match &bound.kind {
+        TypedExprKind::Ident {
+            binding: IdentBinding::Field(fid),
+            ..
+        } => {
+            let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
+            match field {
+                Field::Value { columns, .. } => match columns.as_slice() {
+                    [col] => BoundCarry::Column(ctx.schema.column_name(*col).to_string()),
+                    _ => todo!("M4b temp-bound per-row limit"),
+                },
+                _ => todo!("M4b temp-bound per-row limit"),
+            }
+        }
+        TypedExprKind::Ident {
+            binding: IdentBinding::ProjectedField { name },
+            ..
+        } => BoundCarry::Column(name.clone()),
+        _ => {
+            let was_take = std::mem::replace(&mut ctx.in_take_arg, false);
+            let lowered = scalar(ctx, bound);
+            ctx.in_take_arg = was_take;
+            if free_columns(&lowered, 0)
+                .iter()
+                .any(|c| output_ty(&parent.builder, c, ctx.schema).is_none())
+            {
+                todo!("M4b temp-bound per-row limit");
+            }
+            BoundCarry::Computed(lowered)
+        }
+    };
+    match carry {
+        BoundCarry::Column(name) => {
+            let ty = output_ty(&parent.builder, &name, ctx.schema).unwrap_or_else(|| {
+                todo!("M4b temp-bound per-row limit");
+            });
+            if !carries.iter().any(|(c, _)| c == &name) {
+                carries.push((name.clone(), Some(ty)));
+            }
+            (name, tbound, ty)
+        }
+        BoundCarry::Computed(lowered) => {
+            computed.push((tbound.clone(), lowered, ScalarType::Int));
+            (tbound.clone(), tbound, ScalarType::Int)
+        }
+    }
+}
+
 fn per_row_take_shape(
     ctx: &mut Context,
     parent: &mut Level,
     ops: &[(String, TypedExpr)],
     peeled: &TypedExpr,
+    collapse: Option<PerRowCollapse>,
 ) -> (ResultShape, Option<String>) {
-    enum BoundCarry {
-        Column(String),
-        Computed(SqlExpr),
-    }
-    let tbound_name = |i: usize| {
-        if i == 0 {
-            "$$tbound".to_string()
-        } else {
-            format!("$$tbound{i}")
-        }
-    };
     let mut carries: Vec<(String, Option<ScalarType>)> = Vec::new();
     let mut computed: Vec<(String, SqlExpr, ScalarType)> = Vec::new();
     let mut bounds: Vec<(String, String, ScalarType)> = Vec::new();
     for (i, (_, bound)) in ops.iter().enumerate() {
-        let carry = match &bound.kind {
-            TypedExprKind::Ident {
-                binding: IdentBinding::Field(fid),
-                ..
-            } => {
-                let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
-                match field {
-                    Field::Value { columns, .. } => match columns.as_slice() {
-                        [col] => BoundCarry::Column(ctx.schema.column_name(*col).to_string()),
-                        _ => todo!("M4b temp-bound per-row limit"),
-                    },
-                    _ => todo!("M4b temp-bound per-row limit"),
-                }
-            }
-            TypedExprKind::Ident {
-                binding: IdentBinding::ProjectedField { name },
-                ..
-            } => BoundCarry::Column(name.clone()),
-            _ => {
-                let was_take = std::mem::replace(&mut ctx.in_take_arg, false);
-                let lowered = scalar(ctx, bound);
-                ctx.in_take_arg = was_take;
-                if free_columns(&lowered, 0)
-                    .iter()
-                    .any(|c| output_ty(&parent.builder, c, ctx.schema).is_none())
-                {
-                    todo!("M4b temp-bound per-row limit");
-                }
-                BoundCarry::Computed(lowered)
-            }
-        };
-        match carry {
-            BoundCarry::Column(name) => {
-                let ty = output_ty(&parent.builder, &name, ctx.schema).unwrap_or_else(|| {
-                    todo!("M4b temp-bound per-row limit");
-                });
-                bounds.push((name.clone(), tbound_name(i), ty));
-                if !carries.iter().any(|(c, _)| c == &name) {
-                    carries.push((name, Some(ty)));
-                }
-            }
-            BoundCarry::Computed(lowered) => {
-                bounds.push((tbound_name(i), tbound_name(i), ScalarType::Int));
-                computed.push((tbound_name(i), lowered, ScalarType::Int));
-            }
-        }
+        let (carried, tbound, ty) =
+            carry_per_row_bound(ctx, parent, bound, i, &mut carries, &mut computed);
+        bounds.push((carried, tbound, ty));
     }
+    let collapse_carry = match &collapse {
+        Some(PerRowCollapse::Nth(idx)) => Some(carry_per_row_bound(
+            ctx,
+            parent,
+            idx,
+            ops.len(),
+            &mut carries,
+            &mut computed,
+        )),
+        _ => None,
+    };
     let (temp_idx, _, _, mut child) =
         cross_cartesian(ctx, parent, peeled, &carries, &computed, false);
     for (carried, tbound, ty) in &bounds {
+        child.builder.select.push(SelectItem::Expr {
+            expr: SqlExpr::Column {
+                depth: 1,
+                column: carried.clone(),
+            },
+            output: tbound.clone(),
+            ty: Some(*ty),
+        });
+    }
+    if let Some((carried, tbound, ty)) = &collapse_carry {
         child.builder.select.push(SelectItem::Expr {
             expr: SqlExpr::Column {
                 depth: 1,
@@ -5179,10 +5263,46 @@ fn per_row_take_shape(
             );
         }
     }
+    let cardinality = if collapse.is_some() {
+        Cardinality::One
+    } else {
+        Cardinality::Many
+    };
+    match &collapse {
+        None => {}
+        Some(PerRowCollapse::First) => {
+            child = window_take_bound(
+                ctx,
+                child,
+                "$$pkey",
+                "first",
+                SqlExpr::Param(ParamValue::Int(1)),
+            );
+        }
+        Some(PerRowCollapse::Nth(_)) => {
+            let (_, tbound, _) = collapse_carry
+                .as_ref()
+                .unwrap_or_else(|| unreachable!("nth collapse always carries its index"));
+            let indexed = SqlExpr::Func {
+                name: "$$add".to_string(),
+                args: vec![
+                    non_neg_guard(
+                        SqlExpr::Column {
+                            depth: 0,
+                            column: tbound.clone(),
+                        },
+                        "nth",
+                    ),
+                    SqlExpr::Param(ParamValue::Int(1)),
+                ],
+            };
+            child = window_take_bound(ctx, child, "$$pkey", "nth", indexed);
+        }
+    }
     if child.builder.select.is_empty() {
         child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
     }
-    sink_cross_child(ctx, child, temp_idx, &peeled.ty, Cardinality::Many)
+    sink_cross_child(ctx, child, temp_idx, &peeled.ty, cardinality)
 }
 
 struct PredLane<'a> {
@@ -6051,7 +6171,7 @@ fn rvalue_shape(
         && ctx.temp_collect.is_none()
         && let Some((ops, peeled)) = per_row_take_op(tail)
     {
-        return per_row_take_shape(ctx, parent, &ops, &peeled);
+        return per_row_take_shape(ctx, parent, &ops, &peeled, None);
     }
     let (child_from, child_col, parent_key, m2m_join) = match tail_root_ident(tail) {
         Some(IdentBinding::Field(fid)) => {
@@ -6675,6 +6795,10 @@ fn rscalar_shape(
                     return windowed_collapse(ctx, parent, inner, collapse, prefix);
                 }
                 return rows_collapse(ctx, tail);
+            } else if ctx.temp_collect.is_none()
+                && let Some((ops, peeled, collapse)) = per_row_single_op(tail)
+            {
+                return per_row_take_shape(ctx, parent, &ops, &peeled, Some(collapse));
             } else {
                 todo!("M4b ordered per-parent single");
             }
@@ -6695,6 +6819,12 @@ fn rscalar_shape(
                     return windowed_collapse(ctx, parent, inner, collapse, prefix);
                 }
                 return rows_collapse(ctx, tail);
+            }
+            if name.value == "nth"
+                && ctx.temp_collect.is_none()
+                && let Some((ops, peeled, collapse)) = per_row_single_op(tail)
+            {
+                return per_row_take_shape(ctx, parent, &ops, &peeled, Some(collapse));
             }
             if name.value != "nth" || !nth_temp_routable(tail) {
                 todo!("M4b ordered per-parent single")

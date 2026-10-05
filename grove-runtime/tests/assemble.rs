@@ -2229,6 +2229,61 @@ fn per_row_skip_take_stack_values() {
 }
 
 #[test]
+fn per_row_take_first_values() {
+    assert_eq!(
+        value("users { x = configs.take(age - 28).first() }"),
+        Value::List(vec![
+            Value::Record(vec![("x".to_string(), cfg("n1", "a@x"))]),
+            Value::Record(vec![("x".to_string(), cfg("n1", "a@x"))]),
+        ])
+    );
+}
+
+#[test]
+fn per_row_skip_first_values() {
+    assert_eq!(
+        value("users { x = configs.skip(age - 29).first() }"),
+        Value::List(vec![
+            Value::Record(vec![("x".to_string(), cfg("n2", "zzz"))]),
+            Value::Record(vec![("x".to_string(), Value::Null)]),
+        ])
+    );
+}
+
+#[test]
+fn per_row_take_nth_values() {
+    assert_eq!(
+        value("users { x = configs.take(age - 28).nth(age - 30) }"),
+        Value::List(vec![
+            Value::Record(vec![("x".to_string(), cfg("n1", "a@x"))]),
+            Value::Record(vec![("x".to_string(), Value::Null)]),
+        ])
+    );
+}
+
+#[test]
+fn per_row_nth_bound_values() {
+    assert_eq!(
+        value("users { x = configs.nth(age - 30) }"),
+        Value::List(vec![
+            Value::Record(vec![("x".to_string(), cfg("n1", "a@x"))]),
+            Value::Record(vec![("x".to_string(), Value::Null)]),
+        ])
+    );
+}
+
+#[test]
+fn per_row_nth_negative_aborts() {
+    let mut rt = fixture();
+    let compiled = compile("users { x = configs.nth(age - 31) }");
+    let err = rt.execute_value(&compiled).unwrap_err();
+    assert!(
+        matches!(err, RuntimeError::Aborted(_)),
+        "expected abort, got {err:?}"
+    );
+}
+
+#[test]
 fn nth_temp_bound_values() {
     assert_eq!(
         value("users { o = orders.nth(age - age) }"),
