@@ -2417,3 +2417,34 @@ fn sum_over_same_chain_twice_values() {
         ])
     );
 }
+
+#[test]
+fn take_sort_global_boundary_values() {
+    assert_eq!(
+        value("configs.sort(name).take(1).sort_desc(name)"),
+        Value::List(vec![cfg("a@x", "a@x")])
+    );
+}
+
+#[test]
+fn take_sort_windowed_boundary_values() {
+    assert_eq!(
+        value("users { o = orders.take(1).sort_desc(total) { total } }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "o".to_string(),
+                Value::List(vec![Value::Record(vec![(
+                    "total".to_string(),
+                    Value::Dec(dec("10"))
+                )])]),
+            )]),
+            Value::Record(vec![(
+                "o".to_string(),
+                Value::List(vec![Value::Record(vec![(
+                    "total".to_string(),
+                    Value::Dec(dec("30"))
+                )])]),
+            )]),
+        ])
+    );
+}
