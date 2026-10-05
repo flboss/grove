@@ -2187,3 +2187,43 @@ fn per_row_skip_computed_bound_values() {
         ])
     );
 }
+
+#[test]
+fn per_row_take_stack_values() {
+    assert_eq!(
+        value("users { x = configs.take(3).take(age - 28) }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![cfg("n1", "a@x"), cfg("n2", "zzz")])
+            )]),
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![cfg("n1", "a@x"), cfg("n2", "zzz"), cfg("n3", "b@x")])
+            )]),
+        ])
+    );
+}
+
+#[test]
+fn per_row_skip_take_stack_values() {
+    assert_eq!(
+        value("users { x = configs.skip(1).take(age - 28) }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![cfg("n2", "zzz"), cfg("n3", "b@x")])
+            )]),
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![
+                    cfg("n2", "zzz"),
+                    cfg("n3", "b@x"),
+                    cfg("b@x", "zzz"),
+                    cfg("a@x", "a@x"),
+                    cfg("n1", "zzz"),
+                ])
+            )]),
+        ])
+    );
+}

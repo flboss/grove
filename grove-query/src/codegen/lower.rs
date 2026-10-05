@@ -4591,25 +4591,30 @@ fn rcross_shape(
     (shape, Some(corr.outer_col.clone()))
 }
 
-fn per_row_take_op(tail: &TypedExpr) -> Option<(String, TypedExpr, TypedExpr)> {
+fn per_row_take_op(tail: &TypedExpr) -> Option<(Vec<(String, TypedExpr)>, TypedExpr)> {
     let mut suffix = Vec::new();
     let peeled = peel_cross_window(tail, &mut suffix, true);
-    let [(method, args)] = suffix.as_slice() else {
-        return None;
-    };
-    let [arg] = args.as_slice() else {
-        return None;
-    };
-    if !matches!(&arg.expr.ty, QueryType::Scalar(ScalarType::Int)) {
+    if suffix.is_empty() {
         return None;
     }
-    if !has_scope_ident(&arg.expr) || uses_outer(&arg.expr) {
+    let mut ops = Vec::new();
+    for (method, args) in &suffix {
+        let [arg] = args.as_slice() else {
+            return None;
+        };
+        if !matches!(&arg.expr.ty, QueryType::Scalar(ScalarType::Int)) {
+            return None;
+        }
+        if uses_outer(&arg.expr) || !bound_lang_ok(&arg.expr) {
+            return None;
+        }
+        ops.push((method.clone(), arg.expr.clone()));
+    }
+    if !ops.iter().any(|(_, bound)| has_scope_ident(bound)) {
         return None;
     }
-    if !bound_lang_ok(&arg.expr) {
-        return None;
-    }
-    Some((method.clone(), arg.expr.clone(), peeled))
+    ops.reverse();
+    Some((ops, peeled))
 }
 
 fn bound_lang_ok(expr: &TypedExpr) -> bool {
@@ -4904,87 +4909,101 @@ fn const_proj_cross_shape(
 fn per_row_take_shape(
     ctx: &mut Context,
     parent: &mut Level,
-    method: &str,
-    bound: &TypedExpr,
+    ops: &[(String, TypedExpr)],
     peeled: &TypedExpr,
 ) -> (ResultShape, Option<String>) {
     enum BoundCarry {
         Column(String),
         Computed(SqlExpr),
     }
-    let carry = match &bound.kind {
-        TypedExprKind::Ident {
-            binding: IdentBinding::Field(fid),
-            ..
-        } => {
-            let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
-            match field {
-                Field::Value { columns, .. } => match columns.as_slice() {
-                    [col] => BoundCarry::Column(ctx.schema.column_name(*col).to_string()),
+    let tbound_name = |i: usize| {
+        if i == 0 {
+            "$$tbound".to_string()
+        } else {
+            format!("$$tbound{i}")
+        }
+    };
+    let mut carries: Vec<(String, ScalarType)> = Vec::new();
+    let mut computed: Vec<(String, SqlExpr, ScalarType)> = Vec::new();
+    let mut bounds: Vec<(String, String, ScalarType)> = Vec::new();
+    for (i, (_, bound)) in ops.iter().enumerate() {
+        let carry = match &bound.kind {
+            TypedExprKind::Ident {
+                binding: IdentBinding::Field(fid),
+                ..
+            } => {
+                let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
+                match field {
+                    Field::Value { columns, .. } => match columns.as_slice() {
+                        [col] => BoundCarry::Column(ctx.schema.column_name(*col).to_string()),
+                        _ => todo!("M4b temp-bound per-row limit"),
+                    },
                     _ => todo!("M4b temp-bound per-row limit"),
-                },
-                _ => todo!("M4b temp-bound per-row limit"),
+                }
+            }
+            TypedExprKind::Ident {
+                binding: IdentBinding::ProjectedField { name },
+                ..
+            } => BoundCarry::Column(name.clone()),
+            _ => {
+                let was_take = std::mem::replace(&mut ctx.in_take_arg, false);
+                let lowered = scalar(ctx, bound);
+                ctx.in_take_arg = was_take;
+                if free_columns(&lowered, 0)
+                    .iter()
+                    .any(|c| output_ty(&parent.builder, c, ctx.schema).is_none())
+                {
+                    todo!("M4b temp-bound per-row limit");
+                }
+                BoundCarry::Computed(lowered)
+            }
+        };
+        match carry {
+            BoundCarry::Column(name) => {
+                let ty = output_ty(&parent.builder, &name, ctx.schema).unwrap_or_else(|| {
+                    todo!("M4b temp-bound per-row limit");
+                });
+                bounds.push((name.clone(), tbound_name(i), ty));
+                if !carries.iter().any(|(c, _)| c == &name) {
+                    carries.push((name, ty));
+                }
+            }
+            BoundCarry::Computed(lowered) => {
+                bounds.push((tbound_name(i), tbound_name(i), ScalarType::Int));
+                computed.push((tbound_name(i), lowered, ScalarType::Int));
             }
         }
-        TypedExprKind::Ident {
-            binding: IdentBinding::ProjectedField { name },
-            ..
-        } => BoundCarry::Column(name.clone()),
-        _ => {
-            let was_take = std::mem::replace(&mut ctx.in_take_arg, false);
-            let lowered = scalar(ctx, bound);
-            ctx.in_take_arg = was_take;
-            if free_columns(&lowered, 0)
-                .iter()
-                .any(|c| output_ty(&parent.builder, c, ctx.schema).is_none())
-            {
-                todo!("M4b temp-bound per-row limit");
-            }
-            BoundCarry::Computed(lowered)
-        }
-    };
-    let (bound_name, bound_ty, carries, computed): (
-        String,
-        ScalarType,
-        Vec<(String, ScalarType)>,
-        Vec<(String, SqlExpr, ScalarType)>,
-    ) = match carry {
-        BoundCarry::Column(name) => {
-            let ty = output_ty(&parent.builder, &name, ctx.schema).unwrap_or_else(|| {
-                todo!("M4b temp-bound per-row limit");
-            });
-            let carries = vec![(name.clone(), ty)];
-            (name, ty, carries, Vec::new())
-        }
-        BoundCarry::Computed(lowered) => (
-            "$$tbound".to_string(),
-            ScalarType::Int,
-            Vec::new(),
-            vec![("$$tbound".to_string(), lowered, ScalarType::Int)],
-        ),
-    };
+    }
     let (temp_idx, _, mut child) = cross_cartesian(ctx, parent, peeled, &carries, &computed, false);
-    child.builder.select.push(SelectItem::Expr {
-        expr: SqlExpr::Column {
-            depth: 1,
-            column: bound_name.clone(),
-        },
-        output: "$$tbound".to_string(),
-        ty: Some(bound_ty),
-    });
+    for (carried, tbound, ty) in &bounds {
+        child.builder.select.push(SelectItem::Expr {
+            expr: SqlExpr::Column {
+                depth: 1,
+                column: carried.clone(),
+            },
+            output: tbound.clone(),
+            ty: Some(*ty),
+        });
+    }
     let order = std::mem::take(&mut child.builder.order_by);
     let mut wrapped = wrap_level(ctx, child);
     wrapped.builder.order_by = order;
-    let mut child = window_take_bound(
-        ctx,
-        wrapped,
-        "$$pkey",
-        method,
-        SqlExpr::Column {
+    let mut child = wrapped;
+    for (j, ((method, _), (_, tbound, _))) in ops.iter().zip(bounds.iter()).enumerate() {
+        let bound = SqlExpr::Column {
             depth: 0,
-            column: "$$tbound".to_string(),
-        },
-    );
+            column: tbound.clone(),
+        };
+        if j == 0 {
+            child = window_take_bound(ctx, child, "$$pkey", method, bound);
+        } else if has_window_bound(&child.builder) {
+            conjoin_window_bound(&mut child.builder, method, bound);
+        } else {
+            unreachable!(
+                "stacked per-row take without a window: the first op windows unconditionally"
+            );
+        }
+    }
     if child.builder.select.is_empty() {
         child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
     }
@@ -5604,9 +5623,9 @@ fn rvalue_shape(
     }
     if matches!(tail_root_ident(tail), Some(IdentBinding::Root { .. }))
         && ctx.temp_collect.is_none()
-        && let Some((method, bound, peeled)) = per_row_take_op(tail)
+        && let Some((ops, peeled)) = per_row_take_op(tail)
     {
-        return per_row_take_shape(ctx, parent, &method, &bound, &peeled);
+        return per_row_take_shape(ctx, parent, &ops, &peeled);
     }
     let (child_from, child_col, parent_key, m2m_join) = match tail_root_ident(tail) {
         Some(IdentBinding::Field(fid)) => {
