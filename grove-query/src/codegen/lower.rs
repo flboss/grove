@@ -300,9 +300,7 @@ fn rows_ident(ctx: &mut Context, binding: &IdentBinding, ty: &QueryType) -> Leve
     match binding {
         IdentBinding::Root { root_idx } => fresh_root_level(ctx, *root_idx, ty),
         IdentBinding::Field(fid) if ctx.corr => corr_base_level(ctx, *fid, ty),
-        _ => unreachable!(
-            "non-root ident in row demand: scope idents are scalar, projection outputs route through items"
-        ),
+        _ => todo!("M4b scalar aggregation over derived rows"),
     }
 }
 
@@ -4585,9 +4583,7 @@ fn rvalue_shape(
                 None,
             )
         }
-        _ => unreachable!(
-            "exotic tail root: tail roots are Field/Root idents or Array/If nodes (all routed before this match); remaining kinds infer non-List types, contradicting the List-only callers"
-        ),
+        _ => todo!("M4b projected root inside child tail"),
     };
     let keyed = parent_key.is_some();
     let mut child_builder = SelectBuilder::new();
