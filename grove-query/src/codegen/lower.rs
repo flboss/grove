@@ -8642,7 +8642,7 @@ fn shape_columns(
 }
 
 enum ChainRoot<'a> {
-    Enclosing,
+    Enclosing(usize),
     Global(Box<Level>),
     Collapsed(&'a TypedExpr),
 }
@@ -8681,6 +8681,7 @@ fn scalar_field(
             }
             TypedExprKind::Ident {
                 binding: IdentBinding::Field(fid),
+                depth,
                 ..
             } => {
                 let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
@@ -8689,7 +8690,7 @@ fn scalar_field(
                     _ => unreachable!("value-typed chain root: fields of scalars don't exist"),
                 }
                 hops.push((fid.struct_id(), *fid));
-                break ChainRoot::Enclosing;
+                break ChainRoot::Enclosing(*depth);
             }
             TypedExprKind::Ident {
                 binding: IdentBinding::ProjectedField { .. },
@@ -8709,6 +8710,10 @@ fn scalar_field(
     };
     hops.reverse();
 
+    let enclosing_depth = match &root {
+        ChainRoot::Enclosing(depth) => Some(*depth),
+        _ => None,
+    };
     let global_parent = match root {
         ChainRoot::Collapsed(base) if hops.is_empty() => {
             return single_hop_over_collapsed(ctx, base, name);
@@ -8736,7 +8741,7 @@ fn scalar_field(
                 root_parts: None,
             }))
         }
-        ChainRoot::Enclosing => {
+        ChainRoot::Enclosing(_) => {
             if hops.is_empty() {
                 unreachable!("ident chain root always contributes a hop");
             }
@@ -8753,10 +8758,22 @@ fn scalar_field(
     let (_, first_fid) = hops[0];
     let (next_source, first_shell) = match global_parent {
         Some(parent) => global_first_hop(ctx, *parent, source, first_fid),
-        None if ctx.temp_collect.is_some() && !ctx.in_array_temp => {
+        None if ctx.temp_collect.is_some()
+            && !ctx.in_array_temp
+            && ((ctx.in_take_arg && enclosing_depth == Some(0))
+                || (!ctx.in_take_arg && enclosing_depth == Some(1))) =>
+        {
             temp_first_hop(ctx, source, first_fid)
         }
-        None => hop_shell(ctx, source, first_fid),
+        None if ctx.in_take_arg && ctx.temp_collect.is_none() => {
+            todo!("M4b temp-bound per-row limit")
+        }
+        None => hop_shell_at(
+            ctx,
+            source,
+            first_fid,
+            enclosing_depth.map_or(1, |depth| depth + 1),
+        ),
     };
     source = next_source;
     let mut shells = vec![first_shell];
@@ -9216,6 +9233,15 @@ fn link_cols(schema: &ValidatedSchema, fid: FieldId) -> LinkCols {
 }
 
 fn hop_shell(ctx: &mut Context, source: StructId, fid: FieldId) -> (StructId, SelectBuilder) {
+    hop_shell_at(ctx, source, fid, 1)
+}
+
+fn hop_shell_at(
+    ctx: &mut Context,
+    source: StructId,
+    fid: FieldId,
+    depth: usize,
+) -> (StructId, SelectBuilder) {
     let field = &ctx.schema.structs[source.index()].fields[fid.local()];
     let target = match field {
         Field::Ref { target, .. } => *target,
@@ -9223,7 +9249,7 @@ fn hop_shell(ctx: &mut Context, source: StructId, fid: FieldId) -> (StructId, Se
     };
     let (child_col, parent_col) = hop_link_cols(ctx.schema, fid);
     let parent_rhs = SqlExpr::Column {
-        depth: 1,
+        depth,
         column: parent_col,
     };
     (target, hop_shell_on(child_col, parent_rhs, ctx, target))
@@ -9476,6 +9502,794 @@ fn over_arg(
         }
     }
     (ty, scalar(ctx, arg))
+}
+
+fn over_arg_agg(
+    ctx: &mut Context,
+    base: &TypedExpr,
+    args: &[TypedMethodArg],
+    name: &grove_types::Spanned<String>,
+) -> (ScalarType, SqlExpr) {
+    let arg = one_arg(args, name);
+    let ty = match &arg.ty {
+        QueryType::Scalar(s) => *s,
+        _ => unreachable!("summable scoped arg is scalar: the checker enforces it"),
+    };
+    let mut chains: Vec<Vec<usize>> = Vec::new();
+    let mut path: Vec<usize> = Vec::new();
+    if !collect_over_chains(arg, false, &mut path, &mut chains) {
+        todo!("M4b scoped navigation");
+    }
+    if chains.is_empty() {
+        return (ty, scalar(ctx, arg));
+    }
+    if ctx.child.is_some() && ctx.temp_collect.is_none() {
+        todo!("M4b scoped navigation");
+    }
+    if !agg_simple_base(base) {
+        todo!("M4b scoped navigation");
+    }
+    let Some(fid) = spine_root_field(base) else {
+        todo!("M4b scoped navigation");
+    };
+    if resolve_tail_link(ctx, fid).m2m_join.is_some() {
+        todo!("M4b scoped navigation");
+    }
+    if ctx.temp_collect.is_some() {
+        if ctx.in_array_temp {
+            todo!("M4b scoped navigation");
+        }
+        return (ty, scalar(ctx, arg));
+    }
+    let link = resolve_tail_link(ctx, fid);
+    let mut shells: Vec<(String, SqlExpr)> = Vec::new();
+    for (i, chain_path) in chains.iter().enumerate() {
+        let marker = format!("$$overchain{i}");
+        shells.push((
+            marker,
+            inline_chain_shell(ctx, arg, chain_path, &link.child_col, &link.parent_col),
+        ));
+    }
+    let rewritten = subst_over_markers(arg, &chains);
+    let mut lowered = scalar(ctx, &rewritten);
+    splice_over_shells(&mut lowered, &shells);
+    (ty, lowered)
+}
+
+fn agg_simple_base(node: &TypedExpr) -> bool {
+    match &node.kind {
+        TypedExprKind::Ident { .. } => true,
+        TypedExprKind::Method { base, name, .. }
+            if ["filter", "sort", "sort_asc", "sort_desc", "take", "skip"]
+                .contains(&name.value.as_str()) =>
+        {
+            agg_simple_base(base)
+        }
+        _ => false,
+    }
+}
+
+fn spine_root_field(mut node: &TypedExpr) -> Option<FieldId> {
+    loop {
+        match &node.kind {
+            TypedExprKind::Field { base, .. }
+            | TypedExprKind::Method { base, .. }
+            | TypedExprKind::Projection { base, .. } => node = base,
+            TypedExprKind::Ident {
+                binding: IdentBinding::Field(fid),
+                ..
+            } => return Some(*fid),
+            _ => return None,
+        }
+    }
+}
+
+fn collect_over_chains(
+    expr: &TypedExpr,
+    nested: bool,
+    path: &mut Vec<usize>,
+    out: &mut Vec<Vec<usize>>,
+) -> bool {
+    match &expr.kind {
+        TypedExprKind::Field { base, .. } => {
+            let mut cursor = base.as_ref();
+            while let TypedExprKind::Field { base: next, .. } = &cursor.kind {
+                cursor = next;
+            }
+            if let TypedExprKind::Ident {
+                binding: IdentBinding::Field(_),
+                depth,
+                ..
+            } = &cursor.kind
+            {
+                if *depth > 1 {
+                    return false;
+                }
+                if *depth == 1 {
+                    if nested {
+                        return false;
+                    }
+                    out.push(path.clone());
+                    return true;
+                }
+                return true;
+            }
+            path.push(0);
+            let ok = collect_over_chains(base, true, path, out);
+            path.pop();
+            ok
+        }
+        TypedExprKind::Method { base, args, .. } => {
+            path.push(0);
+            let mut ok = collect_over_chains(base, true, path, out);
+            path.pop();
+            for (i, arg) in args.iter().enumerate() {
+                path.push(i + 1);
+                ok = collect_over_chains(&arg.expr, true, path, out) && ok;
+                path.pop();
+            }
+            ok
+        }
+        TypedExprKind::Binary { lhs, rhs, .. } => {
+            path.push(0);
+            let mut ok = collect_over_chains(lhs, nested, path, out);
+            path.pop();
+            path.push(1);
+            ok = collect_over_chains(rhs, nested, path, out) && ok;
+            path.pop();
+            ok
+        }
+        TypedExprKind::Unary { expr, .. } | TypedExprKind::Cast { expr, .. } => {
+            path.push(0);
+            let ok = collect_over_chains(expr, nested, path, out);
+            path.pop();
+            ok
+        }
+        TypedExprKind::If { arms, default } => {
+            let mut ok = true;
+            for (i, (cond, then)) in arms.iter().enumerate() {
+                path.push(2 * i);
+                ok = collect_over_chains(cond, nested, path, out) && ok;
+                path.pop();
+                path.push(2 * i + 1);
+                ok = collect_over_chains(then, nested, path, out) && ok;
+                path.pop();
+            }
+            path.push(2 * arms.len());
+            ok = collect_over_chains(default, nested, path, out) && ok;
+            path.pop();
+            ok
+        }
+        TypedExprKind::Some { value } => {
+            path.push(0);
+            let ok = collect_over_chains(value, nested, path, out);
+            path.pop();
+            ok
+        }
+        TypedExprKind::Tuple { elements } | TypedExprKind::Array { elements } => {
+            let mut ok = true;
+            for (i, element) in elements.iter().enumerate() {
+                path.push(i);
+                ok = collect_over_chains(element, true, path, out) && ok;
+                path.pop();
+            }
+            ok
+        }
+        TypedExprKind::Struct { fields } => {
+            let mut ok = true;
+            for (i, (_, value)) in fields.iter().enumerate() {
+                path.push(i);
+                ok = collect_over_chains(value, true, path, out) && ok;
+                path.pop();
+            }
+            ok
+        }
+        TypedExprKind::Projection { base, items } => {
+            path.push(0);
+            let mut ok = collect_over_chains(base, true, path, out);
+            path.pop();
+            for (i, item) in items.iter().enumerate() {
+                path.push(i + 1);
+                ok = collect_over_chains(&item.value, true, path, out) && ok;
+                path.pop();
+            }
+            ok
+        }
+        TypedExprKind::Ident {
+            binding: IdentBinding::Field(_),
+            depth,
+            ..
+        } => {
+            if *depth > 1 {
+                return false;
+            }
+            if *depth == 1 {
+                if nested {
+                    return false;
+                }
+                out.push(path.clone());
+            }
+            true
+        }
+        _ => true,
+    }
+}
+
+fn subst_over_markers(expr: &TypedExpr, chains: &[Vec<usize>]) -> TypedExpr {
+    subst_over_markers_at(expr, chains, &[])
+}
+
+fn subst_over_markers_at(expr: &TypedExpr, chains: &[Vec<usize>], path: &[usize]) -> TypedExpr {
+    if let Some(index) = chains.iter().position(|p| p.as_slice() == path) {
+        let marker = format!("$$overchain{index}");
+        return TypedExpr {
+            kind: TypedExprKind::Ident {
+                name: grove_types::Spanned {
+                    value: marker.clone(),
+                    span: expr.span,
+                },
+                binding: IdentBinding::ProjectedField { name: marker },
+                depth: 1,
+            },
+            ty: expr.ty.clone(),
+            span: expr.span,
+        };
+    }
+    let child = |i: usize| {
+        let mut next = path.to_vec();
+        next.push(i);
+        next
+    };
+    let kind = match &expr.kind {
+        TypedExprKind::Field {
+            base,
+            name,
+            optional,
+        } => TypedExprKind::Field {
+            base: Box::new(subst_over_markers_at(base, chains, &child(0))),
+            name: name.clone(),
+            optional: *optional,
+        },
+        TypedExprKind::Method {
+            base,
+            name,
+            args,
+            optional,
+        } => TypedExprKind::Method {
+            base: Box::new(subst_over_markers_at(base, chains, &child(0))),
+            name: name.clone(),
+            args: args
+                .iter()
+                .enumerate()
+                .map(|(i, arg)| TypedMethodArg {
+                    direction: arg.direction.clone(),
+                    expr: subst_over_markers_at(&arg.expr, chains, &child(i + 1)),
+                })
+                .collect(),
+            optional: *optional,
+        },
+        TypedExprKind::Binary { op, lhs, rhs } => TypedExprKind::Binary {
+            op: op.clone(),
+            lhs: Box::new(subst_over_markers_at(lhs, chains, &child(0))),
+            rhs: Box::new(subst_over_markers_at(rhs, chains, &child(1))),
+        },
+        TypedExprKind::Unary { op, expr: inner } => TypedExprKind::Unary {
+            op: op.clone(),
+            expr: Box::new(subst_over_markers_at(inner, chains, &child(0))),
+        },
+        TypedExprKind::Cast { expr: inner, ty } => TypedExprKind::Cast {
+            expr: Box::new(subst_over_markers_at(inner, chains, &child(0))),
+            ty: ty.clone(),
+        },
+        TypedExprKind::If { arms, default } => TypedExprKind::If {
+            arms: arms
+                .iter()
+                .enumerate()
+                .map(|(i, (cond, then))| {
+                    (
+                        subst_over_markers_at(cond, chains, &child(2 * i)),
+                        subst_over_markers_at(then, chains, &child(2 * i + 1)),
+                    )
+                })
+                .collect(),
+            default: Box::new(subst_over_markers_at(
+                default,
+                chains,
+                &child(2 * arms.len()),
+            )),
+        },
+        TypedExprKind::Some { value } => TypedExprKind::Some {
+            value: Box::new(subst_over_markers_at(value, chains, &child(0))),
+        },
+        TypedExprKind::Tuple { elements } => TypedExprKind::Tuple {
+            elements: elements
+                .iter()
+                .enumerate()
+                .map(|(i, element)| subst_over_markers_at(element, chains, &child(i)))
+                .collect(),
+        },
+        TypedExprKind::Array { elements } => TypedExprKind::Array {
+            elements: elements
+                .iter()
+                .enumerate()
+                .map(|(i, element)| subst_over_markers_at(element, chains, &child(i)))
+                .collect(),
+        },
+        TypedExprKind::Struct { fields } => TypedExprKind::Struct {
+            fields: fields
+                .iter()
+                .enumerate()
+                .map(|(i, (name, value))| {
+                    (
+                        name.clone(),
+                        subst_over_markers_at(value, chains, &child(i)),
+                    )
+                })
+                .collect(),
+        },
+        TypedExprKind::Projection { base, items } => TypedExprKind::Projection {
+            base: Box::new(subst_over_markers_at(base, chains, &child(0))),
+            items: items
+                .iter()
+                .enumerate()
+                .map(|(i, item)| TypedProjectionItem {
+                    alias: item.alias.clone(),
+                    value: subst_over_markers_at(&item.value, chains, &child(i + 1)),
+                })
+                .collect(),
+        },
+        _ => return expr.clone(),
+    };
+    TypedExpr {
+        kind,
+        ty: expr.ty.clone(),
+        span: expr.span,
+    }
+}
+
+fn splice_over_shells(expr: &mut SqlExpr, shells: &[(String, SqlExpr)]) {
+    match expr {
+        SqlExpr::Column { column, .. } => {
+            if let Some((_, shell)) = shells.iter().find(|(marker, _)| marker == column) {
+                *expr = shell.clone();
+            }
+        }
+        SqlExpr::Param(_) | SqlExpr::Count => {}
+        SqlExpr::Binary { lhs, rhs, .. } => {
+            splice_over_shells(lhs, shells);
+            splice_over_shells(rhs, shells);
+        }
+        SqlExpr::Not(inner) | SqlExpr::Cast { expr: inner, .. } => {
+            splice_over_shells(inner, shells)
+        }
+        SqlExpr::Func { args, .. } => {
+            for arg in args {
+                splice_over_shells(arg, shells);
+            }
+        }
+        SqlExpr::Case { arms, else_ } => {
+            for (cond, then) in arms {
+                splice_over_shells(cond, shells);
+                splice_over_shells(then, shells);
+            }
+            splice_over_shells(else_, shells);
+        }
+        SqlExpr::In { expr, items } => {
+            splice_over_shells(expr, shells);
+            for item in items {
+                splice_over_shells(item, shells);
+            }
+        }
+        SqlExpr::Coalesce(items) => {
+            for item in items {
+                splice_over_shells(item, shells);
+            }
+        }
+        SqlExpr::InSubquery { expr, query } => {
+            splice_over_shells(expr, shells);
+            splice_builder_shells(query, shells);
+        }
+        SqlExpr::Subquery { query } | SqlExpr::Exists(query) => {
+            splice_builder_shells(query, shells)
+        }
+        SqlExpr::Window {
+            partition, order, ..
+        } => {
+            for part in partition {
+                splice_over_shells(part, shells);
+            }
+            for item in order {
+                splice_over_shells(&mut item.expr, shells);
+            }
+        }
+    }
+}
+
+fn splice_builder_shells(builder: &mut SelectBuilder, shells: &[(String, SqlExpr)]) {
+    for item in &mut builder.select {
+        match item {
+            SelectItem::AllFrom { .. } => {}
+            SelectItem::Column { .. } => {}
+            SelectItem::Expr { expr, .. } => splice_over_shells(expr, shells),
+        }
+    }
+    splice_from_shells(&mut builder.from, shells);
+    for cond in &mut builder.where_ {
+        splice_over_shells(cond, shells);
+    }
+    for item in &mut builder.order_by {
+        splice_over_shells(&mut item.expr, shells);
+    }
+    if let Some(limit) = &mut builder.limit {
+        splice_over_shells(limit, shells);
+    }
+    if let Some(offset) = &mut builder.offset {
+        splice_over_shells(offset, shells);
+    }
+    for arm in &mut builder.unions {
+        splice_builder_shells(arm, shells);
+    }
+}
+
+fn splice_from_shells(from: &mut Option<FromClause>, shells: &[(String, SqlExpr)]) {
+    match from {
+        None
+        | Some(FromClause::Table { .. })
+        | Some(FromClause::Temp { .. })
+        | Some(FromClause::Literal { .. })
+        | Some(FromClause::TableFunction { .. }) => {}
+        Some(FromClause::Subquery { query, .. }) => splice_builder_shells(query, shells),
+        Some(FromClause::Computed { query, .. }) => splice_builder_shells(query, shells),
+        Some(FromClause::Join { left, right }) => {
+            splice_join_side_shells(left, shells);
+            splice_join_side_shells(right, shells);
+        }
+    }
+}
+
+fn splice_join_side_shells(side: &mut Box<FromClause>, shells: &[(String, SqlExpr)]) {
+    match side.as_mut() {
+        FromClause::Subquery { query, .. } => splice_builder_shells(query, shells),
+        FromClause::Computed { query, .. } => splice_builder_shells(query, shells),
+        FromClause::Join { .. } => {
+            unreachable!("nested joins never lower: the renderer cannot address them")
+        }
+        _ => {}
+    }
+}
+
+fn inline_chain_shell(
+    ctx: &mut Context,
+    arg: &TypedExpr,
+    path: &[usize],
+    base_fk: &str,
+    parent_pk: &str,
+) -> SqlExpr {
+    let mut node = arg;
+    for step in path {
+        node = over_child_at(node, *step);
+    }
+    if let TypedExprKind::Ident {
+        binding: IdentBinding::Field(fid),
+        ..
+    } = &node.kind
+    {
+        let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
+        let (col, ty) = match field {
+            Field::Value { columns, ty, .. } => match columns.as_slice() {
+                [column] => (
+                    ctx.schema.column_name(*column).to_string(),
+                    value_scalar(ty),
+                ),
+                _ => unreachable!(
+                    "tuple-valued field ident in over arg: summable args are scalar-typed (the checker enforces it)"
+                ),
+            },
+            _ => unreachable!(
+                "reference field ident in over arg value slot: summable args are scalar-typed (the checker enforces it)"
+            ),
+        };
+        let root_table = ctx.schema.tables
+            [ctx.schema.structs[fid.struct_id().index()].table.index()]
+        .name
+        .clone();
+        let parent_alias = ctx.aliases.table(&root_table);
+        let mut shell = SelectBuilder::new();
+        shell.from = Some(FromClause::Table {
+            table: root_table,
+            alias: parent_alias,
+        });
+        shell.where_ = vec![SqlExpr::Binary {
+            op: SqlBinOp::Eq,
+            lhs: Box::new(SqlExpr::Column {
+                depth: 0,
+                column: parent_pk.to_string(),
+            }),
+            rhs: Box::new(SqlExpr::Column {
+                depth: 1,
+                column: base_fk.to_string(),
+            }),
+        }];
+        shell.select = vec![SelectItem::Column {
+            depth: 0,
+            column: col,
+            output: ctx.aliases.generic(),
+            ty,
+        }];
+        return SqlExpr::Subquery {
+            query: Box::new(shell),
+        };
+    }
+    let (endpoint, mut cursor) = match &node.kind {
+        TypedExprKind::Field { base, name, .. } => (name.value.clone(), base.as_ref()),
+        _ => unreachable!("collected over chain is not a field access"),
+    };
+    let mut hops: Vec<(StructId, FieldId)> = Vec::new();
+    loop {
+        match &cursor.kind {
+            TypedExprKind::Field {
+                base: next,
+                name: hop,
+                ..
+            } => {
+                let sid = match &cursor.ty {
+                    QueryType::List(_) => record_struct(&next.ty),
+                    _ => record_struct(&cursor.ty),
+                };
+                let (fid, field) = ctx.schema.struct_field(sid, &hop.value).unwrap_or_else(|| {
+                    unreachable!("resolved field {} vanished from the schema", hop.value)
+                });
+                match field {
+                    Field::Ref { .. } => {}
+                    _ => unreachable!("value-typed hop {}: scalar results don't chain", hop.value),
+                }
+                hops.push((sid, fid));
+                cursor = next;
+            }
+            _ => {
+                debug_assert!(
+                    matches!(
+                        &cursor.kind,
+                        TypedExprKind::Ident {
+                            binding: IdentBinding::Field(_),
+                            ..
+                        }
+                    ),
+                    "collected over chain without field root"
+                );
+                break;
+            }
+        }
+    }
+    if let TypedExprKind::Ident {
+        binding: IdentBinding::Field(fid),
+        ..
+    } = &cursor.kind
+    {
+        hops.push((fid.struct_id(), *fid));
+    }
+    hops.reverse();
+    let Some(((root_sid, first_fid), rest)) = hops.split_first() else {
+        unreachable!(
+            "collected over chain without hops: collection admits parent-rooted field spines only"
+        )
+    };
+    let _ = root_sid;
+    let root_table = ctx.schema.tables[ctx.schema.structs[first_fid.struct_id().index()]
+        .table
+        .index()]
+    .name
+    .clone();
+    let parent_alias = ctx.aliases.table(&root_table);
+    struct HopBuild {
+        table: String,
+        alias: String,
+        target_col: String,
+        source_col: String,
+    }
+    let mut builds: Vec<HopBuild> = Vec::new();
+    let mut source = *root_sid;
+    for (_, fid) in std::iter::once(&(*root_sid, *first_fid)).chain(rest.iter()) {
+        let field = &ctx.schema.structs[source.index()].fields[fid.local()];
+        let target = match field {
+            Field::Ref { target, .. } => *target,
+            _ => unreachable!("hop over non-reference field"),
+        };
+        let table = ctx.schema.tables[ctx.schema.structs[target.index()].table.index()]
+            .name
+            .clone();
+        let (target_col, source_col) = hop_link_cols(ctx.schema, *fid);
+        builds.push(HopBuild {
+            table: table.clone(),
+            alias: ctx.aliases.table(&table),
+            target_col,
+            source_col,
+        });
+        source = target;
+    }
+    let (final_col, final_ty) = {
+        let (_, field) = ctx
+            .schema
+            .struct_field(source, &endpoint)
+            .unwrap_or_else(|| {
+                unreachable!("resolved field {} vanished from the schema", endpoint)
+            });
+        match field {
+            Field::Value { columns, ty, .. } => match columns.as_slice() {
+                [column] => (
+                    ctx.schema.column_name(*column).to_string(),
+                    value_scalar(ty),
+                ),
+                _ => unreachable!(
+                    "tuple-valued navigation endpoint: scalar-demand chains ending at tuples contradict scalar result types (tuple field access is checker-rejected)"
+                ),
+            },
+            Field::Ref { .. } => unreachable!(
+                "single record in scalar value slot: scalar-demand chains ending at collections contradict scalar result types (list-typed links are checker-rejected)"
+            ),
+            Field::Array { .. } => unreachable!(
+                "array in scalar value slot: scalar-demand chains ending at collections contradict scalar result types (list-typed links are checker-rejected)"
+            ),
+        }
+    };
+    let outers = builds.len() - 1;
+    let base_depth = 2 + outers;
+    let first = &builds[0];
+    let mut inner = SelectBuilder::new();
+    inner.from = Some(FromClause::Join {
+        left: Box::new(FromClause::Table {
+            table: root_table.clone(),
+            alias: parent_alias.clone(),
+        }),
+        right: Box::new(FromClause::Table {
+            table: first.table.clone(),
+            alias: first.alias.clone(),
+        }),
+    });
+    inner.where_ = vec![
+        SqlExpr::Binary {
+            op: SqlBinOp::Eq,
+            lhs: Box::new(SqlExpr::Column {
+                depth: 0,
+                column: first.target_col.clone(),
+            }),
+            rhs: Box::new(SqlExpr::Column {
+                depth: 1,
+                column: first.source_col.clone(),
+            }),
+        },
+        SqlExpr::Binary {
+            op: SqlBinOp::Eq,
+            lhs: Box::new(SqlExpr::Column {
+                depth: 1,
+                column: parent_pk.to_string(),
+            }),
+            rhs: Box::new(SqlExpr::Column {
+                depth: base_depth,
+                column: base_fk.to_string(),
+            }),
+        },
+    ];
+    inner.select = vec![SelectItem::Column {
+        depth: 0,
+        column: if builds.len() == 1 {
+            final_col.clone()
+        } else {
+            builds[1].source_col.clone()
+        },
+        output: ctx.aliases.generic(),
+        ty: if builds.len() == 1 { final_ty } else { None },
+    }];
+    let mut expr = SqlExpr::Subquery {
+        query: Box::new(inner),
+    };
+    for (k, build) in builds.iter().enumerate().skip(1) {
+        let last = k + 1 == builds.len();
+        let mut shell = SelectBuilder::new();
+        shell.from = Some(FromClause::Table {
+            table: build.table.clone(),
+            alias: build.alias.clone(),
+        });
+        shell.where_ = vec![SqlExpr::Binary {
+            op: SqlBinOp::Eq,
+            lhs: Box::new(SqlExpr::Column {
+                depth: 0,
+                column: build.target_col.clone(),
+            }),
+            rhs: Box::new(expr),
+        }];
+        shell.select = vec![SelectItem::Column {
+            depth: 0,
+            column: if last {
+                final_col.clone()
+            } else {
+                builds[k + 1].source_col.clone()
+            },
+            output: ctx.aliases.generic(),
+            ty: if last { final_ty } else { None },
+        }];
+        expr = SqlExpr::Subquery {
+            query: Box::new(shell),
+        };
+    }
+    expr
+}
+
+fn over_child_at(node: &TypedExpr, step: usize) -> &TypedExpr {
+    macro_rules! step {
+        () => {
+            unreachable!("over path outside its tree: collection and navigation diverge")
+        };
+    }
+    match &node.kind {
+        TypedExprKind::Field { base, .. } => {
+            if step == 0 {
+                base
+            } else {
+                step!()
+            }
+        }
+        TypedExprKind::Method { base, args, .. } => {
+            if step == 0 {
+                base
+            } else {
+                match args.get(step - 1) {
+                    Some(arg) => &arg.expr,
+                    None => step!(),
+                }
+            }
+        }
+        TypedExprKind::Binary { lhs, rhs, .. } => match step {
+            0 => lhs,
+            1 => rhs,
+            _ => step!(),
+        },
+        TypedExprKind::Unary { expr, .. } | TypedExprKind::Cast { expr, .. } => {
+            if step == 0 {
+                expr
+            } else {
+                step!()
+            }
+        }
+        TypedExprKind::If { arms, default } => {
+            if step == 2 * arms.len() {
+                default
+            } else if step < 2 * arms.len() {
+                let (cond, then) = &arms[step / 2];
+                if step.is_multiple_of(2) { cond } else { then }
+            } else {
+                step!()
+            }
+        }
+        TypedExprKind::Some { value } => {
+            if step == 0 {
+                value
+            } else {
+                step!()
+            }
+        }
+        TypedExprKind::Tuple { elements } | TypedExprKind::Array { elements } => {
+            match elements.get(step) {
+                Some(element) => element,
+                None => step!(),
+            }
+        }
+        TypedExprKind::Struct { fields } => match fields.get(step) {
+            Some((_, value)) => value,
+            None => step!(),
+        },
+        TypedExprKind::Projection { base, items } => {
+            if step == 0 {
+                base
+            } else {
+                match items.get(step - 1) {
+                    Some(item) => &item.value,
+                    None => step!(),
+                }
+            }
+        }
+        _ => step!(),
+    }
 }
 
 fn has_field_node(expr: &TypedExpr) -> bool {
@@ -9934,11 +10748,11 @@ fn scalar_method(
                 AggOp::Bare(BareAgg::Min, inner_scalar(inner, "min")),
             ),
             "sum_over" => {
-                let (ty, arg) = over_arg(ctx, args, name);
+                let (ty, arg) = over_arg_agg(ctx, base, args, name);
                 scalar_aggregate(ctx, base, AggOp::Over(OverAgg::Sum, ty, arg))
             }
             "avg_over" => {
-                let (ty, arg) = over_arg(ctx, args, name);
+                let (ty, arg) = over_arg_agg(ctx, base, args, name);
                 scalar_aggregate(ctx, base, AggOp::Over(OverAgg::Avg, ty, arg))
             }
             "max_by" | "min_by" => {

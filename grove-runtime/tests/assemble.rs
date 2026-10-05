@@ -2263,3 +2263,36 @@ fn nth_nav_bound_values() {
         ])
     );
 }
+
+#[test]
+fn sum_over_outer_nav_values() {
+    assert_eq!(
+        value("users { s = orders.sum_over(manager.age) }"),
+        Value::List(vec![
+            Value::Record(vec![("s".to_string(), Value::Int(80))]),
+            Value::Record(vec![("s".to_string(), Value::Int(30))]),
+        ])
+    );
+}
+
+#[test]
+fn sum_over_outer_bare_values() {
+    assert_eq!(
+        value("users { s = orders.sum_over(age) }"),
+        Value::List(vec![
+            Value::Record(vec![("s".to_string(), Value::Int(60))]),
+            Value::Record(vec![("s".to_string(), Value::Int(40))]),
+        ])
+    );
+}
+
+#[test]
+fn avg_over_outer_nav_values() {
+    assert_eq!(
+        value("users { s = orders.avg_over(manager.age) }"),
+        Value::List(vec![
+            Value::Record(vec![("s".to_string(), Value::Float(40.0))]),
+            Value::Record(vec![("s".to_string(), Value::Float(30.0))]),
+        ])
+    );
+}
