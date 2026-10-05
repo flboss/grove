@@ -3547,6 +3547,82 @@ fn fold_broadcast_take(
     Some((offset, limit))
 }
 
+fn strip_range_conjunct(node: &TypedExpr) -> TypedExpr {
+    fn is_range_outside(node: &TypedExpr) -> bool {
+        if !uses_outer(node) {
+            return false;
+        }
+        match &node.kind {
+            TypedExprKind::Binary { op, .. } => matches!(
+                op.value,
+                BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Ge
+            ),
+            _ => false,
+        }
+    }
+    fn strip_or(node: &TypedExpr) -> Option<TypedExpr> {
+        let mut kept = Vec::new();
+        for arm in split_or(node) {
+            if !is_range_outside(&arm) {
+                kept.push(arm);
+            }
+        }
+        if kept.is_empty() || kept.len() == split_or(node).len() {
+            return None;
+        }
+        let mut out = kept.remove(0);
+        for arm in kept {
+            out = TypedExpr {
+                kind: TypedExprKind::Binary {
+                    op: grove_types::Spanned {
+                        value: BinaryOp::Or,
+                        span: node.span,
+                    },
+                    lhs: Box::new(out),
+                    rhs: Box::new(arm),
+                },
+                ty: QueryType::Scalar(ScalarType::Bool),
+                span: node.span,
+            };
+        }
+        Some(out)
+    }
+    match &node.kind {
+        TypedExprKind::Method {
+            base, name, args, ..
+        } if name.value == "filter" => {
+            let arg = one_arg(args, name);
+            if let Some(stripped) = strip_or(arg) {
+                return rebuild_filter(node, strip_range_conjunct(base), stripped);
+            }
+            let mut kept = Vec::new();
+            let mut dropped = false;
+            for conjunct in split_and(arg) {
+                if !dropped && is_range_outside(&conjunct) {
+                    dropped = true;
+                } else {
+                    kept.push(conjunct);
+                }
+            }
+            if !dropped {
+                return rebuild_filter(node, strip_range_conjunct(base), arg.clone());
+            }
+            if kept.is_empty() {
+                return strip_range_conjunct(base);
+            }
+            let mut folded = kept.remove(0);
+            for next in kept {
+                folded = and_expr(&folded, &next);
+            }
+            rebuild_filter(node, strip_range_conjunct(base), folded)
+        }
+        TypedExprKind::Method { base, .. } | TypedExprKind::Projection { base, .. } => {
+            rebuild_same(node, strip_range_conjunct(base))
+        }
+        _ => node.clone(),
+    }
+}
+
 fn tail_base(node: &TypedExpr) -> &TypedExpr {
     match &node.kind {
         TypedExprKind::Method { base, .. } | TypedExprKind::Projection { base, .. } => base,
@@ -4108,6 +4184,39 @@ fn rcross_shape(
     {
         todo!("M4b complex cross-root correlation");
     }
+    if correlated.len() == 1
+        && matches!(
+            corr.op,
+            SqlBinOp::Lt | SqlBinOp::Gt | SqlBinOp::Le | SqlBinOp::Ge
+        )
+        && corr.nav.is_none()
+        && matches!(&local_tail.ty, QueryType::List(_))
+        && !tail_uses_projected_outer(tail)
+        && !tail_uses_nav_outer(ctx, tail)
+        && stacked_takes_foldable(tail)
+    {
+        let trunc: Option<(usize, Option<usize>)> = if broadcast.is_empty() || suffix.is_empty() {
+            None
+        } else {
+            match fold_broadcast_take(&local_tail.ty, tail, &suffix) {
+                Some(t) => Some(t),
+                None => todo!("M4b cross tail shape"),
+            }
+        };
+        let stripped = strip_range_conjunct(&peeled_tail);
+        return range_predicate_shape(
+            ctx,
+            parent,
+            RangeLane {
+                stripped: &stripped,
+                corr,
+                broadcast: &broadcast,
+                suffix: &suffix,
+                trunc,
+                cardinality,
+            },
+        );
+    }
     let global_take = suffix.len() == 1 && !tail_take_trailing(tail);
     let lowering_tail = if global_take {
         &local_tail
@@ -4637,6 +4746,128 @@ fn per_row_take_shape(
         child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
     }
     sink_cross_child(ctx, child, temp_idx, &peeled.ty, Cardinality::Many)
+}
+
+struct RangeLane<'a> {
+    stripped: &'a TypedExpr,
+    corr: &'a CorrCond,
+    broadcast: &'a [TypedExpr],
+    suffix: &'a [(String, Vec<TypedMethodArg>)],
+    trunc: Option<(usize, Option<usize>)>,
+    cardinality: Cardinality,
+}
+
+fn range_predicate_shape(
+    ctx: &mut Context,
+    parent: &mut Level,
+    lane: RangeLane<'_>,
+) -> (ResultShape, Option<String>) {
+    let RangeLane {
+        stripped,
+        corr,
+        broadcast,
+        suffix,
+        trunc,
+        cardinality,
+    } = lane;
+    let outer_ty = output_ty(&parent.builder, &corr.outer_col, ctx.schema).unwrap_or_else(|| {
+        todo!("M4b key threading through subqueries");
+    });
+    let (temp_idx, _, mut child) = cross_cartesian(
+        ctx,
+        parent,
+        stripped,
+        &[(corr.outer_col.clone(), outer_ty)],
+        false,
+    );
+    let was_outer = std::mem::replace(&mut ctx.no_outer, true);
+    let child_frag = scalar(ctx, &corr.child);
+    ctx.no_outer = was_outer;
+    let mut pred = SqlExpr::Binary {
+        op: corr.op,
+        lhs: Box::new(SqlExpr::Column {
+            depth: 1,
+            column: corr.outer_col.clone(),
+        }),
+        rhs: Box::new(child_frag),
+    };
+    if !broadcast.is_empty() {
+        let mut locals = broadcast.iter();
+        let first = scalar(ctx, locals.next().expect("broadcast nonempty"));
+        let or_pred = locals.fold(first, |acc, pred| SqlExpr::Binary {
+            op: SqlBinOp::Or,
+            lhs: Box::new(acc),
+            rhs: Box::new(scalar(ctx, pred)),
+        });
+        pred = SqlExpr::Binary {
+            op: SqlBinOp::And,
+            lhs: Box::new(pred),
+            rhs: Box::new(SqlExpr::Not(Box::new(or_pred))),
+        };
+    }
+    let scan_template = if broadcast.is_empty() {
+        None
+    } else {
+        let mut template = child.builder.clone();
+        template.select.retain(|item| match item {
+            SelectItem::Column { output, .. } | SelectItem::Expr { output, .. } => {
+                output != "$$pkey"
+            }
+            SelectItem::AllFrom { .. } => true,
+        });
+        Some(template)
+    };
+    child.builder.where_.push(pred);
+    if !broadcast.is_empty() {
+        child.builder.select.push(SelectItem::Expr {
+            expr: SqlExpr::Param(ParamValue::Int(0)),
+            output: CROSS_PAIR_TAG.to_string(),
+            ty: Some(ScalarType::Int),
+        });
+        let mut arm = scan_template.expect("scan template for broadcast arm");
+        let was_outer = std::mem::replace(&mut ctx.no_outer, true);
+        let mut preds = broadcast.iter();
+        let first = scalar(ctx, preds.next().expect("broadcast nonempty"));
+        let or_pred = preds.fold(first, |acc, pred| SqlExpr::Binary {
+            op: SqlBinOp::Or,
+            lhs: Box::new(acc),
+            rhs: Box::new(scalar(ctx, pred)),
+        });
+        ctx.no_outer = was_outer;
+        arm.where_.push(or_pred);
+        arm.select.push(SelectItem::Expr {
+            expr: SqlExpr::Param(ParamValue::Null),
+            output: "$$pkey".to_string(),
+            ty: None,
+        });
+        arm.select.push(SelectItem::Expr {
+            expr: SqlExpr::Param(ParamValue::Int(1)),
+            output: CROSS_PAIR_TAG.to_string(),
+            ty: Some(ScalarType::Int),
+        });
+        child.builder.unions.push(arm);
+    }
+    if trunc.is_none() {
+        for (method, args) in suffix.iter().rev() {
+            if has_window_bound(&child.builder) {
+                let bound = lower_take_bound(ctx, method, args);
+                conjoin_window_bound(&mut child.builder, method, bound);
+                continue;
+            }
+            let order = std::mem::take(&mut child.builder.order_by);
+            let mut wrapped = wrap_level(ctx, child);
+            wrapped.builder.order_by = order;
+            child = window_take(ctx, wrapped, "$$pkey", method, args);
+        }
+    }
+    let cardinality = match trunc {
+        Some((offset, limit)) => Cardinality::Take { offset, limit },
+        None => cardinality,
+    };
+    if child.builder.select.is_empty() {
+        child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+    }
+    sink_cross_child(ctx, child, temp_idx, &stripped.ty, cardinality)
 }
 
 struct SortLane {

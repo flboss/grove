@@ -1201,7 +1201,10 @@ fn cross_range_pairs_direction_correctly() {
                     cfg("n1", "zzz"),
                 ])
             )]),
-            Value::Record(vec![("x".to_string(), Value::List(vec![]))]),
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![cfg("n2", "zzz"), cfg("b@x", "zzz"), cfg("n1", "zzz")])
+            )]),
         ])
     );
     assert_eq!(
@@ -1211,6 +1214,40 @@ fn cross_range_pairs_direction_correctly() {
             Value::Record(vec![(
                 "x".to_string(),
                 Value::List(vec![cfg("n1", "a@x"), cfg("a@x", "a@x")])
+            )]),
+        ])
+    );
+}
+
+#[test]
+fn cross_range_take_windows_matches() {
+    assert_eq!(
+        value("users { x = configs.filter(owner > email).take(2) }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![cfg("n2", "zzz"), cfg("n3", "b@x")])
+            )]),
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![cfg("n2", "zzz"), cfg("b@x", "zzz")])
+            )]),
+        ])
+    );
+}
+
+#[test]
+fn cross_range_broadcast_take_truncates_values() {
+    assert_eq!(
+        value("users { x = configs.filter(owner > email || name == \"n1\").take(2) }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![cfg("n2", "zzz"), cfg("n3", "b@x")])
+            )]),
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![cfg("n2", "zzz"), cfg("b@x", "zzz")])
             )]),
         ])
     );
