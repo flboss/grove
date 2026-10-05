@@ -1708,3 +1708,95 @@ fn root_first_over_nested_navigation_values() {
         "bag-pick, got {got:?}"
     );
 }
+
+#[test]
+fn skip_prefixed_collapse_values() {
+    assert_eq!(
+        value("users { o = orders.skip(1).first() }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "o".to_string(),
+                Value::Record(vec![("total".to_string(), Value::Dec(dec("20")))]),
+            )]),
+            Value::Record(vec![("o".to_string(), Value::Null)]),
+        ])
+    );
+}
+
+#[test]
+fn stacked_per_parent_take_folds_values() {
+    assert_eq!(
+        value("users { o = orders.take(1).take(2) }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "o".to_string(),
+                Value::List(vec![Value::Record(vec![(
+                    "total".to_string(),
+                    Value::Dec(dec("10"))
+                )]),])
+            )]),
+            Value::Record(vec![(
+                "o".to_string(),
+                Value::List(vec![Value::Record(vec![(
+                    "total".to_string(),
+                    Value::Dec(dec("30"))
+                )]),])
+            )]),
+        ])
+    );
+}
+
+#[test]
+fn stacked_per_parent_skip_take_folds_values() {
+    assert_eq!(
+        value("users { o = orders.skip(1).take(1) }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "o".to_string(),
+                Value::List(vec![Value::Record(vec![(
+                    "total".to_string(),
+                    Value::Dec(dec("20"))
+                )]),])
+            )]),
+            Value::Record(vec![("o".to_string(), Value::List(vec![]))]),
+        ])
+    );
+}
+
+#[test]
+fn stacked_cross_take_folds_values() {
+    assert_eq!(
+        value(
+            "users.filter(name == \"Bob\") { x = configs.filter(owner == email).take(2).take(1) }"
+        ),
+        Value::List(vec![Value::Record(vec![(
+            "x".to_string(),
+            Value::List(vec![cfg("n3", "b@x")]),
+        )])])
+    );
+    let ada = value(
+        "users.filter(name == \"Ada\") { x = configs.filter(owner == email).take(2).take(1) }",
+    );
+    let one = Value::List(vec![Value::Record(vec![(
+        "x".to_string(),
+        Value::List(vec![cfg("n1", "a@x")]),
+    )])]);
+    let other = Value::List(vec![Value::Record(vec![(
+        "x".to_string(),
+        Value::List(vec![cfg("a@x", "a@x")]),
+    )])]);
+    assert!(ada == one || ada == other, "bag-pick, got {ada:?}");
+}
+
+#[test]
+fn stacked_cross_skip_take_folds_values() {
+    assert_eq!(
+        value(
+            "users.filter(name == \"Bob\") { x = configs.filter(owner == email).skip(1).take(1) }"
+        ),
+        Value::List(vec![Value::Record(vec![(
+            "x".to_string(),
+            Value::List(vec![]),
+        )])])
+    );
+}

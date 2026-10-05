@@ -826,7 +826,7 @@ fn rows_method(
                 )
             }
             if needs_wrap(&level) {
-                level = wrap_level(ctx, level);
+                level = wrap_narrow_rn(ctx, level);
             }
             level
                 .builder
@@ -842,7 +842,7 @@ fn rows_method(
                 todo!("M4 per-parent sort over single-row parent");
             }
             if needs_wrap(&level) {
-                level = wrap_level(ctx, level);
+                level = wrap_narrow_rn(ctx, level);
             }
             let default = if name.value == "sort_desc" {
                 OrderDir::Desc
@@ -1003,7 +1003,7 @@ fn rows_method(
                 )
             }
             if needs_wrap(&level) {
-                level = wrap_level(ctx, level);
+                level = wrap_narrow_rn(ctx, level);
             }
             level.builder.order_by = vec![OrderItem {
                 expr: over_arg(ctx, args, name).1,
@@ -1068,6 +1068,25 @@ fn needs_wrap(level: &Level) -> bool {
         || level.builder.offset.is_some()
         || !level.builder.select.is_empty()
         || !level.builder.unions.is_empty()
+}
+
+fn wrap_narrow_rn(ctx: &mut Context, level: Level) -> Level {
+    let served: Vec<(String, Option<ScalarType>)> =
+        builder_output_types(&level.builder, ctx.schema);
+    let mut wrapped = wrap_level(ctx, level);
+    if served.iter().any(|(name, _)| name == "$$rn") {
+        wrapped.builder.select = served
+            .into_iter()
+            .filter(|(name, _)| name != "$$rn")
+            .map(|(name, ty)| SelectItem::Column {
+                depth: 0,
+                column: name.clone(),
+                output: name,
+                ty,
+            })
+            .collect();
+    }
+    wrapped
 }
 
 fn wrap_level(ctx: &mut Context, level: Level) -> Level {
@@ -1318,16 +1337,18 @@ fn window_take(
     method: &str,
     args: &[TypedMethodArg],
 ) -> Level {
-    let bound = match args {
-        [arg] => {
-            let was = std::mem::replace(&mut ctx.in_take_arg, true);
-            let lowered = scalar(ctx, &arg.expr);
-            ctx.in_take_arg = was;
-            lowered
-        }
-        _ => unreachable!("wrong arity for {method}: the checker enforces Fixed arg counts"),
-    };
+    let bound = lower_take_bound(ctx, method, args);
     window_take_bound(ctx, level, fk, method, bound)
+}
+
+fn lower_take_bound(ctx: &mut Context, method: &str, args: &[TypedMethodArg]) -> SqlExpr {
+    let [arg] = args else {
+        unreachable!("wrong arity for {method}: the checker enforces Fixed arg counts")
+    };
+    let was = std::mem::replace(&mut ctx.in_take_arg, true);
+    let lowered = scalar(ctx, &arg.expr);
+    ctx.in_take_arg = was;
+    lowered
 }
 
 fn window_take_bound(
@@ -1337,22 +1358,88 @@ fn window_take_bound(
     method: &str,
     bound: SqlExpr,
 ) -> Level {
-    let guard = non_neg_guard(bound, method);
+    if has_window_bound(&level.builder) {
+        conjoin_window_bound(&mut level.builder, method, bound);
+        return level;
+    }
     let order = std::mem::take(&mut level.builder.order_by);
     let mut level = window_wrap(ctx, level, fk, order);
-    let bound = SqlExpr::Binary {
-        op: match method {
-            "take" => SqlBinOp::Le,
-            _ => SqlBinOp::Gt,
-        },
-        lhs: Box::new(SqlExpr::Column {
+    conjoin_window_bound(&mut level.builder, method, bound);
+    level
+}
+
+fn has_window_bound(builder: &SelectBuilder) -> bool {
+    builder.where_.iter().any(|w| match w {
+        SqlExpr::Binary {
+            op: SqlBinOp::Le | SqlBinOp::Gt | SqlBinOp::Eq,
+            lhs,
+            ..
+        } => matches!(
+            lhs.as_ref(),
+            SqlExpr::Column { column, .. } if column == "$$rn"
+        ),
+        _ => false,
+    })
+}
+
+fn conjoin_window_bound(builder: &mut SelectBuilder, method: &str, bound: SqlExpr) {
+    let mut offset: Option<SqlExpr> = None;
+    for w in &builder.where_ {
+        if let SqlExpr::Binary { op, lhs, rhs } = w
+            && let SqlExpr::Column { column, .. } = lhs.as_ref()
+            && column == "$$rn"
+        {
+            match op {
+                SqlBinOp::Gt => offset = Some(rhs.as_ref().clone()),
+                SqlBinOp::Eq => {
+                    offset = Some(SqlExpr::Func {
+                        name: "$$sub".to_string(),
+                        args: vec![rhs.as_ref().clone(), SqlExpr::Param(ParamValue::Int(1))],
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+    let rn = || {
+        Box::new(SqlExpr::Column {
             depth: 0,
             column: "$$rn".to_string(),
-        }),
-        rhs: Box::new(guard),
+        })
     };
-    level.builder.where_.push(bound);
-    level
+    let rel = |b: SqlExpr| match offset {
+        Some(l) => SqlExpr::Func {
+            name: "$$add".to_string(),
+            args: vec![l, b],
+        },
+        None => b,
+    };
+    let bound = match method {
+        "take" | "skip" => {
+            let guard = non_neg_guard(bound, method);
+            SqlExpr::Binary {
+                op: if method == "take" {
+                    SqlBinOp::Le
+                } else {
+                    SqlBinOp::Gt
+                },
+                lhs: rn(),
+                rhs: Box::new(rel(guard)),
+            }
+        }
+        "first" => SqlExpr::Binary {
+            op: SqlBinOp::Le,
+            lhs: rn(),
+            rhs: Box::new(rel(SqlExpr::Param(ParamValue::Int(1)))),
+        },
+        "nth" => SqlExpr::Binary {
+            op: SqlBinOp::Eq,
+            lhs: rn(),
+            rhs: Box::new(rel(bound)),
+        },
+        _ => unreachable!("{method} is not a take-family method"),
+    };
+    builder.where_.push(bound);
 }
 fn window_wrap(ctx: &mut Context, level: Level, fk: &str, order: Vec<OrderItem>) -> Level {
     let Level {
@@ -1479,7 +1566,6 @@ fn b1_optional_list(
         ..
     } = &value.kind
         && (name.value == "first" || name.value == "nth")
-        && matches!(&inner.kind, TypedExprKind::Field { .. })
         && matches!(tail_root_ident(inner), Some(IdentBinding::Field(_)))
         && !tail_uses_outer(value)
     {
@@ -1707,22 +1793,22 @@ fn b1_nested_collapse(
         child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
     }
     ensure_key(&mut child.builder, &child_col, ctx.schema);
-    let mut child = window_wrap(ctx, child, &child_col, Vec::new());
-    let rn = || SqlExpr::Column {
-        depth: 0,
-        column: "$$rn".to_string(),
+    let mut child = if has_window_bound(&child.builder) {
+        child
+    } else {
+        window_wrap(ctx, child, &child_col, Vec::new())
     };
     match collapse {
-        CollapseKind::First => child.builder.where_.push(SqlExpr::Binary {
-            op: SqlBinOp::Le,
-            lhs: Box::new(rn()),
-            rhs: Box::new(SqlExpr::Param(ParamValue::Int(1))),
-        }),
-        CollapseKind::Nth(arg) => child.builder.where_.push(SqlExpr::Binary {
-            op: SqlBinOp::Eq,
-            lhs: Box::new(rn()),
-            rhs: Box::new(collapse_index(ctx, arg)),
-        }),
+        CollapseKind::First => {
+            conjoin_window_bound(
+                &mut child.builder,
+                "first",
+                SqlExpr::Param(ParamValue::Int(1)),
+            );
+        }
+        CollapseKind::Nth(arg) => {
+            conjoin_window_bound(&mut child.builder, "nth", collapse_index(ctx, arg));
+        }
     }
     let Some(pending) = child.pending.take() else {
         todo!("M4b presence: optional list item");
@@ -3380,6 +3466,34 @@ fn peel_cross_window(
     }
 }
 
+fn stacked_takes_foldable(tail: &TypedExpr) -> bool {
+    let mut node = tail;
+    let mut seen_filter_sort = false;
+    loop {
+        match &node.kind {
+            TypedExprKind::Method {
+                base,
+                name,
+                optional,
+                ..
+            } if ["take", "skip"].contains(&name.value.as_str()) && !optional => {
+                if seen_filter_sort {
+                    return false;
+                }
+                node = base;
+            }
+            TypedExprKind::Projection { base, .. } => {
+                node = base;
+            }
+            TypedExprKind::Method { base, .. } => {
+                seen_filter_sort = true;
+                node = base;
+            }
+            _ => return true,
+        }
+    }
+}
+
 fn tail_base(node: &TypedExpr) -> &TypedExpr {
     match &node.kind {
         TypedExprKind::Method { base, .. } | TypedExprKind::Projection { base, .. } => base,
@@ -3922,7 +4036,9 @@ fn rcross_shape(
     let corr = &correlated[0];
     let mut suffix: Vec<(String, Vec<TypedMethodArg>)> = Vec::new();
     let peeled_tail = peel_cross_window(&local_tail, &mut suffix, false);
-    if suffix.len() > 1 || (!suffix.is_empty() && !broadcast.is_empty()) {
+    if (!suffix.is_empty() && !broadcast.is_empty())
+        || (suffix.len() > 1 && !stacked_takes_foldable(&local_tail))
+    {
         todo!("M4b cross tail shape");
     }
     if correlated.iter().any(|c| c.op == SqlBinOp::Ne)
@@ -4058,6 +4174,11 @@ fn rcross_shape(
     }
     if !global_take {
         for (method, args) in suffix.iter().rev() {
+            if has_window_bound(&child.builder) {
+                let bound = lower_take_bound(ctx, method, args);
+                conjoin_window_bound(&mut child.builder, method, bound);
+                continue;
+            }
             let order = std::mem::take(&mut child.builder.order_by);
             let mut wrapped = wrap_level(ctx, child);
             wrapped.builder.order_by = order;
@@ -5266,32 +5387,36 @@ fn build_capped_level(
             order.extend(sort_keys(ctx, &child, expr, *dir));
         }
     }
-    let mut child = window_wrap(ctx, child, &child_col, order);
-    let rn = || SqlExpr::Column {
-        depth: 0,
-        column: "$$rn".to_string(),
-    };
-    let mut bound = |op: SqlBinOp, rhs: SqlExpr| {
-        child.builder.where_.push(SqlExpr::Binary {
-            op,
-            lhs: Box::new(rn()),
-            rhs: Box::new(rhs),
-        });
-    };
+    let mut child =
+        if has_window_bound(&child.builder) && matches!(&prefix, Some(CollapsePrefix::Sort(_))) {
+            todo!("M4b stacked per-parent take");
+        } else if has_window_bound(&child.builder) {
+            child
+        } else {
+            window_wrap(ctx, child, &child_col, order)
+        };
     if let Some(prefix) = &prefix {
         match prefix {
             CollapsePrefix::Sort(_) => {}
             CollapsePrefix::Take(arg) => {
-                bound(SqlBinOp::Le, non_neg_guard(scalar(ctx, arg), "take"))
+                conjoin_window_bound(&mut child.builder, "take", scalar(ctx, arg));
             }
             CollapsePrefix::Skip(arg) => {
-                bound(SqlBinOp::Gt, non_neg_guard(scalar(ctx, arg), "skip"))
+                conjoin_window_bound(&mut child.builder, "skip", scalar(ctx, arg));
             }
         }
     }
     match collapse {
-        CollapseKind::First => bound(SqlBinOp::Le, SqlExpr::Param(ParamValue::Int(1))),
-        CollapseKind::Nth(arg) => bound(SqlBinOp::Eq, collapse_index(ctx, arg)),
+        CollapseKind::First => {
+            conjoin_window_bound(
+                &mut child.builder,
+                "first",
+                SqlExpr::Param(ParamValue::Int(1)),
+            );
+        }
+        CollapseKind::Nth(arg) => {
+            conjoin_window_bound(&mut child.builder, "nth", collapse_index(ctx, arg));
+        }
     }
     (child, parent_key, child_col)
 }
