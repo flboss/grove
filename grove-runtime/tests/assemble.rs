@@ -2395,3 +2395,25 @@ fn min_by_outer_nav_key_values() {
         ])
     );
 }
+
+#[test]
+fn sum_over_mixed_values() {
+    assert_eq!(
+        value("users { s = orders.sum_over(user.age + manager.age) }"),
+        Value::List(vec![
+            Value::Record(vec![("s".to_string(), Value::Int(140))]),
+            Value::Record(vec![("s".to_string(), Value::Int(70))]),
+        ])
+    );
+}
+
+#[test]
+fn sum_over_same_chain_twice_values() {
+    assert_eq!(
+        value("users { s = orders.sum_over(manager.age + manager.age) }"),
+        Value::List(vec![
+            Value::Record(vec![("s".to_string(), Value::Int(160))]),
+            Value::Record(vec![("s".to_string(), Value::Int(60))]),
+        ])
+    );
+}
