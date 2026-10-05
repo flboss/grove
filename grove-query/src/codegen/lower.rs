@@ -1029,7 +1029,7 @@ fn rows_method(
                 .filter(|tail| tail.per_row)
                 .and_then(|tail| tail.partition.clone())
             {
-                let order_arg = over_arg(ctx, args, name).1;
+                let order_arg = over_arg_window(ctx, args, name).1;
                 let mut level = window_wrap(
                     ctx,
                     level,
@@ -9736,6 +9736,24 @@ fn over_arg(
     };
     if has_field_node(arg) {
         if uses_outer(arg) {
+            todo!("M4b scoped navigation");
+        }
+    }
+    (ty, scalar(ctx, arg))
+}
+
+fn over_arg_window(
+    ctx: &mut Context,
+    args: &[TypedMethodArg],
+    name: &grove_types::Spanned<String>,
+) -> (ScalarType, SqlExpr) {
+    let arg = one_arg(args, name);
+    let ty = match &arg.ty {
+        QueryType::Scalar(s) => *s,
+        _ => unreachable!("summable scoped arg is scalar: the checker enforces it"),
+    };
+    if has_field_node(arg) && uses_outer(arg) {
+        if ctx.temp_collect.is_none() || ctx.in_array_temp {
             todo!("M4b scoped navigation");
         }
     }

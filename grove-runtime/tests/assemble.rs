@@ -2361,3 +2361,37 @@ fn cross_skip_outer_bound_values() {
         ])
     );
 }
+
+#[test]
+fn max_by_outer_nav_key_values() {
+    assert_eq!(
+        value("users { m = orders.max_by(manager.age) }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "m".to_string(),
+                Value::Record(vec![("total".to_string(), Value::Dec(dec("10")))]),
+            )]),
+            Value::Record(vec![(
+                "m".to_string(),
+                Value::Record(vec![("total".to_string(), Value::Dec(dec("30")))]),
+            )]),
+        ])
+    );
+}
+
+#[test]
+fn min_by_outer_nav_key_values() {
+    assert_eq!(
+        value("users { m = orders.min_by(manager.age) }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "m".to_string(),
+                Value::Record(vec![("total".to_string(), Value::Dec(dec("10")))]),
+            )]),
+            Value::Record(vec![(
+                "m".to_string(),
+                Value::Record(vec![("total".to_string(), Value::Dec(dec("30")))]),
+            )]),
+        ])
+    );
+}
