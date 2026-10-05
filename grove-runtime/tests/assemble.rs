@@ -1862,3 +1862,114 @@ fn stacked_take_over_broadcast_folds_values() {
         ])
     );
 }
+
+#[test]
+fn correlated_mixed_sort_orders_values() {
+    assert_eq!(
+        value("users { x = configs.filter(owner == email).sort(name == email) }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![cfg("n1", "a@x"), cfg("a@x", "a@x"),])
+            )]),
+            Value::Record(vec![("x".to_string(), Value::List(vec![cfg("n3", "b@x")]))]),
+        ])
+    );
+}
+
+#[test]
+fn sort_method_keys_values() {
+    let outer = value("users { x = configs.sort(email.len()) }");
+    let mixed = value("users { x = configs.sort(name.len() + email.len()) }");
+    let scan = Value::List(vec![
+        Value::Record(vec![(
+            "x".to_string(),
+            Value::List(vec![
+                cfg("n1", "a@x"),
+                cfg("n2", "zzz"),
+                cfg("n3", "b@x"),
+                cfg("b@x", "zzz"),
+                cfg("a@x", "a@x"),
+                cfg("n1", "zzz"),
+            ]),
+        )]),
+        Value::Record(vec![(
+            "x".to_string(),
+            Value::List(vec![
+                cfg("n1", "a@x"),
+                cfg("n2", "zzz"),
+                cfg("n3", "b@x"),
+                cfg("b@x", "zzz"),
+                cfg("a@x", "a@x"),
+                cfg("n1", "zzz"),
+            ]),
+        )]),
+    ]);
+    assert_eq!(outer, scan);
+    assert_eq!(
+        mixed,
+        Value::List(vec![
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![
+                    cfg("n1", "a@x"),
+                    cfg("n2", "zzz"),
+                    cfg("n3", "b@x"),
+                    cfg("n1", "zzz"),
+                    cfg("b@x", "zzz"),
+                    cfg("a@x", "a@x"),
+                ])
+            )]),
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![
+                    cfg("n1", "a@x"),
+                    cfg("n2", "zzz"),
+                    cfg("n3", "b@x"),
+                    cfg("n1", "zzz"),
+                    cfg("b@x", "zzz"),
+                    cfg("a@x", "a@x"),
+                ])
+            )]),
+        ])
+    );
+}
+
+#[test]
+fn ne_take_windows_complement_values() {
+    assert_eq!(
+        value("users { x = configs.filter(owner != email).take(1) }"),
+        Value::List(vec![
+            Value::Record(vec![("x".to_string(), Value::List(vec![cfg("n2", "zzz")]))]),
+            Value::Record(vec![("x".to_string(), Value::List(vec![cfg("n1", "a@x")]))]),
+        ])
+    );
+}
+
+#[test]
+fn ne_broadcast_take_truncates_values() {
+    assert_eq!(
+        value("users { x = configs.filter(owner != email || name == \"n1\").take(1) }"),
+        Value::List(vec![
+            Value::Record(vec![("x".to_string(), Value::List(vec![cfg("n2", "zzz")]))]),
+            Value::Record(vec![("x".to_string(), Value::List(vec![cfg("n2", "zzz")]))]),
+        ])
+    );
+}
+
+#[test]
+fn multi_ne_with_local_stays_scalar() {
+    assert_eq!(
+        value("users { x = configs.filter(owner != email && name != \"n1\") }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![cfg("n2", "zzz"), cfg("n3", "b@x"), cfg("b@x", "zzz"),])
+            )]),
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![cfg("n2", "zzz"), cfg("b@x", "zzz"), cfg("a@x", "a@x"),])
+            )]),
+        ])
+    );
+}

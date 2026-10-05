@@ -3547,82 +3547,6 @@ fn fold_broadcast_take(
     Some((offset, limit))
 }
 
-fn strip_range_conjunct(node: &TypedExpr) -> TypedExpr {
-    fn is_range_outside(node: &TypedExpr) -> bool {
-        if !uses_outer(node) {
-            return false;
-        }
-        match &node.kind {
-            TypedExprKind::Binary { op, .. } => matches!(
-                op.value,
-                BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Ge
-            ),
-            _ => false,
-        }
-    }
-    fn strip_or(node: &TypedExpr) -> Option<TypedExpr> {
-        let mut kept = Vec::new();
-        for arm in split_or(node) {
-            if !is_range_outside(&arm) {
-                kept.push(arm);
-            }
-        }
-        if kept.is_empty() || kept.len() == split_or(node).len() {
-            return None;
-        }
-        let mut out = kept.remove(0);
-        for arm in kept {
-            out = TypedExpr {
-                kind: TypedExprKind::Binary {
-                    op: grove_types::Spanned {
-                        value: BinaryOp::Or,
-                        span: node.span,
-                    },
-                    lhs: Box::new(out),
-                    rhs: Box::new(arm),
-                },
-                ty: QueryType::Scalar(ScalarType::Bool),
-                span: node.span,
-            };
-        }
-        Some(out)
-    }
-    match &node.kind {
-        TypedExprKind::Method {
-            base, name, args, ..
-        } if name.value == "filter" => {
-            let arg = one_arg(args, name);
-            if let Some(stripped) = strip_or(arg) {
-                return rebuild_filter(node, strip_range_conjunct(base), stripped);
-            }
-            let mut kept = Vec::new();
-            let mut dropped = false;
-            for conjunct in split_and(arg) {
-                if !dropped && is_range_outside(&conjunct) {
-                    dropped = true;
-                } else {
-                    kept.push(conjunct);
-                }
-            }
-            if !dropped {
-                return rebuild_filter(node, strip_range_conjunct(base), arg.clone());
-            }
-            if kept.is_empty() {
-                return strip_range_conjunct(base);
-            }
-            let mut folded = kept.remove(0);
-            for next in kept {
-                folded = and_expr(&folded, &next);
-            }
-            rebuild_filter(node, strip_range_conjunct(base), folded)
-        }
-        TypedExprKind::Method { base, .. } | TypedExprKind::Projection { base, .. } => {
-            rebuild_same(node, strip_range_conjunct(base))
-        }
-        _ => node.clone(),
-    }
-}
-
 fn tail_base(node: &TypedExpr) -> &TypedExpr {
     match &node.kind {
         TypedExprKind::Method { base, .. } | TypedExprKind::Projection { base, .. } => base,
@@ -3712,7 +3636,7 @@ fn sort_key_divertible(key: &TypedExpr) -> bool {
         TypedExprKind::Ident { .. } => !uses_outer(key),
         TypedExprKind::Field { base, .. }
         | TypedExprKind::Method { base, .. }
-        | TypedExprKind::Projection { base, .. } => !uses_outer(key) && sort_key_divertible(base),
+        | TypedExprKind::Projection { base, .. } => sort_key_divertible(base),
         TypedExprKind::Binary { lhs, rhs, .. } => {
             sort_key_divertible(lhs) && sort_key_divertible(rhs)
         }
@@ -4176,6 +4100,104 @@ fn rcross_shape(
     {
         todo!("M4b cross tail shape");
     }
+    if !correlated.is_empty()
+        && correlated.iter().all(|c| c.nav.is_none())
+        && matches!(&local_tail.ty, QueryType::List(_))
+        && !tail_uses_projected_outer(tail)
+        && !tail_uses_nav_outer(ctx, tail)
+        && ctx.nest_depth < 1
+    {
+        let has_range = correlated.iter().any(|c| {
+            matches!(
+                c.op,
+                SqlBinOp::Lt | SqlBinOp::Gt | SqlBinOp::Le | SqlBinOp::Ge
+            )
+        });
+        let mut peeled_sorts = Vec::new();
+        peel_cross_sorts(tail, &mut peeled_sorts);
+        let has_outer_sorts = peeled_sorts
+            .iter()
+            .any(|(_, args)| args.iter().any(|a| uses_outer(&a.expr)));
+        let has_ne_composition = correlated.iter().any(|c| c.op == SqlBinOp::Ne)
+            && (correlated.len() > 1 || !suffix.is_empty() || !broadcast.is_empty());
+        if (has_range || has_outer_sorts || has_ne_composition)
+            && (suffix.is_empty() || stacked_takes_foldable(tail))
+        {
+            let mut carries: Vec<(String, ScalarType)> = Vec::new();
+            let carry_col = |col: &str, carries: &mut Vec<(String, ScalarType)>| -> bool {
+                if carries.iter().any(|(c, _)| c == col) {
+                    return true;
+                }
+                match output_ty(&parent.builder, col, ctx.schema) {
+                    Some(ty) => {
+                        carries.push((col.to_string(), ty));
+                        true
+                    }
+                    None => false,
+                }
+            };
+            let mut ok = true;
+            for corr in correlated.iter() {
+                ok = ok && carry_col(&corr.outer_col, &mut carries);
+            }
+            for (_, args) in &peeled_sorts {
+                for arg in args {
+                    let mut fids = Vec::new();
+                    any_ident(&arg.expr, &mut |e| {
+                        if let TypedExprKind::Ident {
+                            binding: IdentBinding::Field(fid),
+                            depth,
+                            ..
+                        } = &e.kind
+                            && *depth > 0
+                        {
+                            fids.push(*fid);
+                        }
+                        false
+                    });
+                    for fid in fids {
+                        let field =
+                            &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
+                        match field {
+                            Field::Value { columns, .. } => match columns.as_slice() {
+                                [col] => {
+                                    ok =
+                                        ok && carry_col(ctx.schema.column_name(*col), &mut carries);
+                                }
+                                _ => ok = false,
+                            },
+                            _ => ok = false,
+                        }
+                    }
+                }
+            }
+            if tail_uses_optional_sort(tail) {
+            } else if ok {
+                let trunc: Option<(usize, Option<usize>)> =
+                    if broadcast.is_empty() || suffix.is_empty() {
+                        None
+                    } else {
+                        match fold_broadcast_take(&local_tail.ty, tail, &suffix) {
+                            Some(t) => Some(t),
+                            None => todo!("M4b cross tail shape"),
+                        }
+                    };
+                return predicate_join_shape(
+                    ctx,
+                    parent,
+                    PredLane {
+                        peeled: &peeled_tail,
+                        conds: &correlated,
+                        carries,
+                        broadcast: &broadcast,
+                        suffix: &suffix,
+                        trunc,
+                        cardinality,
+                    },
+                );
+            }
+        }
+    }
     if correlated.iter().any(|c| c.op == SqlBinOp::Ne)
         && (correlated.len() > 1
             || !broadcast.is_empty()
@@ -4183,39 +4205,6 @@ fn rcross_shape(
             || cardinality != Cardinality::Many)
     {
         todo!("M4b complex cross-root correlation");
-    }
-    if correlated.len() == 1
-        && matches!(
-            corr.op,
-            SqlBinOp::Lt | SqlBinOp::Gt | SqlBinOp::Le | SqlBinOp::Ge
-        )
-        && corr.nav.is_none()
-        && matches!(&local_tail.ty, QueryType::List(_))
-        && !tail_uses_projected_outer(tail)
-        && !tail_uses_nav_outer(ctx, tail)
-        && stacked_takes_foldable(tail)
-    {
-        let trunc: Option<(usize, Option<usize>)> = if broadcast.is_empty() || suffix.is_empty() {
-            None
-        } else {
-            match fold_broadcast_take(&local_tail.ty, tail, &suffix) {
-                Some(t) => Some(t),
-                None => todo!("M4b cross tail shape"),
-            }
-        };
-        let stripped = strip_range_conjunct(&peeled_tail);
-        return range_predicate_shape(
-            ctx,
-            parent,
-            RangeLane {
-                stripped: &stripped,
-                corr,
-                broadcast: &broadcast,
-                suffix: &suffix,
-                trunc,
-                cardinality,
-            },
-        );
     }
     let global_take = suffix.len() == 1 && !tail_take_trailing(tail);
     let lowering_tail = if global_take {
@@ -4748,62 +4737,66 @@ fn per_row_take_shape(
     sink_cross_child(ctx, child, temp_idx, &peeled.ty, Cardinality::Many)
 }
 
-struct RangeLane<'a> {
-    stripped: &'a TypedExpr,
-    corr: &'a CorrCond,
+struct PredLane<'a> {
+    peeled: &'a TypedExpr,
+    conds: &'a [CorrCond],
+    carries: Vec<(String, ScalarType)>,
     broadcast: &'a [TypedExpr],
     suffix: &'a [(String, Vec<TypedMethodArg>)],
     trunc: Option<(usize, Option<usize>)>,
     cardinality: Cardinality,
 }
 
-fn range_predicate_shape(
+fn predicate_join_shape(
     ctx: &mut Context,
     parent: &mut Level,
-    lane: RangeLane<'_>,
+    lane: PredLane<'_>,
 ) -> (ResultShape, Option<String>) {
-    let RangeLane {
-        stripped,
-        corr,
+    let PredLane {
+        peeled,
+        conds,
+        carries,
         broadcast,
         suffix,
         trunc,
         cardinality,
     } = lane;
-    let outer_ty = output_ty(&parent.builder, &corr.outer_col, ctx.schema).unwrap_or_else(|| {
-        todo!("M4b key threading through subqueries");
-    });
-    let (temp_idx, _, mut child) = cross_cartesian(
-        ctx,
-        parent,
-        stripped,
-        &[(corr.outer_col.clone(), outer_ty)],
-        false,
-    );
-    let was_outer = std::mem::replace(&mut ctx.no_outer, true);
-    let child_frag = scalar(ctx, &corr.child);
-    ctx.no_outer = was_outer;
-    let mut pred = SqlExpr::Binary {
-        op: corr.op,
-        lhs: Box::new(SqlExpr::Column {
-            depth: 1,
-            column: corr.outer_col.clone(),
-        }),
-        rhs: Box::new(child_frag),
-    };
+    let (temp_idx, _, mut child) = cross_cartesian(ctx, parent, peeled, &carries, true);
+    let mut pred: Option<SqlExpr> = None;
+    for corr in conds {
+        let was_outer = std::mem::replace(&mut ctx.no_outer, true);
+        let child_frag = scalar(ctx, &corr.child);
+        ctx.no_outer = was_outer;
+        let arm = SqlExpr::Binary {
+            op: corr.op,
+            lhs: Box::new(SqlExpr::Column {
+                depth: 1,
+                column: corr.outer_col.clone(),
+            }),
+            rhs: Box::new(child_frag),
+        };
+        pred = Some(match pred {
+            Some(acc) => SqlExpr::Binary {
+                op: SqlBinOp::And,
+                lhs: Box::new(acc),
+                rhs: Box::new(arm),
+            },
+            None => arm,
+        });
+    }
     if !broadcast.is_empty() {
         let mut locals = broadcast.iter();
         let first = scalar(ctx, locals.next().expect("broadcast nonempty"));
-        let or_pred = locals.fold(first, |acc, pred| SqlExpr::Binary {
+        let or_pred = locals.fold(first, |acc, local| SqlExpr::Binary {
             op: SqlBinOp::Or,
             lhs: Box::new(acc),
-            rhs: Box::new(scalar(ctx, pred)),
+            rhs: Box::new(scalar(ctx, local)),
         });
-        pred = SqlExpr::Binary {
+        pred = Some(SqlExpr::Binary {
             op: SqlBinOp::And,
-            lhs: Box::new(pred),
+            lhs: Box::new(pred.expect("conjunction over no conditions")),
             rhs: Box::new(SqlExpr::Not(Box::new(or_pred))),
-        };
+        });
     }
     let scan_template = if broadcast.is_empty() {
         None
@@ -4817,7 +4810,9 @@ fn range_predicate_shape(
         });
         Some(template)
     };
-    child.builder.where_.push(pred);
+    if let Some(pred) = pred {
+        child.builder.where_.push(pred);
+    }
     if !broadcast.is_empty() {
         child.builder.select.push(SelectItem::Expr {
             expr: SqlExpr::Param(ParamValue::Int(0)),
@@ -4867,7 +4862,17 @@ fn range_predicate_shape(
     if child.builder.select.is_empty() {
         child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
     }
-    sink_cross_child(ctx, child, temp_idx, &stripped.ty, cardinality)
+    if !child.builder.order_by.is_empty() {
+        let select = child.builder.select.clone();
+        child.builder.order_by = std::mem::take(&mut child.builder.order_by)
+            .into_iter()
+            .map(|item| OrderItem {
+                expr: inline_order_aliases(&select, item.expr),
+                dir: item.dir,
+            })
+            .collect();
+    }
+    sink_cross_child(ctx, child, temp_idx, &peeled.ty, cardinality)
 }
 
 struct SortLane {
@@ -4932,6 +4937,22 @@ fn sortable_cross_tail(ctx: &Context, parent: &Level, tail: &TypedExpr) -> Optio
         sorts,
         carries,
     })
+}
+
+fn tail_uses_optional_sort(node: &TypedExpr) -> bool {
+    match &node.kind {
+        TypedExprKind::Method {
+            base,
+            name,
+            optional,
+            ..
+        } => {
+            (["sort", "sort_asc", "sort_desc"].contains(&name.value.as_str()) && *optional)
+                || tail_uses_optional_sort(base)
+        }
+        TypedExprKind::Projection { base, .. } => tail_uses_optional_sort(base),
+        _ => false,
+    }
 }
 
 fn sorts_left_with_outer(node: &TypedExpr) -> bool {
