@@ -9,6 +9,7 @@ use std::str::FromStr;
 pub const SCHEMA_SRC: &str = r#"
     root users: User;
     root configs: Config;
+    root roles: Role;
     struct User {
         name: String,
         email: String,
@@ -20,6 +21,7 @@ pub const SCHEMA_SRC: &str = r#"
         orders: List<Order>,
         manager: &User,
         subordinates: &List<User>,
+        roles: &List<Role>,
     }
     struct Config {
         name: String,
@@ -34,9 +36,14 @@ pub const SCHEMA_SRC: &str = r#"
         sku: String,
         order: &Order,
     }
+    struct Role {
+        name: String,
+        users: &List<User>,
+    }
     rel Order.user <<-> User.orders (orders.user_id -> users.id);
     rel User.manager <<-> User.subordinates (users.manager_id -> users.id);
     rel Item.order <<-> Order.items (items.order_id -> orders.id);
+    rel Role.users <<->> User.roles via user_roles[role_id -> roles.id, user_id -> users.id];
 "#;
 
 pub fn compile(query: &str) -> CompiledQuery {
@@ -87,7 +94,9 @@ pub fn fixture() -> Runtime {
             "CREATE TABLE users(id INTEGER, name TEXT, email TEXT, age INTEGER, balance BLOB, active INTEGER, created BLOB, ttl BLOB, manager_id INTEGER);
              CREATE TABLE configs(name TEXT, owner TEXT);
              CREATE TABLE orders(id INTEGER, total BLOB, user_id INTEGER);
-             CREATE TABLE items(sku TEXT, order_id INTEGER);",
+             CREATE TABLE items(sku TEXT, order_id INTEGER);
+             CREATE TABLE roles(id INTEGER, name TEXT);
+             CREATE TABLE user_roles(user_id INTEGER, role_id INTEGER);",
         )
         .unwrap();
     let created = encode_instant(&DateTime::from_timestamp(1_700_000_000, 0).unwrap());
@@ -145,6 +154,24 @@ pub fn fixture() -> Runtime {
             .execute(
                 "INSERT INTO items(sku, order_id) VALUES (?, ?)",
                 rusqlite::params![sku, order_id],
+            )
+            .unwrap();
+    }
+    let roles: &[(i64, &str)] = &[(1, "admin"), (2, "dev")];
+    for (id, name) in roles {
+        rt.conn()
+            .execute(
+                "INSERT INTO roles(id, name) VALUES (?, ?)",
+                rusqlite::params![id, name],
+            )
+            .unwrap();
+    }
+    let links: &[(i64, i64)] = &[(1, 1), (1, 2), (2, 2)];
+    for (user_id, role_id) in links {
+        rt.conn()
+            .execute(
+                "INSERT INTO user_roles(user_id, role_id) VALUES (?, ?)",
+                rusqlite::params![user_id, role_id],
             )
             .unwrap();
     }

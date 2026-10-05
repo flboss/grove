@@ -768,6 +768,70 @@ fn agg_scoped_nav_element_rooted_exec() {
 }
 
 #[test]
+fn m2m_pairs_through_junction() {
+    let role =
+        |name: &str| Value::Record(vec![("name".to_string(), Value::String(name.to_string()))]);
+    assert_eq!(
+        value("users { r = roles }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "r".to_string(),
+                Value::List(vec![role("admin"), role("dev")])
+            )]),
+            Value::Record(vec![("r".to_string(), Value::List(vec![role("dev")]))]),
+        ])
+    );
+}
+
+#[test]
+fn m2m_reverse_pairs() {
+    assert_eq!(
+        value(r#"roles { u = users { n = name } }"#),
+        Value::List(vec![
+            Value::Record(vec![(
+                "u".to_string(),
+                Value::List(vec![Value::Record(vec![(
+                    "n".to_string(),
+                    Value::String("Ada".to_string()),
+                )])])
+            )]),
+            Value::Record(vec![(
+                "u".to_string(),
+                Value::List(vec![
+                    Value::Record(vec![("n".to_string(), Value::String("Ada".to_string()))]),
+                    Value::Record(vec![("n".to_string(), Value::String("Bob".to_string()))]),
+                ])
+            )]),
+        ])
+    );
+}
+
+#[test]
+fn m2m_nested_pairs_per_middle() {
+    let role =
+        |name: &str| Value::Record(vec![("name".to_string(), Value::String(name.to_string()))]);
+    assert_eq!(
+        value("users { o = subordinates { r = roles } }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "o".to_string(),
+                Value::List(vec![Value::Record(vec![(
+                    "r".to_string(),
+                    Value::List(vec![role("dev")]),
+                )])])
+            )]),
+            Value::Record(vec![(
+                "o".to_string(),
+                Value::List(vec![Value::Record(vec![(
+                    "r".to_string(),
+                    Value::List(vec![role("admin"), role("dev")]),
+                )])])
+            )]),
+        ])
+    );
+}
+
+#[test]
 fn cross_proj_take_temp_pairs() {
     let Value::List(rows) = value("users { e = email } { x = configs.filter(owner == e).take(1) }")
     else {
