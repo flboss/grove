@@ -7148,18 +7148,35 @@ fn finalize_level(ctx: &mut Context, level: Level) -> RootPlan {
             child_element(ctx.schema, None, item_ty, &outputs, |_| false)
         }
     };
+    let single = matches!(level.element, QueryType::Optional(_));
     let shape = StatementShape {
         columns: shape_columns(builder_output_types(&builder, ctx.schema), |_| false),
-        rows: RowCount::Many,
-    };
-    let result = ResultShape::List {
-        element: Box::new(element),
-        child: ChildRef {
-            stmt: 0,
-            parent: None,
-            cardinality: Cardinality::Many,
-            tag: None,
+        rows: if single {
+            RowCount::ZeroOrOne
+        } else {
+            RowCount::Many
         },
+    };
+    let result = if single {
+        ResultShape::Single {
+            element: Box::new(element),
+            child: ChildRef {
+                stmt: 0,
+                parent: None,
+                cardinality: Cardinality::One,
+                tag: None,
+            },
+        }
+    } else {
+        ResultShape::List {
+            element: Box::new(element),
+            child: ChildRef {
+                stmt: 0,
+                parent: None,
+                cardinality: Cardinality::Many,
+                tag: None,
+            },
+        }
     };
     RootPlan {
         builder,
@@ -7450,7 +7467,21 @@ fn emit_split(
     let mut parent_q = parent_builder;
     let parent_shape = split_parent_shape(&mut parent_q, &hops, ctx.schema, &root_parts);
     let layers = sink_chain(ctx, &hops, 0);
-    let result = nest_layers(ctx.schema, layers, root_ty, true, root_parts, 0);
+    let single = matches!(root_ty, QueryType::Optional(_));
+    let nest = nest_layers(ctx.schema, layers, root_ty, !single, root_parts, 0);
+    let result = if single {
+        ResultShape::Single {
+            element: Box::new(nest),
+            child: ChildRef {
+                stmt: 0,
+                parent: None,
+                cardinality: Cardinality::One,
+                tag: None,
+            },
+        }
+    } else {
+        nest
+    };
     RootPlan {
         builder: parent_q,
         shape: parent_shape,
@@ -8443,6 +8474,12 @@ fn scalar_ident(ctx: &mut Context, binding: &IdentBinding, depth: usize) -> SqlE
 
 fn collapse_parks_split(mut node: &TypedExpr) -> bool {
     loop {
+        if matches!(
+            peel_optional(&node.ty),
+            QueryType::List(inner) if matches!(peel_optional(inner), QueryType::List(_))
+        ) {
+            return true;
+        }
         match &node.kind {
             TypedExprKind::Method { base, name, .. }
                 if [
@@ -8460,10 +8497,12 @@ fn collapse_parks_split(mut node: &TypedExpr) -> bool {
             {
                 node = base;
             }
-            _ => break,
+            TypedExprKind::Field { base, .. } => {
+                node = base;
+            }
+            _ => return false,
         }
     }
-    matches!(&node.ty, QueryType::List(inner) if matches!(inner.as_ref(), QueryType::List(_)))
 }
 
 enum AggOp {

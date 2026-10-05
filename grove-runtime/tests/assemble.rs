@@ -1669,3 +1669,42 @@ fn nested_flatten_take_picks_per_user() {
         pick[0]
     );
 }
+
+#[test]
+fn root_first_assembles_single() {
+    match value("users.first()") {
+        Value::Record(fields) => {
+            let name = fields.iter().find(|(n, _)| n == "name");
+            assert_eq!(
+                name,
+                Some(&("name".to_string(), Value::String("Ada".to_string())))
+            );
+        }
+        other => panic!("single record, got {other:?}"),
+    }
+}
+
+#[test]
+fn root_first_over_nested_literal_value() {
+    assert_eq!(
+        value("[[1], [2]].first()"),
+        Value::List(vec![Value::Int(1)])
+    );
+}
+
+#[test]
+fn root_first_over_nested_navigation_values() {
+    let got = value("users.orders.first()");
+    let ada = Value::List(vec![
+        Value::Record(vec![("total".to_string(), Value::Dec(dec("10")))]),
+        Value::Record(vec![("total".to_string(), Value::Dec(dec("20")))]),
+    ]);
+    let bob = Value::List(vec![Value::Record(vec![(
+        "total".to_string(),
+        Value::Dec(dec("30")),
+    )])]);
+    assert!(
+        got == ada || got == bob || got == Value::List(vec![]),
+        "bag-pick, got {got:?}"
+    );
+}
