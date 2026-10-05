@@ -2419,6 +2419,69 @@ fn sum_over_same_chain_twice_values() {
 }
 
 #[test]
+fn single_hop_values() {
+    assert_eq!(
+        value("users { o = manager.orders }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "o".to_string(),
+                Value::List(vec![Value::Record(vec![(
+                    "total".to_string(),
+                    Value::Dec(dec("30"))
+                )])]),
+            )]),
+            Value::Record(vec![(
+                "o".to_string(),
+                Value::List(vec![
+                    Value::Record(vec![("total".to_string(), Value::Dec(dec("10")))]),
+                    Value::Record(vec![("total".to_string(), Value::Dec(dec("20")))]),
+                ]),
+            )]),
+        ])
+    );
+}
+
+#[test]
+fn single_hop_take_values() {
+    assert_eq!(
+        value("users { o = manager.orders.take(1) }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "o".to_string(),
+                Value::List(vec![Value::Record(vec![(
+                    "total".to_string(),
+                    Value::Dec(dec("30"))
+                )])]),
+            )]),
+            Value::Record(vec![(
+                "o".to_string(),
+                Value::List(vec![Value::Record(vec![(
+                    "total".to_string(),
+                    Value::Dec(dec("10"))
+                )])]),
+            )]),
+        ])
+    );
+}
+
+#[test]
+fn single_hop_skip_values() {
+    assert_eq!(
+        value("users { o = manager.orders.skip(1) }"),
+        Value::List(vec![
+            Value::Record(vec![("o".to_string(), Value::List(vec![]))]),
+            Value::Record(vec![(
+                "o".to_string(),
+                Value::List(vec![Value::Record(vec![(
+                    "total".to_string(),
+                    Value::Dec(dec("20"))
+                )])]),
+            )]),
+        ])
+    );
+}
+
+#[test]
 fn take_sort_global_boundary_values() {
     assert_eq!(
         value("configs.sort(name).take(1).sort_desc(name)"),

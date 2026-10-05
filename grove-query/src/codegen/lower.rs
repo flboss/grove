@@ -37,6 +37,7 @@ pub struct ChildCtx {
     pub per_row: bool,
     pub partition: Option<String>,
     pub anchor: Option<StructId>,
+    pub single_hop: bool,
 }
 
 fn row_struct(ty: &QueryType) -> Option<StructId> {
@@ -402,6 +403,71 @@ fn fresh_root_level(ctx: &mut Context, root_idx: usize, ty: &QueryType) -> Level
     }
 }
 
+struct SingleHop {
+    middle_fk: String,
+    child_from: FromClause,
+    child_col: String,
+}
+
+fn single_hop_parts(ctx: &mut Context, tail: &TypedExpr) -> Option<SingleHop> {
+    let mut node = tail;
+    loop {
+        match &node.kind {
+            TypedExprKind::Method { base, name, .. }
+                if ["take", "skip", "sort", "sort_asc", "sort_desc", "filter"]
+                    .contains(&name.value.as_str()) =>
+            {
+                node = base;
+            }
+            TypedExprKind::Field { base, name, .. } => {
+                let TypedExprKind::Ident {
+                    binding: IdentBinding::Field(mid_fid),
+                    ..
+                } = &base.kind
+                else {
+                    return None;
+                };
+                let mid_field =
+                    &ctx.schema.structs[mid_fid.struct_id().index()].fields[mid_fid.local()];
+                let mid_target = match mid_field {
+                    Field::Ref {
+                        target,
+                        is_list: false,
+                        optional: false,
+                        ..
+                    } => *target,
+                    _ => return None,
+                };
+                let (leaf_fid, leaf_field) = ctx
+                    .schema
+                    .struct_field(mid_target, &name.value)
+                    .unwrap_or_else(|| {
+                        unreachable!("resolved field {} vanished from the schema", name.value)
+                    });
+                match leaf_field {
+                    Field::Ref { is_list: true, .. } => {}
+                    _ => return None,
+                }
+                let link = resolve_tail_link(ctx, leaf_fid);
+                if link.m2m_join.is_some() {
+                    return None;
+                }
+                let middle_fk = match link_cols(ctx.schema, *mid_fid) {
+                    LinkCols::ParentFk { parent_fk, .. } => parent_fk,
+                    LinkCols::TargetFk { parent_pk, .. } => parent_pk,
+                    LinkCols::ManyToMany => return None,
+                };
+                return Some(SingleHop {
+                    middle_fk,
+                    child_from: link.child_from,
+                    child_col: link.child_col,
+                });
+            }
+            _ => return None,
+        }
+    }
+}
+
 fn rows_field(
     ctx: &mut Context,
     base: &TypedExpr,
@@ -413,6 +479,12 @@ fn rows_field(
         return rows(ctx, value);
     }
     if matches!(base.ty, QueryType::Record(_)) {
+        if let Some(tail) = ctx.child.as_mut()
+            && tail.single_hop
+            && let Some(base_level) = tail.base.take()
+        {
+            return base_level;
+        }
         todo!("M4b navigation from single-record base");
     }
     let mut level = rows(ctx, base);
@@ -3013,6 +3085,7 @@ fn lower_tail(
         per_row,
         partition,
         anchor,
+        single_hop: false,
     });
     let was_outer = std::mem::replace(&mut ctx.no_outer, true);
     let child = rows(ctx, tail);
@@ -3642,6 +3715,10 @@ fn prune_cross_filters(
             let pruned_base = prune_cross_filters(ctx, base, correlated, broadcast, temp_form);
             rebuild_same(node, pruned_base)
         }
+        TypedExprKind::Field { base, .. } => rebuild_same(
+            node,
+            prune_cross_filters(ctx, base, correlated, broadcast, temp_form),
+        ),
         TypedExprKind::Ident { .. } => node.clone(),
         _ => todo!("M4b cross tail shape"),
     }
@@ -4521,6 +4598,7 @@ fn rcross_shape(
         per_row: false,
         partition: None,
         anchor,
+        single_hop: false,
     });
     let was_outer = std::mem::replace(&mut ctx.no_outer, true);
     let mut child = rows(ctx, lowering_tail);
@@ -4845,6 +4923,7 @@ fn cross_cartesian(
         per_row: false,
         partition: None,
         anchor,
+        single_hop: false,
     });
     let was_outer = std::mem::replace(&mut ctx.no_outer, !outer_scope);
     let mut child = rows(ctx, peeled);
@@ -5823,6 +5902,97 @@ fn m2m_seed_selects(schema: &ValidatedSchema, builder: &mut SelectBuilder, child
     });
 }
 
+fn single_hop_shape(
+    ctx: &mut Context,
+    _parent: &mut Level,
+    tail: &TypedExpr,
+    parts: SingleHop,
+) -> (ResultShape, Option<String>) {
+    let SingleHop {
+        middle_fk,
+        child_from,
+        child_col,
+    } = parts;
+    let mut child_builder = SelectBuilder::new();
+    child_builder.from = Some(child_from);
+    child_builder.where_ = vec![SqlExpr::InSubquery {
+        expr: Box::new(SqlExpr::Column {
+            depth: 0,
+            column: child_col.clone(),
+        }),
+        query: Box::new(bulk_query()),
+    }];
+    let child_level = Level {
+        builder: child_builder,
+        element: tail.ty.clone(),
+        parent: ParentLink::Root { root_idx: 0 },
+        pending: None,
+        stmt_bound: true,
+        output_shapes: None,
+        root_parts: None,
+    };
+    let anchor = tail_row_struct(ctx, tail);
+    let was_child = ctx.child.replace(ChildCtx {
+        base: Some(child_level),
+        per_row: true,
+        partition: Some(child_col.clone()),
+        anchor,
+        single_hop: true,
+    });
+    let was_outer = std::mem::replace(&mut ctx.no_outer, true);
+    let mut child = rows(ctx, tail);
+    ctx.child = was_child;
+    ctx.no_outer = was_outer;
+    if child.builder.select.is_empty() {
+        child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+    }
+    ensure_key(&mut child.builder, &child_col, ctx.schema);
+    let outputs = builder_outputs(&child.builder, ctx.schema);
+    let shape_cols: Vec<OutputColumn> =
+        shape_columns(builder_output_types(&child.builder, ctx.schema), |name| {
+            name == child_col
+        });
+    let item_ty = match &tail.ty {
+        QueryType::List(sub) => sub.as_ref(),
+        _ => &tail.ty,
+    };
+    let mut element = child_element(
+        ctx.schema,
+        child.output_shapes.as_ref(),
+        item_ty,
+        &outputs,
+        |name| name == child_col,
+    );
+    let idx = ctx.sink(
+        child.builder,
+        StatementShape {
+            columns: shape_cols,
+            rows: RowCount::Many,
+        },
+        StatementKind::Query,
+    );
+    patch_pending_parents(&mut element, idx);
+    let shape = ResultShape::List {
+        element: Box::new(element),
+        child: ChildRef {
+            stmt: idx,
+            parent: Some(ParentRef {
+                stmt: if ctx.nest_depth >= 1 {
+                    PENDING_PARENT_STMT
+                } else {
+                    0
+                },
+                parent_key: middle_fk.clone(),
+                child_key: child_col,
+                negated: false,
+            }),
+            cardinality: Cardinality::Many,
+            tag: None,
+        },
+    };
+    (shape, Some(middle_fk))
+}
+
 fn rvalue_shape(
     ctx: &mut Context,
     parent: &mut Level,
@@ -5842,6 +6012,11 @@ fn rvalue_shape(
     }
     if ctx.nest_depth < 1 && !keyed && tail_uses_outer(tail) {
         return rcross_shape(ctx, parent, tail, Cardinality::Many);
+    }
+    if ctx.temp_collect.is_none()
+        && let Some(parts) = single_hop_parts(ctx, tail)
+    {
+        return single_hop_shape(ctx, parent, tail, parts);
     }
     if array_tail_root(tail) {
         if tail_uses_outer(tail) {
