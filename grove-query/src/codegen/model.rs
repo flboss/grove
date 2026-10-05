@@ -113,6 +113,10 @@ pub struct ParentRef {
 pub enum Cardinality {
     One,
     Many,
+    Take {
+        offset: usize,
+        limit: Option<usize>,
+    },
 }
 
 pub const CROSS_PAIR_TAG: &str = "$$ptag";

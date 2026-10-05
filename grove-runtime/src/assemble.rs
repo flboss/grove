@@ -177,7 +177,6 @@ fn assemble_list(
             .map(Value::List),
         Some(pref) => {
             let (groups, broadcast) = group_by(rows, &pref.child_key, child.stmt)?;
-            let one = matches!(child.cardinality, Cardinality::One);
             let matched = |key: &Value| -> Result<Vec<Value>, RuntimeError> {
                 let mut hits = if pref.negated {
                     let own = key_of(key)?;
@@ -209,8 +208,16 @@ fn assemble_list(
                     }
                 };
                 hits.extend(broadcast.iter().cloned());
-                if one {
-                    hits.truncate(1);
+                match child.cardinality {
+                    Cardinality::One => hits.truncate(1),
+                    Cardinality::Take { offset, limit } => {
+                        hits = hits
+                            .into_iter()
+                            .skip(offset)
+                            .take(limit.unwrap_or(usize::MAX))
+                            .collect();
+                    }
+                    Cardinality::Many => {}
                 }
                 hits.iter()
                     .map(|&i| assemble_shape(element, outputs, Some(&rows[i])))

@@ -1800,3 +1800,28 @@ fn stacked_cross_skip_take_folds_values() {
         )])])
     );
 }
+
+#[test]
+fn take_over_broadcast_truncates_values() {
+    assert_eq!(
+        value("users { x = configs.filter(owner == email || name == \"n1\").take(1) }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![cfg("a@x", "a@x")])
+            )]),
+            Value::Record(vec![("x".to_string(), Value::List(vec![cfg("n3", "b@x")]))]),
+        ])
+    );
+}
+
+#[test]
+fn stacked_take_over_broadcast_folds_values() {
+    assert_eq!(
+        value("users { x = configs.filter(owner == email || name == \"n1\").skip(1).take(1) }"),
+        Value::List(vec![
+            Value::Record(vec![("x".to_string(), Value::List(vec![cfg("n1", "a@x")]))]),
+            Value::Record(vec![("x".to_string(), Value::List(vec![cfg("n1", "a@x")]))]),
+        ])
+    );
+}

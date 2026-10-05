@@ -3494,6 +3494,59 @@ fn stacked_takes_foldable(tail: &TypedExpr) -> bool {
     }
 }
 
+fn fold_broadcast_take(
+    tail_ty: &QueryType,
+    tail: &TypedExpr,
+    suffix: &[(String, Vec<TypedMethodArg>)],
+) -> Option<(usize, Option<usize>)> {
+    if !matches!(tail_ty, QueryType::List(_)) {
+        return None;
+    }
+    if !stacked_takes_foldable(tail) {
+        return None;
+    }
+    let mut node = tail;
+    loop {
+        match &node.kind {
+            TypedExprKind::Method { base, name, .. }
+                if ["sort", "sort_asc", "sort_desc"].contains(&name.value.as_str()) =>
+            {
+                return None;
+            }
+            TypedExprKind::Method { base, .. } | TypedExprKind::Projection { base, .. } => {
+                node = base;
+            }
+            _ => break,
+        }
+    }
+    if !stacked_takes_foldable(tail) {
+        return None;
+    }
+    let mut offset: usize = 0;
+    let mut limit: Option<usize> = None;
+    for (method, args) in suffix.iter().rev() {
+        let [arg] = args.as_slice() else {
+            return None;
+        };
+        let TypedExprKind::Literal(lit) = &arg.expr.kind else {
+            return None;
+        };
+        let crate::ast::Literal::Int(n) = &lit.value else {
+            return None;
+        };
+        let n: usize = (*n).try_into().ok()?;
+        match method.as_str() {
+            "take" => limit = Some(limit.unwrap_or(usize::MAX).min(n)),
+            "skip" => {
+                offset = offset.saturating_add(n);
+                limit = limit.map(|l| l.saturating_sub(n));
+            }
+            _ => return None,
+        }
+    }
+    Some((offset, limit))
+}
+
 fn tail_base(node: &TypedExpr) -> &TypedExpr {
     match &node.kind {
         TypedExprKind::Method { base, .. } | TypedExprKind::Projection { base, .. } => base,
@@ -4036,7 +4089,13 @@ fn rcross_shape(
     let corr = &correlated[0];
     let mut suffix: Vec<(String, Vec<TypedMethodArg>)> = Vec::new();
     let peeled_tail = peel_cross_window(&local_tail, &mut suffix, false);
-    if (!suffix.is_empty() && !broadcast.is_empty())
+    let broadcast_truncate: Option<(usize, Option<usize>)> =
+        if broadcast.is_empty() || suffix.is_empty() {
+            None
+        } else {
+            fold_broadcast_take(&local_tail.ty, tail, &suffix)
+        };
+    if (!suffix.is_empty() && !broadcast.is_empty() && broadcast_truncate.is_none())
         || (suffix.len() > 1 && !stacked_takes_foldable(&local_tail))
     {
         todo!("M4b cross tail shape");
@@ -4172,7 +4231,7 @@ fn rcross_shape(
         });
         child.builder.unions.push(arm);
     }
-    if !global_take {
+    if !global_take && broadcast_truncate.is_none() {
         for (method, args) in suffix.iter().rev() {
             if has_window_bound(&child.builder) {
                 let bound = lower_take_bound(ctx, method, args);
@@ -4219,11 +4278,14 @@ fn rcross_shape(
             child_key: "$$pkey".to_string(),
             negated: corr.op == SqlBinOp::Ne,
         }),
-        cardinality,
+        cardinality: match broadcast_truncate {
+            Some((offset, limit)) => Cardinality::Take { offset, limit },
+            None => cardinality,
+        },
         tag: None,
     };
     let shape = match cardinality {
-        Cardinality::Many => ResultShape::List {
+        Cardinality::Many | Cardinality::Take { .. } => ResultShape::List {
             element: Box::new(element),
             child: child_ref,
         },
@@ -4434,7 +4496,7 @@ fn sink_cross_child(
         tag: None,
     };
     let shape = match cardinality {
-        Cardinality::Many => ResultShape::List {
+        Cardinality::Many | Cardinality::Take { .. } => ResultShape::List {
             element: Box::new(element),
             child: child_ref,
         },
@@ -5885,7 +5947,7 @@ fn rtemp_shape(
         StatementKind::Query,
     );
     let shape = match cardinality {
-        Cardinality::Many => ResultShape::List {
+        Cardinality::Many | Cardinality::Take { .. } => ResultShape::List {
             element: Box::new(element),
             child: ChildRef {
                 stmt: idx,
