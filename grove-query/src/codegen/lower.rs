@@ -2767,6 +2767,7 @@ struct NavCarry {
     target_col: String,
     endpoint: String,
     endpoint_ty: ScalarType,
+    default: Option<SqlExpr>,
 }
 
 enum OuterRef {
@@ -3080,7 +3081,20 @@ fn nav_carry(ctx: &mut Context, outer_side: &TypedExpr) -> NavCarry {
         target_col,
         endpoint: endpoint_col,
         endpoint_ty,
+        default: None,
     }
+}
+
+fn nav_carry_default(ctx: &mut Context, outer_side: &TypedExpr) -> NavCarry {
+    let (base, default) = match &outer_side.kind {
+        TypedExprKind::Method {
+            base, name, args, ..
+        } if name.value == "unwrap_or" => (base.as_ref(), one_arg(args, name)),
+        _ => todo!("M4b complex cross-root correlation"),
+    };
+    let mut carry = nav_carry(ctx, base);
+    carry.default = Some(scalar(ctx, default));
+    carry
 }
 
 fn tail_uses_nav_outer(ctx: &Context, tail: &TypedExpr) -> bool {
@@ -3154,8 +3168,16 @@ fn nav_carry_item(ctx: &mut Context, nav: &NavCarry) -> SelectItem {
         }),
     }];
     SelectItem::Expr {
-        expr: SqlExpr::Subquery {
-            query: Box::new(nav_q),
+        expr: match &nav.default {
+            Some(default) => SqlExpr::Coalesce(vec![
+                SqlExpr::Subquery {
+                    query: Box::new(nav_q),
+                },
+                default.clone(),
+            ]),
+            None => SqlExpr::Subquery {
+                query: Box::new(nav_q),
+            },
         },
         output: nav.carry.clone(),
         ty: Some(nav.endpoint_ty),
@@ -3216,6 +3238,9 @@ fn check_corr(ctx: &mut Context, conjunct: &TypedExpr, temp_form: bool) -> CorrC
                         todo!("M4b complex cross-root correlation");
                     }
                     OuterRef::Nav(nav_carry(ctx, outer_side))
+                }
+                TypedExprKind::Method { name, .. } if name.value == "unwrap_or" && temp_form => {
+                    OuterRef::Nav(nav_carry_default(ctx, outer_side))
                 }
                 _ => todo!("M4b complex cross-root correlation"),
             };
@@ -7270,8 +7295,28 @@ fn scalar_field(
         ChainRoot::Collapsed(base) if hops.is_empty() => {
             return single_hop_over_collapsed(ctx, base, name);
         }
-        ChainRoot::Collapsed(_) => {
-            todo!("M3 navigation chained over collapsed records");
+        ChainRoot::Collapsed(base) => {
+            let derived = single_row_query(ctx, base, vec![SelectItem::AllFrom { depth: 0 }]);
+            Some(Box::new(Level {
+                builder: SelectBuilder {
+                    select: vec![SelectItem::AllFrom { depth: 0 }],
+                    from: Some(FromClause::Subquery {
+                        query: Box::new(derived),
+                        alias: ctx.aliases.subquery(),
+                    }),
+                    where_: Vec::new(),
+                    order_by: Vec::new(),
+                    limit: None,
+                    offset: None,
+                    unions: Vec::new(),
+                },
+                element: base.ty.clone(),
+                parent: ParentLink::Root { root_idx: 0 },
+                pending: None,
+                stmt_bound: false,
+                output_shapes: None,
+                root_parts: None,
+            }))
         }
         ChainRoot::Enclosing => {
             if hops.is_empty() {

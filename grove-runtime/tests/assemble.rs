@@ -832,6 +832,31 @@ fn m2m_nested_pairs_per_middle() {
 }
 
 #[test]
+fn cross_nav_unwrap_or_coalesce_exec() {
+    assert_eq!(
+        value(r#"users { x = configs.filter(owner == mentor?.email.unwrap_or("zzz")) }"#),
+        Value::List(vec![
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![cfg("n2", "zzz"), cfg("b@x", "zzz"), cfg("n1", "zzz"),])
+            )]),
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![cfg("n1", "a@x"), cfg("a@x", "a@x"),])
+            )]),
+        ])
+    );
+}
+
+#[test]
+fn chained_over_collapsed_exec() {
+    assert_eq!(
+        value("users.first()?.manager?.name"),
+        Value::String("Bob".to_string())
+    );
+}
+
+#[test]
 fn cross_proj_take_temp_pairs() {
     let Value::List(rows) = value("users { e = email } { x = configs.filter(owner == e).take(1) }")
     else {
