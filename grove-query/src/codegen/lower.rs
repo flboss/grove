@@ -307,7 +307,54 @@ fn rows_ident(ctx: &mut Context, binding: &IdentBinding, ty: &QueryType) -> Leve
 fn corr_base_level(ctx: &mut Context, fid: FieldId, ty: &QueryType) -> Level {
     let link = resolve_tail_link(ctx, fid);
     if link.m2m_join.is_some() {
-        todo!("M4 many-to-many navigation");
+        let parts = m2m_parts(ctx.schema, fid).unwrap_or_else(|| {
+            unreachable!("M2M link without junction parts: resolve_tail_link produced them");
+        });
+        let junction_alias = ctx.aliases.table(&parts.junction_table);
+        let mut subquery = SelectBuilder::new();
+        subquery.select = vec![SelectItem::Column {
+            depth: 0,
+            column: parts.junction_target_col.clone(),
+            output: parts.junction_target_col.clone(),
+            ty: None,
+        }];
+        subquery.from = Some(FromClause::Table {
+            table: parts.junction_table.clone(),
+            alias: junction_alias.clone(),
+        });
+        subquery.where_ = vec![SqlExpr::Binary {
+            op: SqlBinOp::Eq,
+            lhs: Box::new(SqlExpr::Column {
+                depth: 0,
+                column: parts.junction_parent_col.clone(),
+            }),
+            rhs: Box::new(SqlExpr::Column {
+                depth: 2,
+                column: link.parent_col.clone(),
+            }),
+        }];
+        let target_alias = ctx.aliases.table(&parts.target_table);
+        let mut builder = SelectBuilder::new();
+        builder.from = Some(FromClause::Table {
+            table: parts.target_table.clone(),
+            alias: target_alias,
+        });
+        builder.where_ = vec![SqlExpr::InSubquery {
+            expr: Box::new(SqlExpr::Column {
+                depth: 0,
+                column: parts.target_pk.clone(),
+            }),
+            query: Box::new(subquery),
+        }];
+        return Level {
+            builder,
+            element: ty.clone(),
+            parent: ParentLink::Root { root_idx: 0 },
+            pending: None,
+            stmt_bound: true,
+            output_shapes: None,
+            root_parts: None,
+        };
     }
     let mut builder = SelectBuilder::new();
     builder.from = Some(link.child_from);
@@ -783,7 +830,7 @@ fn global_first_hop(
             parent_pk,
         } => (child_fk, parent_pk),
         LinkCols::ManyToMany => {
-            unreachable!("many-to-many hops are list-typed: scalar chains never cross them")
+            todo!("M4 many-to-many navigation");
         }
     };
     let table = ctx.schema.tables[ctx.schema.structs[target.index()].table.index()]
@@ -1647,19 +1694,48 @@ fn b1_chained(
         todo!("M4b presence: optional list item");
     }
     let tail_link = resolve_tail_link(ctx, tail_fid);
-    if tail_link.m2m_join.is_some() {
-        todo!("M4 many-to-many navigation");
-    }
     let (outer_level, outer_parent_key, outer_child_col) = build_capped_level(ctx, peeled);
     let mut inner_builder = SelectBuilder::new();
-    inner_builder.from = Some(tail_link.child_from);
-    inner_builder.where_ = vec![SqlExpr::InSubquery {
-        expr: Box::new(SqlExpr::Column {
-            depth: 0,
-            column: tail_link.child_col.clone(),
-        }),
-        query: Box::new(bulk_query()),
-    }];
+    if let Some((target_pk, junction_target_col)) = &tail_link.m2m_join {
+        inner_builder.from = Some(tail_link.child_from.clone());
+        inner_builder.where_ = vec![
+            SqlExpr::InSubquery {
+                expr: Box::new(SqlExpr::Column {
+                    depth: 1,
+                    column: tail_link.child_col.clone(),
+                }),
+                query: Box::new(bulk_query()),
+            },
+            SqlExpr::Binary {
+                op: SqlBinOp::Eq,
+                lhs: Box::new(SqlExpr::Column {
+                    depth: 0,
+                    column: target_pk.clone(),
+                }),
+                rhs: Box::new(SqlExpr::Column {
+                    depth: 1,
+                    column: junction_target_col.clone(),
+                }),
+            },
+        ];
+        m2m_seed_selects(ctx.schema, &mut inner_builder, &tail_link.child_col);
+        let alias = ctx.aliases.subquery();
+        let mut outer = SelectBuilder::new();
+        outer.from = Some(FromClause::Subquery {
+            query: Box::new(inner_builder),
+            alias,
+        });
+        inner_builder = outer;
+    } else {
+        inner_builder.from = Some(tail_link.child_from.clone());
+        inner_builder.where_ = vec![SqlExpr::InSubquery {
+            expr: Box::new(SqlExpr::Column {
+                depth: 0,
+                column: tail_link.child_col.clone(),
+            }),
+            query: Box::new(bulk_query()),
+        }];
+    }
     let inner_level = Level {
         builder: inner_builder,
         element: peel_optional(&value.ty).clone(),
@@ -5274,6 +5350,30 @@ fn distribute_if_tuple(
         span,
     })
 }
+fn m2m_seed_selects(schema: &ValidatedSchema, builder: &mut SelectBuilder, child_col: &str) {
+    let target_from = match builder.from.as_ref() {
+        Some(FromClause::Join { right, .. }) => Some((**right).clone()),
+        _ => unreachable!("M2M child without a junction join"),
+    };
+    for (name, ty) in from_columns_typed(&target_from, schema) {
+        if name == child_col {
+            todo!("M4 many-to-many navigation");
+        }
+        builder.select.push(SelectItem::Column {
+            depth: 0,
+            column: name.clone(),
+            output: name,
+            ty,
+        });
+    }
+    builder.select.push(SelectItem::Column {
+        depth: 1,
+        column: child_col.to_string(),
+        output: child_col.to_string(),
+        ty: None,
+    });
+}
+
 fn rvalue_shape(
     ctx: &mut Context,
     parent: &mut Level,
@@ -5361,9 +5461,6 @@ fn rvalue_shape(
     let mut child_builder = SelectBuilder::new();
     child_builder.from = Some(child_from);
     if keyed {
-        if m2m_join.is_some() && tail_has_limit_op(tail) {
-            todo!("M4 many-to-many navigation");
-        }
         if let Some((target_pk, junction_target_col)) = &m2m_join {
             child_builder.where_ = vec![
                 SqlExpr::InSubquery {
@@ -5395,6 +5492,16 @@ fn rvalue_shape(
             }];
         }
     }
+    if keyed && m2m_join.is_some() && tail_has_limit_op(tail) {
+        m2m_seed_selects(ctx.schema, &mut child_builder, &child_col);
+        let alias = ctx.aliases.subquery();
+        let mut outer = SelectBuilder::new();
+        outer.from = Some(FromClause::Subquery {
+            query: Box::new(child_builder),
+            alias,
+        });
+        child_builder = outer;
+    }
     let child_level = Level {
         builder: child_builder,
         element: tail.ty.clone(),
@@ -5425,27 +5532,14 @@ fn rvalue_shape(
     if keyed {
         if m2m_join.is_some() {
             if child.builder.select.is_empty() {
-                let target_from = match child.builder.from.as_ref() {
-                    Some(FromClause::Join { right, .. }) => Some((**right).clone()),
-                    _ => unreachable!("M2M child without a junction join"),
-                };
-                for (name, ty) in from_columns_typed(&target_from, ctx.schema) {
-                    if name == child_col {
-                        todo!("M4 many-to-many navigation");
+                match child.builder.from.as_ref() {
+                    Some(FromClause::Join { .. }) => {
+                        m2m_seed_selects(ctx.schema, &mut child.builder, &child_col);
                     }
-                    child.builder.select.push(SelectItem::Column {
-                        depth: 0,
-                        column: name.clone(),
-                        output: name,
-                        ty,
-                    });
+                    _ => {
+                        child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+                    }
                 }
-                child.builder.select.push(SelectItem::Column {
-                    depth: 1,
-                    column: child_col.clone(),
-                    output: child_col.clone(),
-                    ty: None,
-                });
             }
             let served = child.builder.select.iter().any(|item| match item {
                 SelectItem::AllFrom { .. } => false,
@@ -5453,7 +5547,7 @@ fn rvalue_shape(
                     output == &child_col
                 }
             });
-            if !served {
+            if !served && matches!(child.builder.from, Some(FromClause::Join { .. })) {
                 child.builder.select.push(SelectItem::Column {
                     depth: 1,
                     column: child_col.clone(),
@@ -5660,13 +5754,15 @@ fn build_capped_level(
         prefix,
         ..
     } = peeled;
-    let (child_from, child_col, parent_key) = match tail_root_ident(base) {
+    let (child_from, child_col, parent_key, m2m_join) = match tail_root_ident(base) {
         Some(IdentBinding::Field(fid)) => {
             let link = resolve_tail_link(ctx, *fid);
-            if link.m2m_join.is_some() {
-                todo!("M4 many-to-many navigation");
-            }
-            (link.child_from, link.child_col, Some(link.parent_col))
+            (
+                link.child_from,
+                link.child_col,
+                Some(link.parent_col),
+                link.m2m_join,
+            )
         }
         _ => unreachable!("exotic windowed collapse base: peel admits keyed field tails only"),
     };
@@ -5674,14 +5770,48 @@ fn build_capped_level(
         builder: {
             let mut child_builder = SelectBuilder::new();
             child_builder.from = Some(child_from);
-            child_builder.where_ = vec![SqlExpr::InSubquery {
-                expr: Box::new(SqlExpr::Column {
-                    depth: 0,
-                    column: child_col.clone(),
-                }),
-                query: Box::new(bulk_query()),
-            }];
-            child_builder
+            if let Some((target_pk, junction_target_col)) = &m2m_join {
+                child_builder.where_ = vec![
+                    SqlExpr::InSubquery {
+                        expr: Box::new(SqlExpr::Column {
+                            depth: 1,
+                            column: child_col.clone(),
+                        }),
+                        query: Box::new(bulk_query()),
+                    },
+                    SqlExpr::Binary {
+                        op: SqlBinOp::Eq,
+                        lhs: Box::new(SqlExpr::Column {
+                            depth: 0,
+                            column: target_pk.clone(),
+                        }),
+                        rhs: Box::new(SqlExpr::Column {
+                            depth: 1,
+                            column: junction_target_col.clone(),
+                        }),
+                    },
+                ];
+            } else {
+                child_builder.where_ = vec![SqlExpr::InSubquery {
+                    expr: Box::new(SqlExpr::Column {
+                        depth: 0,
+                        column: child_col.clone(),
+                    }),
+                    query: Box::new(bulk_query()),
+                }];
+            }
+            if m2m_join.is_some() {
+                m2m_seed_selects(ctx.schema, &mut child_builder, &child_col);
+                let alias = ctx.aliases.subquery();
+                let mut outer = SelectBuilder::new();
+                outer.from = Some(FromClause::Subquery {
+                    query: Box::new(child_builder),
+                    alias,
+                });
+                outer
+            } else {
+                child_builder
+            }
         },
         element: base.ty.clone(),
         parent: ParentLink::Root { root_idx: 0 },
@@ -5959,14 +6089,16 @@ fn rscalar_shape(
     if ctx.nest_depth < 1 && !keyed && tail_uses_outer(eff) {
         return rcross_shape(ctx, parent, eff, Cardinality::One);
     }
-    let (child_from, child_col, parent_key) = match tail_root_ident(eff) {
+    let (child_from, child_col, parent_key, m2m_join) = match tail_root_ident(eff) {
         Some(IdentBinding::Field(fid)) => {
             let link = resolve_tail_link(ctx, *fid);
-            if link.m2m_join.is_some() {
-                todo!("M4 many-to-many navigation");
-            }
             let _ = parent;
-            (link.child_from, link.child_col, Some(link.parent_col))
+            (
+                link.child_from,
+                link.child_col,
+                Some(link.parent_col),
+                link.m2m_join,
+            )
         }
         Some(IdentBinding::Root { root_idx }) => {
             let root = &ctx.schema.roots[*root_idx];
@@ -5980,6 +6112,7 @@ fn rscalar_shape(
                 },
                 String::new(),
                 None,
+                None,
             )
         }
         _ => unreachable!(
@@ -5990,13 +6123,44 @@ fn rscalar_shape(
     let mut child_builder = SelectBuilder::new();
     child_builder.from = Some(child_from);
     if keyed {
-        child_builder.where_ = vec![SqlExpr::InSubquery {
-            expr: Box::new(SqlExpr::Column {
-                depth: 0,
-                column: child_col.clone(),
-            }),
-            query: Box::new(bulk_query()),
-        }];
+        if let Some((target_pk, junction_target_col)) = &m2m_join {
+            child_builder.where_ = vec![
+                SqlExpr::InSubquery {
+                    expr: Box::new(SqlExpr::Column {
+                        depth: 1,
+                        column: child_col.clone(),
+                    }),
+                    query: Box::new(bulk_query()),
+                },
+                SqlExpr::Binary {
+                    op: SqlBinOp::Eq,
+                    lhs: Box::new(SqlExpr::Column {
+                        depth: 0,
+                        column: target_pk.clone(),
+                    }),
+                    rhs: Box::new(SqlExpr::Column {
+                        depth: 1,
+                        column: junction_target_col.clone(),
+                    }),
+                },
+            ];
+            m2m_seed_selects(ctx.schema, &mut child_builder, &child_col);
+            let alias = ctx.aliases.subquery();
+            let mut outer = SelectBuilder::new();
+            outer.from = Some(FromClause::Subquery {
+                query: Box::new(child_builder),
+                alias,
+            });
+            child_builder = outer;
+        } else {
+            child_builder.where_ = vec![SqlExpr::InSubquery {
+                expr: Box::new(SqlExpr::Column {
+                    depth: 0,
+                    column: child_col.clone(),
+                }),
+                query: Box::new(bulk_query()),
+            }];
+        }
     }
     let child_level = Level {
         builder: child_builder,
@@ -6068,12 +6232,16 @@ fn rscalar_shape(
 }
 
 fn temp_key_query(temp: &str) -> SelectBuilder {
+    temp_col_query(temp, "$$key", Some(ScalarType::Int))
+}
+
+fn temp_col_query(temp: &str, column: &str, ty: Option<ScalarType>) -> SelectBuilder {
     SelectBuilder {
         select: vec![SelectItem::Column {
             depth: 0,
-            column: "$$key".to_string(),
-            output: "$$key".to_string(),
-            ty: Some(ScalarType::Int),
+            column: column.to_string(),
+            output: column.to_string(),
+            ty,
         }],
         from: Some(FromClause::Table {
             table: temp.to_string(),
@@ -6102,13 +6270,15 @@ fn rtemp_shape(
     let reduced_tail = beta_reduce_tail(tail);
     let tail: &TypedExpr = &reduced_tail;
     let temp = ctx.aliases.temp();
-    let (child_from, child_col, key_col) = match tail_root_ident(tail) {
+    let (child_from, child_col, key_col, m2m_join) = match tail_root_ident(tail) {
         Some(IdentBinding::Field(fid)) => {
             let link = resolve_tail_link(ctx, *fid);
-            if link.m2m_join.is_some() {
-                todo!("M4 many-to-many navigation");
-            }
-            (link.child_from, link.child_col, link.parent_col)
+            (
+                link.child_from,
+                link.child_col,
+                link.parent_col,
+                link.m2m_join,
+            )
         }
         _ => unreachable!(
             "exotic temp tail root: temp tails bottom at Field idents (single-spine tails admit one root); remaining kinds infer non-List types, contradicting the List-only callers"
@@ -6117,13 +6287,49 @@ fn rtemp_shape(
     let parent_q = parent.builder.clone();
     let mut child_builder = SelectBuilder::new();
     child_builder.from = Some(child_from);
-    child_builder.where_ = vec![SqlExpr::InSubquery {
-        expr: Box::new(SqlExpr::Column {
-            depth: 0,
-            column: child_col.clone(),
-        }),
-        query: Box::new(temp_key_query(&temp)),
-    }];
+    let pair_col = if m2m_join.is_some() {
+        key_col.clone()
+    } else {
+        "$$key".to_string()
+    };
+    if let Some((target_pk, junction_target_col)) = &m2m_join {
+        child_builder.where_ = vec![
+            SqlExpr::InSubquery {
+                expr: Box::new(SqlExpr::Column {
+                    depth: 1,
+                    column: child_col.clone(),
+                }),
+                query: Box::new(temp_col_query(&temp, &key_col, None)),
+            },
+            SqlExpr::Binary {
+                op: SqlBinOp::Eq,
+                lhs: Box::new(SqlExpr::Column {
+                    depth: 0,
+                    column: target_pk.clone(),
+                }),
+                rhs: Box::new(SqlExpr::Column {
+                    depth: 1,
+                    column: junction_target_col.clone(),
+                }),
+            },
+        ];
+        m2m_seed_selects(ctx.schema, &mut child_builder, &child_col);
+        let alias = ctx.aliases.subquery();
+        let mut outer = SelectBuilder::new();
+        outer.from = Some(FromClause::Subquery {
+            query: Box::new(child_builder),
+            alias,
+        });
+        child_builder = outer;
+    } else {
+        child_builder.where_ = vec![SqlExpr::InSubquery {
+            expr: Box::new(SqlExpr::Column {
+                depth: 0,
+                column: child_col.clone(),
+            }),
+            query: Box::new(temp_key_query(&temp)),
+        }];
+    }
     let child_level = Level {
         builder: child_builder,
         element: tail.ty.clone(),
@@ -6157,6 +6363,9 @@ fn rtemp_shape(
             todo!("M4b key threading through subqueries");
         }
         ensure_key(&mut create_q, col, ctx.schema);
+    }
+    if m2m_join.is_some() {
+        ensure_key(&mut create_q, &key_col, ctx.schema);
     }
     create_q.select.push(SelectItem::Column {
         depth: 0,
@@ -6205,7 +6414,7 @@ fn rtemp_shape(
                 stmt: idx,
                 parent: Some(ParentRef {
                     stmt: temp_idx,
-                    parent_key: "$$key".to_string(),
+                    parent_key: pair_col.clone(),
                     child_key: child_col,
                     negated: false,
                 }),
@@ -6219,7 +6428,7 @@ fn rtemp_shape(
                 stmt: idx,
                 parent: Some(ParentRef {
                     stmt: temp_idx,
-                    parent_key: "$$key".to_string(),
+                    parent_key: pair_col.clone(),
                     child_key: child_col,
                     negated: false,
                 }),
@@ -6228,7 +6437,7 @@ fn rtemp_shape(
             },
         },
     };
-    (shape, Some("$$key".to_string()))
+    (shape, Some(pair_col))
 }
 
 fn null_cells(ty: &QueryType, out: &mut Vec<(SqlExpr, Option<ScalarType>)>) {
@@ -8770,7 +8979,7 @@ fn hop_shell(ctx: &mut Context, source: StructId, fid: FieldId) -> (StructId, Se
             parent_pk,
         } => (child_fk, parent_pk),
         LinkCols::ManyToMany => {
-            unreachable!("many-to-many hops are list-typed: scalar chains never cross them")
+            todo!("M4 many-to-many navigation");
         }
     };
     let table = ctx.schema.tables[ctx.schema.structs[target.index()].table.index()]

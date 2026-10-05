@@ -1729,6 +1729,142 @@ fn root_first_over_nested_literal_value() {
     );
 }
 
+fn role(name: &str) -> Value {
+    Value::Record(vec![("name".to_string(), Value::String(name.to_string()))])
+}
+
+#[test]
+fn m2m_take_windows_junction_key_values() {
+    assert_eq!(
+        value("users { r = roles.take(1) }"),
+        Value::List(vec![
+            Value::Record(vec![("r".to_string(), Value::List(vec![role("admin")]))]),
+            Value::Record(vec![("r".to_string(), Value::List(vec![role("dev")]))]),
+        ])
+    );
+}
+
+#[test]
+fn m2m_skip_windows_junction_key_values() {
+    assert_eq!(
+        value("users { r = roles.skip(1) }"),
+        Value::List(vec![
+            Value::Record(vec![("r".to_string(), Value::List(vec![role("dev")]))]),
+            Value::Record(vec![("r".to_string(), Value::List(vec![]))]),
+        ])
+    );
+}
+
+#[test]
+fn m2m_single_first_values() {
+    assert_eq!(
+        value("users { r = roles.first() }"),
+        Value::List(vec![
+            Value::Record(vec![("r".to_string(), role("admin"))]),
+            Value::Record(vec![("r".to_string(), role("dev"))]),
+        ])
+    );
+}
+
+#[test]
+fn m2m_nth_values() {
+    assert_eq!(
+        value("users { r = roles.nth(0) }"),
+        Value::List(vec![
+            Value::Record(vec![("r".to_string(), role("admin"))]),
+            Value::Record(vec![("r".to_string(), role("dev"))]),
+        ])
+    );
+}
+
+#[test]
+fn m2m_maxby_values() {
+    assert_eq!(
+        value("users { r = roles.max_by(name) }"),
+        Value::List(vec![
+            Value::Record(vec![("r".to_string(), role("dev"))]),
+            Value::Record(vec![("r".to_string(), role("dev"))]),
+        ])
+    );
+}
+
+#[test]
+fn m2m_temp_take_values() {
+    assert_eq!(
+        value("users { x = roles.take(age) }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![role("admin"), role("dev"),])
+            )]),
+            Value::Record(vec![("x".to_string(), Value::List(vec![role("dev")]))]),
+        ])
+    );
+}
+
+#[test]
+fn m2m_corr_len_values() {
+    assert_eq!(
+        value("users { s = roles.len() }"),
+        Value::List(vec![
+            Value::Record(vec![("s".to_string(), Value::Int(2))]),
+            Value::Record(vec![("s".to_string(), Value::Int(1))]),
+        ])
+    );
+}
+
+#[test]
+fn m2m_b1_collapse_tail_values() {
+    assert_eq!(
+        value("users { o = subordinates.first()?.roles }"),
+        Value::List(vec![
+            Value::Record(vec![("o".to_string(), Value::List(vec![role("dev")]))]),
+            Value::Record(vec![(
+                "o".to_string(),
+                Value::List(vec![role("admin"), role("dev"),])
+            )]),
+        ])
+    );
+}
+
+#[test]
+fn m2m_reverse_bare_values() {
+    fn names(v: Value) -> Vec<String> {
+        match v {
+            Value::List(rows) => rows
+                .into_iter()
+                .map(|r| match r {
+                    Value::Record(fields) => match fields.iter().find(|(n, _)| n == "name") {
+                        Some((_, Value::String(n))) => n.clone(),
+                        other => panic!("name field, got {other:?}"),
+                    },
+                    other => panic!("user record, got {other:?}"),
+                })
+                .collect(),
+            other => panic!("root list, got {other:?}"),
+        }
+    }
+    match value("roles { u = users }") {
+        Value::List(rows) => {
+            assert_eq!(rows.len(), 2);
+            let mut it = rows.into_iter();
+            match (it.next(), it.next()) {
+                (Some(Value::Record(admin)), Some(Value::Record(dev))) => {
+                    let admin_u = admin.iter().find(|(n, _)| n == "u").map(|(_, v)| v.clone());
+                    let dev_u = dev.iter().find(|(n, _)| n == "u").map(|(_, v)| v.clone());
+                    assert_eq!(admin_u.map(names), Some(vec!["Ada".to_string()]));
+                    assert_eq!(
+                        dev_u.map(names),
+                        Some(vec!["Ada".to_string(), "Bob".to_string()])
+                    );
+                }
+                other => panic!("two role rows, got {other:?}"),
+            }
+        }
+        other => panic!("root list, got {other:?}"),
+    }
+}
+
 #[test]
 fn root_first_over_nested_navigation_values() {
     let got = value("users.orders.first()");
