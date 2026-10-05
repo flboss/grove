@@ -64,6 +64,7 @@ fn tail_row_struct(ctx: &Context, tail: &TypedExpr) -> Option<StructId> {
 
 pub struct TempCollect {
     pub temp: String,
+    pub key_col: String,
     pub child_fk: String,
     pub refs: Vec<String>,
 }
@@ -2813,10 +2814,10 @@ fn resolve_tail_link(ctx: &mut Context, fid: FieldId) -> ChildLink {
 }
 
 fn scalar_ident_temp(ctx: &mut Context, binding: &IdentBinding) -> SqlExpr {
-    let (temp, child_fk) = ctx
+    let (temp, key_col, child_fk) = ctx
         .temp_collect
         .as_ref()
-        .map(|c| (c.temp.clone(), c.child_fk.clone()))
+        .map(|c| (c.temp.clone(), c.key_col.clone(), c.child_fk.clone()))
         .unwrap_or_else(|| unreachable!("temp record outside temp mode"));
     let column = match binding {
         IdentBinding::Field(fid) => {
@@ -2840,7 +2841,7 @@ fn scalar_ident_temp(ctx: &mut Context, binding: &IdentBinding) -> SqlExpr {
         IdentBinding::Prev { .. } => todo!("mutations era: prev"),
     };
     record_temp_ref(ctx, &column);
-    temp_lookup(ctx, &temp, &column, &child_fk)
+    temp_lookup_on(ctx, &temp, &column, &key_col, &child_fk, 1)
 }
 
 fn record_temp_ref(ctx: &mut Context, column: &str) {
@@ -2853,14 +2854,11 @@ fn record_temp_ref(ctx: &mut Context, column: &str) {
     }
 }
 
-fn temp_lookup(ctx: &Context, temp: &str, column: &str, child_fk: &str) -> SqlExpr {
-    temp_lookup_at(ctx, temp, column, child_fk, 1)
-}
-
-fn temp_lookup_at(
+fn temp_lookup_on(
     ctx: &Context,
     temp: &str,
     column: &str,
+    key_col: &str,
     child_fk: &str,
     fk_depth: usize,
 ) -> SqlExpr {
@@ -2879,7 +2877,7 @@ fn temp_lookup_at(
         op: SqlBinOp::Eq,
         lhs: Box::new(SqlExpr::Column {
             depth: 0,
-            column: "$$key".to_string(),
+            column: key_col.to_string(),
         }),
         rhs: Box::new(SqlExpr::Column {
             depth: fk_depth,
@@ -4280,6 +4278,7 @@ fn rcross_shape(
                 && parent.builder.offset.is_none()
                 && !tail_uses_projected_outer(tail)
                 && !tail_uses_nav_outer(ctx, tail)
+                && !take_bound_ident(tail)
         }
         _ => false,
     };
@@ -4301,7 +4300,7 @@ fn rcross_shape(
     }
     let corr = &correlated[0];
     let mut suffix: Vec<(String, Vec<TypedMethodArg>)> = Vec::new();
-    let peeled_tail = peel_cross_window(&local_tail, &mut suffix, false);
+    let peeled_tail = peel_cross_window(&local_tail, &mut suffix, true);
     let broadcast_truncate: Option<(usize, Option<usize>)> =
         if broadcast.is_empty() || suffix.is_empty() {
             None
@@ -4336,14 +4335,14 @@ fn rcross_shape(
         if (has_range || has_outer_sorts || has_ne_composition)
             && (suffix.is_empty() || stacked_takes_foldable(tail))
         {
-            let mut carries: Vec<(String, ScalarType)> = Vec::new();
-            let carry_col = |col: &str, carries: &mut Vec<(String, ScalarType)>| -> bool {
+            let mut carries: Vec<(String, Option<ScalarType>)> = Vec::new();
+            let carry_col = |col: &str, carries: &mut Vec<(String, Option<ScalarType>)>| -> bool {
                 if carries.iter().any(|(c, _)| c == col) {
                     return true;
                 }
                 match output_ty(&parent.builder, col, ctx.schema) {
                     Some(ty) => {
-                        carries.push((col.to_string(), ty));
+                        carries.push((col.to_string(), Some(ty)));
                         true
                     }
                     None => false,
@@ -4384,6 +4383,29 @@ fn rcross_shape(
                     }
                 }
             }
+            let mut suffix_temp = false;
+            for (_, args) in &suffix {
+                for arg in args {
+                    let Some(cols) = suffix_bound_carry_cols(ctx, &parent.builder, &arg.expr)
+                    else {
+                        ok = false;
+                        break;
+                    };
+                    if !cols.is_empty() {
+                        suffix_temp = true;
+                    }
+                    for (col, ty) in cols {
+                        if carries.iter().any(|(c, _)| c == &col) {
+                            continue;
+                        }
+                        if !served_col(ctx, &parent.builder, &col) {
+                            ok = false;
+                            break;
+                        }
+                        carries.push((col, ty));
+                    }
+                }
+            }
             if tail_uses_optional_sort(tail) {
             } else if ok {
                 let trunc: Option<(usize, Option<usize>)> =
@@ -4404,6 +4426,7 @@ fn rcross_shape(
                         carries,
                         broadcast: &broadcast,
                         suffix: &suffix,
+                        suffix_temp,
                         trunc,
                         cardinality,
                     },
@@ -4425,11 +4448,11 @@ fn rcross_shape(
     } else {
         &peeled_tail
     };
-    let (source_name, temp_idx): (String, Option<usize>) = if bare {
+    let (source_name, temp_idx, suffix_temp): (String, Option<usize>, Option<String>) = if bare {
         let table = ctx.schema.tables[ctx.schema.structs[corr.outer_struct.index()].table.index()]
             .name
             .clone();
-        (table, None)
+        (table, None, None)
     } else {
         let temp = ctx.aliases.temp();
         let mut create_q = parent.builder.clone();
@@ -4439,6 +4462,30 @@ fn rcross_shape(
         for corr in &correlated {
             if let Some(nav) = &corr.nav {
                 create_q.select.push(nav_carry_item(ctx, nav));
+            }
+        }
+        let mut suffix_temp_ok = true;
+        let mut suffix_needs_temp = false;
+        for (_, args) in &suffix {
+            for arg in args {
+                match suffix_bound_carry_cols(ctx, &parent.builder, &arg.expr) {
+                    Some(cols) => {
+                        if !cols.is_empty() {
+                            suffix_needs_temp = true;
+                        }
+                        for (col, ty) in cols {
+                            if !available_cols(&create_q, ctx.schema).contains(&col) {
+                                create_q.select.push(SelectItem::Column {
+                                    depth: 0,
+                                    column: col.clone(),
+                                    output: col,
+                                    ty,
+                                });
+                            }
+                        }
+                    }
+                    None => suffix_temp_ok = false,
+                }
             }
         }
         if corr.nav.is_none() && !available_cols(&create_q, ctx.schema).contains(&corr.outer_col) {
@@ -4454,7 +4501,8 @@ fn rcross_shape(
             StatementKind::Temp { name: temp.clone() },
         );
         swap_parent_to_temp(parent, &temp, &create_outputs);
-        (temp, Some(idx))
+        let suffix_temp = (suffix_temp_ok && suffix_needs_temp).then(|| temp.clone());
+        (temp, Some(idx), suffix_temp)
     };
     let mut child_builder = SelectBuilder::new();
     child_builder.from = Some(cross_root_scan(ctx, tail));
@@ -4543,6 +4591,22 @@ fn rcross_shape(
         child.builder.unions.push(arm);
     }
     if !global_take && broadcast_truncate.is_none() {
+        let serves_pkey = child.builder.select.iter().any(|item| match item {
+            SelectItem::Column { output, .. } | SelectItem::Expr { output, .. } => {
+                output == "$$pkey"
+            }
+            SelectItem::AllFrom { .. } => false,
+        });
+        let temp_bound = suffix_temp.as_ref().filter(|_| serves_pkey);
+        let was_temp = temp_bound.map(|temp| {
+            ctx.temp_collect.replace(TempCollect {
+                temp: temp.clone(),
+                key_col: corr.outer_col.clone(),
+                child_fk: "$$pkey".to_string(),
+                refs: Vec::new(),
+            })
+        });
+        let mut first_window = was_temp.is_some();
         for (method, args) in suffix.iter().rev() {
             if has_window_bound(&child.builder) {
                 let bound = lower_take_bound(ctx, method, args);
@@ -4551,8 +4615,22 @@ fn rcross_shape(
             }
             let order = std::mem::take(&mut child.builder.order_by);
             let mut wrapped = wrap_level(ctx, child);
+            if first_window {
+                wrapped.builder.where_.push(SqlExpr::Binary {
+                    op: SqlBinOp::IsNot,
+                    lhs: Box::new(SqlExpr::Column {
+                        depth: 0,
+                        column: "$$pkey".to_string(),
+                    }),
+                    rhs: Box::new(SqlExpr::Param(ParamValue::Null)),
+                });
+                first_window = false;
+            }
             wrapped.builder.order_by = order;
             child = window_take(ctx, wrapped, "$$pkey", method, args);
+        }
+        if let Some(was) = was_temp {
+            ctx.temp_collect = was;
         }
     }
     if child.builder.select.is_empty() {
@@ -4692,10 +4770,10 @@ fn cross_cartesian(
     ctx: &mut Context,
     parent: &mut Level,
     peeled: &TypedExpr,
-    extra: &[(String, ScalarType)],
+    extra: &[(String, Option<ScalarType>)],
     extra_computed: &[(String, SqlExpr, ScalarType)],
     outer_scope: bool,
-) -> (usize, Vec<(String, Option<ScalarType>)>, Level) {
+) -> (usize, String, Vec<(String, Option<ScalarType>)>, Level) {
     let temp = ctx.aliases.temp();
     let mut create_q = parent.builder.clone();
     if create_q.select.is_empty() {
@@ -4707,7 +4785,7 @@ fn cross_cartesian(
                 depth: 0,
                 column: name.clone(),
                 output: name.clone(),
-                ty: Some(*ty),
+                ty: *ty,
             });
         }
     }
@@ -4799,7 +4877,7 @@ fn cross_cartesian(
         output: "$$pkey".to_string(),
         ty: None,
     });
-    (temp_idx, create_outputs, child)
+    (temp_idx, temp, create_outputs, child)
 }
 
 fn sink_cross_child(
@@ -4880,7 +4958,7 @@ fn const_proj_cross_shape(
     if items.iter().all(|item| !uses_outer(&item.value)) {
         return None;
     }
-    let mut carries: Vec<(String, ScalarType)> = Vec::new();
+    let mut carries: Vec<(String, Option<ScalarType>)> = Vec::new();
     for item in items {
         let mut fids = Vec::new();
         let mut foreign = false;
@@ -4909,11 +4987,11 @@ fn const_proj_cross_shape(
             };
             let ty = output_ty(&parent.builder, &col, ctx.schema)?;
             if !carries.iter().any(|(c, _)| c == &col) {
-                carries.push((col, ty));
+                carries.push((col, Some(ty)));
             }
         }
     }
-    let (temp_idx, _, child) = cross_cartesian(ctx, parent, tail, &carries, &[], true);
+    let (temp_idx, _, _, child) = cross_cartesian(ctx, parent, tail, &carries, &[], true);
     Some(sink_cross_child(
         ctx,
         child,
@@ -4940,7 +5018,7 @@ fn per_row_take_shape(
             format!("$$tbound{i}")
         }
     };
-    let mut carries: Vec<(String, ScalarType)> = Vec::new();
+    let mut carries: Vec<(String, Option<ScalarType>)> = Vec::new();
     let mut computed: Vec<(String, SqlExpr, ScalarType)> = Vec::new();
     let mut bounds: Vec<(String, String, ScalarType)> = Vec::new();
     for (i, (_, bound)) in ops.iter().enumerate() {
@@ -4982,7 +5060,7 @@ fn per_row_take_shape(
                 });
                 bounds.push((name.clone(), tbound_name(i), ty));
                 if !carries.iter().any(|(c, _)| c == &name) {
-                    carries.push((name, ty));
+                    carries.push((name, Some(ty)));
                 }
             }
             BoundCarry::Computed(lowered) => {
@@ -4991,7 +5069,8 @@ fn per_row_take_shape(
             }
         }
     }
-    let (temp_idx, _, mut child) = cross_cartesian(ctx, parent, peeled, &carries, &computed, false);
+    let (temp_idx, _, _, mut child) =
+        cross_cartesian(ctx, parent, peeled, &carries, &computed, false);
     for (carried, tbound, ty) in &bounds {
         child.builder.select.push(SelectItem::Expr {
             expr: SqlExpr::Column {
@@ -5030,13 +5109,147 @@ fn per_row_take_shape(
 struct PredLane<'a> {
     peeled: &'a TypedExpr,
     conds: &'a [CorrCond],
-    carries: Vec<(String, ScalarType)>,
+    carries: Vec<(String, Option<ScalarType>)>,
     broadcast: &'a [TypedExpr],
     suffix: &'a [(String, Vec<TypedMethodArg>)],
+    suffix_temp: bool,
     trunc: Option<(usize, Option<usize>)>,
     cardinality: Cardinality,
 }
 
+fn served_col(ctx: &Context, builder: &SelectBuilder, col: &str) -> bool {
+    output_ty(builder, col, ctx.schema).is_some()
+        || available_from_cols(&builder.from, ctx.schema)
+            .iter()
+            .any(|c| c == col)
+}
+
+fn suffix_bound_carry_cols(
+    ctx: &Context,
+    parent: &SelectBuilder,
+    bound: &TypedExpr,
+) -> Option<Vec<(String, Option<ScalarType>)>> {
+    fn ident_col(
+        ctx: &Context,
+        parent: &SelectBuilder,
+        fid: FieldId,
+        out: &mut Vec<(String, Option<ScalarType>)>,
+    ) -> bool {
+        let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
+        match field {
+            Field::Value { columns, .. } => match columns.as_slice() {
+                [col] => {
+                    let name = ctx.schema.column_name(*col).to_string();
+                    if !served_col(ctx, parent, &name) {
+                        return false;
+                    }
+                    if !out.iter().any(|(c, _)| c == &name) {
+                        out.push((name.clone(), output_ty(parent, &name, ctx.schema)));
+                    }
+                    true
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+    fn walk(
+        ctx: &Context,
+        parent: &SelectBuilder,
+        node: &TypedExpr,
+        out: &mut Vec<(String, Option<ScalarType>)>,
+    ) -> bool {
+        match &node.kind {
+            TypedExprKind::Field { base, .. } => {
+                let mut cursor = base.as_ref();
+                while let TypedExprKind::Field { base: next, .. } = &cursor.kind {
+                    cursor = next;
+                }
+                if let TypedExprKind::Ident {
+                    binding: IdentBinding::Field(fid),
+                    depth,
+                    ..
+                } = &cursor.kind
+                {
+                    if *depth > 0 {
+                        return true;
+                    }
+                    let served = match link_cols(ctx.schema, *fid) {
+                        LinkCols::ParentFk { parent_fk, .. } => {
+                            if !served_col(ctx, parent, &parent_fk) {
+                                return false;
+                            }
+                            if !out.iter().any(|(c, _)| c == &parent_fk) {
+                                out.push((parent_fk, None));
+                            }
+                            true
+                        }
+                        LinkCols::TargetFk { parent_pk, .. } => {
+                            if !served_col(ctx, parent, &parent_pk) {
+                                return false;
+                            }
+                            if !out.iter().any(|(c, _)| c == &parent_pk) {
+                                out.push((parent_pk, None));
+                            }
+                            true
+                        }
+                        LinkCols::ManyToMany => false,
+                    };
+                    return served;
+                }
+                true
+            }
+            TypedExprKind::Ident {
+                binding: IdentBinding::Field(fid),
+                depth,
+                ..
+            } => {
+                if *depth > 1 {
+                    return false;
+                }
+                ident_col(ctx, parent, *fid, out)
+            }
+            TypedExprKind::Ident {
+                binding: IdentBinding::ProjectedField { name },
+                ..
+            } => {
+                if !served_col(ctx, parent, name) {
+                    return false;
+                }
+                if !out.iter().any(|(c, _)| c == name) {
+                    out.push((name.clone(), output_ty(parent, name, ctx.schema)));
+                }
+                true
+            }
+            TypedExprKind::Method { base, args, .. } => {
+                walk(ctx, parent, base, out) && args.iter().all(|a| walk(ctx, parent, &a.expr, out))
+            }
+            TypedExprKind::Binary { lhs, rhs, .. } => {
+                walk(ctx, parent, lhs, out) && walk(ctx, parent, rhs, out)
+            }
+            TypedExprKind::Unary { expr, .. } | TypedExprKind::Cast { expr, .. } => {
+                walk(ctx, parent, expr, out)
+            }
+            TypedExprKind::If { arms, default } => {
+                arms.iter()
+                    .all(|(c, t)| walk(ctx, parent, c, out) && walk(ctx, parent, t, out))
+                    && walk(ctx, parent, default, out)
+            }
+            TypedExprKind::Some { value } => walk(ctx, parent, value, out),
+            TypedExprKind::Tuple { .. }
+            | TypedExprKind::Array { .. }
+            | TypedExprKind::Struct { .. }
+            | TypedExprKind::Projection { .. } => false,
+            _ => true,
+        }
+    }
+    let mut cols = Vec::new();
+    if walk(ctx, parent, bound, &mut cols) {
+        Some(cols)
+    } else {
+        None
+    }
+}
 fn predicate_join_shape(
     ctx: &mut Context,
     parent: &mut Level,
@@ -5048,10 +5261,11 @@ fn predicate_join_shape(
         carries,
         broadcast,
         suffix,
+        suffix_temp,
         trunc,
         cardinality,
     } = lane;
-    let (temp_idx, _, mut child) = cross_cartesian(ctx, parent, peeled, &carries, &[], true);
+    let (temp_idx, temp, _, mut child) = cross_cartesian(ctx, parent, peeled, &carries, &[], true);
     let mut pred: Option<SqlExpr> = None;
     for corr in conds {
         let was_outer = std::mem::replace(&mut ctx.no_outer, true);
@@ -5133,6 +5347,23 @@ fn predicate_join_shape(
         child.builder.unions.push(arm);
     }
     if trunc.is_none() {
+        let temp_bound = suffix_temp
+            && child.builder.select.iter().any(|item| match item {
+                SelectItem::Column { output, .. } | SelectItem::Expr { output, .. } => {
+                    output == "$$pkey"
+                }
+                SelectItem::AllFrom { .. } => false,
+            });
+        let was_temp = if temp_bound {
+            Some(ctx.temp_collect.replace(TempCollect {
+                temp: temp.clone(),
+                key_col: "$$key".to_string(),
+                child_fk: "$$pkey".to_string(),
+                refs: Vec::new(),
+            }))
+        } else {
+            None
+        };
         for (method, args) in suffix.iter().rev() {
             if has_window_bound(&child.builder) {
                 let bound = lower_take_bound(ctx, method, args);
@@ -5143,6 +5374,9 @@ fn predicate_join_shape(
             let mut wrapped = wrap_level(ctx, child);
             wrapped.builder.order_by = order;
             child = window_take(ctx, wrapped, "$$pkey", method, args);
+        }
+        if let Some(was) = was_temp {
+            ctx.temp_collect = was;
         }
     }
     let cardinality = match trunc {
@@ -5168,7 +5402,7 @@ fn predicate_join_shape(
 struct SortLane {
     peeled: TypedExpr,
     sorts: Vec<(String, Vec<TypedMethodArg>)>,
-    carries: Vec<(String, ScalarType)>,
+    carries: Vec<(String, Option<ScalarType>)>,
 }
 
 fn sortable_cross_tail(ctx: &Context, parent: &Level, tail: &TypedExpr) -> Option<SortLane> {
@@ -5190,7 +5424,7 @@ fn sortable_cross_tail(ctx: &Context, parent: &Level, tail: &TypedExpr) -> Optio
             }
         }
     }
-    let mut carries: Vec<(String, ScalarType)> = Vec::new();
+    let mut carries: Vec<(String, Option<ScalarType>)> = Vec::new();
     for (_, args) in &sorts {
         for arg in args {
             let mut fids = Vec::new();
@@ -5217,7 +5451,7 @@ fn sortable_cross_tail(ctx: &Context, parent: &Level, tail: &TypedExpr) -> Optio
                 };
                 let ty = output_ty(&parent.builder, &col, ctx.schema)?;
                 if !carries.iter().any(|(c, _)| c == &col) {
-                    carries.push((col, ty));
+                    carries.push((col, Some(ty)));
                 }
             }
         }
@@ -5265,7 +5499,7 @@ fn sorted_cross_shape(
     lane: SortLane,
     cardinality: Cardinality,
 ) -> (ResultShape, Option<String>) {
-    let (temp_idx, _, mut child) =
+    let (temp_idx, _, _, mut child) =
         cross_cartesian(ctx, parent, &lane.peeled, &lane.carries, &[], false);
     let was_outer = std::mem::replace(&mut ctx.no_outer, false);
     let mut order = Vec::new();
@@ -6559,6 +6793,7 @@ fn rtemp_shape(
     };
     ctx.temp_collect = Some(TempCollect {
         temp: temp.clone(),
+        key_col: "$$key".to_string(),
         child_fk: child_col.clone(),
         refs: Vec::new(),
     });
@@ -7462,6 +7697,7 @@ fn rtemp_array_shape(
     let ref_tys = resolve_ref_tys(ctx, parent, &refs);
     ctx.temp_collect = Some(TempCollect {
         temp: temp.clone(),
+        key_col: "$$key".to_string(),
         child_fk: "$$key".to_string(),
         refs,
     });
@@ -7593,6 +7829,7 @@ fn rtemp_method_shape(
     let ref_tys = resolve_ref_tys(ctx, parent, &refs);
     ctx.temp_collect = Some(TempCollect {
         temp: temp.clone(),
+        key_col: "$$key".to_string(),
         child_fk: "$$key".to_string(),
         refs,
     });
@@ -7748,6 +7985,7 @@ fn scalar_temp_array(
     swap_parent_to_temp(parent, &temp, &create_outputs);
     ctx.temp_collect = Some(TempCollect {
         temp: temp.clone(),
+        key_col: "$$key".to_string(),
         child_fk: "$$key".to_string(),
         refs,
     });
@@ -9261,14 +9499,14 @@ fn temp_first_hop(ctx: &mut Context, source: StructId, fid: FieldId) -> (StructI
         Field::Ref { target, .. } => *target,
         _ => unreachable!("hop over non-reference field"),
     };
-    let (temp, child_fk) = ctx
+    let (temp, key_col, child_fk) = ctx
         .temp_collect
         .as_ref()
-        .map(|c| (c.temp.clone(), c.child_fk.clone()))
+        .map(|c| (c.temp.clone(), c.key_col.clone(), c.child_fk.clone()))
         .unwrap_or_else(|| unreachable!("temp first hop outside temp mode"));
     let (child_col, parent_col) = hop_link_cols(ctx.schema, fid);
     record_temp_ref(ctx, &parent_col);
-    let parent_rhs = temp_lookup_at(ctx, &temp, &parent_col, &child_fk, 2);
+    let parent_rhs = temp_lookup_on(ctx, &temp, &parent_col, &key_col, &child_fk, 2);
     (target, hop_shell_on(child_col, parent_rhs, ctx, target))
 }
 

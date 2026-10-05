@@ -2241,7 +2241,6 @@ fn nth_temp_bound_values() {
                 "o".to_string(),
                 Value::Record(vec![("total".to_string(), Value::Dec(dec("30")))]),
             )]),
-            Value::Record(vec![("o".to_string(), Value::Null)]),
         ])
     );
 }
@@ -2259,6 +2258,16 @@ fn nth_nav_bound_values() {
                 "o".to_string(),
                 Value::Record(vec![("total".to_string(), Value::Dec(dec("30")))]),
             )]),
+        ])
+    );
+}
+
+#[test]
+fn nth_out_of_range_values() {
+    assert_eq!(
+        value("users { o = orders.nth(age) }"),
+        Value::List(vec![
+            Value::Record(vec![("o".to_string(), Value::Null)]),
             Value::Record(vec![("o".to_string(), Value::Null)]),
         ])
     );
@@ -2293,6 +2302,62 @@ fn avg_over_outer_nav_values() {
         Value::List(vec![
             Value::Record(vec![("s".to_string(), Value::Float(40.0))]),
             Value::Record(vec![("s".to_string(), Value::Float(30.0))]),
+        ])
+    );
+}
+
+#[test]
+fn cross_take_outer_bound_values() {
+    assert_eq!(
+        value("users { x = configs.filter(owner == email).take(age) }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![cfg("n1", "a@x"), cfg("a@x", "a@x")])
+            )]),
+            Value::Record(vec![("x".to_string(), Value::List(vec![cfg("n3", "b@x")]))]),
+        ])
+    );
+}
+
+#[test]
+fn cross_ne_take_outer_bound_values() {
+    assert_eq!(
+        value("users { x = configs.filter(owner != email).take(age) }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![
+                    cfg("n2", "zzz"),
+                    cfg("n3", "b@x"),
+                    cfg("b@x", "zzz"),
+                    cfg("n1", "zzz"),
+                ])
+            )]),
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![
+                    cfg("n1", "a@x"),
+                    cfg("n2", "zzz"),
+                    cfg("b@x", "zzz"),
+                    cfg("a@x", "a@x"),
+                    cfg("n1", "zzz"),
+                ])
+            )]),
+        ])
+    );
+}
+
+#[test]
+fn cross_skip_outer_bound_values() {
+    assert_eq!(
+        value("users { x = configs.filter(owner == email).skip(age - 29) }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "x".to_string(),
+                Value::List(vec![cfg("a@x", "a@x")])
+            )]),
+            Value::Record(vec![("x".to_string(), Value::List(vec![]))]),
         ])
     );
 }
