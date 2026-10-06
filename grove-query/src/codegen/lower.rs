@@ -30,6 +30,7 @@ pub struct Context<'s> {
     pub nest_depth: usize,
     pub temp_collect: Option<TempCollect>,
     pub in_array_temp: bool,
+    nav_carries: Vec<(String, NavCarry)>,
 }
 
 pub struct ChildCtx {
@@ -84,6 +85,7 @@ impl<'s> Context<'s> {
             nest_depth: 0,
             temp_collect: None,
             in_array_temp: false,
+            nav_carries: Vec::new(),
         }
     }
 
@@ -3915,14 +3917,20 @@ impl CorrGroup {
     }
 }
 
+#[derive(Debug, Clone)]
 struct NavCarry {
     carry: String,
-    target: StructId,
-    parent_col: String,
-    target_col: String,
+    chain: Vec<NavHop>,
     endpoint: String,
     endpoint_ty: ScalarType,
     default: Option<SqlExpr>,
+}
+
+#[derive(Debug, Clone)]
+struct NavHop {
+    table: String,
+    pk: String,
+    fk: String,
 }
 
 enum OuterRef {
@@ -4491,36 +4499,95 @@ fn split_and(expr: &TypedExpr) -> Vec<TypedExpr> {
 }
 
 fn nav_carry(ctx: &mut Context, outer_side: &TypedExpr) -> NavCarry {
+    let key = canon_expr(outer_side);
+    if let Some(hit) = ctx.nav_carries.iter().find(|(k, _)| k == &key) {
+        return hit.1.clone();
+    }
+    let carry = nav_carry_inner(ctx, outer_side);
+    ctx.nav_carries.push((key, carry.clone()));
+    carry
+}
+
+fn nav_carry_inner(ctx: &mut Context, outer_side: &TypedExpr) -> NavCarry {
     let (base, endpoint) = match &outer_side.kind {
         TypedExprKind::Field { base, name, .. } => (base.as_ref(), name.value.clone()),
         _ => todo!("M4b complex cross-root correlation"),
     };
-    let ref_fid = match &base.kind {
-        TypedExprKind::Ident {
-            binding: IdentBinding::Field(fid),
-            depth,
-            ..
-        } if *depth > 0 => match &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()] {
-            Field::Ref { .. } => *fid,
+    let mut hops: Vec<FieldId> = Vec::new();
+    let mut cursor = base;
+    loop {
+        match &cursor.kind {
+            TypedExprKind::Field {
+                base: next,
+                name: hop,
+                ..
+            } => {
+                let sid = match peel_optional(&cursor.ty) {
+                    QueryType::Record(RecordSource::Schema(sid)) => *sid,
+                    _ => todo!("M4b complex cross-root correlation"),
+                };
+                let (fid, field) = ctx.schema.struct_field(sid, &hop.value).unwrap_or_else(|| {
+                    unreachable!("resolved field {} vanished from the schema", hop.value)
+                });
+                match field {
+                    Field::Ref { .. } => {}
+                    _ => todo!("M4b complex cross-root correlation"),
+                }
+                hops.push(fid);
+                cursor = next;
+            }
+            TypedExprKind::Ident {
+                binding: IdentBinding::Field(fid),
+                depth,
+                ..
+            } => {
+                if *depth == 0 {
+                    todo!("M4b complex cross-root correlation");
+                }
+                let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
+                match field {
+                    Field::Ref { .. } => {}
+                    _ => todo!("M4b complex cross-root correlation"),
+                }
+                hops.push(*fid);
+                break;
+            }
             _ => todo!("M4b complex cross-root correlation"),
-        },
-        _ => todo!("M4b complex cross-root correlation"),
-    };
-    let target = match &ctx.schema.structs[ref_fid.struct_id().index()].fields[ref_fid.local()] {
-        Field::Ref { target, .. } => *target,
-        _ => unreachable!("nav root re-resolved non-Ref: checked above"),
-    };
-    let (parent_col, target_col) = match link_cols(ctx.schema, ref_fid) {
-        LinkCols::ParentFk {
-            parent_fk,
-            child_pk,
-        } => (parent_fk, child_pk),
-        LinkCols::TargetFk {
-            child_fk,
-            parent_pk,
-        } => (parent_pk, child_fk),
-        LinkCols::ManyToMany => todo!("M4b complex cross-root correlation"),
-    };
+        }
+    }
+    hops.reverse();
+    let mut chain: Vec<NavHop> = Vec::with_capacity(hops.len());
+    let mut source: Option<StructId> = None;
+    for fid in &hops {
+        let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
+        let target = match field {
+            Field::Ref { target, .. } => *target,
+            _ => unreachable!("nav hop re-resolved non-Ref: checked above"),
+        };
+        let (child_col, parent_col) = match link_cols(ctx.schema, *fid) {
+            LinkCols::ParentFk {
+                parent_fk,
+                child_pk,
+            } => (child_pk, parent_fk),
+            LinkCols::TargetFk {
+                child_fk,
+                parent_pk,
+            } => (child_fk, parent_pk),
+            LinkCols::ManyToMany => todo!("M4b complex cross-root correlation"),
+        };
+        let table = ctx.schema.tables[ctx.schema.structs[target.index()].table.index()]
+            .name
+            .clone();
+        chain.push(NavHop {
+            table,
+            pk: child_col,
+            fk: parent_col,
+        });
+        source = Some(target);
+    }
+    let target = source.unwrap_or_else(|| {
+        unreachable!("nav chain without hops: the unwind always pushes the root")
+    });
     let (endpoint_col, endpoint_ty) = match ctx.schema.struct_field(target, &endpoint) {
         Some((_, Field::Value { ty, columns, .. })) => match columns.as_slice() {
             [col] => match value_scalar(ty) {
@@ -4533,9 +4600,7 @@ fn nav_carry(ctx: &mut Context, outer_side: &TypedExpr) -> NavCarry {
     };
     NavCarry {
         carry: ctx.aliases.nav(),
-        target,
-        parent_col,
-        target_col,
+        chain,
         endpoint: endpoint_col,
         endpoint_ty,
         default: None,
@@ -4549,9 +4614,24 @@ fn nav_carry_default(ctx: &mut Context, outer_side: &TypedExpr) -> NavCarry {
         } if name.value == "unwrap_or" => (base.as_ref(), one_arg(args, name)),
         _ => todo!("M4b complex cross-root correlation"),
     };
-    let mut carry = nav_carry(ctx, base);
+    let key = canon_expr(outer_side);
+    if let Some(hit) = ctx.nav_carries.iter().find(|(k, _)| k == &key) {
+        return hit.1.clone();
+    }
+    let mut carry = nav_carry_inner(ctx, base);
     carry.default = Some(scalar(ctx, default));
+    ctx.nav_carries.push((key, carry.clone()));
     carry
+}
+
+fn field_chain_root_is_outer(mut node: &TypedExpr) -> bool {
+    loop {
+        match &node.kind {
+            TypedExprKind::Field { base, .. } => node = base,
+            TypedExprKind::Ident { depth, .. } => return *depth > 0,
+            _ => return false,
+        }
+    }
 }
 
 fn tail_uses_nav_outer(ctx: &Context, tail: &TypedExpr) -> bool {
@@ -4598,43 +4678,82 @@ fn tail_uses_nav_outer(ctx: &Context, tail: &TypedExpr) -> bool {
 }
 
 fn nav_carry_item(ctx: &mut Context, nav: &NavCarry) -> SelectItem {
-    let target_table = ctx.schema.tables[ctx.schema.structs[nav.target.index()].table.index()]
-        .name
-        .clone();
-    let target_alias = ctx.aliases.table(&target_table);
-    let mut nav_q = SelectBuilder::new();
-    nav_q.select = vec![SelectItem::Column {
-        depth: 0,
-        column: nav.endpoint.clone(),
-        output: nav.endpoint.clone(),
-        ty: Some(nav.endpoint_ty),
-    }];
-    nav_q.from = Some(FromClause::Table {
-        table: target_table,
-        alias: target_alias,
+    let temp_depth = nav.chain.len();
+    let mut hops = nav.chain.iter().enumerate();
+    let (_, first) = hops.next().unwrap_or_else(|| {
+        unreachable!("nav chain without hops: the unwind always pushes the root")
     });
-    nav_q.where_ = vec![SqlExpr::Binary {
+    let first_alias = ctx.aliases.table(&first.table);
+    let mut inner = SelectBuilder::new();
+    inner.from = Some(FromClause::Table {
+        table: first.table.clone(),
+        alias: first_alias,
+    });
+    inner.where_ = vec![SqlExpr::Binary {
         op: SqlBinOp::Eq,
         lhs: Box::new(SqlExpr::Column {
             depth: 0,
-            column: nav.target_col.clone(),
+            column: first.pk.clone(),
         }),
         rhs: Box::new(SqlExpr::Column {
-            depth: 1,
-            column: nav.parent_col.clone(),
+            depth: temp_depth,
+            column: first.fk.clone(),
         }),
     }];
+    inner.select = vec![SelectItem::Column {
+        depth: 0,
+        column: if nav.chain.len() == 1 {
+            nav.endpoint.clone()
+        } else {
+            nav.chain[1].fk.clone()
+        },
+        output: if nav.chain.len() == 1 {
+            nav.endpoint.clone()
+        } else {
+            ctx.aliases.generic()
+        },
+        ty: if nav.chain.len() == 1 {
+            Some(nav.endpoint_ty)
+        } else {
+            None
+        },
+    }];
+    let mut expr = SqlExpr::Subquery {
+        query: Box::new(inner),
+    };
+    for (k, hop) in hops {
+        let last = k + 1 == nav.chain.len();
+        let mut shell = SelectBuilder::new();
+        shell.from = Some(FromClause::Table {
+            table: hop.table.clone(),
+            alias: ctx.aliases.table(&hop.table),
+        });
+        shell.where_ = vec![SqlExpr::Binary {
+            op: SqlBinOp::Eq,
+            lhs: Box::new(SqlExpr::Column {
+                depth: 0,
+                column: hop.pk.clone(),
+            }),
+            rhs: Box::new(expr),
+        }];
+        shell.select = vec![SelectItem::Column {
+            depth: 0,
+            column: if last {
+                nav.endpoint.clone()
+            } else {
+                nav.chain[k + 1].fk.clone()
+            },
+            output: ctx.aliases.generic(),
+            ty: if last { Some(nav.endpoint_ty) } else { None },
+        }];
+        expr = SqlExpr::Subquery {
+            query: Box::new(shell),
+        };
+    }
     SelectItem::Expr {
         expr: match &nav.default {
-            Some(default) => SqlExpr::Coalesce(vec![
-                SqlExpr::Subquery {
-                    query: Box::new(nav_q),
-                },
-                default.clone(),
-            ]),
-            None => SqlExpr::Subquery {
-                query: Box::new(nav_q),
-            },
+            Some(default) => SqlExpr::Coalesce(vec![expr, default.clone()]),
+            None => expr,
         },
         output: nav.carry.clone(),
         ty: Some(nav.endpoint_ty),
@@ -4681,16 +4800,7 @@ fn check_corr(ctx: &mut Context, conjunct: &TypedExpr, temp_form: bool) -> CorrC
                     binding: IdentBinding::ProjectedField { name },
                     ..
                 } if temp_form => OuterRef::Projected(name.clone()),
-                TypedExprKind::Field { base, name, .. }
-                    if matches!(
-                        &base.kind,
-                        TypedExprKind::Ident {
-                            binding: IdentBinding::Field(_),
-                            depth,
-                            ..
-                        } if *depth > 0
-                    ) =>
-                {
+                TypedExprKind::Field { base, .. } if field_chain_root_is_outer(base) => {
                     if !temp_form {
                         todo!("M4b complex cross-root correlation");
                     }
@@ -5051,8 +5161,12 @@ fn rcross_shape(
         if create_q.select.is_empty() {
             create_q.select = vec![SelectItem::AllFrom { depth: 0 }];
         }
+        let mut emitted: Vec<&str> = Vec::new();
         for corr in correlated.iter().flat_map(CorrGroup::conds) {
-            if let Some(nav) = &corr.nav {
+            if let Some(nav) = &corr.nav
+                && !emitted.contains(&nav.carry.as_str())
+            {
+                emitted.push(&nav.carry);
                 create_q.select.push(nav_carry_item(ctx, nav));
             }
         }

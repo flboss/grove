@@ -817,6 +817,24 @@ fn slice_cross_root() {
             rec(&[("name", s("Cyd")), ("cs", Value::List(vec![]))]),
         ])
     );
+    assert_eq!(
+        value(
+            r#"users { name, cs = configs.filter(manager.email == owner || manager.email == "x") { name } }"#
+        ),
+        Value::List(vec![
+            rec(&[("name", s("Ada")), ("cs", Value::List(vec![]))]),
+            rec(&[("name", s("Bob")), ("cs", Value::List(vec![]))]),
+            rec(&[("name", s("Cyd")), ("cs", Value::List(vec![]))]),
+        ])
+    );
+    assert_eq!(
+        value("users { name, cs = configs.filter(owner == manager.manager.email) { name } }"),
+        Value::List(vec![
+            rec(&[("name", s("Ada")), ("cs", Value::List(vec![]))]),
+            rec(&[("name", s("Bob")), ("cs", Value::List(vec![]))]),
+            rec(&[("name", s("Cyd")), ("cs", Value::List(vec![]))]),
+        ])
+    );
 }
 
 
