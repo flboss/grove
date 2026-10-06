@@ -12977,8 +12977,8 @@ fn eq_op(lhs: &QueryType, rhs: &QueryType) -> SqlBinOp {
 }
 
 fn record_equality(ctx: &mut Context, lhs: &TypedExpr, rhs: &TypedExpr) -> Option<SqlExpr> {
-    if let (Some((lcol, ldepth, lnull)), Some((rcol, rdepth, rnull))) =
-        (ref_identity(ctx, lhs), ref_identity(ctx, rhs))
+    if let (Some((l, lnull)), Some((r, rnull))) =
+        (ref_identity_expr(ctx, lhs), ref_identity_expr(ctx, rhs))
     {
         return Some(SqlExpr::Binary {
             op: if lnull || rnull {
@@ -12986,14 +12986,8 @@ fn record_equality(ctx: &mut Context, lhs: &TypedExpr, rhs: &TypedExpr) -> Optio
             } else {
                 SqlBinOp::Eq
             },
-            lhs: Box::new(SqlExpr::Column {
-                depth: ldepth,
-                column: lcol,
-            }),
-            rhs: Box::new(SqlExpr::Column {
-                depth: rdepth,
-                column: rcol,
-            }),
+            lhs: Box::new(l),
+            rhs: Box::new(r),
         });
     }
     match (&lhs.kind, &rhs.kind) {
@@ -13007,37 +13001,115 @@ fn record_equality(ctx: &mut Context, lhs: &TypedExpr, rhs: &TypedExpr) -> Optio
         }
         (TypedExprKind::Struct { .. }, _) => ref_literal_equality(ctx, rhs, lhs),
         (_, TypedExprKind::Struct { .. }) => ref_literal_equality(ctx, lhs, rhs),
+        (
+            TypedExprKind::Ident {
+                binding: lbinding,
+                depth: ldepth,
+                ..
+            },
+            TypedExprKind::Ident {
+                binding: rbinding,
+                depth: rdepth,
+                ..
+            },
+        ) if lbinding == rbinding
+            && ldepth == rdepth
+            && matches!(lbinding, IdentBinding::Field(_))
+            && matches!(peel_optional(&lhs.ty), QueryType::Record(_))
+            && matches!(peel_optional(&rhs.ty), QueryType::Record(_)) =>
+        {
+            Some(SqlExpr::Param(ParamValue::Bool(true)))
+        }
         _ => None,
     }
 }
 
-fn ref_identity(ctx: &mut Context, expr: &TypedExpr) -> Option<(String, usize, bool)> {
-    let mut cursor = expr;
-    loop {
-        match &cursor.kind {
-            TypedExprKind::Some { value } => cursor = value,
-            TypedExprKind::Ident {
-                binding: IdentBinding::Field(fid),
-                depth,
-                ..
-            } => {
-                let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
-                match field {
-                    Field::Ref {
-                        optional,
-                        is_list: false,
-                        ..
-                    } => match link_cols(ctx.schema, *fid) {
-                        LinkCols::ParentFk { parent_fk, .. } => {
-                            return Some((parent_fk, *depth, expr.ty.is_optional() || *optional));
-                        }
-                        _ => return None,
-                    },
-                    _ => return None,
-                }
+fn ref_identity_expr(ctx: &mut Context, expr: &TypedExpr) -> Option<(SqlExpr, bool)> {
+    if let TypedExprKind::Some { value } = &expr.kind {
+        let (inner, _) = ref_identity_expr(ctx, value)?;
+        return Some((inner, true));
+    }
+    match &expr.kind {
+        TypedExprKind::Ident {
+            binding: IdentBinding::Field(fid),
+            depth,
+            ..
+        } => {
+            let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
+            match field {
+                Field::Ref {
+                    optional,
+                    is_list: false,
+                    ..
+                } => match link_cols(ctx.schema, *fid) {
+                    LinkCols::ParentFk { parent_fk, .. } => Some((
+                        SqlExpr::Column {
+                            depth: *depth,
+                            column: parent_fk,
+                        },
+                        expr.ty.is_optional() || *optional,
+                    )),
+                    _ => None,
+                },
+                _ => None,
             }
-            _ => return None,
         }
+        TypedExprKind::Field { base, name, .. } => {
+            if ctx.temp_collect.is_some() || ctx.in_array_temp {
+                return None;
+            }
+            let sid = match peel_optional(&base.ty) {
+                QueryType::Record(RecordSource::Schema(sid)) => *sid,
+                _ => return None,
+            };
+            let (fid, field) = ctx.schema.struct_field(sid, &name.value)?;
+            let target = match field {
+                Field::Ref {
+                    target,
+                    is_list: false,
+                    ..
+                } => *target,
+                _ => return None,
+            };
+            let (inner, _) = ref_identity_expr(ctx, base)?;
+            let (fk_col, pk_col) = match link_cols(ctx.schema, fid) {
+                LinkCols::ParentFk {
+                    parent_fk,
+                    child_pk,
+                } => (parent_fk, child_pk),
+                _ => return None,
+            };
+            let table = ctx.schema.tables[ctx.schema.structs[target.index()].table.index()]
+                .name
+                .clone();
+            let alias = ctx.aliases.table(&table);
+            let mut shell = SelectBuilder::new();
+            shell.from = Some(FromClause::Table {
+                table: table.clone(),
+                alias,
+            });
+            shell.select = vec![SelectItem::Column {
+                depth: 0,
+                column: fk_col.clone(),
+                output: fk_col,
+                ty: None,
+            }];
+            shell.where_ = vec![SqlExpr::Binary {
+                op: SqlBinOp::Eq,
+                lhs: Box::new(SqlExpr::Column {
+                    depth: 0,
+                    column: pk_col,
+                }),
+                rhs: Box::new(shift_depths(inner, 1)),
+            }];
+            Some((
+                SqlExpr::Subquery {
+                    query: Box::new(shell),
+                },
+                true,
+            ))
+        }
+        _ => None,
     }
 }
 
@@ -13046,21 +13118,13 @@ fn ref_literal_equality(
     ref_expr: &TypedExpr,
     lit_expr: &TypedExpr,
 ) -> Option<SqlExpr> {
-    let TypedExprKind::Ident {
-        binding: IdentBinding::Field(fid),
-        ..
-    } = &ref_expr.kind
-    else {
+    if matches!(
+        peel_optional(&ref_expr.ty),
+        QueryType::Record(RecordSource::Projection(_))
+    ) {
         return None;
-    };
-    let target = match &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()] {
-        Field::Ref {
-            target,
-            is_list: false,
-            ..
-        } => *target,
-        _ => return None,
-    };
+    }
+    let target = record_struct(peel_optional(&ref_expr.ty));
     let TypedExprKind::Struct { fields } = &lit_expr.kind else {
         return None;
     };

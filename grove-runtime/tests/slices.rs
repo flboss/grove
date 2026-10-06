@@ -1712,6 +1712,42 @@ fn slice_record_comparison() {
 }
 
 #[test]
+fn slice_record_spines() {
+    assert_eq!(
+        value("users[manager.manager == manager] { name }"),
+        Value::List(vec![
+            rec(&[("name", s("Ada"))]),
+            rec(&[("name", s("Bob"))]),
+            rec(&[("name", s("Cyd"))]),
+        ])
+    );
+    assert_eq!(
+        value("users[mentor?.manager == mentor?.manager] { name }"),
+        Value::List(vec![
+            rec(&[("name", s("Ada"))]),
+            rec(&[("name", s("Bob"))]),
+            rec(&[("name", s("Cyd"))]),
+        ])
+    );
+    assert_eq!(
+        value("users[mentor?.manager == mentor] { name }"),
+        Value::List(vec![rec(&[("name", s("Ada"))]), rec(&[("name", s("Cyd"))]),])
+    );
+    assert_eq!(
+        value(r#"users[manager.manager == { name = "Bob" }] { name }"#),
+        Value::List(vec![
+            rec(&[("name", s("Ada"))]),
+            rec(&[("name", s("Bob"))]),
+            rec(&[("name", s("Cyd"))]),
+        ])
+    );
+    assert_eq!(
+        value(r#"users[manager.manager == { name = "Zelda" }] { name }"#),
+        Value::List(vec![])
+    );
+}
+
+#[test]
 fn slice_list_comparison() {
     assert_eq!(value("[1, 2] == [1, 2]"), Value::Bool(true));
     assert_eq!(value("[1, 2] == [1, 2, 3]"), Value::Bool(false));
