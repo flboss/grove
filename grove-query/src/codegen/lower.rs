@@ -2476,6 +2476,9 @@ fn lower_value(
         if let Some((select, shape, keys)) = scalar_temp_take_agg(ctx, parent, &prefix, value) {
             return (select, shape, keys);
         }
+        if let Some((select, shape, keys)) = scalar_temp_take_single(ctx, parent, &prefix, value) {
+            return (select, shape, keys);
+        }
         if let Some((select, shape, keys)) = scalar_temp_array(ctx, parent, &prefix, value) {
             return (select, shape, keys);
         }
@@ -8134,6 +8137,187 @@ fn scalar_temp_take_agg(
     let subquery = finish_scalar_aggregate(ctx, base, child, agg);
     let item = SelectItem::Expr {
         expr: subquery,
+        output: prefix.to_string(),
+        ty: scalar_of(&value.ty),
+    };
+    Some((
+        vec![item],
+        ResultShape::Column(prefix.to_string()),
+        Vec::new(),
+    ))
+}
+
+struct TakeTempScope {
+    temp: String,
+    key_col: String,
+}
+
+fn begin_take_temp(ctx: &mut Context, base: &TypedExpr) -> Option<TakeTempScope> {
+    if ctx.child.is_some() || ctx.temp_collect.is_some() || ctx.in_take_arg {
+        return None;
+    }
+    if ctx.nest_depth >= 1 {
+        return None;
+    }
+    if !take_bound_ident(base) {
+        return None;
+    }
+    let fid = match tail_root_ident(base) {
+        Some(IdentBinding::Field(fid)) => *fid,
+        _ => return None,
+    };
+    let link = resolve_tail_link(ctx, fid);
+    if link.m2m_join.is_some() {
+        return None;
+    }
+    let temp = ctx.aliases.temp();
+    let child_fk = link.child_col.clone();
+    let key_col = link.parent_col.clone();
+    ctx.temp_collect = Some(TempCollect {
+        temp: temp.clone(),
+        key_col: "$$key".to_string(),
+        child_fk,
+        refs: Vec::new(),
+    });
+    Some(TakeTempScope { temp, key_col })
+}
+
+fn finish_take_temp(ctx: &mut Context, parent: &mut Level, scope: TakeTempScope) {
+    let refs = ctx
+        .temp_collect
+        .take()
+        .unwrap_or_else(|| unreachable!("take temp vanished mid-lowering"))
+        .refs;
+    freeze_parent_temp(ctx, parent, &scope.temp, &scope.key_col, &refs, &[]);
+}
+
+fn tail_has_offset(mut node: &TypedExpr) -> bool {
+    loop {
+        match &node.kind {
+            TypedExprKind::Method { base, name, .. }
+                if name.value == "skip" || name.value == "nth" =>
+            {
+                return true;
+            }
+            TypedExprKind::Method { base, .. }
+            | TypedExprKind::Field { base, .. }
+            | TypedExprKind::Projection { base, .. } => node = base,
+            _ => return false,
+        }
+    }
+}
+
+fn scalar_temp_take_single(
+    ctx: &mut Context,
+    parent: &mut Level,
+    prefix: &str,
+    value: &TypedExpr,
+) -> Option<(Vec<SelectItem>, ResultShape, Vec<String>)> {
+    let (collapse, field_name) = match &value.kind {
+        TypedExprKind::Field { base, name, .. } => (base.as_ref(), name.value.clone()),
+        _ => return None,
+    };
+    let TypedExprKind::Method {
+        base,
+        name,
+        args,
+        optional,
+    } = &collapse.kind
+    else {
+        return None;
+    };
+    if *optional || (name.value != "first" && name.value != "nth") {
+        return None;
+    }
+    if !matches!(&base.ty, QueryType::List(_)) {
+        return None;
+    }
+    let field_col = match peel_optional(&base.ty) {
+        QueryType::List(inner) => match peel_optional(inner) {
+            QueryType::Record(RecordSource::Schema(sid)) => {
+                match ctx.schema.struct_field(*sid, &field_name) {
+                    Some((_, Field::Value { columns, .. })) => match columns.as_slice() {
+                        [col] => ctx.schema.column_name(*col).to_string(),
+                        _ => return None,
+                    },
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let offset = match name.value.as_str() {
+        "first" => None,
+        _ => match args.as_slice() {
+            [arg] => match &arg.expr.kind {
+                TypedExprKind::Literal(lit) => match &lit.value {
+                    Literal::Int(n) => Some(*n),
+                    _ => return None,
+                },
+                _ => return None,
+            },
+            _ => return None,
+        },
+    };
+    if tail_has_offset(base) {
+        return None;
+    }
+    let scope = begin_take_temp(ctx, base)?;
+    let link = match tail_root_ident(base) {
+        Some(IdentBinding::Field(fid)) => resolve_tail_link(ctx, *fid),
+        _ => unreachable!("take temp base re-resolved non-field: gated above"),
+    };
+    let (child_from, child_col) = (link.child_from.clone(), link.child_col.clone());
+    let temp = scope.temp.clone();
+    let mut child_builder = SelectBuilder::new();
+    child_builder.from = Some(child_from);
+    child_builder.where_ = vec![SqlExpr::InSubquery {
+        expr: Box::new(SqlExpr::Column {
+            depth: 0,
+            column: child_col.clone(),
+        }),
+        query: Box::new(temp_key_query(&temp)),
+    }];
+    let child_level = Level {
+        builder: child_builder,
+        element: base.ty.clone(),
+        parent: ParentLink::Root { root_idx: 0 },
+        pending: None,
+        stmt_bound: true,
+        output_shapes: None,
+        root_parts: None,
+    };
+    let mut child = lower_tail(ctx, base, child_level, true, Some(child_col.clone()), false);
+    if child.builder.select.is_empty() {
+        child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+    }
+    finish_take_temp(ctx, parent, scope);
+    child.builder.where_.push(SqlExpr::Binary {
+        op: SqlBinOp::Eq,
+        lhs: Box::new(SqlExpr::Column {
+            depth: 0,
+            column: child_col,
+        }),
+        rhs: Box::new(SqlExpr::Column {
+            depth: 1,
+            column: "$$key".to_string(),
+        }),
+    });
+    child.builder.limit = Some(SqlExpr::Param(ParamValue::Int(1)));
+    if let Some(n) = offset {
+        child.builder.offset = Some(SqlExpr::Param(ParamValue::Int(n)));
+    }
+    child.builder.select = vec![SelectItem::Column {
+        depth: 0,
+        column: field_col,
+        output: prefix.to_string(),
+        ty: scalar_of(&value.ty),
+    }];
+    let item = SelectItem::Expr {
+        expr: SqlExpr::Subquery {
+            query: Box::new(child.builder),
+        },
         output: prefix.to_string(),
         ty: scalar_of(&value.ty),
     };

@@ -1888,6 +1888,26 @@ fn slice_take_reduction() {
 }
 
 #[test]
+fn slice_temp_take_first() {
+    assert_eq!(
+        value("users { t = orders.take(age).first()?.total }"),
+        Value::List(vec![
+            rec(&[("t", n("10"))]),
+            rec(&[("t", n("30"))]),
+            rec(&[("t", Value::Null)]),
+        ])
+    );
+    assert_eq!(
+        value("users { t = orders.take(age).nth(1)?.total }"),
+        Value::List(vec![
+            rec(&[("t", n("20"))]),
+            rec(&[("t", Value::Null)]),
+            rec(&[("t", Value::Null)]),
+        ])
+    );
+}
+
+#[test]
 fn slice_list_mixed() {
     assert_eq!(
         value(r#"users[tags == ["x", "y"]] { name }"#),
