@@ -6340,7 +6340,7 @@ fn cross_root_scan(ctx: &mut Context, tail: &TypedExpr) -> FromClause {
             }
         }
         _ => unreachable!(
-            "exotic cross tail root: cross tails bottom at Field/Root idents (single-spine tails admit one root); remaining kinds infer non-List types, contradicting the List-only callers"
+            "exotic cross tail root: cross tails bottom at Field/Root idents (single-spine tails admit one root); other List-typed bottoms (projected idents) rewrite through definition substitution before lanes run, and take-arg positions admit no scope idents (QT0001); remaining kinds infer non-List types, contradicting the List-only callers"
         ),
     }
 }
@@ -7441,7 +7441,7 @@ fn rscalar_shape(
             )
         }
         _ => unreachable!(
-            "exotic single tail root: If tails are rejected by callers and Field/Root tails route above; remaining kinds infer non-record types (Some-of-optional is checker-rejected), contradicting the record-only callers"
+            "exotic single tail root: If tails are rejected by callers and Field/Root tails route above; other record-typed bottoms (projected idents) rewrite through definition substitution before lanes run; remaining kinds infer non-record types (Some-of-optional is checker-rejected), contradicting the record-only callers"
         ),
     };
     let keyed = parent_key.is_some();
@@ -7773,7 +7773,7 @@ fn rtemp_shape(
             )
         }
         _ => unreachable!(
-            "exotic temp tail root: temp tails bottom at Field idents (single-spine tails admit one root); remaining kinds infer non-List types, contradicting the List-only callers"
+            "exotic temp tail root: temp tails bottom at Field idents (single-spine tails admit one root); other List-typed bottoms (projected idents) rewrite through definition substitution before lanes run, and take-arg positions admit no scope idents (QT0001); remaining kinds infer non-List types, contradicting the List-only callers"
         ),
     };
     let mut child_builder = SelectBuilder::new();
