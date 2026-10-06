@@ -1638,6 +1638,58 @@ fn slice_tuple_comparison() {
 }
 
 #[test]
+fn slice_record_comparison() {
+    assert_eq!(
+        value("users[manager == manager] { name }"),
+        Value::List(vec![
+            rec(&[("name", s("Ada"))]),
+            rec(&[("name", s("Bob"))]),
+            rec(&[("name", s("Cyd"))]),
+        ])
+    );
+    assert_eq!(
+        value("users[manager != manager] { name }"),
+        Value::List(vec![])
+    );
+    assert_eq!(
+        value("users[mentor == mentor] { name }"),
+        Value::List(vec![
+            rec(&[("name", s("Ada"))]),
+            rec(&[("name", s("Bob"))]),
+            rec(&[("name", s("Cyd"))]),
+        ])
+    );
+    assert_eq!(
+        value(r#"users[manager == { name = "Bob" }] { name }"#),
+        Value::List(vec![
+            rec(&[("name", s("Ada"))]),
+            rec(&[("name", s("Bob"))]),
+            rec(&[("name", s("Cyd"))]),
+        ])
+    );
+    assert_eq!(
+        value(r#"users[manager == { name = "Nobody" }] { name }"#),
+        Value::List(vec![])
+    );
+    assert_eq!(
+        value("users { x = ({ n = name } == { n = name }) }"),
+        Value::List(vec![
+            rec(&[("x", Value::Bool(true))]),
+            rec(&[("x", Value::Bool(true))]),
+            rec(&[("x", Value::Bool(true))]),
+        ])
+    );
+    assert_eq!(
+        value(r#"users { x = ({ n = name } == { n = "zzz" }) }"#),
+        Value::List(vec![
+            rec(&[("x", Value::Bool(false))]),
+            rec(&[("x", Value::Bool(false))]),
+            rec(&[("x", Value::Bool(false))]),
+        ])
+    );
+}
+
+#[test]
 fn slice_structs() {
     assert_eq!(
         value("if true { { a = 1 } } else { { a = 2 } }"),

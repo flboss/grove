@@ -12630,6 +12630,160 @@ fn or_sql(lhs: SqlExpr, rhs: SqlExpr) -> SqlExpr {
     }
 }
 
+fn deep_value_equality(ctx: &mut Context, lhs: &TypedExpr, rhs: &TypedExpr) -> Option<SqlExpr> {
+    match (peel_optional(&lhs.ty), peel_optional(&rhs.ty)) {
+        (QueryType::Scalar(_), QueryType::Scalar(_)) => Some(SqlExpr::Binary {
+            op: eq_op(&lhs.ty, &rhs.ty),
+            lhs: Box::new(scalar(ctx, lhs)),
+            rhs: Box::new(scalar(ctx, rhs)),
+        }),
+        (QueryType::Tuple(_), QueryType::Tuple(_)) => {
+            let (l, r) = match (cmp_positions(ctx, lhs), cmp_positions(ctx, rhs)) {
+                (Some(l), Some(r)) => (l, r),
+                _ => return None,
+            };
+            conjoin_eq_positions(&l, &r, false)
+        }
+        (QueryType::Record(_), QueryType::Record(_)) => record_equality(ctx, lhs, rhs),
+        _ => None,
+    }
+}
+
+fn eq_op(lhs: &QueryType, rhs: &QueryType) -> SqlBinOp {
+    if lhs.is_optional() || rhs.is_optional() {
+        SqlBinOp::Is
+    } else {
+        SqlBinOp::Eq
+    }
+}
+
+fn record_equality(ctx: &mut Context, lhs: &TypedExpr, rhs: &TypedExpr) -> Option<SqlExpr> {
+    if let (Some((lcol, ldepth, lnull)), Some((rcol, rdepth, rnull))) =
+        (ref_identity(ctx, lhs), ref_identity(ctx, rhs))
+    {
+        return Some(SqlExpr::Binary {
+            op: if lnull || rnull {
+                SqlBinOp::Is
+            } else {
+                SqlBinOp::Eq
+            },
+            lhs: Box::new(SqlExpr::Column {
+                depth: ldepth,
+                column: lcol,
+            }),
+            rhs: Box::new(SqlExpr::Column {
+                depth: rdepth,
+                column: rcol,
+            }),
+        });
+    }
+    match (&lhs.kind, &rhs.kind) {
+        (TypedExprKind::Struct { fields: lfields }, TypedExprKind::Struct { fields: rfields }) => {
+            let mut conjuncts = Vec::with_capacity(lfields.len());
+            for (lname, lval) in lfields {
+                let (_, rval) = rfields.iter().find(|(n, _)| n.value == lname.value)?;
+                conjuncts.push(deep_value_equality(ctx, lval, rval)?);
+            }
+            conjuncts.into_iter().reduce(and_sql)
+        }
+        (TypedExprKind::Struct { .. }, _) => ref_literal_equality(ctx, rhs, lhs),
+        (_, TypedExprKind::Struct { .. }) => ref_literal_equality(ctx, lhs, rhs),
+        _ => None,
+    }
+}
+
+fn ref_identity(ctx: &mut Context, expr: &TypedExpr) -> Option<(String, usize, bool)> {
+    let mut cursor = expr;
+    loop {
+        match &cursor.kind {
+            TypedExprKind::Some { value } => cursor = value,
+            TypedExprKind::Ident {
+                binding: IdentBinding::Field(fid),
+                depth,
+                ..
+            } => {
+                let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
+                match field {
+                    Field::Ref {
+                        optional,
+                        is_list: false,
+                        ..
+                    } => match link_cols(ctx.schema, *fid) {
+                        LinkCols::ParentFk { parent_fk, .. } => {
+                            return Some((parent_fk, *depth, expr.ty.is_optional() || *optional));
+                        }
+                        _ => return None,
+                    },
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn ref_literal_equality(
+    ctx: &mut Context,
+    ref_expr: &TypedExpr,
+    lit_expr: &TypedExpr,
+) -> Option<SqlExpr> {
+    let TypedExprKind::Ident {
+        binding: IdentBinding::Field(fid),
+        ..
+    } = &ref_expr.kind
+    else {
+        return None;
+    };
+    let target = match &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()] {
+        Field::Ref {
+            target,
+            is_list: false,
+            ..
+        } => *target,
+        _ => return None,
+    };
+    let TypedExprKind::Struct { fields } = &lit_expr.kind else {
+        return None;
+    };
+    let mut conjuncts = Vec::with_capacity(fields.len());
+    for (name, value) in fields {
+        let (_, schema_field) = ctx.schema.struct_field(target, &name.value)?;
+        let synthetic = TypedExpr {
+            kind: TypedExprKind::Field {
+                base: Box::new(ref_expr.clone()),
+                name: name.clone(),
+                optional: false,
+            },
+            ty: schema_field_query_type(schema_field),
+            span: value.span,
+        };
+        conjuncts.push(deep_value_equality(ctx, &synthetic, value)?);
+    }
+    conjuncts.into_iter().reduce(and_sql)
+}
+
+fn schema_field_query_type(field: &Field) -> QueryType {
+    match field {
+        Field::Value { ty, .. } => QueryType::from(ty),
+        Field::Array { element, .. } => QueryType::List(Box::new(QueryType::from(element))),
+        Field::Ref {
+            target,
+            optional,
+            is_list,
+            ..
+        } => {
+            let inner = QueryType::Record(RecordSource::Schema(*target));
+            if *is_list {
+                QueryType::List(Box::new(inner))
+            } else if *optional {
+                inner.wrap_optional()
+            } else {
+                inner
+            }
+        }
+    }
+}
+
 fn scalar_binary(
     ctx: &mut Context,
     op: &grove_types::Spanned<BinaryOp>,
@@ -12680,15 +12834,7 @@ fn scalar_binary(
                     rhs: Box::new(scalar(ctx, rhs)),
                 };
             }
-            let (l, r) = match (cmp_positions(ctx, lhs), cmp_positions(ctx, rhs)) {
-                (Some(l), Some(r)) => (l, r),
-                _ => todo!(
-                    "comparison-overhaul: deep equality over {} vs {}",
-                    lhs.ty,
-                    rhs.ty
-                ),
-            };
-            let conj = conjoin_eq_positions(&l, &r, false).unwrap_or_else(|| {
+            let conj = deep_value_equality(ctx, lhs, rhs).unwrap_or_else(|| {
                 todo!(
                     "comparison-overhaul: deep equality over {} vs {}",
                     lhs.ty,
@@ -12773,15 +12919,10 @@ fn scalar_binary(
                         items: elements.iter().map(|e| scalar(ctx, e)).collect(),
                     };
                 }
-                let needle = cmp_positions(ctx, lhs)
-                    .unwrap_or_else(|| todo!("comparison-overhaul: deep `in` over {}", lhs.ty));
                 elements
                     .iter()
                     .map(|alternative| {
-                        let positions = cmp_positions(ctx, alternative).unwrap_or_else(|| {
-                            todo!("comparison-overhaul: deep `in` over {}", lhs.ty)
-                        });
-                        conjoin_eq_positions(&needle, &positions, false).unwrap_or_else(|| {
+                        deep_value_equality(ctx, lhs, alternative).unwrap_or_else(|| {
                             todo!("comparison-overhaul: deep `in` over {}", lhs.ty)
                         })
                     })
