@@ -1790,6 +1790,34 @@ fn slice_list_comparison() {
 }
 
 #[test]
+fn slice_list_mixed() {
+    assert_eq!(
+        value(r#"users[tags == ["x", "y"]] { name }"#),
+        Value::List(vec![rec(&[("name", s("Ada"))])])
+    );
+    assert_eq!(
+        value(r#"users[tags == ["z"]] { name }"#),
+        Value::List(vec![rec(&[("name", s("Bob"))])])
+    );
+    assert_eq!(
+        value(r#"users[tags == ["zzz"]] { name }"#),
+        Value::List(vec![])
+    );
+    assert_eq!(
+        value(r#"users[["x", "y"] == tags] { name }"#),
+        Value::List(vec![rec(&[("name", s("Ada"))])])
+    );
+    assert_eq!(
+        value("users[scores == [5, 7]] { name }"),
+        Value::List(vec![rec(&[("name", s("Ada"))])])
+    );
+    assert_eq!(
+        value(r#"users[tags.take(1) == ["x"]] { name }"#),
+        Value::List(vec![rec(&[("name", s("Ada"))])])
+    );
+}
+
+#[test]
 fn slice_composite_contains() {
     assert_eq!(value("[(1, 2)].contains((1, 2))"), Value::Bool(true));
     assert_eq!(value("[(1, 2)].contains((3, 4))"), Value::Bool(false));

@@ -13176,7 +13176,19 @@ fn list_equality(ctx: &mut Context, lhs: &TypedExpr, rhs: &TypedExpr) -> Option<
     {
         return literal_list_equality(ctx, l, r);
     }
-    let (a, b) = (list_side_query(ctx, lhs)?, list_side_query(ctx, rhs)?);
+    let (l_hint, r_hint): (Option<String>, Option<String>) = match (&lhs.kind, &rhs.kind) {
+        (TypedExprKind::Array { elements }, _) if elements.iter().all(|e| e.ty.is_scalar()) => {
+            (None, array_root_value_col(ctx, rhs))
+        }
+        (_, TypedExprKind::Array { elements }) if elements.iter().all(|e| e.ty.is_scalar()) => {
+            (array_root_value_col(ctx, lhs), None)
+        }
+        _ => (None, None),
+    };
+    let (a, b) = (
+        list_side_query(ctx, lhs, l_hint.as_deref())?,
+        list_side_query(ctx, rhs, r_hint.as_deref())?,
+    );
     if a.cols.len() != b.cols.len() {
         return None;
     }
@@ -13263,7 +13275,37 @@ struct ListSide {
     rn: String,
 }
 
-fn list_side_query(ctx: &mut Context, expr: &TypedExpr) -> Option<ListSide> {
+fn array_root_value_col(ctx: &Context, expr: &TypedExpr) -> Option<String> {
+    match &expr.kind {
+        TypedExprKind::Ident {
+            binding: IdentBinding::Field(fid),
+            ..
+        } => {
+            let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
+            match field {
+                Field::Array { storage, .. } => match storage.value.as_slice() {
+                    [col] => Some(ctx.schema.column_name(*col).to_string()),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        TypedExprKind::Method { base, name, .. }
+            if ["take", "skip", "sort", "sort_asc", "sort_desc", "flatten"]
+                .contains(&name.value.as_str()) =>
+        {
+            array_root_value_col(ctx, base)
+        }
+        TypedExprKind::Some { value } => array_root_value_col(ctx, value),
+        _ => None,
+    }
+}
+
+fn list_side_query(
+    ctx: &mut Context,
+    expr: &TypedExpr,
+    restrict: Option<&str>,
+) -> Option<ListSide> {
     if let TypedExprKind::Array { elements } = &expr.kind {
         return literal_side_query(ctx, elements);
     }
@@ -13311,7 +13353,8 @@ fn list_side_query(ctx: &mut Context, expr: &TypedExpr) -> Option<ListSide> {
     let mut order = Vec::new();
     if !limited && !level.builder.order_by.is_empty() {
         let cols = builder_outputs(&level.builder, ctx.schema);
-        if !order_threadable(&level.builder.order_by, &cols) {
+        let thread_cols = restrict.map(|only| vec![only.to_string()]).unwrap_or(cols);
+        if !order_threadable(&level.builder.order_by, &thread_cols) {
             return None;
         }
         order = std::mem::take(&mut level.builder.order_by);
@@ -13322,9 +13365,15 @@ fn list_side_query(ctx: &mut Context, expr: &TypedExpr) -> Option<ListSide> {
     } else if level.builder.select.is_empty() {
         level.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
     }
-    let cols = builder_outputs(&level.builder, ctx.schema);
+    let mut cols = builder_outputs(&level.builder, ctx.schema);
     if cols.is_empty() {
         return None;
+    }
+    if let Some(only) = restrict {
+        if !cols.iter().any(|c| c == only) {
+            return None;
+        }
+        cols = vec![only.to_string()];
     }
     level.builder = shift_outer_builder(level.builder, 2);
     let mut rn = ctx.aliases.generic();
