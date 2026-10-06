@@ -3951,6 +3951,34 @@ fn prune_cross_filters(
                         let (conds, arms) = split_disjuncts(ctx, &conjunct, temp_form);
                         correlated.extend(conds);
                         broadcast.extend(arms);
+                    } else if let Some(pairs) = tuple_corr_pairs(&conjunct) {
+                        let mut seen: Vec<String> = Vec::with_capacity(pairs.len());
+                        let mut distinct = 0;
+                        for pair in &pairs {
+                            if uses_outer(pair) {
+                                let key = canon_expr(pair);
+                                if !seen.contains(&key) {
+                                    seen.push(key);
+                                    distinct += 1;
+                                }
+                            }
+                        }
+                        if distinct > 1 {
+                            todo!("M4b complex cross-root correlation");
+                        }
+                        let mut emitted: Vec<String> = Vec::with_capacity(pairs.len());
+                        for pair in pairs {
+                            if uses_outer(&pair) {
+                                let key = canon_expr(&pair);
+                                if emitted.contains(&key) {
+                                    continue;
+                                }
+                                emitted.push(key);
+                                correlated.push(check_corr(ctx, &pair, temp_form));
+                            } else {
+                                locals.push(pair);
+                            }
+                        }
                     } else {
                         correlated.push(check_corr(ctx, &conjunct, temp_form));
                     }
@@ -4231,12 +4259,213 @@ fn split_disjuncts(
     let mut locals = Vec::new();
     for disjunct in split_or(conjunct) {
         if uses_outer(&disjunct) {
-            conds.push(check_corr(ctx, &disjunct, temp_form));
+            if let Some(pairs) = tuple_corr_pairs(&disjunct) {
+                for pair in pairs {
+                    if !uses_outer(&pair) {
+                        todo!("M4b complex cross-root correlation");
+                    }
+                    conds.push(check_corr(ctx, &pair, temp_form));
+                }
+            } else {
+                conds.push(check_corr(ctx, &disjunct, temp_form));
+            }
         } else {
             locals.push(disjunct);
         }
     }
     (conds, locals)
+}
+
+fn tuple_corr_pairs(conjunct: &TypedExpr) -> Option<Vec<TypedExpr>> {
+    let TypedExprKind::Binary { op, lhs, rhs } = &conjunct.kind else {
+        return None;
+    };
+    if op.value != BinaryOp::Eq {
+        return None;
+    }
+    let (QueryType::Tuple(_), QueryType::Tuple(_)) =
+        (peel_optional(&lhs.ty), peel_optional(&rhs.ty))
+    else {
+        return None;
+    };
+    if uses_outer(lhs) == uses_outer(rhs) {
+        return None;
+    }
+    let l_elems = tuple_corr_elements(lhs)?;
+    let r_elems = tuple_corr_elements(rhs)?;
+    if l_elems.len() != r_elems.len() {
+        return None;
+    }
+    let mut pairs = Vec::with_capacity(l_elems.len());
+    for (l, r) in l_elems.into_iter().zip(r_elems) {
+        if !l.ty.is_scalar() || !r.ty.is_scalar() {
+            return None;
+        }
+        pairs.push(TypedExpr {
+            kind: TypedExprKind::Binary {
+                op: grove_types::Spanned {
+                    value: BinaryOp::Eq,
+                    span: conjunct.span,
+                },
+                lhs: Box::new(l),
+                rhs: Box::new(r),
+            },
+            ty: QueryType::Scalar(ScalarType::Bool),
+            span: conjunct.span,
+        });
+    }
+    Some(pairs)
+}
+
+fn canon_expr(expr: &TypedExpr) -> String {
+    fn canon_ty(ty: &QueryType, out: &mut String) {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{ty}");
+    }
+    fn canon(node: &TypedExprKind, out: &mut String) {
+        use std::fmt::Write as _;
+        match node {
+            TypedExprKind::Literal(lit) => {
+                let _ = write!(out, "lit({:?})", lit.value);
+            }
+            TypedExprKind::TypeConstant { ty, name } => {
+                let _ = write!(out, "const({:?},{:?})", ty.value, name.value);
+            }
+            TypedExprKind::Ident {
+                name,
+                binding,
+                depth,
+            } => {
+                let _ = write!(
+                    out,
+                    "ident({name:?},{binding:?},{depth})",
+                    name = name.value
+                );
+            }
+            TypedExprKind::Field {
+                base,
+                name,
+                optional,
+            } => {
+                out.push_str("field(");
+                canon(&base.kind, out);
+                let _ = write!(out, ",{:?},{optional})", name.value);
+            }
+            TypedExprKind::Method {
+                base,
+                name,
+                args,
+                optional,
+            } => {
+                out.push_str("method(");
+                canon(&base.kind, out);
+                let _ = write!(out, ",{:?},[", name.value);
+                for arg in args {
+                    canon(&arg.expr.kind, out);
+                    out.push(',');
+                }
+                let _ = write!(out, "],{optional})");
+            }
+            TypedExprKind::Binary { op, lhs, rhs } => {
+                out.push_str("bin(");
+                out.push_str(&op.value.to_string());
+                out.push(',');
+                canon(&lhs.kind, out);
+                out.push(',');
+                canon(&rhs.kind, out);
+                out.push(')');
+            }
+            TypedExprKind::Unary { op, expr } => {
+                out.push_str("un(");
+                out.push_str(&op.value.to_string());
+                out.push(',');
+                canon(&expr.kind, out);
+                out.push(')');
+            }
+            TypedExprKind::Cast { expr, ty } => {
+                out.push_str("cast(");
+                canon(&expr.kind, out);
+                let _ = write!(out, ",{:?})", ty.value);
+            }
+            TypedExprKind::If { arms, default } => {
+                out.push_str("if([");
+                for (c, t) in arms {
+                    canon(&c.kind, out);
+                    out.push(',');
+                    canon(&t.kind, out);
+                    out.push(';');
+                }
+                out.push_str("],");
+                canon(&default.kind, out);
+                out.push(')');
+            }
+            TypedExprKind::Some { value } => {
+                out.push_str("some(");
+                canon(&value.kind, out);
+                out.push(')');
+            }
+            TypedExprKind::Tuple { elements } => {
+                out.push_str("tup([");
+                for e in elements {
+                    canon(&e.kind, out);
+                    out.push(',');
+                }
+                out.push_str("])");
+            }
+            TypedExprKind::Array { elements } => {
+                out.push_str("arr([");
+                for e in elements {
+                    canon(&e.kind, out);
+                    out.push(',');
+                }
+                out.push_str("])");
+            }
+            TypedExprKind::Struct { fields } => {
+                out.push_str("struct([");
+                for (n, e) in fields {
+                    let _ = write!(out, "{:?}=", n.value);
+                    canon(&e.kind, out);
+                    out.push(',');
+                }
+                out.push_str("])");
+            }
+            TypedExprKind::Projection { base, items } => {
+                out.push_str("proj(");
+                canon(&base.kind, out);
+                out.push_str(",[");
+                for item in items {
+                    let _ = write!(out, "{:?}=", item.alias.value);
+                    canon(&item.value.kind, out);
+                    out.push(',');
+                }
+                out.push_str("])");
+            }
+        }
+    }
+    let mut out = String::new();
+    canon(&expr.kind, &mut out);
+    out.push('|');
+    canon_ty(&expr.ty, &mut out);
+    out
+}
+
+fn tuple_corr_elements(expr: &TypedExpr) -> Option<Vec<TypedExpr>> {
+    match &expr.kind {
+        TypedExprKind::Tuple { elements } => Some(elements.clone()),
+        TypedExprKind::If { arms, default } => {
+            let QueryType::Tuple(tys) = peel_optional(&expr.ty) else {
+                return None;
+            };
+            match distribute_if_tuple(arms, default, tys, expr.span, expr.ty.clone()) {
+                Some(synthetic) => match synthetic.kind {
+                    TypedExprKind::Tuple { elements } => Some(elements),
+                    _ => None,
+                },
+                None => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 fn split_and(expr: &TypedExpr) -> Vec<TypedExpr> {
