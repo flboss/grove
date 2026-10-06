@@ -2661,6 +2661,9 @@ fn rows_projection(ctx: &mut Context, base: &TypedExpr, items: &[TypedProjection
     }
     level.builder.select = select;
     for key in parent_keys {
+        if matches!(level.builder.from, Some(FromClause::Join { .. })) {
+            continue;
+        }
         ensure_key(&mut level.builder, &key, ctx.schema);
     }
     level.output_shapes = Some(fields);
@@ -4906,6 +4909,18 @@ fn cross_cartesian(
     extra_computed: &[(String, SqlExpr, ScalarType)],
     outer_scope: bool,
 ) -> (usize, String, Vec<(String, Option<ScalarType>)>, Level) {
+    let (temp_idx, temp, create_outputs) = cross_cartesian_temp(ctx, parent, extra, extra_computed);
+    let data_from = cross_root_scan(ctx, peeled);
+    let child = cross_cartesian_child(ctx, &temp, &create_outputs, data_from, peeled, outer_scope);
+    (temp_idx, temp, create_outputs, child)
+}
+
+fn cross_cartesian_temp(
+    ctx: &mut Context,
+    parent: &mut Level,
+    extra: &[(String, Option<ScalarType>)],
+    extra_computed: &[(String, SqlExpr, ScalarType)],
+) -> (usize, String, Vec<(String, Option<ScalarType>)>) {
     let temp = ctx.aliases.temp();
     let mut create_q = parent.builder.clone();
     if create_q.select.is_empty() {
@@ -4947,11 +4962,21 @@ fn cross_cartesian(
         StatementKind::Temp { name: temp.clone() },
     );
     swap_parent_to_temp(parent, &temp, &create_outputs);
-    let data_from = cross_root_scan(ctx, peeled);
+    (temp_idx, temp, create_outputs)
+}
+
+fn cross_cartesian_child(
+    ctx: &mut Context,
+    temp: &str,
+    create_outputs: &[(String, Option<ScalarType>)],
+    data_from: FromClause,
+    peeled: &TypedExpr,
+    outer_scope: bool,
+) -> Level {
     let mut child_builder = SelectBuilder::new();
     child_builder.from = Some(FromClause::Join {
         left: Box::new(FromClause::Temp {
-            name: temp.clone(),
+            name: temp.to_string(),
             columns: create_outputs
                 .iter()
                 .map(|(name, ty)| NamedColumn {
@@ -5010,7 +5035,7 @@ fn cross_cartesian(
         output: "$$pkey".to_string(),
         ty: None,
     });
-    (temp_idx, temp, create_outputs, child)
+    child
 }
 
 fn sink_cross_child(
@@ -5076,23 +5101,33 @@ fn const_proj_cross_shape(
     let TypedExprKind::Projection { base, items } = &tail.kind else {
         return None;
     };
-    if !matches!(
+    let bare = matches!(
         &base.kind,
         TypedExprKind::Ident {
             binding: IdentBinding::Root { .. },
             ..
         }
-    ) {
+    );
+    let pipeline = !bare
+        && ctx.child.is_none()
+        && ctx.temp_collect.is_none()
+        && !ctx.in_take_arg
+        && ctx.nest_depth < 1
+        && const_pipeline_base(base);
+    if !bare && !pipeline {
         return None;
     }
-    if items.iter().any(|item| !item.value.ty.is_scalar()) {
-        return None;
-    }
-    if items.iter().all(|item| !uses_outer(&item.value)) {
+    let has_lists = items
+        .iter()
+        .any(|item| matches!(item.value.ty, QueryType::List(_)));
+    if !has_lists && items.iter().all(|item| !uses_outer(&item.value)) {
         return None;
     }
     let mut carries: Vec<(String, Option<ScalarType>)> = Vec::new();
     for item in items {
+        if !item.value.ty.is_scalar() {
+            continue;
+        }
         let mut fids = Vec::new();
         let mut foreign = false;
         any_ident(&item.value, &mut |e| {
@@ -5124,14 +5159,229 @@ fn const_proj_cross_shape(
             }
         }
     }
-    let (temp_idx, _, _, child) = cross_cartesian(ctx, parent, tail, &carries, &[], true);
-    Some(sink_cross_child(
+    let keys = const_list_keys(ctx, parent, base, items)?;
+    let had_lists = has_lists;
+    for (col, ty) in &keys {
+        if !carries.iter().any(|(c, _)| c == col) {
+            carries.push((col.clone(), *ty));
+        }
+    }
+    let input = ConstCrossInput {
+        carries,
+        keys,
+        had_lists,
+    };
+    if pipeline {
+        return const_pipeline_cross_shape(ctx, parent, tail, base, items, &input, cardinality);
+    }
+    let (temp_idx, _, _, child) = cross_cartesian(ctx, parent, tail, &input.carries, &[], true);
+    Some(sink_const_cross_child(
         ctx,
         child,
         temp_idx,
         &tail.ty,
         cardinality,
+        &input.keys,
+        input.had_lists,
     ))
+}
+
+struct ConstCrossInput {
+    carries: Vec<(String, Option<ScalarType>)>,
+    keys: Vec<(String, Option<ScalarType>)>,
+    had_lists: bool,
+}
+
+fn const_list_keys(
+    ctx: &mut Context,
+    parent: &mut Level,
+    base: &TypedExpr,
+    items: &[TypedProjectionItem],
+) -> Option<Vec<(String, Option<ScalarType>)>> {
+    let data_from = cross_root_scan(ctx, base);
+    let data_cols: Vec<String> = from_columns_typed(&Some(data_from), ctx.schema)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    let mut keys: Vec<(String, Option<ScalarType>)> = Vec::new();
+    for item in items {
+        if item.value.ty.is_scalar() {
+            continue;
+        }
+        if !matches!(item.value.ty, QueryType::List(_)) {
+            return None;
+        }
+        if !const_inner_routable(&item.value) {
+            return None;
+        }
+        let Some(IdentBinding::Field(fid)) = tail_root_ident(&item.value) else {
+            return None;
+        };
+        if tail_uses_outer(&item.value) || take_bound_ident(&item.value) {
+            return None;
+        }
+        let link = resolve_tail_link(ctx, *fid);
+        if link.m2m_join.is_some() {
+            return None;
+        }
+        let col = link.parent_col.clone();
+        if data_cols.contains(&col) {
+            return None;
+        }
+        let ty = output_ty(&parent.builder, &col, ctx.schema)?;
+        if !keys.iter().any(|(c, _)| c == &col) {
+            keys.push((col, Some(ty)));
+        }
+    }
+    Some(keys)
+}
+
+fn const_inner_routable(node: &TypedExpr) -> bool {
+    match &node.kind {
+        TypedExprKind::Ident { .. }
+        | TypedExprKind::Literal(_)
+        | TypedExprKind::TypeConstant { .. } => true,
+        TypedExprKind::Field { base, .. } => const_inner_routable(base),
+        TypedExprKind::Method { base, args, .. } => {
+            const_inner_routable(base) && args.iter().all(|a| const_inner_routable(&a.expr))
+        }
+        TypedExprKind::Binary { lhs, rhs, .. } => {
+            const_inner_routable(lhs) && const_inner_routable(rhs)
+        }
+        TypedExprKind::Unary { expr, .. } | TypedExprKind::Cast { expr, .. } => {
+            const_inner_routable(expr)
+        }
+        _ => false,
+    }
+}
+
+fn sink_const_cross_child(
+    ctx: &mut Context,
+    mut child: Level,
+    temp_idx: usize,
+    tail_ty: &QueryType,
+    cardinality: Cardinality,
+    keys: &[(String, Option<ScalarType>)],
+    had_lists: bool,
+) -> (ResultShape, Option<String>) {
+    if had_lists {
+        let key_names: Vec<&String> = keys.iter().map(|(name, _)| name).collect();
+        child.builder.select.retain(|item| {
+            !matches!(item,
+                SelectItem::Column { depth: 0, output, .. } if key_names.contains(&output))
+        });
+        let served = builder_outputs(&child.builder, ctx.schema);
+        for (key, ty) in keys {
+            if !served.contains(key) {
+                child.builder.select.push(SelectItem::Column {
+                    depth: 1,
+                    column: key.clone(),
+                    output: key.clone(),
+                    ty: *ty,
+                });
+            }
+        }
+    }
+    let (mut shape, key) = sink_cross_child(ctx, child, temp_idx, tail_ty, cardinality);
+    if had_lists
+        && let ResultShape::List { element, child } | ResultShape::Single { element, child } =
+            &mut shape
+    {
+        let idx = child.stmt;
+        patch_pending_parents(element, idx);
+    }
+    (shape, key)
+}
+
+fn const_pipeline_cross_shape(
+    ctx: &mut Context,
+    parent: &mut Level,
+    tail: &TypedExpr,
+    base: &TypedExpr,
+    items: &[TypedProjectionItem],
+    input: &ConstCrossInput,
+    cardinality: Cardinality,
+) -> Option<(ResultShape, Option<String>)> {
+    let mut data = rows(ctx, base);
+    if data.pending.is_some() {
+        todo!("M4b nested collection inside cross child");
+    }
+    if data.builder.select.is_empty() {
+        for (name, ty) in from_columns_typed(&data.builder.from, ctx.schema) {
+            data.builder.select.push(SelectItem::Column {
+                depth: 0,
+                column: name.clone(),
+                output: name,
+                ty,
+            });
+        }
+    }
+    if data.builder.select.is_empty() {
+        todo!("M4b cross tail shape");
+    }
+    let data_alias = ctx.aliases.subquery();
+    let data_from = FromClause::Subquery {
+        query: Box::new(data.builder),
+        alias: data_alias,
+    };
+    let (temp_idx, temp, create_outputs) = cross_cartesian_temp(ctx, parent, &input.carries, &[]);
+    let mut bottom = base;
+    while let TypedExprKind::Method { base: next, .. } = &bottom.kind {
+        bottom = next;
+    }
+    let proj_tail = TypedExpr {
+        kind: TypedExprKind::Projection {
+            base: Box::new(bottom.clone()),
+            items: items.to_vec(),
+        },
+        ty: tail.ty.clone(),
+        span: tail.span,
+    };
+    let child = cross_cartesian_child(ctx, &temp, &create_outputs, data_from, &proj_tail, true);
+    Some(sink_const_cross_child(
+        ctx,
+        child,
+        temp_idx,
+        &tail.ty,
+        cardinality,
+        &input.keys,
+        input.had_lists,
+    ))
+}
+
+fn const_pipeline_base(base: &TypedExpr) -> bool {
+    let mut node = base;
+    loop {
+        match &node.kind {
+            TypedExprKind::Ident {
+                binding: IdentBinding::Root { .. },
+                ..
+            } => return true,
+            TypedExprKind::Method {
+                base: next,
+                name,
+                args,
+                optional,
+            } => {
+                if *optional {
+                    return false;
+                }
+                if !["take", "skip", "filter", "sort", "sort_asc", "sort_desc"]
+                    .contains(&name.value.as_str())
+                {
+                    return false;
+                }
+                if args
+                    .iter()
+                    .any(|a| uses_outer(&a.expr) || take_bound_ident(&a.expr))
+                {
+                    return false;
+                }
+                node = next;
+            }
+            _ => return false,
+        }
+    }
 }
 
 fn carry_per_row_bound(

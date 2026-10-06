@@ -398,6 +398,108 @@ fn slice_via_array_values() {
 }
 
 #[test]
+fn cross_list_inner_values() {
+    let ada = || rec(&[("s", Value::List(vec![Value::Int(5), Value::Int(7)]))]);
+    let bob = || rec(&[("s", Value::List(vec![Value::Int(9)]))]);
+    let cyd = || rec(&[("s", Value::List(vec![]))]);
+    assert_eq!(
+        value("users { x = configs { s = scores } }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![ada(), ada()]))]),
+            rec(&[("x", Value::List(vec![bob(), bob()]))]),
+            rec(&[("x", Value::List(vec![cyd(), cyd()]))]),
+        ])
+    );
+}
+
+#[test]
+fn cross_list_inner_take_values() {
+    assert_eq!(
+        value("users { x = configs { s = scores.take(1) } }"),
+        Value::List(vec![
+            rec(&[(
+                "x",
+                Value::List(vec![
+                    rec(&[("s", Value::List(vec![Value::Int(5)]))]),
+                    rec(&[("s", Value::List(vec![Value::Int(5)]))]),
+                ])
+            )]),
+            rec(&[(
+                "x",
+                Value::List(vec![
+                    rec(&[("s", Value::List(vec![Value::Int(9)]))]),
+                    rec(&[("s", Value::List(vec![Value::Int(9)]))]),
+                ])
+            )]),
+            rec(&[(
+                "x",
+                Value::List(vec![
+                    rec(&[("s", Value::List(vec![]))]),
+                    rec(&[("s", Value::List(vec![]))]),
+                ])
+            )]),
+        ])
+    );
+}
+
+#[test]
+fn cross_list_pipeline_values() {
+    assert_eq!(
+        value("users { x = configs.take(1) { s = scores } }"),
+        Value::List(vec![
+            rec(&[(
+                "x",
+                Value::List(vec![rec(&[(
+                    "s",
+                    Value::List(vec![Value::Int(5), Value::Int(7)])
+                )])])
+            )]),
+            rec(&[(
+                "x",
+                Value::List(vec![rec(&[("s", Value::List(vec![Value::Int(9)]))])])
+            )]),
+            rec(&[("x", Value::List(vec![rec(&[("s", Value::List(vec![]))])]))]),
+        ])
+    );
+}
+
+#[test]
+fn cross_list_mixed_values() {
+    assert_eq!(
+        value("users { x = configs { s = scores, n = name } }"),
+        Value::List(vec![
+            rec(&[(
+                "x",
+                Value::List(vec![
+                    rec(&[
+                        ("s", Value::List(vec![Value::Int(5), Value::Int(7)])),
+                        ("n", s("n1")),
+                    ]),
+                    rec(&[
+                        ("s", Value::List(vec![Value::Int(5), Value::Int(7)])),
+                        ("n", s("n2")),
+                    ]),
+                ])
+            )]),
+            rec(&[(
+                "x",
+                Value::List(vec![
+                    rec(&[("s", Value::List(vec![Value::Int(9)])), ("n", s("n1")),]),
+                    rec(&[("s", Value::List(vec![Value::Int(9)])), ("n", s("n2")),]),
+                ])
+            )]),
+            rec(&[(
+                "x",
+                Value::List(vec![
+                    rec(&[("s", Value::List(vec![])), ("n", s("n1"))]),
+                    rec(&[("s", Value::List(vec![])), ("n", s("n2"))]),
+                ])
+            )]),
+        ])
+    );
+}
+
+#[test]
 fn slice_nested_via_root() {
     assert_eq!(
         value("users.scores"),

@@ -642,6 +642,78 @@ fn cross_projection_outer_consts_keep_siblings() {
     );
 }
 
+fn u_const(o: &str) -> Value {
+    Value::Record(vec![(
+        "u".to_string(),
+        Value::List(vec![Value::Record(vec![(
+            "n".to_string(),
+            Value::String(o.to_string()),
+        )])]),
+    )])
+}
+
+#[test]
+fn cross_projection_pipeline_take_consts_values() {
+    assert_eq!(
+        value("configs { u = users.take(1) { n = owner } }"),
+        Value::List(
+            ["a@x", "zzz", "b@x", "zzz", "a@x", "zzz"]
+                .iter()
+                .map(|o| u_const(o))
+                .collect()
+        )
+    );
+}
+
+#[test]
+fn cross_projection_pipeline_filter_consts_values() {
+    assert_eq!(
+        value("configs { u = users.filter(age > 35) { n = owner } }"),
+        Value::List(
+            ["a@x", "zzz", "b@x", "zzz", "a@x", "zzz"]
+                .iter()
+                .map(|o| u_const(o))
+                .collect()
+        )
+    );
+}
+
+#[test]
+fn cross_projection_pipeline_filter_empty_values() {
+    assert_eq!(
+        value("configs { u = users.filter(age > 100) { n = owner } }"),
+        Value::List(
+            ["a@x", "zzz", "b@x", "zzz", "a@x", "zzz"]
+                .iter()
+                .map(|_| Value::Record(vec![("u".to_string(), Value::List(vec![]))]))
+                .collect()
+        )
+    );
+}
+
+fn u_mixed(o: &str) -> Value {
+    Value::Record(vec![(
+        "u".to_string(),
+        Value::List(vec![Value::Record(vec![
+            ("n".to_string(), Value::String("Ada".to_string())),
+            ("o".to_string(), Value::String(o.to_string())),
+        ])]),
+    )])
+}
+
+#[test]
+fn cross_projection_pipeline_mixed_values() {
+    assert_eq!(
+        value("configs { u = users.take(1) { n = name, o = owner } }"),
+        Value::List(
+            ["a@x", "zzz", "b@x", "zzz", "a@x", "zzz"]
+                .iter()
+                .map(|o| u_mixed(o))
+                .collect()
+        )
+    );
+}
+
 #[test]
 fn cross_inequality_pairs_complement() {
     assert_eq!(
