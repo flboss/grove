@@ -1587,6 +1587,57 @@ fn slice_tuples() {
 }
 
 #[test]
+fn slice_tuple_comparison() {
+    assert_eq!(value("(1, 2) == (1, 2)"), Value::Bool(true));
+    assert_eq!(value("(1, 2) == (1, 3)"), Value::Bool(false));
+    assert_eq!(value("(1, 2) != (1, 3)"), Value::Bool(true));
+    assert_eq!(value("(1, 2) != (1, 2)"), Value::Bool(false));
+    assert_eq!(value("(1, 2) < (3, 4)"), Value::Bool(true));
+    assert_eq!(value("(1, 2) < (1, 2)"), Value::Bool(false));
+    assert_eq!(value("(1, 2) < (1, 3)"), Value::Bool(true));
+    assert_eq!(value("(1, 2) <= (1, 2)"), Value::Bool(true));
+    assert_eq!(value("(3, 4) > (1, 9)"), Value::Bool(true));
+    assert_eq!(value("(1, 2) >= (2, 1)"), Value::Bool(false));
+    assert_eq!(value("(1, 2) in ((1, 2), (3, 4))"), Value::Bool(true));
+    assert_eq!(value("(5, 6) in ((1, 2), (3, 4))"), Value::Bool(false));
+    assert_eq!(
+        value("users[(age, 1) == (30, 1)] { name }"),
+        Value::List(vec![rec(&[("name", s("Ada"))])])
+    );
+    assert_eq!(
+        value("users[(age, 99) == (30, 1)] { name }"),
+        Value::List(vec![])
+    );
+    assert_eq!(
+        value("users[pos == (1.0f, 2.0f)] { name }"),
+        Value::List(vec![rec(&[("name", s("Ada"))])])
+    );
+    assert_eq!(
+        value("users[pos < (3.0f, 4.0f)] { name }"),
+        Value::List(vec![rec(&[("name", s("Ada"))])])
+    );
+    assert_eq!(
+        value("users[(nickname, age) == (nickname, age)] { name }"),
+        Value::List(vec![
+            rec(&[("name", s("Ada"))]),
+            rec(&[("name", s("Bob"))]),
+            rec(&[("name", s("Cyd"))]),
+        ])
+    );
+    assert_eq!(
+        value("(if true { (1, 2) } else { (3, 4) }) == (1, 2)"),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        value("users { t = (age, 1) }[t == (30, 1)] { t }"),
+        Value::List(vec![Value::Record(vec![(
+            "t".to_string(),
+            Value::Tuple(vec![Value::Int(30), Value::Int(1)]),
+        )])])
+    );
+}
+
+#[test]
 fn slice_structs() {
     assert_eq!(
         value("if true { { a = 1 } } else { { a = 2 } }"),

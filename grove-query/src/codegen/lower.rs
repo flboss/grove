@@ -6353,6 +6353,32 @@ fn collapse_tuple_method(
     args: &[TypedMethodArg],
     tys: &[QueryType],
 ) -> (Vec<SelectItem>, ResultShape, Vec<String>) {
+    let (level, outputs) = collapse_tuple_level(ctx, base, name, args, tys);
+    let mut select = Vec::with_capacity(outputs.len());
+    let mut shapes = Vec::with_capacity(outputs.len());
+    for (i, (column, position_ty)) in outputs.iter().zip(collapse_position_tys(tys)).enumerate() {
+        let output = if prefix.is_empty() {
+            format!("c{i}")
+        } else {
+            format!("{prefix}_c{i}")
+        };
+        select.push(SelectItem::Expr {
+            expr: collapse_position_subquery(&level, column, position_ty),
+            output: output.clone(),
+            ty: position_ty,
+        });
+        shapes.push(ResultShape::Column(output));
+    }
+    (select, ResultShape::Tuple(shapes), Vec::new())
+}
+
+fn collapse_tuple_level(
+    ctx: &mut Context,
+    base: &TypedExpr,
+    name: &grove_types::Spanned<String>,
+    args: &[TypedMethodArg],
+    tys: &[QueryType],
+) -> (Level, Vec<String>) {
     let mut level = rows(ctx, base);
     if level.pending.is_some() {
         unreachable!(
@@ -6367,38 +6393,34 @@ fn collapse_tuple_method(
     if outputs.len() != tys.len() {
         unreachable!("tuple-row width drift: tuple levels emit positions in order");
     }
-    let mut select = Vec::with_capacity(outputs.len());
-    let mut shapes = Vec::with_capacity(outputs.len());
-    for (i, column) in outputs.iter().enumerate() {
-        let output = if prefix.is_empty() {
-            format!("c{i}")
-        } else {
-            format!("{prefix}_c{i}")
-        };
-        let position_ty = tys.get(i).and_then(scalar_of);
-        select.push(SelectItem::Expr {
-            expr: SqlExpr::Subquery {
-                query: Box::new(SelectBuilder {
-                    select: vec![SelectItem::Column {
-                        depth: 0,
-                        column: column.clone(),
-                        output: column.clone(),
-                        ty: position_ty,
-                    }],
-                    from: level.builder.from.clone(),
-                    where_: level.builder.where_.clone(),
-                    order_by: level.builder.order_by.clone(),
-                    limit: level.builder.limit.clone(),
-                    offset: level.builder.offset.clone(),
-                    unions: Vec::new(),
-                }),
-            },
-            output: output.clone(),
-            ty: position_ty,
-        });
-        shapes.push(ResultShape::Column(output));
+    (level, outputs)
+}
+
+fn collapse_position_tys(tys: &[QueryType]) -> Vec<Option<ScalarType>> {
+    tys.iter().map(scalar_of).collect()
+}
+
+fn collapse_position_subquery(
+    level: &Level,
+    column: &str,
+    position_ty: Option<ScalarType>,
+) -> SqlExpr {
+    SqlExpr::Subquery {
+        query: Box::new(SelectBuilder {
+            select: vec![SelectItem::Column {
+                depth: 0,
+                column: column.to_string(),
+                output: column.to_string(),
+                ty: position_ty,
+            }],
+            from: level.builder.from.clone(),
+            where_: level.builder.where_.clone(),
+            order_by: level.builder.order_by.clone(),
+            limit: level.builder.limit.clone(),
+            offset: level.builder.offset.clone(),
+            unions: Vec::new(),
+        }),
     }
-    (select, ResultShape::Tuple(shapes), Vec::new())
 }
 
 fn if_broadcast_tail(tail: &TypedExpr) -> bool {
@@ -12379,6 +12401,235 @@ fn apply_scalar_method(
     }
 }
 
+struct CmpPosition {
+    expr: SqlExpr,
+    optional: bool,
+}
+
+fn cmp_positions(ctx: &mut Context, expr: &TypedExpr) -> Option<Vec<CmpPosition>> {
+    if let TypedExprKind::Some { value } = &expr.kind {
+        let mut out = cmp_positions(ctx, value)?;
+        for position in &mut out {
+            position.optional = true;
+        }
+        return Some(out);
+    }
+    let wrapped = expr.ty.is_optional();
+    let mut out = match peel_optional(&expr.ty) {
+        QueryType::Scalar(_) => vec![CmpPosition {
+            expr: scalar(ctx, expr),
+            optional: wrapped,
+        }],
+        QueryType::Tuple(tys) => cmp_tuple_positions(ctx, expr, tys)?,
+        _ => return None,
+    };
+    if wrapped {
+        for position in &mut out {
+            position.optional = true;
+        }
+    }
+    Some(out)
+}
+
+fn cmp_tuple_positions(
+    ctx: &mut Context,
+    expr: &TypedExpr,
+    tys: &[QueryType],
+) -> Option<Vec<CmpPosition>> {
+    match &expr.kind {
+        TypedExprKind::Tuple { elements } => {
+            if elements.len() != tys.len() {
+                return None;
+            }
+            let mut out = Vec::with_capacity(tys.len());
+            for (element, ty) in elements.iter().zip(tys.iter()) {
+                match peel_optional(ty) {
+                    QueryType::Scalar(_) => out.push(CmpPosition {
+                        expr: scalar(ctx, element),
+                        optional: element.ty.is_optional(),
+                    }),
+                    QueryType::Tuple(_) => out.extend(cmp_positions(ctx, element)?),
+                    _ => return None,
+                }
+            }
+            Some(out)
+        }
+        TypedExprKind::If { arms, default } => {
+            let mut branch_sets = Vec::with_capacity(arms.len() + 1);
+            for (_, body) in arms {
+                branch_sets.push(cmp_positions(ctx, body)?);
+            }
+            branch_sets.push(cmp_positions(ctx, default)?);
+            let mut out = Vec::with_capacity(tys.len());
+            for i in 0..tys.len() {
+                let mut case_arms = Vec::with_capacity(arms.len());
+                for ((cond, _), positions) in arms.iter().zip(branch_sets.iter()) {
+                    case_arms.push((scalar(ctx, cond), positions.get(i)?.expr.clone()));
+                }
+                let optional = branch_sets
+                    .iter()
+                    .any(|positions| positions.get(i).is_some_and(|p| p.optional));
+                out.push(CmpPosition {
+                    expr: SqlExpr::Case {
+                        arms: case_arms,
+                        else_: Box::new(branch_sets[arms.len()].get(i)?.expr.clone()),
+                    },
+                    optional,
+                });
+            }
+            Some(out)
+        }
+        TypedExprKind::Ident {
+            binding: IdentBinding::Field(fid),
+            depth,
+            ..
+        } => {
+            let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
+            match field {
+                Field::Value { columns, .. } => {
+                    if columns.len() != tys.len() || tys.iter().any(|t| !t.is_scalar()) {
+                        return None;
+                    }
+                    Some(
+                        columns
+                            .iter()
+                            .zip(tys.iter())
+                            .map(|(column, ty)| CmpPosition {
+                                expr: SqlExpr::Column {
+                                    depth: *depth,
+                                    column: ctx.schema.column_name(*column).to_string(),
+                                },
+                                optional: ty.is_optional(),
+                            })
+                            .collect(),
+                    )
+                }
+                _ => None,
+            }
+        }
+        TypedExprKind::Ident {
+            binding: IdentBinding::ProjectedField { name },
+            depth,
+            ..
+        } => {
+            if *depth != 0 {
+                return None;
+            }
+            projected_tuple_positions(name, tys, *depth)
+        }
+        TypedExprKind::Method {
+            base, name, args, ..
+        } if ["first", "nth"].contains(&name.value.as_str()) => {
+            let (level, outputs) = collapse_tuple_level(ctx, base, name, args, tys);
+            if outputs.len() != tys.len() {
+                return None;
+            }
+            let position_tys = collapse_position_tys(tys);
+            Some(
+                outputs
+                    .iter()
+                    .zip(position_tys.iter())
+                    .zip(tys.iter())
+                    .map(|((column, position_ty), ty)| CmpPosition {
+                        expr: collapse_position_subquery(&level, column, *position_ty),
+                        optional: ty.is_optional(),
+                    })
+                    .collect(),
+            )
+        }
+        _ => None,
+    }
+}
+
+fn projected_tuple_positions(
+    prefix: &str,
+    tys: &[QueryType],
+    depth: usize,
+) -> Option<Vec<CmpPosition>> {
+    let mut out = Vec::new();
+    for (i, ty) in tys.iter().enumerate() {
+        let column = format!("{prefix}_c{i}");
+        match peel_optional(ty) {
+            QueryType::Scalar(_) => out.push(CmpPosition {
+                expr: SqlExpr::Column { depth, column },
+                optional: ty.is_optional(),
+            }),
+            QueryType::Tuple(inner) => {
+                out.extend(projected_tuple_positions(&column, inner, depth)?)
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+fn conjoin_eq_positions(
+    lhs: &[CmpPosition],
+    rhs: &[CmpPosition],
+    force_null_safe: bool,
+) -> Option<SqlExpr> {
+    if lhs.len() != rhs.len() {
+        return None;
+    }
+    lhs.iter()
+        .zip(rhs.iter())
+        .map(|(l, r)| {
+            let op = if force_null_safe || l.optional || r.optional {
+                SqlBinOp::Is
+            } else {
+                SqlBinOp::Eq
+            };
+            SqlExpr::Binary {
+                op,
+                lhs: Box::new(l.expr.clone()),
+                rhs: Box::new(r.expr.clone()),
+            }
+        })
+        .reduce(and_sql)
+}
+
+fn lexicographic_lt(lhs: &[CmpPosition], rhs: &[CmpPosition]) -> Option<SqlExpr> {
+    if lhs.len() != rhs.len() {
+        return None;
+    }
+    let mut disjuncts = Vec::with_capacity(lhs.len());
+    for i in 0..lhs.len() {
+        let mut conjuncts = Vec::with_capacity(i + 1);
+        for (l, r) in lhs.iter().zip(rhs.iter()).take(i) {
+            conjuncts.push(SqlExpr::Binary {
+                op: SqlBinOp::Is,
+                lhs: Box::new(l.expr.clone()),
+                rhs: Box::new(r.expr.clone()),
+            });
+        }
+        conjuncts.push(SqlExpr::Binary {
+            op: SqlBinOp::Lt,
+            lhs: Box::new(lhs[i].expr.clone()),
+            rhs: Box::new(rhs[i].expr.clone()),
+        });
+        disjuncts.push(conjuncts.into_iter().reduce(and_sql).unwrap_or_else(|| {
+            unreachable!("lexicographic term holds the final comparison by construction")
+        }));
+    }
+    disjuncts.into_iter().reduce(or_sql)
+}
+
+fn and_sql(lhs: SqlExpr, rhs: SqlExpr) -> SqlExpr {
+    SqlExpr::Binary {
+        op: SqlBinOp::And,
+        lhs: Box::new(lhs),
+        rhs: Box::new(rhs),
+    }
+}
+
+fn or_sql(lhs: SqlExpr, rhs: SqlExpr) -> SqlExpr {
+    SqlExpr::Binary {
+        op: SqlBinOp::Or,
+        lhs: Box::new(lhs),
+        rhs: Box::new(rhs),
+    }
+}
+
 fn scalar_binary(
     ctx: &mut Context,
     op: &grove_types::Spanned<BinaryOp>,
@@ -12416,32 +12667,74 @@ fn scalar_binary(
             }
         }
         BinaryOp::Eq | BinaryOp::Ne => {
-            if !lhs.ty.is_scalar() || !rhs.ty.is_scalar() {
+            if lhs.ty.is_scalar() && rhs.ty.is_scalar() {
+                let op = match op.value {
+                    BinaryOp::Eq if lhs.ty.is_optional() || rhs.ty.is_optional() => SqlBinOp::Is,
+                    BinaryOp::Ne if lhs.ty.is_optional() || rhs.ty.is_optional() => SqlBinOp::IsNot,
+                    BinaryOp::Eq => SqlBinOp::Eq,
+                    _ => SqlBinOp::Ne,
+                };
+                return SqlExpr::Binary {
+                    op,
+                    lhs: Box::new(scalar(ctx, lhs)),
+                    rhs: Box::new(scalar(ctx, rhs)),
+                };
+            }
+            let (l, r) = match (cmp_positions(ctx, lhs), cmp_positions(ctx, rhs)) {
+                (Some(l), Some(r)) => (l, r),
+                _ => todo!(
+                    "comparison-overhaul: deep equality over {} vs {}",
+                    lhs.ty,
+                    rhs.ty
+                ),
+            };
+            let conj = conjoin_eq_positions(&l, &r, false).unwrap_or_else(|| {
                 todo!(
                     "comparison-overhaul: deep equality over {} vs {}",
                     lhs.ty,
                     rhs.ty
-                );
-            }
-            let op = match op.value {
-                BinaryOp::Eq if lhs.ty.is_optional() || rhs.ty.is_optional() => SqlBinOp::Is,
-                BinaryOp::Ne if lhs.ty.is_optional() || rhs.ty.is_optional() => SqlBinOp::IsNot,
-                BinaryOp::Eq => SqlBinOp::Eq,
-                _ => SqlBinOp::Ne,
-            };
-            SqlExpr::Binary {
-                op,
-                lhs: Box::new(scalar(ctx, lhs)),
-                rhs: Box::new(scalar(ctx, rhs)),
+                )
+            });
+            if op.value == BinaryOp::Eq {
+                conj
+            } else {
+                SqlExpr::Not(Box::new(conj))
             }
         }
         BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Ge => {
             if matches!(lhs.ty, QueryType::Tuple(_)) || matches!(rhs.ty, QueryType::Tuple(_)) {
-                todo!(
-                    "comparison-overhaul: tuple ordering over {} vs {}",
-                    lhs.ty,
-                    rhs.ty
-                );
+                let (l, r) = match (cmp_positions(ctx, lhs), cmp_positions(ctx, rhs)) {
+                    (Some(l), Some(r)) => (l, r),
+                    _ => todo!(
+                        "comparison-overhaul: tuple ordering over {} vs {}",
+                        lhs.ty,
+                        rhs.ty
+                    ),
+                };
+                let (l, r) = match op.value {
+                    BinaryOp::Gt | BinaryOp::Ge => (r, l),
+                    _ => (l, r),
+                };
+                let lt = lexicographic_lt(&l, &r).unwrap_or_else(|| {
+                    todo!(
+                        "comparison-overhaul: tuple ordering over {} vs {}",
+                        lhs.ty,
+                        rhs.ty
+                    )
+                });
+                return match op.value {
+                    BinaryOp::Lt | BinaryOp::Gt => lt,
+                    _ => {
+                        let eq = conjoin_eq_positions(&l, &r, true).unwrap_or_else(|| {
+                            todo!(
+                                "comparison-overhaul: tuple ordering over {} vs {}",
+                                lhs.ty,
+                                rhs.ty
+                            )
+                        });
+                        or_sql(lt, eq)
+                    }
+                };
             }
             if !lhs.ty.is_scalar() || !rhs.ty.is_scalar() {
                 unreachable!(
@@ -12474,13 +12767,26 @@ fn scalar_binary(
         }
         BinaryOp::In => match &rhs.kind {
             TypedExprKind::Tuple { elements } => {
-                if !lhs.ty.is_scalar() || elements.iter().any(|e| !e.ty.is_scalar()) {
-                    todo!("comparison-overhaul: deep `in` over {}", lhs.ty);
+                if lhs.ty.is_scalar() && elements.iter().all(|e| e.ty.is_scalar()) {
+                    return SqlExpr::In {
+                        expr: Box::new(scalar(ctx, lhs)),
+                        items: elements.iter().map(|e| scalar(ctx, e)).collect(),
+                    };
                 }
-                SqlExpr::In {
-                    expr: Box::new(scalar(ctx, lhs)),
-                    items: elements.iter().map(|e| scalar(ctx, e)).collect(),
-                }
+                let needle = cmp_positions(ctx, lhs)
+                    .unwrap_or_else(|| todo!("comparison-overhaul: deep `in` over {}", lhs.ty));
+                elements
+                    .iter()
+                    .map(|alternative| {
+                        let positions = cmp_positions(ctx, alternative).unwrap_or_else(|| {
+                            todo!("comparison-overhaul: deep `in` over {}", lhs.ty)
+                        });
+                        conjoin_eq_positions(&needle, &positions, false).unwrap_or_else(|| {
+                            todo!("comparison-overhaul: deep `in` over {}", lhs.ty)
+                        })
+                    })
+                    .reduce(or_sql)
+                    .unwrap_or_else(|| todo!("comparison-overhaul: deep `in` over {}", lhs.ty))
             }
             _ => unreachable!("non-tuple `in` RHS: the checker requires a tuple"),
         },
