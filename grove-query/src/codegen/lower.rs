@@ -3845,23 +3845,29 @@ fn available_cols(builder: &SelectBuilder, schema: &ValidatedSchema) -> Vec<Stri
     if builder.select.is_empty() && !builder.unions.is_empty() {
         return union_outputs(builder, schema);
     }
+    let mut cols = Vec::new();
+    for item in &builder.select {
+        match item {
+            SelectItem::AllFrom { .. } => {}
+            SelectItem::Column { output, .. } | SelectItem::Expr { output, .. } => {
+                if !cols.contains(output) {
+                    cols.push(output.clone());
+                }
+            }
+        }
+    }
     if builder
         .select
         .iter()
         .any(|item| matches!(item, SelectItem::AllFrom { .. }))
     {
-        return available_from_cols(&builder.from, schema);
-    }
-    builder
-        .select
-        .iter()
-        .filter_map(|item| match item {
-            SelectItem::AllFrom { .. } => None,
-            SelectItem::Column { output, .. } | SelectItem::Expr { output, .. } => {
-                Some(output.clone())
+        for col in available_from_cols(&builder.from, schema) {
+            if !cols.contains(&col) {
+                cols.push(col);
             }
-        })
-        .collect()
+        }
+    }
+    cols
 }
 
 fn available_from_cols(from: &Option<FromClause>, schema: &ValidatedSchema) -> Vec<String> {
@@ -4001,7 +4007,6 @@ fn prune_cross_filters(
 fn peel_cross_window(
     node: &TypedExpr,
     suffix: &mut Vec<(String, Vec<TypedMethodArg>)>,
-    outer_bounds: bool,
 ) -> TypedExpr {
     match &node.kind {
         TypedExprKind::Method {
@@ -4010,20 +4015,12 @@ fn peel_cross_window(
             args,
             optional,
         } if ["take", "skip"].contains(&name.value.as_str()) && !optional => {
-            if !outer_bounds {
-                for arg in args {
-                    if uses_outer(&arg.expr) {
-                        todo!("M4b temp-bound per-row limit");
-                    }
-                }
-            }
             suffix.push((name.value.clone(), args.clone()));
-            peel_cross_window(base, suffix, outer_bounds)
+            peel_cross_window(base, suffix)
         }
-        TypedExprKind::Method { .. } | TypedExprKind::Projection { .. } => rebuild_same(
-            node,
-            peel_cross_window(tail_base(node), suffix, outer_bounds),
-        ),
+        TypedExprKind::Method { .. } | TypedExprKind::Projection { .. } => {
+            rebuild_same(node, peel_cross_window(tail_base(node), suffix))
+        }
         _ => node.clone(),
     }
 }
@@ -4651,7 +4648,7 @@ fn rcross_shape(
     }
     let corr = &correlated[0];
     let mut suffix: Vec<(String, Vec<TypedMethodArg>)> = Vec::new();
-    let peeled_tail = peel_cross_window(&local_tail, &mut suffix, true);
+    let peeled_tail = peel_cross_window(&local_tail, &mut suffix);
     let broadcast_truncate: Option<(usize, Option<usize>)> =
         if broadcast.is_empty() || suffix.is_empty() {
             None
@@ -5040,7 +5037,7 @@ fn rcross_shape(
 
 fn per_row_take_op(tail: &TypedExpr) -> Option<(Vec<(String, TypedExpr)>, TypedExpr)> {
     let mut suffix = Vec::new();
-    let peeled = peel_cross_window(tail, &mut suffix, true);
+    let peeled = peel_cross_window(tail, &mut suffix);
     if suffix.is_empty() {
         return None;
     }
