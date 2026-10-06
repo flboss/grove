@@ -63,9 +63,22 @@ pub fn render_select(
             render_expr(cond, stack, true, sql, params);
         }
     }
+    for _ in 0..pushed {
+        let _ = stack.pop();
+    }
     for union in &builder.unions {
         sql.push_str(" UNION ALL ");
         render_select(union, stack, sql, params);
+    }
+    match &builder.from {
+        Some(FromClause::Join { left, right }) => {
+            stack.push(left.alias().to_string());
+            stack.push(right.alias().to_string());
+        }
+        Some(from) => {
+            stack.push(from.alias().to_string());
+        }
+        None => {}
     }
     if !builder.order_by.is_empty() {
         sql.push_str(" ORDER BY ");
