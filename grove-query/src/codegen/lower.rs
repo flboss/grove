@@ -409,6 +409,30 @@ struct SingleHop {
     child_col: String,
 }
 
+fn single_hop_collapse_parts(ctx: &mut Context, tail: &TypedExpr) -> Option<SingleHop> {
+    let TypedExprKind::Method {
+        base, name, args, ..
+    } = &tail.kind
+    else {
+        return None;
+    };
+    if name.value == "first" {
+        if !args.is_empty() {
+            return None;
+        }
+    } else if name.value == "nth" {
+        let [arg] = args.as_slice() else {
+            return None;
+        };
+        if !matches!(&arg.expr.ty, QueryType::Scalar(ScalarType::Int)) {
+            return None;
+        }
+    } else {
+        return None;
+    }
+    single_hop_parts(ctx, base)
+}
+
 fn single_hop_parts(ctx: &mut Context, tail: &TypedExpr) -> Option<SingleHop> {
     let mut node = tail;
     loop {
@@ -6446,6 +6470,7 @@ fn single_hop_shape(
     _parent: &mut Level,
     tail: &TypedExpr,
     parts: SingleHop,
+    cardinality: Cardinality,
 ) -> (ResultShape, Option<String>) {
     let SingleHop {
         middle_fk,
@@ -6511,22 +6536,42 @@ fn single_hop_shape(
         StatementKind::Query,
     );
     patch_pending_parents(&mut element, idx);
-    let shape = ResultShape::List {
-        element: Box::new(element),
-        child: ChildRef {
-            stmt: idx,
-            parent: Some(ParentRef {
-                stmt: if ctx.nest_depth >= 1 {
-                    PENDING_PARENT_STMT
-                } else {
-                    0
-                },
-                parent_key: middle_fk.clone(),
-                child_key: child_col,
-                negated: false,
-            }),
-            cardinality: Cardinality::Many,
-            tag: None,
+    let shape = match cardinality {
+        Cardinality::Many | Cardinality::Take { .. } => ResultShape::List {
+            element: Box::new(element),
+            child: ChildRef {
+                stmt: idx,
+                parent: Some(ParentRef {
+                    stmt: if ctx.nest_depth >= 1 {
+                        PENDING_PARENT_STMT
+                    } else {
+                        0
+                    },
+                    parent_key: middle_fk.clone(),
+                    child_key: child_col,
+                    negated: false,
+                }),
+                cardinality: Cardinality::Many,
+                tag: None,
+            },
+        },
+        Cardinality::One => ResultShape::Single {
+            element: Box::new(element),
+            child: ChildRef {
+                stmt: idx,
+                parent: Some(ParentRef {
+                    stmt: if ctx.nest_depth >= 1 {
+                        PENDING_PARENT_STMT
+                    } else {
+                        0
+                    },
+                    parent_key: middle_fk.clone(),
+                    child_key: child_col,
+                    negated: false,
+                }),
+                cardinality: Cardinality::One,
+                tag: None,
+            },
         },
     };
     (shape, Some(middle_fk))
@@ -6555,7 +6600,7 @@ fn rvalue_shape(
     if ctx.temp_collect.is_none()
         && let Some(parts) = single_hop_parts(ctx, tail)
     {
-        return single_hop_shape(ctx, parent, tail, parts);
+        return single_hop_shape(ctx, parent, tail, parts, Cardinality::Many);
     }
     if array_tail_root(tail) {
         if tail_uses_outer(tail) {
@@ -7237,6 +7282,10 @@ fn rscalar_shape(
                 && let Some((ops, peeled, collapse)) = per_row_single_op(tail)
             {
                 return per_row_take_shape(ctx, parent, &ops, &peeled, Some(collapse));
+            } else if ctx.temp_collect.is_none()
+                && let Some(parts) = single_hop_collapse_parts(ctx, tail)
+            {
+                return single_hop_shape(ctx, parent, tail, parts, Cardinality::One);
             } else {
                 todo!("M4b ordered per-parent single");
             }
@@ -7263,6 +7312,12 @@ fn rscalar_shape(
                 && let Some((ops, peeled, collapse)) = per_row_single_op(tail)
             {
                 return per_row_take_shape(ctx, parent, &ops, &peeled, Some(collapse));
+            }
+            if name.value == "nth"
+                && ctx.temp_collect.is_none()
+                && let Some(parts) = single_hop_collapse_parts(ctx, tail)
+            {
+                return single_hop_shape(ctx, parent, tail, parts, Cardinality::One);
             }
             if name.value != "nth" || !nth_temp_routable(tail) {
                 todo!("M4b ordered per-parent single")

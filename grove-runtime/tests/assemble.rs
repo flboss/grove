@@ -2686,6 +2686,37 @@ fn single_hop_skip_values() {
 }
 
 #[test]
+fn single_hop_first_values() {
+    assert_eq!(
+        value("users { o = manager.orders.first() }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "o".to_string(),
+                Value::Record(vec![("total".to_string(), Value::Dec(dec("30")))]),
+            )]),
+            Value::Record(vec![(
+                "o".to_string(),
+                Value::Record(vec![("total".to_string(), Value::Dec(dec("10")))]),
+            )]),
+        ])
+    );
+}
+
+#[test]
+fn single_hop_nth_values() {
+    assert_eq!(
+        value("users { o = manager.orders.nth(1) }"),
+        Value::List(vec![
+            Value::Record(vec![("o".to_string(), Value::Null)]),
+            Value::Record(vec![(
+                "o".to_string(),
+                Value::Record(vec![("total".to_string(), Value::Dec(dec("20")))]),
+            )]),
+        ])
+    );
+}
+
+#[test]
 fn take_sort_global_boundary_values() {
     assert_eq!(
         value("configs.sort(name).take(1).sort_desc(name)"),
