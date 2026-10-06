@@ -1732,6 +1732,37 @@ fn slice_list_comparison() {
 }
 
 #[test]
+fn slice_composite_contains() {
+    assert_eq!(value("[(1, 2)].contains((1, 2))"), Value::Bool(true));
+    assert_eq!(value("[(1, 2)].contains((3, 4))"), Value::Bool(false));
+    assert_eq!(
+        value("[(1, 2), (3, 4)].contains((3, 4))"),
+        Value::Bool(true)
+    );
+    assert_eq!(value("[{ a = 1 }].contains({ a = 1 })"), Value::Bool(true));
+    assert_eq!(
+        value("[(1, 2)].take(1).contains((1, 2))"),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        value("users { x = [(age, 1)].contains((30, 1)) }"),
+        Value::List(vec![
+            rec(&[("x", Value::Bool(true))]),
+            rec(&[("x", Value::Bool(false))]),
+            rec(&[("x", Value::Bool(false))]),
+        ])
+    );
+    assert_eq!(
+        value("users[orders.contains({ total = 10.0 })] { name }"),
+        Value::List(vec![rec(&[("name", s("Ada"))])])
+    );
+    assert_eq!(
+        value("users[orders.contains({ total = 99.0 })] { name }"),
+        Value::List(vec![])
+    );
+}
+
+#[test]
 fn slice_structs() {
     assert_eq!(
         value("if true { { a = 1 } } else { { a = 2 } }"),

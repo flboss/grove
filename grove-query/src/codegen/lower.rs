@@ -12158,9 +12158,98 @@ fn derived_contains_exists(ctx: &mut Context, base: &TypedExpr, needle: &TypedEx
     SqlExpr::Exists(Box::new(level.builder))
 }
 
+fn composite_contains_exists(
+    ctx: &mut Context,
+    base: &TypedExpr,
+    needle: &TypedExpr,
+) -> Option<SqlExpr> {
+    if ctx.temp_collect.is_some() || ctx.in_array_temp || ctx.child.is_some() {
+        return None;
+    }
+    if let TypedExprKind::Array { elements } = &base.kind {
+        let mut disjuncts = Vec::with_capacity(elements.len());
+        for element in elements {
+            disjuncts.push(deep_value_equality(ctx, element, needle)?);
+        }
+        return balanced_or(disjuncts);
+    }
+    if !matches!(&base.kind, TypedExprKind::Array { .. })
+        && (has_scope_ident(base) || uses_outer(base))
+        && !matches!(
+            &base.kind,
+            TypedExprKind::Ident { .. } | TypedExprKind::Method { .. }
+        )
+    {
+        return None;
+    }
+    let corr = has_row_setting_ident(base) || tail_uses_outer(base);
+    let was_corr = std::mem::replace(&mut ctx.corr, corr);
+    let was_outer = std::mem::replace(&mut ctx.no_outer, !corr);
+    let sunk_before = ctx.statements.len();
+    let mut level = rows(ctx, base);
+    let sunk_after = ctx.statements.len();
+    ctx.corr = was_corr;
+    ctx.no_outer = was_outer;
+    if level.pending.is_some() || sunk_after != sunk_before {
+        return None;
+    }
+    if !level.builder.select.is_empty() || !level.builder.unions.is_empty() {
+        level = wrap_level(ctx, level);
+    }
+    if level.builder.select.is_empty() {
+        level.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+    }
+    let cols = builder_outputs(&level.builder, ctx.schema);
+    let mut where_ = match peel_optional(&needle.ty) {
+        QueryType::Tuple(_) => {
+            let positions = cmp_positions(ctx, needle)?;
+            if positions.len() != cols.len() {
+                return None;
+            }
+            positions
+                .into_iter()
+                .zip(cols.iter())
+                .map(|(p, col)| SqlExpr::Binary {
+                    op: SqlBinOp::Is,
+                    lhs: Box::new(SqlExpr::Column {
+                        depth: 0,
+                        column: col.clone(),
+                    }),
+                    rhs: Box::new(shift_depths(p.expr, 1)),
+                })
+                .collect()
+        }
+        QueryType::Record(_) => {
+            let TypedExprKind::Struct { fields: values } = &needle.kind else {
+                return None;
+            };
+            let mut terms = Vec::with_capacity(values.len());
+            for (name, vexpr) in values {
+                let column = cols.iter().find(|c| *c == &name.value)?;
+                if !matches!(peel_optional(&vexpr.ty), QueryType::Scalar(_)) {
+                    return None;
+                }
+                terms.push(SqlExpr::Binary {
+                    op: SqlBinOp::Is,
+                    lhs: Box::new(SqlExpr::Column {
+                        depth: 0,
+                        column: column.clone(),
+                    }),
+                    rhs: Box::new(shift_depths(scalar(ctx, vexpr), 1)),
+                });
+            }
+            terms
+        }
+        _ => return None,
+    };
+    level.builder.where_.append(&mut where_);
+    Some(SqlExpr::Exists(Box::new(level.builder)))
+}
+
 fn contains_exists(ctx: &mut Context, base: &TypedExpr, needle: &TypedExpr) -> SqlExpr {
     if !needle.ty.is_scalar() {
-        todo!("comparison-overhaul: composite membership");
+        return composite_contains_exists(ctx, base, needle)
+            .unwrap_or_else(|| todo!("comparison-overhaul: composite membership"));
     }
     if let TypedExprKind::Array { elements } = &base.kind {
         let inner = match &base.ty {
@@ -12872,7 +12961,7 @@ fn literal_list_equality(
     for (l, r) in lhs.iter().zip(rhs.iter()) {
         conjuncts.push(deep_value_equality(ctx, l, r)?);
     }
-    conjuncts.into_iter().reduce(and_sql)
+    balanced_and(conjuncts)
 }
 
 struct ListSide {
@@ -13080,6 +13169,42 @@ fn list_side_len(ctx: &mut Context, side: &ListSide) -> SqlExpr {
             unions: Vec::new(),
         }),
     }
+}
+
+fn balanced_and(mut terms: Vec<SqlExpr>) -> Option<SqlExpr> {
+    if terms.is_empty() {
+        return None;
+    }
+    while terms.len() > 1 {
+        let mut next = Vec::with_capacity(terms.len().div_ceil(2));
+        let mut it = terms.into_iter();
+        while let Some(l) = it.next() {
+            match it.next() {
+                Some(r) => next.push(and_sql(l, r)),
+                None => next.push(l),
+            }
+        }
+        terms = next;
+    }
+    terms.into_iter().next()
+}
+
+fn balanced_or(mut terms: Vec<SqlExpr>) -> Option<SqlExpr> {
+    if terms.is_empty() {
+        return None;
+    }
+    while terms.len() > 1 {
+        let mut next = Vec::with_capacity(terms.len().div_ceil(2));
+        let mut it = terms.into_iter();
+        while let Some(l) = it.next() {
+            match it.next() {
+                Some(r) => next.push(or_sql(l, r)),
+                None => next.push(l),
+            }
+        }
+        terms = next;
+    }
+    terms.into_iter().next()
 }
 
 fn scalar_binary(
