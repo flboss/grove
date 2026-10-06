@@ -500,6 +500,69 @@ fn cross_list_mixed_values() {
 }
 
 #[test]
+fn chained_projection_reuses_values() {
+    let ord = |t: &str| Value::Record(vec![("total".to_string(), Value::Dec(dec(t)))]);
+    assert_eq!(
+        value("users { x = orders } { y = x }"),
+        Value::List(vec![
+            rec(&[("y", Value::List(vec![ord("10"), ord("20")]))]),
+            rec(&[("y", Value::List(vec![ord("30")]))]),
+            rec(&[("y", Value::List(vec![]))]),
+        ])
+    );
+}
+
+#[test]
+fn chained_projection_take_values() {
+    let ord = |t: &str| Value::Record(vec![("total".to_string(), Value::Dec(dec(t)))]);
+    assert_eq!(
+        value("users { x = orders } { y = x.take(1) }"),
+        Value::List(vec![
+            rec(&[("y", Value::List(vec![ord("10")]))]),
+            rec(&[("y", Value::List(vec![ord("30")]))]),
+            rec(&[("y", Value::List(vec![]))]),
+        ])
+    );
+}
+
+#[test]
+fn projected_list_agg_values() {
+    assert_eq!(
+        value("users { x = scores } { y = x.sum() }"),
+        Value::List(vec![
+            rec(&[("y", Value::Int(12))]),
+            rec(&[("y", Value::Int(9))]),
+            rec(&[("y", Value::Null)]),
+        ])
+    );
+}
+
+#[test]
+fn projected_records_nav_values() {
+    assert_eq!(
+        value("users { m = manager } { x = m.name }"),
+        Value::List(vec![
+            rec(&[("x", s("Bob"))]),
+            rec(&[("x", s("Bob"))]),
+            rec(&[("x", s("Bob"))]),
+        ])
+    );
+}
+
+#[test]
+fn projected_nonscalar_field_values() {
+    let ord = |t: &str| Value::Record(vec![("total".to_string(), Value::Dec(dec(t)))]);
+    assert_eq!(
+        value("users { o = orders }.o"),
+        Value::List(vec![
+            rec(&[("o", Value::List(vec![ord("10"), ord("20")]))]),
+            rec(&[("o", Value::List(vec![ord("30")]))]),
+            rec(&[("o", Value::List(vec![]))]),
+        ])
+    );
+}
+
+#[test]
 fn slice_nested_via_root() {
     assert_eq!(
         value("users.scores"),

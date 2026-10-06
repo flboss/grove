@@ -575,6 +575,23 @@ fn rows_field(
                     unreachable!("resolved projection field {} vanished", name.value)
                 });
             if !field.ty.is_scalar() {
+                if let Some(shape) = level.output_shapes.as_ref().and_then(|shapes| {
+                    shapes.iter().find_map(|(alias, shape)| {
+                        if alias == &name.value {
+                            shape.clone()
+                        } else {
+                            None
+                        }
+                    })
+                }) {
+                    match shape {
+                        ResultShape::List { .. } | ResultShape::Single { .. } => {
+                            level.output_shapes = Some(vec![(name.value.clone(), Some(shape))]);
+                            return level;
+                        }
+                        _ => {}
+                    }
+                }
                 todo!("M4 non-scalar projection field access");
             }
             level.builder.select.push(SelectItem::Column {
@@ -2634,18 +2651,167 @@ fn reslot_position(
     }
 }
 
+fn chained_defs(base: &TypedExpr) -> Vec<(&str, &TypedExpr)> {
+    let mut defs = Vec::new();
+    let mut node = base;
+    loop {
+        match &node.kind {
+            TypedExprKind::Projection { base: next, items } => {
+                for item in items {
+                    defs.push((item.alias.value.as_str(), &item.value));
+                }
+                node = next;
+            }
+            _ => return defs,
+        }
+    }
+}
+
+fn subst_projected_defs(value: &TypedExpr, defs: &[(&str, &TypedExpr)]) -> TypedExpr {
+    match &value.kind {
+        TypedExprKind::Ident {
+            binding: IdentBinding::ProjectedField { name },
+            depth,
+            ..
+        } if *depth == 0 && matches!(value.ty, QueryType::List(_) | QueryType::Record(_)) => {
+            if let Some((_, def)) = defs.iter().find(|(alias, _)| *alias == name.as_str())
+                && !tail_uses_outer(def)
+            {
+                return subst_projected_defs(def, defs);
+            }
+            value.clone()
+        }
+        TypedExprKind::Field {
+            base,
+            name,
+            optional,
+        } => TypedExpr {
+            kind: TypedExprKind::Field {
+                base: Box::new(subst_projected_defs(base, defs)),
+                name: name.clone(),
+                optional: *optional,
+            },
+            ty: value.ty.clone(),
+            span: value.span,
+        },
+        TypedExprKind::Method {
+            base,
+            name,
+            args,
+            optional,
+        } => {
+            let scoped_args = ["sum_over", "avg_over"].contains(&name.value.as_str());
+            TypedExpr {
+                kind: TypedExprKind::Method {
+                    base: Box::new(subst_projected_defs(base, defs)),
+                    name: name.clone(),
+                    args: args
+                        .iter()
+                        .map(|arg| TypedMethodArg {
+                            direction: arg.direction.clone(),
+                            expr: if scoped_args {
+                                arg.expr.clone()
+                            } else {
+                                subst_projected_defs(&arg.expr, defs)
+                            },
+                        })
+                        .collect(),
+                    optional: *optional,
+                },
+                ty: value.ty.clone(),
+                span: value.span,
+            }
+        }
+        TypedExprKind::Binary { op, lhs, rhs } => TypedExpr {
+            kind: TypedExprKind::Binary {
+                op: op.clone(),
+                lhs: Box::new(subst_projected_defs(lhs, defs)),
+                rhs: Box::new(subst_projected_defs(rhs, defs)),
+            },
+            ty: value.ty.clone(),
+            span: value.span,
+        },
+        TypedExprKind::Unary { op, expr } => TypedExpr {
+            kind: TypedExprKind::Unary {
+                op: op.clone(),
+                expr: Box::new(subst_projected_defs(expr, defs)),
+            },
+            ty: value.ty.clone(),
+            span: value.span,
+        },
+        TypedExprKind::Cast { expr, ty } => TypedExpr {
+            kind: TypedExprKind::Cast {
+                expr: Box::new(subst_projected_defs(expr, defs)),
+                ty: ty.clone(),
+            },
+            ty: value.ty.clone(),
+            span: value.span,
+        },
+        TypedExprKind::If { arms, default } => TypedExpr {
+            kind: TypedExprKind::If {
+                arms: arms
+                    .iter()
+                    .map(|(cond, then)| {
+                        (
+                            subst_projected_defs(cond, defs),
+                            subst_projected_defs(then, defs),
+                        )
+                    })
+                    .collect(),
+                default: Box::new(subst_projected_defs(default, defs)),
+            },
+            ty: value.ty.clone(),
+            span: value.span,
+        },
+        TypedExprKind::Some { value: inner } => TypedExpr {
+            kind: TypedExprKind::Some {
+                value: Box::new(subst_projected_defs(inner, defs)),
+            },
+            ty: value.ty.clone(),
+            span: value.span,
+        },
+        TypedExprKind::Tuple { elements } => TypedExpr {
+            kind: TypedExprKind::Tuple {
+                elements: elements
+                    .iter()
+                    .map(|e| subst_projected_defs(e, defs))
+                    .collect(),
+            },
+            ty: value.ty.clone(),
+            span: value.span,
+        },
+        TypedExprKind::Struct { fields } => TypedExpr {
+            kind: TypedExprKind::Struct {
+                fields: fields
+                    .iter()
+                    .map(|(name, e)| (name.clone(), subst_projected_defs(e, defs)))
+                    .collect(),
+            },
+            ty: value.ty.clone(),
+            span: value.span,
+        },
+        _ => value.clone(),
+    }
+}
+
 fn rows_projection(ctx: &mut Context, base: &TypedExpr, items: &[TypedProjectionItem]) -> Level {
     let mut level = rows(ctx, base);
     if level.pending.is_some() {
         unreachable!("projection over nested/optional lists is rejected upstream");
     }
+    let defs = chained_defs(base);
     let mut select = Vec::with_capacity(items.len());
     let mut fields: Vec<(String, Option<ResultShape>)> = Vec::with_capacity(items.len());
     let mut parent_keys: Vec<String> = Vec::new();
     for item in items {
         let alias = item.alias.value.clone();
+        let value = if matches!(item.value.kind, TypedExprKind::Ident { .. }) {
+            item.value.clone()
+        } else {
+            subst_projected_defs(&item.value, &defs)
+        };
         let (mut item_select, shape, mut keys) =
-            lower_value(ctx, &mut level, alias.clone(), &item.value);
+            lower_value(ctx, &mut level, alias.clone(), &value);
         select.append(&mut item_select);
         fields.push((
             alias,
@@ -6451,6 +6617,25 @@ fn rvalue_shape(
                 None,
                 None,
             )
+        }
+        Some(IdentBinding::ProjectedField { name }) => {
+            if matches!(tail.kind, TypedExprKind::Ident { .. })
+                && let Some(shape) = parent.output_shapes.as_ref().and_then(|fields| {
+                    fields.iter().find_map(
+                        |(alias, shape)| {
+                            if alias == name { shape.clone() } else { None }
+                        },
+                    )
+                })
+            {
+                match shape {
+                    ResultShape::List { .. } | ResultShape::Single { .. } => {
+                        return (shape, None);
+                    }
+                    _ => {}
+                }
+            }
+            todo!("M4b projected root inside child tail")
         }
         _ => todo!("M4b projected root inside child tail"),
     };
