@@ -2623,6 +2623,34 @@ fn temp_take_negative_bound_aborts() {
 }
 
 #[test]
+fn unwrap_record_rows_falls_back_values() {
+    assert_eq!(
+        value("users { x = mentor.unwrap_or(manager).name }"),
+        Value::List(vec![
+            Value::Record(vec![("x".to_string(), Value::String("Bob".to_string()))]),
+            Value::Record(vec![("x".to_string(), Value::String("Ada".to_string()))]),
+        ])
+    );
+}
+
+#[test]
+fn unwrap_record_rows_keep_siblings_values() {
+    assert_eq!(
+        value("users { x = mentor.unwrap_or(manager).name, y = name }"),
+        Value::List(vec![
+            Value::Record(vec![
+                ("x".to_string(), Value::String("Bob".to_string())),
+                ("y".to_string(), Value::String("Ada".to_string())),
+            ]),
+            Value::Record(vec![
+                ("x".to_string(), Value::String("Ada".to_string())),
+                ("y".to_string(), Value::String("Bob".to_string())),
+            ]),
+        ])
+    );
+}
+
+#[test]
 fn single_hop_values() {
     assert_eq!(
         value("users { o = manager.orders }"),

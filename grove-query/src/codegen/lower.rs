@@ -1178,7 +1178,7 @@ fn rows_method(
             level
         }
         "unwrap_or" if matches!(peel_optional(&level.element), QueryType::Record(_)) => {
-            todo!("M4 presence-directed unwrap over records")
+            unwrap_or_record_rows(ctx, level, one_arg(args, name))
         }
         "unwrap" => assert_present_rows(ctx, level, "unwrap failed: value was none".to_string()),
         "unwrap_or" => {
@@ -1215,9 +1215,7 @@ fn rows_method(
                     };
                     unwrap_or_rows(ctx, level, one_arg(args, name), probe_from)
                 }
-                QueryType::Record(_) => {
-                    todo!("M4 presence-directed unwrap over records")
-                }
+                QueryType::Record(_) => unwrap_or_record_rows(ctx, level, one_arg(args, name)),
                 _ => todo!("M4b presence: unwrap over list in row demand"),
             }
         }
@@ -2207,7 +2205,7 @@ fn assert_present_rows(ctx: &mut Context, level: Level, msg: String) -> Level {
     base_inner.select = vec![SelectItem::AllFrom { depth: 0 }];
     let ncols = builder_outputs(&base_inner, ctx.schema).len();
     let mut base_inner = shift_outer_builder(base_inner, 2);
-    let guard_base = shift_outer_builder(base_inner.clone(), 2);
+    let guard_base = shift_outer_builder(base_inner.clone(), 1);
     base_inner.select.push(SelectItem::Expr {
         expr: SqlExpr::Param(ParamValue::Null),
         output: "$$abort".to_string(),
@@ -2312,6 +2310,86 @@ fn fold_literal_pick(base: &TypedExpr) -> Option<Option<TypedExpr>> {
     Some(Some(elem.clone()))
 }
 
+fn unwrap_or_record_rows(ctx: &mut Context, level: Level, default: &TypedExpr) -> Level {
+    if take_bound_ident(default)
+        || any_ident(
+            default,
+            &mut |e| matches!(&e.kind, TypedExprKind::Ident { depth, .. } if *depth > 1),
+        )
+    {
+        todo!("M4 presence-directed unwrap over records");
+    }
+    let Level {
+        mut builder,
+        element,
+        parent,
+        pending,
+        stmt_bound,
+        output_shapes,
+        root_parts,
+    } = level;
+    if pending.is_some() {
+        todo!("M4 presence-directed unwrap over records");
+    }
+    if builder.select.is_empty() {
+        builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+    }
+    let mut base_inner = SelectBuilder::new();
+    base_inner.from = Some(FromClause::Subquery {
+        query: Box::new(builder),
+        alias: ctx.aliases.subquery(),
+    });
+    base_inner.select = vec![SelectItem::AllFrom { depth: 0 }];
+    let base_inner = shift_outer_builder(base_inner, 2);
+    let guard_base = shift_outer_builder(base_inner.clone(), 2);
+    builder = base_inner;
+    let default_level = rows(ctx, default);
+    if default_level.pending.is_some() || !default_level.builder.unions.is_empty() {
+        todo!("M4 presence-directed unwrap over records");
+    }
+    let mut arm_inner = SelectBuilder::new();
+    arm_inner.from = Some(FromClause::Subquery {
+        query: Box::new({
+            let mut arm_builder = default_level.builder;
+            if arm_builder.select.is_empty() {
+                arm_builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+            }
+            if builder_outputs(&builder, ctx.schema) != builder_outputs(&arm_builder, ctx.schema) {
+                todo!("M4 presence-directed unwrap over records");
+            }
+            arm_builder
+        }),
+        alias: ctx.aliases.subquery(),
+    });
+    arm_inner.select = vec![SelectItem::AllFrom { depth: 0 }];
+    let mut arm = shift_outer_builder(arm_inner, 2);
+    let mut probe = SelectBuilder::new();
+    probe.select = vec![SelectItem::Expr {
+        expr: SqlExpr::Param(ParamValue::Int(1)),
+        output: "c0".to_string(),
+        ty: Some(ScalarType::Int),
+    }];
+    probe.from = Some(FromClause::Subquery {
+        query: Box::new(guard_base),
+        alias: ctx.aliases.subquery(),
+    });
+    arm.where_
+        .push(SqlExpr::Not(Box::new(SqlExpr::Exists(Box::new(probe)))));
+    builder.unions.push(arm);
+    wrap_level(
+        ctx,
+        Level {
+            builder,
+            element,
+            parent,
+            pending: None,
+            stmt_bound,
+            output_shapes,
+            root_parts,
+        },
+    )
+}
+
 fn unwrap_or_rows(
     ctx: &mut Context,
     level: Level,
@@ -2341,7 +2419,7 @@ fn unwrap_or_rows(
     });
     base_inner.select = vec![SelectItem::AllFrom { depth: 0 }];
     let base_inner = shift_outer_builder(base_inner, 2);
-    let guard_base = shift_outer_builder(base_inner.clone(), 2);
+    let guard_base = shift_outer_builder(base_inner.clone(), 1);
     builder = base_inner;
     let default_level = rows(ctx, default);
     if default_level.pending.is_some() || !default_level.builder.unions.is_empty() {
