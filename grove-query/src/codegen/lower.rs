@@ -11037,12 +11037,21 @@ fn over_arg_agg(
         QueryType::Scalar(s) => *s,
         _ => unreachable!("summable scoped arg is scalar: the checker enforces it"),
     };
+    let lexical_ok = ctx.child.is_none() && ctx.temp_collect.is_none() && agg_simple_base(base);
+    let mut skipped: Vec<TypedExpr> = Vec::new();
+    let owned;
+    let arg = if lexical_ok {
+        owned = splice_lexical_collections(arg, &mut skipped);
+        &owned
+    } else {
+        arg
+    };
     let mut chains: Vec<Vec<usize>> = Vec::new();
     let mut path: Vec<usize> = Vec::new();
     if !collect_over_chains(arg, false, &mut path, &mut chains) {
         todo!("M4b scoped navigation");
     }
-    if chains.is_empty() {
+    if chains.is_empty() && skipped.is_empty() {
         return (ty, scalar(ctx, arg));
     }
     if ctx.child.is_some() && ctx.temp_collect.is_none() {
@@ -11072,10 +11081,329 @@ fn over_arg_agg(
             inline_chain_shell(ctx, arg, chain_path, &link.child_col, &link.parent_col),
         ));
     }
+    for (j, subtree) in skipped.iter().enumerate() {
+        let parent_table = ctx.schema.tables
+            [ctx.schema.structs[fid.struct_id().index()].table.index()]
+        .name
+        .clone();
+        let Some(shell) = collection_chain_shell(
+            ctx,
+            subtree,
+            &link.child_col,
+            &parent_table,
+            &link.parent_col,
+        ) else {
+            todo!("M4b scoped navigation");
+        };
+        shells.push((format!("$$overlex{j}"), shell));
+    }
+    fn collection_chain_shell(
+        ctx: &mut Context,
+        subtree: &TypedExpr,
+        base_fk: &str,
+        parent_table: &str,
+        parent_pk: &str,
+    ) -> Option<SqlExpr> {
+        let TypedExprKind::Method {
+            base: coll, name, ..
+        } = &subtree.kind
+        else {
+            return None;
+        };
+        if name.value != "len" {
+            return None;
+        }
+        enum CollRoot {
+            Nav {
+                target: StructId,
+                coll_fid: FieldId,
+                prefix_fk: String,
+            },
+            Bare {
+                owner: StructId,
+                coll_fid: FieldId,
+            },
+        }
+        let root = match &coll.kind {
+            TypedExprKind::Field {
+                base: prefix,
+                name: coll_name,
+                ..
+            } => {
+                let TypedExprKind::Ident {
+                    binding: IdentBinding::Field(prefix_fid),
+                    depth: prefix_depth,
+                    ..
+                } = &prefix.kind
+                else {
+                    return None;
+                };
+                if *prefix_depth != 1 {
+                    return None;
+                }
+                let prefix_field =
+                    &ctx.schema.structs[prefix_fid.struct_id().index()].fields[prefix_fid.local()];
+                let (prefix_target, prefix_fk) = match prefix_field {
+                    Field::Ref {
+                        target,
+                        optional: _,
+                        is_list: false,
+                        ..
+                    } => match link_cols(ctx.schema, *prefix_fid) {
+                        LinkCols::ParentFk { parent_fk, .. } => (*target, parent_fk),
+                        _ => return None,
+                    },
+                    _ => return None,
+                };
+                let (coll_fid, _) = ctx.schema.struct_field(prefix_target, &coll_name.value)?;
+                CollRoot::Nav {
+                    target: prefix_target,
+                    coll_fid,
+                    prefix_fk,
+                }
+            }
+            TypedExprKind::Ident {
+                binding: IdentBinding::Field(coll_fid),
+                depth,
+                ..
+            } => {
+                if *depth != 1 {
+                    return None;
+                }
+                CollRoot::Bare {
+                    owner: coll_fid.struct_id(),
+                    coll_fid: *coll_fid,
+                }
+            }
+            _ => return None,
+        };
+        let (owner, coll_fid, prefix) = match root {
+            CollRoot::Nav {
+                target,
+                coll_fid,
+                prefix_fk,
+            } => (target, coll_fid, Some(prefix_fk)),
+            CollRoot::Bare { owner, coll_fid } => (owner, coll_fid, None),
+        };
+        let (ctable, clink) = match &ctx.schema.structs[owner.index()].fields[coll_fid.local()] {
+            Field::Ref { .. } => {
+                let relation = &ctx.schema.relations[ctx
+                    .schema
+                    .relation_of_field(coll_fid)
+                    .unwrap_or_else(|| unreachable!("reference field without relation"))
+                    .index()];
+                match relation {
+                    grove_schema::validated::Relation::ManyToOne { child_ref, fk, .. } => {
+                        let child_table = ctx.schema.tables[ctx.schema.structs
+                            [child_ref.struct_id().index()]
+                        .table
+                        .index()]
+                        .name
+                        .clone();
+                        (child_table, ctx.schema.column_name(*fk).to_string())
+                    }
+                    _ => return None,
+                }
+            }
+            Field::Array { storage, .. } => (
+                ctx.schema.tables[storage.table.index()].name.clone(),
+                ctx.schema.column_name(storage.key).to_string(),
+            ),
+            _ => return None,
+        };
+        let calias = ctx.aliases.table(&ctable);
+        let mut shell = SelectBuilder::new();
+        shell.from = Some(FromClause::Table {
+            table: ctable.clone(),
+            alias: calias,
+        });
+        shell.select = vec![SelectItem::Expr {
+            expr: SqlExpr::Count,
+            output: ctx.aliases.generic(),
+            ty: None,
+        }];
+        let link_rhs = match prefix {
+            Some(prefix_fk) => {
+                let fk_sub = SelectBuilder {
+                    select: vec![SelectItem::Column {
+                        depth: 0,
+                        column: prefix_fk.clone(),
+                        output: prefix_fk,
+                        ty: None,
+                    }],
+                    from: Some(FromClause::Table {
+                        table: parent_table.to_string(),
+                        alias: ctx.aliases.table(parent_table),
+                    }),
+                    where_: vec![SqlExpr::Binary {
+                        op: SqlBinOp::Eq,
+                        lhs: Box::new(SqlExpr::Column {
+                            depth: 0,
+                            column: parent_pk.to_string(),
+                        }),
+                        rhs: Box::new(SqlExpr::Column {
+                            depth: 2,
+                            column: base_fk.to_string(),
+                        }),
+                    }],
+                    order_by: Vec::new(),
+                    limit: None,
+                    offset: None,
+                    unions: Vec::new(),
+                };
+                SqlExpr::Subquery {
+                    query: Box::new(fk_sub),
+                }
+            }
+            None => SqlExpr::Column {
+                depth: 1,
+                column: base_fk.to_string(),
+            },
+        };
+        let calias = ctx.aliases.table(&ctable);
+        let mut shell = SelectBuilder::new();
+        shell.from = Some(FromClause::Table {
+            table: ctable,
+            alias: calias,
+        });
+        shell.select = vec![SelectItem::Expr {
+            expr: SqlExpr::Count,
+            output: ctx.aliases.generic(),
+            ty: None,
+        }];
+        shell.where_ = vec![SqlExpr::Binary {
+            op: SqlBinOp::Eq,
+            lhs: Box::new(SqlExpr::Column {
+                depth: 0,
+                column: clink,
+            }),
+            rhs: Box::new(link_rhs),
+        }];
+        Some(SqlExpr::Subquery {
+            query: Box::new(shell),
+        })
+    }
     let rewritten = subst_over_markers(arg, &chains);
     let mut lowered = scalar(ctx, &rewritten);
     splice_over_shells(&mut lowered, &shells);
     (ty, lowered)
+}
+
+fn splice_lexical_collections(expr: &TypedExpr, skipped: &mut Vec<TypedExpr>) -> TypedExpr {
+    if let TypedExprKind::Method { base, .. } = &expr.kind
+        && matches!(peel_optional(&base.ty), QueryType::List(_))
+        && collection_root_is_parent(base)
+    {
+        let marker = format!("$$overlex{}", skipped.len());
+        skipped.push(expr.clone());
+        return TypedExpr {
+            kind: TypedExprKind::Ident {
+                name: grove_types::Spanned {
+                    value: marker.clone(),
+                    span: expr.span,
+                },
+                binding: IdentBinding::ProjectedField { name: marker },
+                depth: 1,
+            },
+            ty: expr.ty.clone(),
+            span: expr.span,
+        };
+    }
+    let mut child = |e: &TypedExpr| splice_lexical_collections(e, skipped);
+    let kind = match &expr.kind {
+        TypedExprKind::Field {
+            base,
+            name,
+            optional,
+        } => TypedExprKind::Field {
+            base: Box::new(child(base)),
+            name: name.clone(),
+            optional: *optional,
+        },
+        TypedExprKind::Method {
+            base,
+            name,
+            args,
+            optional,
+        } => TypedExprKind::Method {
+            base: Box::new(child(base)),
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|arg| TypedMethodArg {
+                    direction: arg.direction.clone(),
+                    expr: child(&arg.expr),
+                })
+                .collect(),
+            optional: *optional,
+        },
+        TypedExprKind::Binary { op, lhs, rhs } => TypedExprKind::Binary {
+            op: op.clone(),
+            lhs: Box::new(child(lhs)),
+            rhs: Box::new(child(rhs)),
+        },
+        TypedExprKind::Unary { op, expr: inner } => TypedExprKind::Unary {
+            op: op.clone(),
+            expr: Box::new(child(inner)),
+        },
+        TypedExprKind::Cast { expr: inner, ty } => TypedExprKind::Cast {
+            expr: Box::new(child(inner)),
+            ty: ty.clone(),
+        },
+        TypedExprKind::If { arms, default } => TypedExprKind::If {
+            arms: arms
+                .iter()
+                .map(|(cond, then)| (child(cond), child(then)))
+                .collect(),
+            default: Box::new(child(default)),
+        },
+        TypedExprKind::Some { value } => TypedExprKind::Some {
+            value: Box::new(child(value)),
+        },
+        TypedExprKind::Tuple { elements } => TypedExprKind::Tuple {
+            elements: elements.iter().map(child).collect(),
+        },
+        TypedExprKind::Array { elements } => TypedExprKind::Array {
+            elements: elements.iter().map(child).collect(),
+        },
+        TypedExprKind::Struct { fields } => TypedExprKind::Struct {
+            fields: fields
+                .iter()
+                .map(|(name, value)| (name.clone(), child(value)))
+                .collect(),
+        },
+        TypedExprKind::Projection { base, items } => TypedExprKind::Projection {
+            base: Box::new(child(base)),
+            items: items
+                .iter()
+                .map(|item| TypedProjectionItem {
+                    alias: item.alias.clone(),
+                    value: child(&item.value),
+                })
+                .collect(),
+        },
+        _ => return expr.clone(),
+    };
+    TypedExpr {
+        kind,
+        ty: expr.ty.clone(),
+        span: expr.span,
+    }
+}
+
+fn collection_root_is_parent(mut node: &TypedExpr) -> bool {
+    loop {
+        match &node.kind {
+            TypedExprKind::Field { base, .. } => node = base,
+            TypedExprKind::Method { base, .. } => node = base,
+            TypedExprKind::Ident {
+                binding: IdentBinding::Field(_),
+                depth,
+                ..
+            } => return *depth == 1,
+            _ => return false,
+        }
+    }
 }
 
 fn agg_simple_base(node: &TypedExpr) -> bool {
