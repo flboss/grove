@@ -3901,6 +3901,20 @@ struct CorrCond {
     nav: Option<NavCarry>,
 }
 
+enum CorrGroup {
+    Single(Box<CorrCond>),
+    Any(Vec<CorrCond>),
+}
+
+impl CorrGroup {
+    fn conds(&self) -> &[CorrCond] {
+        match self {
+            CorrGroup::Single(cond) => std::slice::from_ref(cond.as_ref()),
+            CorrGroup::Any(conds) => conds,
+        }
+    }
+}
+
 struct NavCarry {
     carry: String,
     target: StructId,
@@ -3921,8 +3935,8 @@ fn split_cross_tail(
     ctx: &mut Context,
     tail: &TypedExpr,
     temp_form: bool,
-) -> (TypedExpr, Vec<CorrCond>, Vec<TypedExpr>) {
-    let mut correlated: Vec<CorrCond> = Vec::new();
+) -> (TypedExpr, Vec<CorrGroup>, Vec<TypedExpr>) {
+    let mut correlated: Vec<CorrGroup> = Vec::new();
     let mut broadcast: Vec<TypedExpr> = Vec::new();
     let pruned = prune_cross_filters(ctx, tail, &mut correlated, &mut broadcast, temp_form);
     (pruned, correlated, broadcast)
@@ -3931,7 +3945,7 @@ fn split_cross_tail(
 fn prune_cross_filters(
     ctx: &mut Context,
     node: &TypedExpr,
-    correlated: &mut Vec<CorrCond>,
+    correlated: &mut Vec<CorrGroup>,
     broadcast: &mut Vec<TypedExpr>,
     temp_form: bool,
 ) -> TypedExpr {
@@ -3948,24 +3962,12 @@ fn prune_cross_filters(
                 if uses_outer(&conjunct) {
                     if matches!(&conjunct.kind, TypedExprKind::Binary { op, .. } if op.value == BinaryOp::Or)
                     {
-                        let (conds, arms) = split_disjuncts(ctx, &conjunct, temp_form);
-                        correlated.extend(conds);
+                        let (group, arms) = split_disjuncts(ctx, &conjunct, temp_form);
+                        if let Some(group) = group {
+                            correlated.push(group);
+                        }
                         broadcast.extend(arms);
                     } else if let Some(pairs) = tuple_corr_pairs(&conjunct) {
-                        let mut seen: Vec<String> = Vec::with_capacity(pairs.len());
-                        let mut distinct = 0;
-                        for pair in &pairs {
-                            if uses_outer(pair) {
-                                let key = canon_expr(pair);
-                                if !seen.contains(&key) {
-                                    seen.push(key);
-                                    distinct += 1;
-                                }
-                            }
-                        }
-                        if distinct > 1 {
-                            todo!("M4b complex cross-root correlation");
-                        }
                         let mut emitted: Vec<String> = Vec::with_capacity(pairs.len());
                         for pair in pairs {
                             if uses_outer(&pair) {
@@ -3974,13 +3976,17 @@ fn prune_cross_filters(
                                     continue;
                                 }
                                 emitted.push(key);
-                                correlated.push(check_corr(ctx, &pair, temp_form));
+                                correlated.push(CorrGroup::Single(Box::new(check_corr(
+                                    ctx, &pair, temp_form,
+                                ))));
                             } else {
                                 locals.push(pair);
                             }
                         }
                     } else {
-                        correlated.push(check_corr(ctx, &conjunct, temp_form));
+                        correlated.push(CorrGroup::Single(Box::new(check_corr(
+                            ctx, &conjunct, temp_form,
+                        ))));
                     }
                 } else {
                     locals.push(conjunct);
@@ -4254,7 +4260,7 @@ fn split_disjuncts(
     ctx: &mut Context,
     conjunct: &TypedExpr,
     temp_form: bool,
-) -> (Vec<CorrCond>, Vec<TypedExpr>) {
+) -> (Option<CorrGroup>, Vec<TypedExpr>) {
     let mut conds = Vec::new();
     let mut locals = Vec::new();
     for disjunct in split_or(conjunct) {
@@ -4273,7 +4279,12 @@ fn split_disjuncts(
             locals.push(disjunct);
         }
     }
-    (conds, locals)
+    let group = if conds.is_empty() {
+        None
+    } else {
+        Some(CorrGroup::Any(conds))
+    };
+    (group, locals)
 }
 
 fn tuple_corr_pairs(conjunct: &TypedExpr) -> Option<Vec<TypedExpr>> {
@@ -4868,14 +4879,15 @@ fn rcross_shape(
         }
         todo!("M4b composite cross-root correlation");
     }
-    if correlated.len() > 1
-        && correlated.iter().any(|c| {
-            c.outer_col != correlated[0].outer_col || c.outer_struct != correlated[0].outer_struct
-        })
+    let flat: Vec<&CorrCond> = correlated.iter().flat_map(CorrGroup::conds).collect();
+    if flat.len() > 1
+        && flat
+            .iter()
+            .any(|c| c.outer_col != flat[0].outer_col || c.outer_struct != flat[0].outer_struct)
     {
         todo!("M4b complex cross-root correlation");
     }
-    let corr = &correlated[0];
+    let corr = flat[0];
     let mut suffix: Vec<(String, Vec<TypedMethodArg>)> = Vec::new();
     let peeled_tail = peel_cross_window(&local_tail, &mut suffix);
     let broadcast_truncate: Option<(usize, Option<usize>)> =
@@ -4890,13 +4902,16 @@ fn rcross_shape(
         todo!("M4b cross tail shape");
     }
     if !correlated.is_empty()
-        && correlated.iter().all(|c| c.nav.is_none())
+        && correlated
+            .iter()
+            .flat_map(CorrGroup::conds)
+            .all(|c| c.nav.is_none())
         && matches!(&local_tail.ty, QueryType::List(_))
         && !tail_uses_projected_outer(tail)
         && !tail_uses_nav_outer(ctx, tail)
         && ctx.nest_depth < 1
     {
-        let has_range = correlated.iter().any(|c| {
+        let has_range = flat.iter().any(|c| {
             matches!(
                 c.op,
                 SqlBinOp::Lt | SqlBinOp::Gt | SqlBinOp::Le | SqlBinOp::Ge
@@ -4907,8 +4922,8 @@ fn rcross_shape(
         let has_outer_sorts = peeled_sorts
             .iter()
             .any(|(_, args)| args.iter().any(|a| uses_outer(&a.expr)));
-        let has_ne_composition = correlated.iter().any(|c| c.op == SqlBinOp::Ne)
-            && (correlated.len() > 1 || !suffix.is_empty() || !broadcast.is_empty());
+        let has_ne_composition = flat.iter().any(|c| c.op == SqlBinOp::Ne)
+            && (flat.len() > 1 || !suffix.is_empty() || !broadcast.is_empty());
         if (has_range || has_outer_sorts || has_ne_composition)
             && (suffix.is_empty() || stacked_takes_foldable(tail))
         {
@@ -4926,7 +4941,7 @@ fn rcross_shape(
                 }
             };
             let mut ok = true;
-            for corr in correlated.iter() {
+            for corr in flat.iter() {
                 ok = ok && carry_col(&corr.outer_col, &mut carries);
             }
             for (_, args) in &peeled_sorts {
@@ -5011,8 +5026,8 @@ fn rcross_shape(
             }
         }
     }
-    if correlated.iter().any(|c| c.op == SqlBinOp::Ne)
-        && (correlated.len() > 1
+    if flat.iter().any(|c| c.op == SqlBinOp::Ne)
+        && (flat.len() > 1
             || !broadcast.is_empty()
             || !suffix.is_empty()
             || cardinality != Cardinality::Many)
@@ -5036,7 +5051,7 @@ fn rcross_shape(
         if create_q.select.is_empty() {
             create_q.select = vec![SelectItem::AllFrom { depth: 0 }];
         }
-        for corr in &correlated {
+        for corr in correlated.iter().flat_map(CorrGroup::conds) {
             if let Some(nav) = &corr.nav {
                 create_q.select.push(nav_carry_item(ctx, nav));
             }
@@ -5110,17 +5125,24 @@ fn rcross_shape(
     if child.builder.select.is_empty() {
         child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
     }
-    let pkey_where = if correlated.len() > 1 {
-        let mut conds = correlated.iter();
-        let first = pkey_arm_cond(ctx, conds.next().expect("correlated nonempty"));
-        conds.fold(first, |acc, extra| SqlExpr::Binary {
-            op: SqlBinOp::Or,
-            lhs: Box::new(acc),
-            rhs: Box::new(pkey_arm_cond(ctx, extra)),
-        })
-    } else {
-        pkey_arm_cond(ctx, corr)
-    };
+    let mut units = correlated.iter().map(|group| match group {
+        CorrGroup::Single(cond) => pkey_arm_cond(ctx, cond),
+        CorrGroup::Any(conds) => {
+            let mut arms = conds.iter().map(|cond| pkey_arm_cond(ctx, cond));
+            let first = arms.next().expect("disjunction unit nonempty");
+            arms.fold(first, |acc, extra| SqlExpr::Binary {
+                op: SqlBinOp::Or,
+                lhs: Box::new(acc),
+                rhs: Box::new(extra),
+            })
+        }
+    });
+    let first = units.next().expect("correlated nonempty");
+    let pkey_where = units.fold(first, |acc, extra| SqlExpr::Binary {
+        op: SqlBinOp::And,
+        lhs: Box::new(acc),
+        rhs: Box::new(extra),
+    });
     let pkey_where = if broadcast.is_empty() {
         pkey_where
     } else {
@@ -6054,7 +6076,7 @@ fn per_row_take_shape(
 
 struct PredLane<'a> {
     peeled: &'a TypedExpr,
-    conds: &'a [CorrCond],
+    conds: &'a [CorrGroup],
     carries: Vec<(String, Option<ScalarType>)>,
     broadcast: &'a [TypedExpr],
     suffix: &'a [(String, Vec<TypedMethodArg>)],
@@ -6213,25 +6235,35 @@ fn predicate_join_shape(
     } = lane;
     let (temp_idx, temp, _, mut child) = cross_cartesian(ctx, parent, peeled, &carries, &[], true);
     let mut pred: Option<SqlExpr> = None;
-    for corr in conds {
-        let was_outer = std::mem::replace(&mut ctx.no_outer, true);
-        let child_frag = scalar(ctx, &corr.child);
-        ctx.no_outer = was_outer;
-        let arm = SqlExpr::Binary {
-            op: corr.op,
-            lhs: Box::new(SqlExpr::Column {
-                depth: 1,
-                column: corr.outer_col.clone(),
-            }),
-            rhs: Box::new(child_frag),
-        };
+    for group in conds {
+        let mut arms = group.conds().iter().map(|corr| {
+            let was_outer = std::mem::replace(&mut ctx.no_outer, true);
+            let child_frag = scalar(ctx, &corr.child);
+            ctx.no_outer = was_outer;
+            SqlExpr::Binary {
+                op: corr.op,
+                lhs: Box::new(SqlExpr::Column {
+                    depth: 1,
+                    column: corr.outer_col.clone(),
+                }),
+                rhs: Box::new(child_frag),
+            }
+        });
+        let mut unit = arms.next().expect("correlation unit nonempty");
+        for arm in arms {
+            unit = SqlExpr::Binary {
+                op: SqlBinOp::Or,
+                lhs: Box::new(unit),
+                rhs: Box::new(arm),
+            };
+        }
         pred = Some(match pred {
             Some(acc) => SqlExpr::Binary {
                 op: SqlBinOp::And,
                 lhs: Box::new(acc),
-                rhs: Box::new(arm),
+                rhs: Box::new(unit),
             },
-            None => arm,
+            None => unit,
         });
     }
     if !broadcast.is_empty() {
