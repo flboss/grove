@@ -12645,6 +12645,7 @@ fn deep_value_equality(ctx: &mut Context, lhs: &TypedExpr, rhs: &TypedExpr) -> O
             conjoin_eq_positions(&l, &r, false)
         }
         (QueryType::Record(_), QueryType::Record(_)) => record_equality(ctx, lhs, rhs),
+        (QueryType::List(_), QueryType::List(_)) => list_equality(ctx, lhs, rhs),
         _ => None,
     }
 }
@@ -12781,6 +12782,303 @@ fn schema_field_query_type(field: &Field) -> QueryType {
                 inner
             }
         }
+    }
+}
+
+fn list_equality(ctx: &mut Context, lhs: &TypedExpr, rhs: &TypedExpr) -> Option<SqlExpr> {
+    if ctx.temp_collect.is_some() || ctx.in_array_temp {
+        return None;
+    }
+    if let (TypedExprKind::Array { elements: l }, TypedExprKind::Array { elements: r }) =
+        (&lhs.kind, &rhs.kind)
+    {
+        return literal_list_equality(ctx, l, r);
+    }
+    let (a, b) = (list_side_query(ctx, lhs)?, list_side_query(ctx, rhs)?);
+    if a.cols.len() != b.cols.len() {
+        return None;
+    }
+    let count_a = list_side_len(ctx, &a);
+    let count_b = list_side_len(ctx, &b);
+    let len_eq = SqlExpr::Binary {
+        op: SqlBinOp::Eq,
+        lhs: Box::new(count_a),
+        rhs: Box::new(count_b),
+    };
+    let mut inner_where = vec![SqlExpr::Binary {
+        op: SqlBinOp::Eq,
+        lhs: Box::new(SqlExpr::Column {
+            depth: 0,
+            column: b.rn.clone(),
+        }),
+        rhs: Box::new(SqlExpr::Column {
+            depth: 1,
+            column: a.rn.clone(),
+        }),
+    }];
+    for (acol, bcol) in a.cols.iter().zip(b.cols.iter()) {
+        inner_where.push(SqlExpr::Binary {
+            op: SqlBinOp::Is,
+            lhs: Box::new(SqlExpr::Column {
+                depth: 0,
+                column: bcol.clone(),
+            }),
+            rhs: Box::new(SqlExpr::Column {
+                depth: 1,
+                column: acol.clone(),
+            }),
+        });
+    }
+    let inner = SelectBuilder {
+        select: vec![SelectItem::AllFrom { depth: 0 }],
+        from: Some(FromClause::Subquery {
+            query: Box::new(shift_outer_builder(b.numbered, 1)),
+            alias: ctx.aliases.subquery(),
+        }),
+        where_: inner_where,
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        unions: Vec::new(),
+    };
+    let outer = SelectBuilder {
+        select: vec![SelectItem::AllFrom { depth: 0 }],
+        from: Some(FromClause::Subquery {
+            query: Box::new(a.numbered),
+            alias: ctx.aliases.subquery(),
+        }),
+        where_: vec![SqlExpr::Not(Box::new(SqlExpr::Exists(Box::new(inner))))],
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        unions: Vec::new(),
+    };
+    Some(and_sql(
+        len_eq,
+        SqlExpr::Not(Box::new(SqlExpr::Exists(Box::new(outer)))),
+    ))
+}
+
+fn literal_list_equality(
+    ctx: &mut Context,
+    lhs: &[TypedExpr],
+    rhs: &[TypedExpr],
+) -> Option<SqlExpr> {
+    let mut conjuncts = vec![SqlExpr::Binary {
+        op: SqlBinOp::Eq,
+        lhs: Box::new(SqlExpr::Param(ParamValue::Int(lhs.len() as i64))),
+        rhs: Box::new(SqlExpr::Param(ParamValue::Int(rhs.len() as i64))),
+    }];
+    for (l, r) in lhs.iter().zip(rhs.iter()) {
+        conjuncts.push(deep_value_equality(ctx, l, r)?);
+    }
+    conjuncts.into_iter().reduce(and_sql)
+}
+
+struct ListSide {
+    numbered: SelectBuilder,
+    cols: Vec<String>,
+    rn: String,
+}
+
+fn list_side_query(ctx: &mut Context, expr: &TypedExpr) -> Option<ListSide> {
+    if let TypedExprKind::Array { elements } = &expr.kind {
+        return literal_side_query(ctx, elements);
+    }
+    match &expr.kind {
+        TypedExprKind::Ident {
+            binding: IdentBinding::Root { .. },
+            ..
+        } => {
+            return None;
+        }
+        TypedExprKind::Method { name, .. }
+            if ![
+                "take",
+                "skip",
+                "sort",
+                "sort_asc",
+                "sort_desc",
+                "filter",
+                "flatten",
+            ]
+            .contains(&name.value.as_str()) =>
+        {
+            return None;
+        }
+        _ => {}
+    }
+    if ctx.child.is_some() {
+        return None;
+    }
+    let corr = has_row_setting_ident(expr) || tail_uses_outer(expr);
+    let was_corr = std::mem::replace(&mut ctx.corr, corr);
+    let was_outer = std::mem::replace(&mut ctx.no_outer, !corr);
+    let sunk_before = ctx.statements.len();
+    let mut level = rows(ctx, expr);
+    let sunk_after = ctx.statements.len();
+    ctx.corr = was_corr;
+    ctx.no_outer = was_outer;
+    if level.pending.is_some() {
+        return None;
+    }
+    if sunk_after != sunk_before {
+        return None;
+    }
+    let limited = level.builder.limit.is_some() || level.builder.offset.is_some();
+    let mut order = Vec::new();
+    if !limited && !level.builder.order_by.is_empty() {
+        let cols = builder_outputs(&level.builder, ctx.schema);
+        if !order_threadable(&level.builder.order_by, &cols) {
+            return None;
+        }
+        order = std::mem::take(&mut level.builder.order_by);
+    }
+    if limited || !level.builder.unions.is_empty() || !level.builder.select.is_empty() {
+        level = wrap_level(ctx, level);
+        level.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+    } else if level.builder.select.is_empty() {
+        level.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+    }
+    let cols = builder_outputs(&level.builder, ctx.schema);
+    if cols.is_empty() {
+        return None;
+    }
+    level.builder = shift_outer_builder(level.builder, 2);
+    let mut rn = ctx.aliases.generic();
+    while cols.contains(&rn) {
+        rn = ctx.aliases.generic();
+    }
+    let mut select: Vec<SelectItem> = cols
+        .iter()
+        .map(|column| SelectItem::Column {
+            depth: 0,
+            column: column.clone(),
+            output: column.clone(),
+            ty: None,
+        })
+        .collect();
+    select.push(SelectItem::Expr {
+        expr: SqlExpr::Window {
+            func: "ROW_NUMBER".to_string(),
+            partition: Vec::new(),
+            order,
+        },
+        output: rn.clone(),
+        ty: None,
+    });
+    Some(ListSide {
+        numbered: SelectBuilder {
+            select,
+            from: Some(FromClause::Subquery {
+                query: Box::new(level.builder),
+                alias: ctx.aliases.subquery(),
+            }),
+            where_: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            unions: Vec::new(),
+        },
+        cols,
+        rn,
+    })
+}
+
+fn literal_side_query(ctx: &mut Context, elements: &[TypedExpr]) -> Option<ListSide> {
+    if elements.iter().any(|e| !e.ty.is_scalar()) {
+        return None;
+    }
+    let mut arms = elements.iter().map(|element| {
+        let mut arm = SelectBuilder::new();
+        arm.select = vec![SelectItem::Expr {
+            expr: shift_depths(scalar(ctx, element), 3),
+            output: "c0".to_string(),
+            ty: None,
+        }];
+        arm
+    });
+    let first = arms.next()?;
+    let mut query = first;
+    query.unions = arms.collect();
+    let mut rn = ctx.aliases.generic();
+    if rn == "c0" {
+        rn = ctx.aliases.generic();
+    }
+    Some(ListSide {
+        numbered: SelectBuilder {
+            select: vec![
+                SelectItem::Column {
+                    depth: 0,
+                    column: "c0".to_string(),
+                    output: "c0".to_string(),
+                    ty: None,
+                },
+                SelectItem::Expr {
+                    expr: SqlExpr::Window {
+                        func: "ROW_NUMBER".to_string(),
+                        partition: Vec::new(),
+                        order: Vec::new(),
+                    },
+                    output: rn.clone(),
+                    ty: None,
+                },
+            ],
+            from: Some(FromClause::Subquery {
+                query: Box::new(query),
+                alias: ctx.aliases.subquery(),
+            }),
+            where_: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            unions: Vec::new(),
+        },
+        cols: vec!["c0".to_string()],
+        rn,
+    })
+}
+
+fn order_threadable(order: &[OrderItem], cols: &[String]) -> bool {
+    order.iter().all(|item| order_key_cols(&item.expr, cols))
+}
+
+fn order_key_cols(expr: &SqlExpr, cols: &[String]) -> bool {
+    match expr {
+        SqlExpr::Column { column, .. } => cols.contains(column),
+        SqlExpr::Param(_) | SqlExpr::Count => true,
+        SqlExpr::Binary { lhs, rhs, .. } => order_key_cols(lhs, cols) && order_key_cols(rhs, cols),
+        SqlExpr::Not(x) => order_key_cols(x, cols),
+        SqlExpr::Func { args, .. } => args.iter().all(|a| order_key_cols(a, cols)),
+        SqlExpr::Case { arms, else_ } => {
+            arms.iter()
+                .all(|(c, t)| order_key_cols(c, cols) && order_key_cols(t, cols))
+                && order_key_cols(else_, cols)
+        }
+        SqlExpr::Coalesce(items) => items.iter().all(|i| order_key_cols(i, cols)),
+        SqlExpr::Cast { expr, .. } => order_key_cols(expr, cols),
+        _ => false,
+    }
+}
+
+fn list_side_len(ctx: &mut Context, side: &ListSide) -> SqlExpr {
+    SqlExpr::Subquery {
+        query: Box::new(SelectBuilder {
+            select: vec![SelectItem::Expr {
+                expr: SqlExpr::Count,
+                output: ctx.aliases.generic(),
+                ty: None,
+            }],
+            from: Some(FromClause::Subquery {
+                query: Box::new(side.numbered.clone()),
+                alias: ctx.aliases.subquery(),
+            }),
+            where_: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            unions: Vec::new(),
+        }),
     }
 }
 

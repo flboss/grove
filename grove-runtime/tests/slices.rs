@@ -1690,6 +1690,48 @@ fn slice_record_comparison() {
 }
 
 #[test]
+fn slice_list_comparison() {
+    assert_eq!(value("[1, 2] == [1, 2]"), Value::Bool(true));
+    assert_eq!(value("[1, 2] == [1, 2, 3]"), Value::Bool(false));
+    assert_eq!(value("[1, 2] == [2, 1]"), Value::Bool(false));
+    assert_eq!(value("[1, 2] != [2, 1]"), Value::Bool(true));
+    assert_eq!(value("[[1]] == [[1]]"), Value::Bool(true));
+    assert_eq!(value("[(1, 2)] == [(2, 1)]"), Value::Bool(false));
+    assert_eq!(
+        value("users[orders == orders] { name }"),
+        Value::List(vec![
+            rec(&[("name", s("Ada"))]),
+            rec(&[("name", s("Bob"))]),
+            rec(&[("name", s("Cyd"))]),
+        ])
+    );
+    assert_eq!(
+        value("users[orders != orders] { name }"),
+        Value::List(vec![])
+    );
+    assert_eq!(
+        value("users[tags == tags] { name }"),
+        Value::List(vec![
+            rec(&[("name", s("Ada"))]),
+            rec(&[("name", s("Bob"))]),
+            rec(&[("name", s("Cyd"))]),
+        ])
+    );
+    assert_eq!(
+        value("users[orders.take(1) == orders.take(2)] { name }"),
+        Value::List(vec![rec(&[("name", s("Bob"))]), rec(&[("name", s("Cyd"))])])
+    );
+    assert_eq!(
+        value("(if true { [1] } else { [2] }) == [1]"),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        value("(if false { [1] } else { [2] }) == [1]"),
+        Value::Bool(false)
+    );
+}
+
+#[test]
 fn slice_structs() {
     assert_eq!(
         value("if true { { a = 1 } } else { { a = 2 } }"),
