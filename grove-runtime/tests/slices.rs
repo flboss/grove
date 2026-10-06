@@ -1826,6 +1826,34 @@ fn slice_over_collection_nested() {
 }
 
 #[test]
+fn slice_take_reduction() {
+    assert_eq!(
+        value("users { s = scores.take(1).sum() }"),
+        Value::List(vec![
+            rec(&[("s", Value::Int(5))]),
+            rec(&[("s", Value::Int(9))]),
+            rec(&[("s", Value::Null)]),
+        ])
+    );
+    assert_eq!(
+        value("users { s = scores.skip(1).sum() }"),
+        Value::List(vec![
+            rec(&[("s", Value::Int(7))]),
+            rec(&[("s", Value::Null)]),
+            rec(&[("s", Value::Null)]),
+        ])
+    );
+    assert_eq!(
+        value("users { s = scores.take(1).len() }"),
+        Value::List(vec![
+            rec(&[("s", Value::Int(1))]),
+            rec(&[("s", Value::Int(1))]),
+            rec(&[("s", Value::Int(0))]),
+        ])
+    );
+}
+
+#[test]
 fn slice_list_mixed() {
     assert_eq!(
         value(r#"users[tags == ["x", "y"]] { name }"#),

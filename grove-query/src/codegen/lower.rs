@@ -12240,9 +12240,7 @@ fn scalar_list_col(ctx: &mut Context, base: &TypedExpr) -> String {
         }
         TypedExprKind::Method { base, name, .. } if name.value == "flatten" => match &base.kind {
             TypedExprKind::Array { .. } | TypedExprKind::Method { .. } => "c0".to_string(),
-            _ => unreachable!(
-                "flatten over non-mergeable rows in aggregation: only array-rooted pipelines flatten to scalar lists"
-            ),
+            _ => todo!("M4b scalar aggregation over derived rows"),
         },
         TypedExprKind::Array { .. } => match &base.ty {
             QueryType::List(inner) if matches!(peel_optional(inner), QueryType::Scalar(_)) => {
@@ -12443,6 +12441,9 @@ fn finish_scalar_aggregate(
     mut level: Level,
     agg: AggOp,
 ) -> SqlExpr {
+    if level.builder.limit.is_some() || level.builder.offset.is_some() {
+        level = wrap_level(ctx, level);
+    }
     if let Some(pending) = level.pending {
         let _ = pending;
         match agg {
