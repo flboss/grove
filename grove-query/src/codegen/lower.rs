@@ -1850,7 +1850,7 @@ fn b1_chained(
         todo!("M4b presence: optional list item");
     }
     let tail_link = resolve_tail_link(ctx, tail_fid);
-    let (outer_level, outer_parent_key, outer_child_col) = build_capped_level(ctx, peeled);
+    let (outer_level, outer_parent_key, outer_child_col) = build_capped_level(ctx, peeled, None);
     let mut inner_builder = SelectBuilder::new();
     if let Some((target_pk, junction_target_col)) = &tail_link.m2m_join {
         inner_builder.from = Some(tail_link.child_from.clone());
@@ -7487,6 +7487,7 @@ fn rows_collapse(ctx: &mut Context, tail: &TypedExpr) -> (ResultShape, Option<St
 fn build_capped_level(
     ctx: &mut Context,
     peeled: PeeledCollapse<'_>,
+    temp: Option<&TakeTempScope>,
 ) -> (Level, Option<String>, String) {
     let PeeledCollapse {
         inner: base,
@@ -7510,7 +7511,20 @@ fn build_capped_level(
         builder: {
             let mut child_builder = SelectBuilder::new();
             child_builder.from = Some(child_from);
-            if let Some((target_pk, junction_target_col)) = &m2m_join {
+            if let Some(scope) = temp {
+                if m2m_join.is_some() {
+                    unreachable!(
+                        "take-temp collapse over M2M: begin_take_temp declines junction links before opening"
+                    );
+                }
+                child_builder.where_ = vec![SqlExpr::InSubquery {
+                    expr: Box::new(SqlExpr::Column {
+                        depth: 0,
+                        column: child_col.clone(),
+                    }),
+                    query: Box::new(temp_key_query(&scope.temp)),
+                }];
+            } else if let Some((target_pk, junction_target_col)) = &m2m_join {
                 child_builder.where_ = vec![
                     SqlExpr::InSubquery {
                         expr: Box::new(SqlExpr::Column {
@@ -7621,20 +7635,31 @@ fn windowed_collapse(
             prefix,
             keyed: true,
         },
+        None,
     );
     if child.builder.select.is_empty() {
         child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
     }
     ensure_key(&mut child.builder, &child_col, ctx.schema);
+    let item_ty = match &base.ty {
+        QueryType::List(sub) => sub.as_ref(),
+        _ => &base.ty,
+    };
+    sink_keyed_single(ctx, child, parent_key, child_col, item_ty)
+}
+
+fn sink_keyed_single(
+    ctx: &mut Context,
+    child: Level,
+    parent_key: Option<String>,
+    child_col: String,
+    item_ty: &QueryType,
+) -> (ResultShape, Option<String>) {
     let outputs = builder_outputs(&child.builder, ctx.schema);
     let shape_cols: Vec<OutputColumn> =
         shape_columns(builder_output_types(&child.builder, ctx.schema), |name| {
             name == child_col
         });
-    let item_ty = match &base.ty {
-        QueryType::List(sub) => sub.as_ref(),
-        _ => &base.ty,
-    };
     let mut element = child_element(
         ctx.schema,
         child.output_shapes.as_ref(),
@@ -7670,6 +7695,83 @@ fn windowed_collapse(
         },
     };
     (shape, parent_key)
+}
+
+fn take_temp_row_collapse(
+    ctx: &mut Context,
+    parent: &mut Level,
+    tail: &TypedExpr,
+) -> Option<(ResultShape, Option<String>)> {
+    let TypedExprKind::Method {
+        base,
+        name,
+        args,
+        optional,
+    } = &tail.kind
+    else {
+        return None;
+    };
+    if *optional {
+        return None;
+    }
+    let collapse = if name.value == "first" {
+        if !args.is_empty() {
+            return None;
+        }
+        CollapseKind::First
+    } else if name.value == "nth" {
+        let [arg] = args.as_slice() else {
+            return None;
+        };
+        match &arg.expr.kind {
+            TypedExprKind::Literal(lit) if matches!(&lit.value, Literal::Int(_)) => {
+                CollapseKind::Nth(&arg.expr)
+            }
+            _ => return None,
+        }
+    } else {
+        return None;
+    };
+    if !matches!(&base.ty, QueryType::List(_)) {
+        return None;
+    }
+    let TypedExprKind::Method {
+        name: tail_name,
+        optional: tail_optional,
+        ..
+    } = &base.kind
+    else {
+        return None;
+    };
+    if *tail_optional || !["take", "skip"].contains(&tail_name.value.as_str()) {
+        return None;
+    }
+    if !take_bound_ident(base) {
+        return None;
+    }
+    let scope = begin_take_temp(ctx, base)?;
+    let (mut child, parent_key, child_col) = build_capped_level(
+        ctx,
+        PeeledCollapse {
+            inner: base,
+            collapse,
+            prefix: None,
+            keyed: true,
+        },
+        Some(&scope),
+    );
+    finish_take_temp(ctx, parent, scope);
+    if child.builder.select.is_empty() {
+        child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+    }
+    ensure_key(&mut child.builder, &child_col, ctx.schema);
+    let item_ty = match &base.ty {
+        QueryType::List(sub) => sub.as_ref(),
+        _ => &base.ty,
+    };
+    Some(sink_keyed_single(
+        ctx, child, parent_key, child_col, item_ty,
+    ))
 }
 
 fn collapse_index(ctx: &mut Context, arg: &TypedExpr) -> SqlExpr {
@@ -7799,6 +7901,10 @@ fn rscalar_shape(
                 && let Some(parts) = single_hop_collapse_parts(ctx, tail)
             {
                 return single_hop_shape(ctx, parent, tail, parts, Cardinality::One);
+            } else if ctx.temp_collect.is_none()
+                && let Some(shape) = take_temp_row_collapse(ctx, parent, tail)
+            {
+                return shape;
             } else {
                 todo!("M4b ordered per-parent single");
             }
@@ -7831,6 +7937,12 @@ fn rscalar_shape(
                 && let Some(parts) = single_hop_collapse_parts(ctx, tail)
             {
                 return single_hop_shape(ctx, parent, tail, parts, Cardinality::One);
+            }
+            if name.value == "nth"
+                && ctx.temp_collect.is_none()
+                && let Some(shape) = take_temp_row_collapse(ctx, parent, tail)
+            {
+                return shape;
             }
             if name.value != "nth" || !nth_temp_routable(tail) {
                 todo!("M4b ordered per-parent single")
@@ -11600,6 +11712,7 @@ fn over_arg_agg(
             table: String,
             pk: String,
             fk: String,
+            temp: bool,
         }
         let root = match &coll.kind {
             TypedExprKind::Field {
@@ -11653,6 +11766,7 @@ fn over_arg_agg(
                                 table,
                                 pk: child_pk,
                                 fk: parent_fk,
+                                temp: false,
                             });
                             target
                         }
@@ -11683,6 +11797,7 @@ fn over_arg_agg(
                                     table,
                                     pk: child_pk,
                                     fk: parent_fk,
+                                    temp: false,
                                 });
                                 *next
                             }
@@ -11749,12 +11864,28 @@ fn over_arg_agg(
         };
         let extra: usize = usize::from(!tails.is_empty());
         let link_rhs = match prefix {
-            Some(hops) => {
+            Some(mut hops) => {
+                if ctx.in_take_temp {
+                    let (temp, key_col) = ctx
+                        .temp_collect
+                        .as_ref()
+                        .map(|tc| (tc.temp.clone(), tc.key_col.clone()))
+                        .unwrap_or_else(|| unreachable!("take-temp shell outside take-temp scope"));
+                    record_temp_ref(ctx, &hops[0].fk);
+                    hops[0].table = temp.clone();
+                    hops[0].pk = key_col;
+                    hops[0].temp = true;
+                }
                 let mut inner = SqlExpr::Column {
                     depth: hops.len() + extra + 1,
                     column: base_fk.to_string(),
                 };
                 for hop in hops.iter() {
+                    let alias = if hop.temp {
+                        hop.table.clone()
+                    } else {
+                        ctx.aliases.table(&hop.table)
+                    };
                     let hop_sub = SelectBuilder {
                         select: vec![SelectItem::Column {
                             depth: 0,
@@ -11764,7 +11895,7 @@ fn over_arg_agg(
                         }],
                         from: Some(FromClause::Table {
                             table: hop.table.clone(),
-                            alias: ctx.aliases.table(&hop.table),
+                            alias,
                         }),
                         where_: vec![SqlExpr::Binary {
                             op: SqlBinOp::Eq,

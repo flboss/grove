@@ -1960,6 +1960,42 @@ fn slice_take_reduction() {
 }
 
 #[test]
+fn slice_take_prefixed_collapse() {
+    assert_eq!(
+        value("users { o = orders.take(age).first() }"),
+        Value::List(vec![
+            rec(&[("o", rec(&[("total", n("10"))]))]),
+            rec(&[("o", rec(&[("total", n("30"))]))]),
+            rec(&[("o", Value::Null)]),
+        ])
+    );
+    assert_eq!(
+        value("users { o = orders.take(age - 29).first() }"),
+        Value::List(vec![
+            rec(&[("o", rec(&[("total", n("10"))]))]),
+            rec(&[("o", rec(&[("total", n("30"))]))]),
+            rec(&[("o", Value::Null)]),
+        ])
+    );
+    assert_eq!(
+        value("users { o = orders.take(age).nth(1) }"),
+        Value::List(vec![
+            rec(&[("o", rec(&[("total", n("20"))]))]),
+            rec(&[("o", Value::Null)]),
+            rec(&[("o", Value::Null)]),
+        ])
+    );
+    assert_eq!(
+        value("users { o = orders.skip(age - 30).first() }"),
+        Value::List(vec![
+            rec(&[("o", rec(&[("total", n("10"))]))]),
+            rec(&[("o", Value::Null)]),
+            rec(&[("o", Value::Null)]),
+        ])
+    );
+}
+
+#[test]
 fn slice_temp_take_first() {
     assert_eq!(
         value("users { t = orders.take(age).first()?.total }"),
