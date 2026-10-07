@@ -1010,6 +1010,15 @@ fn rows_method(
                 level.builder.where_.insert(0, expr);
                 return level;
             }
+            if has_scope_ident(pred)
+                && level.builder.order_by.is_empty()
+                && level.builder.limit.is_none()
+                && level.builder.offset.is_none()
+                && let Some(expr) = scalar_array_temp_expr(ctx, &mut level, pred)
+            {
+                level.builder.where_.insert(0, expr);
+                return level;
+            }
             level.builder.where_.insert(0, scalar(ctx, pred));
             level
         }
@@ -1042,6 +1051,15 @@ fn rows_method(
                     && level.builder.limit.is_none()
                     && level.builder.offset.is_none()
                     && let Some(expr) = scalar_take_temp_expr(ctx, &mut level, &arg.expr)
+                {
+                    new_keys.push(OrderItem { expr, dir });
+                    continue;
+                }
+                if has_scope_ident(&arg.expr)
+                    && level.builder.order_by.is_empty()
+                    && level.builder.limit.is_none()
+                    && level.builder.offset.is_none()
+                    && let Some(expr) = scalar_array_temp_expr(ctx, &mut level, &arg.expr)
                 {
                     new_keys.push(OrderItem { expr, dir });
                     continue;
@@ -2509,6 +2527,19 @@ fn lower_value(
         }
         if take_bound_ident(value)
             && let Some(expr) = scalar_take_temp_expr(ctx, parent, value)
+        {
+            return (
+                vec![SelectItem::Expr {
+                    expr,
+                    output: prefix.clone(),
+                    ty: scalar_of(&value.ty),
+                }],
+                ResultShape::Column(prefix),
+                Vec::new(),
+            );
+        }
+        if has_scope_ident(value)
+            && let Some(expr) = scalar_array_temp_expr(ctx, parent, value)
         {
             return (
                 vec![SelectItem::Expr {
@@ -8299,6 +8330,92 @@ fn take_temp_reduction_subquery(
     finish_scalar_aggregate(ctx, base, child, agg)
 }
 
+fn is_array_temp_reduction(name: &str) -> bool {
+    matches!(
+        name,
+        "len" | "sum" | "avg" | "max" | "min" | "contains" | "first" | "nth"
+    )
+}
+
+fn array_temp_root(mut node: &TypedExpr) -> bool {
+    loop {
+        match &node.kind {
+            TypedExprKind::Array { .. } => return true,
+            TypedExprKind::Method { base, name, .. }
+                if [
+                    "take",
+                    "skip",
+                    "filter",
+                    "sort",
+                    "sort_asc",
+                    "sort_desc",
+                    "flatten",
+                ]
+                .contains(&name.value.as_str()) =>
+            {
+                node = base
+            }
+            _ => return false,
+        }
+    }
+}
+
+fn collect_array_temp_reductions<'e>(expr: &'e TypedExpr, out: &mut Vec<&'e TypedExpr>) {
+    match &expr.kind {
+        TypedExprKind::Method {
+            base,
+            name,
+            optional,
+            ..
+        } => {
+            if !optional
+                && is_array_temp_reduction(&name.value)
+                && matches!(&base.ty, QueryType::List(_))
+                && array_temp_root(base)
+                && has_scope_ident(expr)
+            {
+                out.push(expr);
+            }
+        }
+        TypedExprKind::Binary { lhs, rhs, .. } => {
+            collect_array_temp_reductions(lhs, out);
+            collect_array_temp_reductions(rhs, out);
+        }
+        TypedExprKind::Unary { expr: inner, .. }
+        | TypedExprKind::Cast { expr: inner, .. }
+        | TypedExprKind::Some { value: inner } => collect_array_temp_reductions(inner, out),
+        TypedExprKind::If { arms, default } => {
+            for (cond, then) in arms {
+                collect_array_temp_reductions(cond, out);
+                collect_array_temp_reductions(then, out);
+            }
+            collect_array_temp_reductions(default, out);
+        }
+        _ => {}
+    }
+}
+
+fn find_array_temp_reduction(expr: &TypedExpr) -> Option<&TypedExpr> {
+    let mut found = Vec::new();
+    collect_array_temp_reductions(expr, &mut found);
+    match found.as_slice() {
+        [single] => Some(*single),
+        _ => None,
+    }
+}
+
+fn scalar_array_temp_expr(
+    ctx: &mut Context,
+    parent: &mut Level,
+    expr: &TypedExpr,
+) -> Option<SqlExpr> {
+    let target = find_array_temp_reduction(expr)?;
+    let (subquery, _) = scalar_temp_array_expr(ctx, parent, target)?;
+    ctx.take_temp_alias = Some((target as *const TypedExpr, subquery));
+    let out = scalar(ctx, expr);
+    ctx.take_temp_alias = None;
+    Some(out)
+}
 fn is_take_temp_reduction(name: &str) -> bool {
     matches!(
         name,
@@ -9133,40 +9250,29 @@ fn temp_branch_arms<'a>(
 
 fn peel_row_ops<'a>(mut node: &'a TypedExpr) -> Option<(&'a TypedExpr, Vec<EntryMethod<'a>>)> {
     let mut methods = Vec::new();
-    let mut sorted = false;
     loop {
         match &node.kind {
             TypedExprKind::Method {
                 base, name, args, ..
             } => {
                 let entry = match name.value.as_str() {
-                    "take" | "skip" => {
-                        if sorted {
-                            return None;
-                        }
-                        EntryMethod::TakeSkip {
-                            name: name.value.clone(),
-                            args,
-                        }
-                    }
-                    "sort" | "sort_asc" | "sort_desc" => {
-                        sorted = true;
-                        EntryMethod::Sort {
-                            args,
-                            default: if name.value == "sort_desc" {
-                                OrderDir::Desc
-                            } else {
-                                OrderDir::Asc
-                            },
-                            wrap: false,
-                        }
-                    }
-                    "filter" => {
-                        sorted = true;
-                        EntryMethod::Filter {
-                            pred: one_arg(args, name),
-                        }
-                    }
+                    "take" | "skip" => EntryMethod::TakeSkip {
+                        name: name.value.clone(),
+                        args,
+                    },
+                    "sort" | "sort_asc" | "sort_desc" => EntryMethod::Sort {
+                        args,
+                        default: if name.value == "sort_desc" {
+                            OrderDir::Desc
+                        } else {
+                            OrderDir::Asc
+                        },
+                        wrap: false,
+                        scope: false,
+                    },
+                    "filter" => EntryMethod::Filter {
+                        pred: one_arg(args, name),
+                    },
                     _ => return None,
                 };
                 methods.push(entry);
@@ -9190,6 +9296,7 @@ enum EntryMethod<'a> {
         args: &'a [TypedMethodArg],
         default: OrderDir,
         wrap: bool,
+        scope: bool,
     },
     Filter {
         pred: &'a TypedExpr,
@@ -9220,11 +9327,13 @@ fn apply_entry_method(
             args,
             default,
             wrap,
+            scope,
         } => {
             let mut level = level;
             if wrap {
                 level = wrap_level(ctx, level);
             }
+            let was_take = std::mem::replace(&mut ctx.in_take_arg, scope);
             let mut keys = Vec::new();
             for arg in args {
                 let dir = match &arg.direction {
@@ -9236,6 +9345,7 @@ fn apply_entry_method(
                 };
                 keys.extend(sort_keys(ctx, &level, &arg.expr, dir));
             }
+            ctx.in_take_arg = was_take;
             level.builder.order_by.extend(keys);
             level.builder
         }
@@ -9525,7 +9635,7 @@ fn rtemp_array_shape(
     ctx.temp_collect = Some(TempCollect {
         temp: temp.clone(),
         key_col: "$$key".to_string(),
-        child_fk: "$$key".to_string(),
+        child_fk: "c0".to_string(),
         refs,
     });
     ctx.in_array_temp = true;
@@ -9602,12 +9712,18 @@ fn rtemp_method_shape(
         },
     };
     let rewritten_cols: Vec<&str> = fieldmap.iter().map(|(_, col)| col.as_str()).collect();
-    for m in &mut methods {
-        let EntryMethod::Sort { args, wrap, .. } = m else {
+    for position in 0..methods.len() {
+        let windowed_below = methods[..position]
+            .iter()
+            .any(|m| matches!(m, EntryMethod::TakeSkip { .. }));
+        let EntryMethod::Sort {
+            args, wrap, scope, ..
+        } = &mut methods[position]
+        else {
             continue;
         };
         let mut rewritten = false;
-        let mut scope = false;
+        let mut scope_only = false;
         for arg in *args {
             any_ident(&arg.expr, &mut |e| match &e.kind {
                 TypedExprKind::Ident {
@@ -9623,16 +9739,17 @@ fn rtemp_method_shape(
                     depth: 0,
                     ..
                 } => {
-                    scope = true;
+                    scope_only = true;
                     false
                 }
                 _ => false,
             });
         }
-        if rewritten && scope {
+        if rewritten && scope_only {
             todo!("M6 correlated literal projection item");
         }
-        *wrap = rewritten;
+        *wrap = rewritten || (scope_only && windowed_below);
+        *scope = scope_only && !rewritten && windowed_below;
     }
     let TypedExprKind::Array { elements } = &array.kind else {
         unreachable!("peeled chain bottom is always the bare array")
@@ -9657,7 +9774,7 @@ fn rtemp_method_shape(
     ctx.temp_collect = Some(TempCollect {
         temp: temp.clone(),
         key_col: "$$key".to_string(),
-        child_fk: "$$key".to_string(),
+        child_fk: "c0".to_string(),
         refs,
     });
     ctx.in_array_temp = true;
@@ -9738,6 +9855,24 @@ fn scalar_temp_array(
     prefix: &str,
     value: &TypedExpr,
 ) -> Option<(Vec<SelectItem>, ResultShape, Vec<String>)> {
+    let (expr, ty) = scalar_temp_array_expr(ctx, parent, value)?;
+    let item = SelectItem::Expr {
+        expr,
+        output: prefix.to_string(),
+        ty,
+    };
+    Some((
+        vec![item],
+        ResultShape::Column(prefix.to_string()),
+        vec!["$$key".to_string()],
+    ))
+}
+
+fn scalar_temp_array_expr(
+    ctx: &mut Context,
+    parent: &mut Level,
+    value: &TypedExpr,
+) -> Option<(SqlExpr, Option<ScalarType>)> {
     if ctx.child.is_some()
         || ctx.temp_collect.is_some()
         || ctx.in_take_arg
@@ -9824,7 +9959,7 @@ fn scalar_temp_array(
     ctx.temp_collect = Some(TempCollect {
         temp: temp.clone(),
         key_col: "$$key".to_string(),
-        child_fk: "$$key".to_string(),
+        child_fk: "c0".to_string(),
         refs,
     });
     ctx.in_array_temp = true;
@@ -9905,7 +10040,7 @@ fn scalar_temp_array(
                     SelectItem::Column {
                         depth: 0,
                         column: "c0".to_string(),
-                        output: "$$key".to_string(),
+                        output: "c0".to_string(),
                         ty: None,
                     },
                     SelectItem::Column {
@@ -9986,16 +10121,7 @@ fn scalar_temp_array(
     };
     ctx.in_array_temp = false;
     ctx.temp_collect.take();
-    let item = SelectItem::Expr {
-        expr,
-        output: prefix.to_string(),
-        ty: result_ty,
-    };
-    Some((
-        vec![item],
-        ResultShape::Column(prefix.to_string()),
-        vec!["$$key".to_string()],
-    ))
+    Some((expr, result_ty))
 }
 
 fn filter_chain_to_field_ident(mut node: &TypedExpr) -> bool {
@@ -16234,6 +16360,9 @@ fn rows_array(ctx: &mut Context, expr: &TypedExpr) -> Level {
         ),
     };
     literal_depth(inner);
+    if ctx.temp_collect.is_some() && (ctx.child.is_some() || ctx.nest_depth >= 1) {
+        todo!("M6 correlated literal projection item");
+    }
     let items: Vec<(&TypedExpr, Option<i64>)> = elements.iter().map(|e| (e, None)).collect();
     let mut chain = register_literal_level(ctx, inner, items);
     let this = chain.remove(0);
@@ -16540,10 +16669,14 @@ fn collect_temp_refs(
                     name.value.as_str(),
                     "sort" | "sort_asc" | "sort_desc" | "filter"
                 );
+                let take_bound_args = ["take", "skip"].contains(&name.value.as_str())
+                    && args.iter().all(|arg| bound_lang_ok(&arg.expr));
                 go(schema, base, under_row, out, skip)
                     && args.iter().all(|arg| {
                         if flat_args {
                             go_arg(schema, &arg.expr, out, skip)
+                        } else if take_bound_args {
+                            go(schema, &arg.expr, false, out, skip)
                         } else {
                             go(schema, &arg.expr, true, out, skip)
                         }

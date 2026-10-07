@@ -1303,6 +1303,62 @@ fn slice_temp_method_tails() {
             rec(&[("x", Value::List(vec![Value::List(vec![Value::Int(50)])]))]),
         ])
     );
+    assert_eq!(
+        value("users { x = [1, 2, 3].take(age - 30) }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![]))]),
+            rec(&[(
+                "x",
+                Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
+            )]),
+            rec(&[(
+                "x",
+                Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
+            )]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [age, age + 1].take(age - 30) }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![]))]),
+            rec(&[("x", Value::List(vec![Value::Int(40), Value::Int(41)]),)]),
+            rec(&[("x", Value::List(vec![Value::Int(50), Value::Int(51)]),)]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [age, age + 1].take(1).sort_asc(age) }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![Value::Int(30)]))]),
+            rec(&[("x", Value::List(vec![Value::Int(40)]))]),
+            rec(&[("x", Value::List(vec![Value::Int(50)]))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [{a = 3}, {a = 1}, {a = 2}].take(2).sort_asc(a) }"),
+        Value::List(vec![
+            rec(&[(
+                "x",
+                Value::List(vec![
+                    rec(&[("a", Value::Int(1))]),
+                    rec(&[("a", Value::Int(3))])
+                ]),
+            )]),
+            rec(&[(
+                "x",
+                Value::List(vec![
+                    rec(&[("a", Value::Int(1))]),
+                    rec(&[("a", Value::Int(3))])
+                ]),
+            )]),
+            rec(&[(
+                "x",
+                Value::List(vec![
+                    rec(&[("a", Value::Int(1))]),
+                    rec(&[("a", Value::Int(3))])
+                ]),
+            )]),
+        ])
+    );
 }
 
 #[test]
@@ -2071,6 +2127,30 @@ fn slice_take_prefixed_collapse() {
             rec(&[("t", n("10"))]),
             rec(&[("t", n("30"))]),
             rec(&[("t", Value::Null)]),
+        ])
+    );
+}
+
+#[test]
+fn slice_array_temp_predicate_sort() {
+    assert_eq!(
+        value(r#"users.filter([age].contains(30)) { name }"#),
+        Value::List(vec![rec(&[("name", s("Ada"))])])
+    );
+    assert_eq!(
+        value(r#"users { big = [age].contains(30) }"#),
+        Value::List(vec![
+            rec(&[("big", Value::Bool(true))]),
+            rec(&[("big", Value::Bool(false))]),
+            rec(&[("big", Value::Bool(false))]),
+        ])
+    );
+    assert_eq!(
+        value("users.sort([age, age + 1].take(age - 30).len()) { name }"),
+        Value::List(vec![
+            rec(&[("name", s("Ada"))]),
+            rec(&[("name", s("Bob"))]),
+            rec(&[("name", s("Cyd"))]),
         ])
     );
 }
