@@ -1908,6 +1908,42 @@ fn slice_temp_take_first() {
 }
 
 #[test]
+fn slice_temp_take_predicate_sort() {
+    assert_eq!(
+        value("users.filter(orders.take(age).len() > 1) { name }"),
+        Value::List(vec![rec(&[("name", s("Ada"))])])
+    );
+    assert_eq!(
+        value("users { name, big = orders.take(age).len() > 1 }"),
+        Value::List(vec![
+            rec(&[("name", s("Ada")), ("big", Value::Bool(true))]),
+            rec(&[("name", s("Bob")), ("big", Value::Bool(false))]),
+            rec(&[("name", s("Cyd")), ("big", Value::Bool(false))]),
+        ])
+    );
+    assert_eq!(
+        value("users.sort(orders.take(age).len()) { name }"),
+        Value::List(vec![
+            rec(&[("name", s("Cyd"))]),
+            rec(&[("name", s("Bob"))]),
+            rec(&[("name", s("Ada"))]),
+        ])
+    );
+    assert_eq!(
+        value("users.sort_desc(orders.take(age).len()) { name }"),
+        Value::List(vec![
+            rec(&[("name", s("Ada"))]),
+            rec(&[("name", s("Bob"))]),
+            rec(&[("name", s("Cyd"))]),
+        ])
+    );
+    assert_eq!(
+        value("users.filter(orders.take(age).len() > age - 29) { name }"),
+        Value::List(vec![rec(&[("name", s("Ada"))])])
+    );
+}
+
+#[test]
 fn slice_list_mixed() {
     assert_eq!(
         value(r#"users[tags == ["x", "y"]] { name }"#),

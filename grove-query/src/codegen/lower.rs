@@ -31,6 +31,7 @@ pub struct Context<'s> {
     pub temp_collect: Option<TempCollect>,
     pub in_array_temp: bool,
     nav_carries: Vec<(String, NavCarry)>,
+    take_temp_alias: Option<(*const TypedExpr, SqlExpr)>,
 }
 
 pub struct ChildCtx {
@@ -86,6 +87,7 @@ impl<'s> Context<'s> {
             temp_collect: None,
             in_array_temp: false,
             nav_carries: Vec::new(),
+            take_temp_alias: None,
         }
     }
 
@@ -187,6 +189,11 @@ fn reduce_step(node: &TypedExpr) -> Option<TypedExpr> {
 }
 
 pub fn scalar(ctx: &mut Context, expr: &TypedExpr) -> SqlExpr {
+    if let Some((target, subquery)) = &ctx.take_temp_alias
+        && std::ptr::eq(*target, expr as *const TypedExpr)
+    {
+        return subquery.clone();
+    }
     match &expr.kind {
         TypedExprKind::Literal(lit) => scalar_literal(&lit.value),
         TypedExprKind::TypeConstant { ty, name } => scalar_constant(ty.value, name.value),
@@ -991,10 +998,17 @@ fn rows_method(
             if needs_wrap(&level) {
                 level = wrap_narrow_rn(ctx, level);
             }
-            level
-                .builder
-                .where_
-                .insert(0, scalar(ctx, one_arg(args, name)));
+            let pred = one_arg(args, name);
+            if take_bound_ident(pred)
+                && level.builder.order_by.is_empty()
+                && level.builder.limit.is_none()
+                && level.builder.offset.is_none()
+                && let Some(expr) = scalar_take_temp_expr(ctx, &mut level, pred)
+            {
+                level.builder.where_.insert(0, expr);
+                return level;
+            }
+            level.builder.where_.insert(0, scalar(ctx, pred));
             level
         }
         "sort" | "sort_asc" | "sort_desc" => {
@@ -1021,6 +1035,15 @@ fn rows_method(
                     },
                     None => default,
                 };
+                if take_bound_ident(&arg.expr)
+                    && level.builder.order_by.is_empty()
+                    && level.builder.limit.is_none()
+                    && level.builder.offset.is_none()
+                    && let Some(expr) = scalar_take_temp_expr(ctx, &mut level, &arg.expr)
+                {
+                    new_keys.push(OrderItem { expr, dir });
+                    continue;
+                }
                 new_keys.extend(sort_keys(ctx, &level, &arg.expr, dir));
             }
             level.builder.order_by.extend(new_keys);
@@ -2481,6 +2504,19 @@ fn lower_value(
         }
         if let Some((select, shape, keys)) = scalar_temp_array(ctx, parent, &prefix, value) {
             return (select, shape, keys);
+        }
+        if take_bound_ident(value)
+            && let Some(expr) = scalar_take_temp_expr(ctx, parent, value)
+        {
+            return (
+                vec![SelectItem::Expr {
+                    expr,
+                    output: prefix.clone(),
+                    ty: scalar_of(&value.ty),
+                }],
+                ResultShape::Column(prefix),
+                Vec::new(),
+            );
         }
         let value_ty = scalar_of(&value.ty);
         let item = match scalar(ctx, value) {
@@ -8046,33 +8082,57 @@ fn scalar_temp_take_agg(
     if ctx.nest_depth >= 1 {
         return None;
     }
-    let over = matches!(name.value.as_str(), "sum_over" | "avg_over");
-    let bare = matches!(name.value.as_str(), "len" | "sum" | "avg" | "max" | "min");
-    if !over && !bare {
+    let is_reduction = matches!(name.value.as_str(), "sum_over" | "avg_over")
+        || matches!(name.value.as_str(), "len" | "sum" | "avg" | "max" | "min");
+    if !is_reduction {
         return None;
     }
     let QueryType::List(_) = &base.ty else {
         return None;
     };
+    let Some(scope) = begin_take_temp(ctx, base) else {
+        return None;
+    };
+    let subquery = take_temp_reduction_subquery(ctx, &scope, base, name, args);
+    finish_take_temp(ctx, parent, scope);
+    let item = SelectItem::Expr {
+        expr: subquery,
+        output: prefix.to_string(),
+        ty: scalar_of(&value.ty),
+    };
+    Some((
+        vec![item],
+        ResultShape::Column(prefix.to_string()),
+        Vec::new(),
+    ))
+}
+
+fn take_temp_reduction_subquery(
+    ctx: &mut Context,
+    scope: &TakeTempScope,
+    base: &TypedExpr,
+    name: &grove_types::Spanned<String>,
+    args: &[TypedMethodArg],
+) -> SqlExpr {
     let fid = match tail_root_ident(base) {
         Some(IdentBinding::Field(fid)) => *fid,
-        _ => return None,
+        _ => unreachable!(
+            "take-temp reduction without field root: begin_take_temp gates this before opening"
+        ),
     };
     if !take_bound_ident(base) {
-        return None;
+        unreachable!(
+            "take-temp reduction without scope-bound take: begin_take_temp gates this before opening"
+        );
     }
     let link = resolve_tail_link(ctx, fid);
     if link.m2m_join.is_some() {
-        return None;
+        unreachable!(
+            "take-temp reduction over M2M: begin_take_temp declines junction links before opening"
+        );
     }
-    let (child_from, child_col, key_col) = (link.child_from, link.child_col, link.parent_col);
-    let temp = ctx.aliases.temp();
-    ctx.temp_collect = Some(TempCollect {
-        temp: temp.clone(),
-        key_col: "$$key".to_string(),
-        child_fk: child_col.clone(),
-        refs: Vec::new(),
-    });
+    let (child_from, child_col) = (link.child_from, link.child_col);
+    let over = matches!(name.value.as_str(), "sum_over" | "avg_over");
     let agg = if over {
         let op = if name.value == "sum_over" {
             OverAgg::Sum
@@ -8083,7 +8143,9 @@ fn scalar_temp_take_agg(
         AggOp::Over(op, ty, arg)
     } else {
         let QueryType::List(inner) = &base.ty else {
-            unreachable!("reduction base is List: gated above")
+            unreachable!(
+                "reduction base is List: whole-value lane gates this; splice finder admits List bases only"
+            )
         };
         match name.value.as_str() {
             "len" => AggOp::Len,
@@ -8091,7 +8153,9 @@ fn scalar_temp_take_agg(
             "avg" => AggOp::Bare(BareAgg::Avg, inner_scalar(inner, &name.value)),
             "max" => AggOp::Bare(BareAgg::Max, inner_scalar(inner, &name.value)),
             "min" => AggOp::Bare(BareAgg::Min, inner_scalar(inner, &name.value)),
-            _ => unreachable!("reduction method: gated above"),
+            _ => unreachable!(
+                "reduction method: whole-value lane gates names; splice finder admits reductions only"
+            ),
         }
     };
     let mut child_builder = SelectBuilder::new();
@@ -8101,7 +8165,7 @@ fn scalar_temp_take_agg(
             depth: 0,
             column: child_col.clone(),
         }),
-        query: Box::new(temp_key_query(&temp)),
+        query: Box::new(temp_key_query(&scope.temp)),
     }];
     let child_level = Level {
         builder: child_builder,
@@ -8113,16 +8177,10 @@ fn scalar_temp_take_agg(
         root_parts: None,
     };
     let mut child = lower_tail(ctx, base, child_level, true, Some(child_col.clone()), false);
-    let refs = ctx
-        .temp_collect
-        .take()
-        .unwrap_or_else(|| unreachable!("temp collect vanished mid-lowering"))
-        .refs;
     if child.builder.select.is_empty() {
         child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
     }
     ensure_key(&mut child.builder, &child_col, ctx.schema);
-    let _temp_idx = freeze_parent_temp(ctx, parent, &temp, &key_col, &refs, &[]);
     child.builder.where_.push(SqlExpr::Binary {
         op: SqlBinOp::Eq,
         lhs: Box::new(SqlExpr::Column {
@@ -8134,17 +8192,84 @@ fn scalar_temp_take_agg(
             column: "$$key".to_string(),
         }),
     });
-    let subquery = finish_scalar_aggregate(ctx, base, child, agg);
-    let item = SelectItem::Expr {
-        expr: subquery,
-        output: prefix.to_string(),
-        ty: scalar_of(&value.ty),
+    finish_scalar_aggregate(ctx, base, child, agg)
+}
+
+fn is_take_temp_reduction(name: &str) -> bool {
+    matches!(
+        name,
+        "len" | "sum" | "avg" | "max" | "min" | "sum_over" | "avg_over"
+    )
+}
+
+fn collect_take_temp_reductions<'e>(expr: &'e TypedExpr, out: &mut Vec<&'e TypedExpr>) {
+    match &expr.kind {
+        TypedExprKind::Method {
+            base,
+            name,
+            optional,
+            ..
+        } => {
+            if !optional
+                && is_take_temp_reduction(&name.value)
+                && matches!(base.ty, QueryType::List(_))
+                && take_bound_ident(base)
+            {
+                out.push(expr);
+            }
+        }
+        TypedExprKind::Binary { lhs, rhs, .. } => {
+            collect_take_temp_reductions(lhs, out);
+            collect_take_temp_reductions(rhs, out);
+        }
+        TypedExprKind::Unary { expr: inner, .. }
+        | TypedExprKind::Cast { expr: inner, .. }
+        | TypedExprKind::Some { value: inner } => collect_take_temp_reductions(inner, out),
+        TypedExprKind::If { arms, default } => {
+            for (cond, then) in arms {
+                collect_take_temp_reductions(cond, out);
+                collect_take_temp_reductions(then, out);
+            }
+            collect_take_temp_reductions(default, out);
+        }
+        _ => {}
+    }
+}
+
+fn find_take_temp_reduction(expr: &TypedExpr) -> Option<&TypedExpr> {
+    let mut found = Vec::new();
+    collect_take_temp_reductions(expr, &mut found);
+    match found.as_slice() {
+        [single] => Some(*single),
+        _ => None,
+    }
+}
+
+fn scalar_take_temp_expr(
+    ctx: &mut Context,
+    parent: &mut Level,
+    expr: &TypedExpr,
+) -> Option<SqlExpr> {
+    let target = find_take_temp_reduction(expr)?;
+    let TypedExprKind::Method {
+        base,
+        name,
+        args,
+        optional,
+    } = &target.kind
+    else {
+        unreachable!("reduction finder returns reduction methods only")
     };
-    Some((
-        vec![item],
-        ResultShape::Column(prefix.to_string()),
-        Vec::new(),
-    ))
+    if *optional {
+        return None;
+    }
+    let scope = begin_take_temp(ctx, base)?;
+    let subquery = take_temp_reduction_subquery(ctx, &scope, base, name, args);
+    finish_take_temp(ctx, parent, scope);
+    ctx.take_temp_alias = Some((target as *const TypedExpr, subquery));
+    let out = scalar(ctx, expr);
+    ctx.take_temp_alias = None;
+    Some(out)
 }
 
 struct TakeTempScope {
