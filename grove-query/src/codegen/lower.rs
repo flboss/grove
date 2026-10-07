@@ -13413,6 +13413,11 @@ fn contains_exists(ctx: &mut Context, base: &TypedExpr, needle: &TypedExpr) -> S
             if ["take", "skip", "sort", "sort_asc", "sort_desc", "flatten"]
                 .contains(&name.value.as_str()) =>
         {
+            if ["take", "skip"].contains(&name.value.as_str())
+                && let Some(query) = storage_contains_tailed(ctx, base, needle)
+            {
+                return SqlExpr::Exists(Box::new(query));
+            }
             return derived_contains_exists(ctx, base, needle);
         }
         TypedExprKind::Field { .. } => {
@@ -13433,6 +13438,15 @@ fn contains_exists(ctx: &mut Context, base: &TypedExpr, needle: &TypedExpr) -> S
         },
         _ => todo!("M4b contains over derived collection"),
     };
+    SqlExpr::Exists(Box::new(storage_contains_query(ctx, fid, needle, &[])))
+}
+
+fn storage_contains_query(
+    ctx: &mut Context,
+    fid: FieldId,
+    needle: &TypedExpr,
+    tails: &[(&str, &[TypedMethodArg])],
+) -> SelectBuilder {
     let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
     let (storage, link) = match field {
         Field::Array { storage, link, .. } => (storage, link),
@@ -13457,28 +13471,91 @@ fn contains_exists(ctx: &mut Context, base: &TypedExpr, needle: &TypedExpr) -> S
             "multi-column via array in contains: via clauses carry exactly key+value columns"
         ),
     };
-    query.where_ = vec![
-        SqlExpr::Binary {
-            op: SqlBinOp::Eq,
-            lhs: Box::new(SqlExpr::Column {
-                depth: 0,
-                column: key_col,
-            }),
-            rhs: Box::new(SqlExpr::Column {
-                depth: 1,
-                column: ctx.schema.column_name(*link).to_string(),
-            }),
-        },
-        SqlExpr::Binary {
-            op: SqlBinOp::Eq,
-            lhs: Box::new(SqlExpr::Column {
-                depth: 0,
-                column: value_col,
-            }),
-            rhs: Box::new(scalar(ctx, needle)),
-        },
-    ];
-    SqlExpr::Exists(Box::new(query))
+    let owner_depth = 1 + usize::from(!tails.is_empty());
+    let link_pred = SqlExpr::Binary {
+        op: SqlBinOp::Eq,
+        lhs: Box::new(SqlExpr::Column {
+            depth: 0,
+            column: key_col,
+        }),
+        rhs: Box::new(SqlExpr::Column {
+            depth: owner_depth,
+            column: ctx.schema.column_name(*link).to_string(),
+        }),
+    };
+    let value_pred = SqlExpr::Binary {
+        op: SqlBinOp::Eq,
+        lhs: Box::new(SqlExpr::Column {
+            depth: 0,
+            column: value_col.clone(),
+        }),
+        rhs: Box::new(scalar(ctx, needle)),
+    };
+    if tails.is_empty() {
+        query.where_ = vec![link_pred, value_pred];
+        return query;
+    }
+    query.select = vec![SelectItem::Column {
+        depth: 0,
+        column: value_col.clone(),
+        output: value_col.clone(),
+        ty: None,
+    }];
+    query.where_ = vec![link_pred];
+    for (method, args) in tails.iter().rev() {
+        compose_limit_inner(&mut query, method, args, ctx);
+    }
+    let mut outer = SelectBuilder::new();
+    outer.from = Some(FromClause::Subquery {
+        query: Box::new(query),
+        alias: ctx.aliases.subquery(),
+    });
+    outer.select = vec![SelectItem::AllFrom { depth: 0 }];
+    outer.where_ = vec![value_pred];
+    outer
+}
+
+fn storage_contains_tailed(
+    ctx: &mut Context,
+    base: &TypedExpr,
+    needle: &TypedExpr,
+) -> Option<SelectBuilder> {
+    let mut tails: Vec<(&str, &[TypedMethodArg])> = Vec::new();
+    let mut node = base;
+    while let TypedExprKind::Method {
+        base: inner,
+        name,
+        args,
+        optional,
+    } = &node.kind
+    {
+        if *optional || !["take", "skip"].contains(&name.value.as_str()) {
+            break;
+        }
+        if args.iter().any(|a| has_scope_ident(&a.expr)) {
+            return None;
+        }
+        tails.push((name.value.as_str(), args.as_slice()));
+        node = inner.as_ref();
+    }
+    if tails.is_empty() {
+        return None;
+    }
+    let TypedExprKind::Ident {
+        binding: IdentBinding::Field(fid),
+        ..
+    } = &node.kind
+    else {
+        return None;
+    };
+    if !matches!(
+        ctx.schema.structs[fid.struct_id().index()].fields[fid.local()],
+        Field::Array { .. }
+    ) {
+        return None;
+    }
+    let query = storage_contains_query(ctx, *fid, needle, &tails);
+    Some(query)
 }
 
 fn apply_scalar_method(

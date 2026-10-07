@@ -1925,6 +1925,38 @@ fn slice_take_reduction() {
             rec(&[("s", Value::Int(0))]),
         ])
     );
+    assert_eq!(
+        value(r#"users { c = tags.take(1).contains("x") }"#),
+        Value::List(vec![
+            rec(&[("c", Value::Bool(true))]),
+            rec(&[("c", Value::Bool(false))]),
+            rec(&[("c", Value::Bool(false))]),
+        ])
+    );
+    assert_eq!(
+        value(r#"users { c = tags.skip(1).contains("y") }"#),
+        Value::List(vec![
+            rec(&[("c", Value::Bool(true))]),
+            rec(&[("c", Value::Bool(false))]),
+            rec(&[("c", Value::Bool(false))]),
+        ])
+    );
+    assert_eq!(
+        value("users { c = scores.take(1).contains(5) }"),
+        Value::List(vec![
+            rec(&[("c", Value::Bool(true))]),
+            rec(&[("c", Value::Bool(false))]),
+            rec(&[("c", Value::Bool(false))]),
+        ])
+    );
+    assert_eq!(
+        value("users { t = orders.take(1) { total }.take(1) }"),
+        Value::List(vec![
+            rec(&[("t", Value::List(vec![rec(&[("total", n("10"))])]))]),
+            rec(&[("t", Value::List(vec![rec(&[("total", n("30"))])]))]),
+            rec(&[("t", Value::List(vec![]))]),
+        ])
+    );
 }
 
 #[test]
