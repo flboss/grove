@@ -13316,6 +13316,11 @@ fn scalar_method(
                 unreachable!("max_by/min_by return records: callers never enter scalar demand")
             }
             "first" | "nth" => {
+                if let Some(query) = scalar_first_tailed(ctx, base, &name.value, args) {
+                    return SqlExpr::Subquery {
+                        query: Box::new(query),
+                    };
+                }
                 let mut level = rows(ctx, base);
                 if level.pending.is_some() {
                     unreachable!(
@@ -13365,6 +13370,95 @@ fn scalar_method(
             unreachable!("checker never emits Void/Unknown method bases")
         }
     }
+}
+
+fn scalar_first_tailed(
+    ctx: &mut Context,
+    base: &TypedExpr,
+    name: &str,
+    args: &[TypedMethodArg],
+) -> Option<SelectBuilder> {
+    if name != "first" && name != "nth" {
+        return None;
+    }
+    let collapse_args: &[TypedMethodArg] = if name == "nth" {
+        match args {
+            [arg] => std::slice::from_ref(arg),
+            _ => return None,
+        }
+    } else {
+        if !args.is_empty() {
+            return None;
+        }
+        &[]
+    };
+    if collapse_args.iter().any(|a| has_scope_ident(&a.expr)) {
+        return None;
+    }
+    let mut tails: Vec<(&str, &[TypedMethodArg])> = Vec::new();
+    let mut node = base;
+    while let TypedExprKind::Method {
+        base: inner,
+        name: tail_name,
+        args: tail_args,
+        optional: tail_optional,
+    } = &node.kind
+    {
+        if *tail_optional || !["take", "skip"].contains(&tail_name.value.as_str()) {
+            break;
+        }
+        if tail_args.iter().any(|a| has_scope_ident(&a.expr)) {
+            return None;
+        }
+        tails.push((tail_name.value.as_str(), tail_args.as_slice()));
+        node = inner.as_ref();
+    }
+    let TypedExprKind::Ident {
+        binding: IdentBinding::Field(fid),
+        ..
+    } = &node.kind
+    else {
+        return None;
+    };
+    let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
+    let (storage, link) = match field {
+        Field::Array { storage, link, .. } => (storage, link),
+        _ => return None,
+    };
+    let QueryType::List(inner) = &base.ty else {
+        return None;
+    };
+    let table = ctx.schema.tables[storage.table.index()].name.clone();
+    let alias = ctx.aliases.table(&table);
+    let mut query = SelectBuilder::new();
+    query.from = Some(FromClause::Table { table, alias });
+    let key_col = ctx.schema.column_name(storage.key).to_string();
+    let value_col = match storage.value.as_slice() {
+        [col] => ctx.schema.column_name(*col).to_string(),
+        _ => return None,
+    };
+    query.select = vec![SelectItem::Column {
+        depth: 0,
+        column: value_col,
+        output: ctx.aliases.generic(),
+        ty: Some(inner_scalar(inner, name)),
+    }];
+    query.where_ = vec![SqlExpr::Binary {
+        op: SqlBinOp::Eq,
+        lhs: Box::new(SqlExpr::Column {
+            depth: 0,
+            column: key_col,
+        }),
+        rhs: Box::new(SqlExpr::Column {
+            depth: 1,
+            column: ctx.schema.column_name(*link).to_string(),
+        }),
+    }];
+    for (method, args) in tails.iter().rev() {
+        compose_limit(&mut query, method, args, ctx);
+    }
+    compose_limit(&mut query, name, collapse_args, ctx);
+    Some(query)
 }
 
 fn one_arg<'a>(args: &'a [TypedMethodArg], name: &grove_types::Spanned<String>) -> &'a TypedExpr {

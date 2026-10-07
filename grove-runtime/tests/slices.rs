@@ -2036,6 +2036,42 @@ fn slice_take_prefixed_collapse() {
 }
 
 #[test]
+fn slice_scalar_first_storage() {
+    assert_eq!(
+        value(r#"users { c = tags.first() }"#),
+        Value::List(vec![
+            rec(&[("c", s("x"))]),
+            rec(&[("c", s("z"))]),
+            rec(&[("c", Value::Null)]),
+        ])
+    );
+    assert_eq!(
+        value(r#"users { c = tags.take(1).first() }"#),
+        Value::List(vec![
+            rec(&[("c", s("x"))]),
+            rec(&[("c", s("z"))]),
+            rec(&[("c", Value::Null)]),
+        ])
+    );
+    assert_eq!(
+        value(r#"users { c = tags.skip(1).first() }"#),
+        Value::List(vec![
+            rec(&[("c", s("y"))]),
+            rec(&[("c", Value::Null)]),
+            rec(&[("c", Value::Null)]),
+        ])
+    );
+    assert_eq!(
+        value("users { c = scores.nth(1) }"),
+        Value::List(vec![
+            rec(&[("c", Value::Int(7))]),
+            rec(&[("c", Value::Null)]),
+            rec(&[("c", Value::Null)]),
+        ])
+    );
+}
+
+#[test]
 fn slice_temp_take_first() {
     assert_eq!(
         value("users { t = orders.take(age).first()?.total }"),
