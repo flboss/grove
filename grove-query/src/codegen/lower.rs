@@ -7139,6 +7139,9 @@ fn rvalue_shape(
         return rtemp_shape(ctx, parent, tail, Cardinality::Many);
     }
     if ctx.nest_depth < 1 && !keyed && tail_uses_outer(tail) {
+        if matches!(tail.kind, TypedExprKind::Array { .. }) {
+            return rtemp_array_shape(ctx, parent, tail);
+        }
         return rcross_shape(ctx, parent, tail, Cardinality::Many);
     }
     if ctx.temp_collect.is_none()

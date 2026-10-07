@@ -1212,11 +1212,19 @@ fn slice_nested_correlated_arrays() {
         ])
     );
     assert_eq!(
-        value("users { x = [{a = age}].first()?.a }"),
+        value("users { x = [age, age + 1].nth(age - 30) }"),
         Value::List(vec![
             rec(&[("x", Value::Int(30))]),
-            rec(&[("x", Value::Int(40))]),
-            rec(&[("x", Value::Int(50))]),
+            rec(&[("x", Value::Null)]),
+            rec(&[("x", Value::Null)]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [(users.first()?.name)] }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![s("Ada")]))]),
+            rec(&[("x", Value::List(vec![s("Ada")]))]),
+            rec(&[("x", Value::List(vec![s("Ada")]))]),
         ])
     );
     assert_eq!(
