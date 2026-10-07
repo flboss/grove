@@ -1211,6 +1211,46 @@ fn slice_nested_correlated_arrays() {
             )]),
         ])
     );
+    assert_eq!(
+        value("users { x = [{a = age}].first()?.a }"),
+        Value::List(vec![
+            rec(&[("x", Value::Int(30))]),
+            rec(&[("x", Value::Int(40))]),
+            rec(&[("x", Value::Int(50))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [{a = age}, {a = age + 1}].nth(1)?.a }"),
+        Value::List(vec![
+            rec(&[("x", Value::Int(31))]),
+            rec(&[("x", Value::Int(41))]),
+            rec(&[("x", Value::Int(51))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [age, age + 1].nth(age - 30) }"),
+        Value::List(vec![
+            rec(&[("x", Value::Int(30))]),
+            rec(&[("x", Value::Null)]),
+            rec(&[("x", Value::Null)]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [{a = 1}, {a = 2}].nth(1)?.a }"),
+        Value::List(vec![
+            rec(&[("x", Value::Int(2))]),
+            rec(&[("x", Value::Int(2))]),
+            rec(&[("x", Value::Int(2))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [{a = 1}, {a = 2}].nth(5)?.a }"),
+        Value::List(vec![
+            rec(&[("x", Value::Null)]),
+            rec(&[("x", Value::Null)]),
+            rec(&[("x", Value::Null)]),
+        ])
+    );
 }
 
 #[test]

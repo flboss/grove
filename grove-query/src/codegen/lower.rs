@@ -9792,16 +9792,27 @@ fn scalar_temp_array(
         if (has_scope_ident(needle) || uses_outer(needle)) && !shiftable_needle(needle) {
             return None;
         }
-    } else if args
-        .iter()
-        .any(|arg| has_scope_ident(&arg.expr) || uses_outer(&arg.expr))
+    } else if name.value != "nth"
+        && args
+            .iter()
+            .any(|arg| has_scope_ident(&arg.expr) || uses_outer(&arg.expr))
     {
         return None;
     }
     if !temp_nest_ok(inner) {
         return None;
     }
-    let refs = collect_temp_refs(ctx.schema, base, &[])?;
+    let mut refs = collect_temp_refs(ctx.schema, base, &[])?;
+    if name.value == "nth" {
+        let index_arg = match args.as_slice() {
+            [arg] => arg,
+            _ => return None,
+        };
+        if !shiftable_needle(&index_arg.expr) {
+            return None;
+        }
+        refs.extend(collect_temp_refs(ctx.schema, &index_arg.expr, &refs)?);
+    }
     if refs.iter().any(|r| r == "c0" || r == "c1" || r == "$$key") {
         return None;
     }
@@ -9875,9 +9886,73 @@ fn scalar_temp_array(
                 output: ctx.aliases.generic(),
                 ty: result_ty,
             }];
-            middle.from = Some(inner_from);
-            middle.where_ = vec![key_pred()];
-            compose_limit(&mut middle, &name.value, args, ctx);
+            let scope_index = args
+                .iter()
+                .any(|arg| has_scope_ident(&arg.expr) || uses_outer(&arg.expr));
+            if scope_index {
+                let was_take = std::mem::replace(&mut ctx.in_take_arg, true);
+                let idx = scalar(ctx, one_arg(args, name));
+                ctx.in_take_arg = was_take;
+                let pos = SqlExpr::Func {
+                    name: "$$add".to_string(),
+                    args: vec![
+                        non_neg_guard(idx, "nth"),
+                        SqlExpr::Param(ParamValue::Int(1)),
+                    ],
+                };
+                let mut numbered = SelectBuilder::new();
+                numbered.select = vec![
+                    SelectItem::Column {
+                        depth: 0,
+                        column: "c0".to_string(),
+                        output: "$$key".to_string(),
+                        ty: None,
+                    },
+                    SelectItem::Column {
+                        depth: 0,
+                        column: "c1".to_string(),
+                        output: "c1".to_string(),
+                        ty: None,
+                    },
+                    SelectItem::Expr {
+                        expr: SqlExpr::Window {
+                            func: "ROW_NUMBER".to_string(),
+                            partition: Vec::new(),
+                            order: Vec::new(),
+                        },
+                        output: "$$rn".to_string(),
+                        ty: Some(ScalarType::Int),
+                    },
+                ];
+                numbered.from = Some(inner_from);
+                numbered.where_ = vec![SqlExpr::Binary {
+                    op: SqlBinOp::Eq,
+                    lhs: Box::new(SqlExpr::Column {
+                        depth: 0,
+                        column: "c0".to_string(),
+                    }),
+                    rhs: Box::new(SqlExpr::Column {
+                        depth: 2,
+                        column: "$$key".to_string(),
+                    }),
+                }];
+                middle.from = Some(FromClause::Subquery {
+                    query: Box::new(numbered),
+                    alias: ctx.aliases.subquery(),
+                });
+                middle.where_ = vec![SqlExpr::Binary {
+                    op: SqlBinOp::Eq,
+                    lhs: Box::new(SqlExpr::Column {
+                        depth: 0,
+                        column: "$$rn".to_string(),
+                    }),
+                    rhs: Box::new(pos),
+                }];
+            } else {
+                middle.from = Some(inner_from);
+                middle.where_ = vec![key_pred()];
+                compose_limit(&mut middle, &name.value, args, ctx);
+            }
             SqlExpr::Subquery {
                 query: Box::new(middle),
             }
@@ -10894,6 +10969,146 @@ fn scalar_field(
     }
 }
 
+fn correlated_pick_cell(
+    ctx: &mut Context,
+    elem: &TypedExpr,
+    fields: &[ProjectionField],
+    name: &str,
+) -> Option<(SqlExpr, ScalarType)> {
+    let node = peel_some(elem);
+    let TypedExprKind::Struct { fields: elements } = &node.kind else {
+        return None;
+    };
+    let field = fields.iter().find(|f| f.name == name)?;
+    if !matches!(
+        peel_optional(&field.ty),
+        QueryType::Scalar(_) | QueryType::Optional(_)
+    ) {
+        return None;
+    }
+    let (_, e) = elements.iter().find(|(fname, _)| fname.value == name)?;
+    let mut out = Vec::new();
+    temp_array_cell(ctx, &field.ty, e, &mut out);
+    match out.as_slice() {
+        [(expr, Some(ty))] => Some((expr.clone(), *ty)),
+        _ => None,
+    }
+}
+
+fn correlated_collapse_item(
+    ctx: &mut Context,
+    elements: &[TypedExpr],
+    method: &str,
+    args: &[TypedMethodArg],
+    fields: &[ProjectionField],
+    name: &str,
+) -> Option<SelectItem> {
+    let mut cells: Vec<Option<(SqlExpr, ScalarType)>> = Vec::new();
+    for elem in elements.iter() {
+        let cell = correlated_pick_cell(ctx, elem, fields, name);
+        cells.push(cell);
+    }
+    let output = ctx.aliases.generic();
+    let none_ty = || {
+        fields
+            .iter()
+            .find(|f| f.name == name)
+            .and_then(|f| match peel_optional(&f.ty) {
+                QueryType::Scalar(s) => Some(*s),
+                _ => None,
+            })
+    };
+    let select_one = |cell: Option<(SqlExpr, ScalarType)>| {
+        let (expr, ty) = match cell {
+            Some((expr, ty)) => (expr, Some(ty)),
+            None => (SqlExpr::Param(ParamValue::Null), none_ty()),
+        };
+        SelectItem::Expr {
+            expr,
+            output: output.clone(),
+            ty,
+        }
+    };
+    if method == "first" {
+        let [cell, ..] = cells.as_slice() else {
+            return None;
+        };
+        return Some(select_one(cell.clone()));
+    }
+    let [arg] = args else {
+        return None;
+    };
+    const NEG_MSG: &str = "nth requires a non-negative integer";
+    let panic_cell = || SelectItem::Expr {
+        expr: SqlExpr::Func {
+            name: "$$panic".to_string(),
+            args: vec![SqlExpr::Param(ParamValue::String(NEG_MSG.to_string()))],
+        },
+        output: output.clone(),
+        ty: none_ty(),
+    };
+    match &arg.expr.kind {
+        TypedExprKind::Literal(lit) => match &lit.value {
+            Literal::Int(n) => {
+                if *n < 0 {
+                    return Some(panic_cell());
+                }
+                return Some(select_one(cells.get(*n as usize).cloned().flatten()));
+            }
+            _ => return None,
+        },
+        TypedExprKind::Unary { op, expr } if op.value == UnaryOp::Neg => {
+            if let TypedExprKind::Literal(lit) = &expr.kind
+                && let Literal::Int(_) = &lit.value
+            {
+                return Some(panic_cell());
+            }
+            return None;
+        }
+        _ => {}
+    }
+    let idx = scalar(ctx, &arg.expr);
+    let guarded = SqlExpr::Case {
+        arms: vec![(
+            SqlExpr::Binary {
+                op: SqlBinOp::Lt,
+                lhs: Box::new(idx.clone()),
+                rhs: Box::new(SqlExpr::Param(ParamValue::Int(0))),
+            },
+            SqlExpr::Func {
+                name: "$$panic".to_string(),
+                args: vec![SqlExpr::Param(ParamValue::String(NEG_MSG.to_string()))],
+            },
+        )],
+        else_: Box::new({
+            let mut arms = Vec::with_capacity(cells.len());
+            for (i, cell) in cells.into_iter().enumerate() {
+                let (expr, _) = match cell {
+                    Some((expr, ty)) => (expr, Some(ty)),
+                    None => (SqlExpr::Param(ParamValue::Null), none_ty()),
+                };
+                arms.push((
+                    SqlExpr::Binary {
+                        op: SqlBinOp::Eq,
+                        lhs: Box::new(idx.clone()),
+                        rhs: Box::new(SqlExpr::Param(ParamValue::Int(i as i64))),
+                    },
+                    expr,
+                ));
+            }
+            SqlExpr::Case {
+                arms,
+                else_: Box::new(SqlExpr::Param(ParamValue::Null)),
+            }
+        }),
+    };
+    Some(SelectItem::Expr {
+        expr: guarded,
+        output,
+        ty: none_ty(),
+    })
+}
+
 fn single_hop_over_collapsed(
     ctx: &mut Context,
     base: &TypedExpr,
@@ -10920,9 +11135,10 @@ fn single_hop_over_collapsed(
     if let TypedExprKind::Method {
         base: inner,
         name: m,
+        args: margs,
         ..
     } = &base.kind
-        && m.value == "first"
+        && (m.value == "first" || m.value == "nth")
         && matches!(&inner.kind, TypedExprKind::Array { .. })
         && !has_scope_ident(inner)
         && let QueryType::Optional(o) = &base.ty
@@ -10941,9 +11157,37 @@ fn single_hop_over_collapsed(
             output: column,
             ty: column_ty,
         }];
-        compose_limit(&mut level.builder, "first", &[], ctx);
+        compose_limit(&mut level.builder, &m.value, margs, ctx);
         return SqlExpr::Subquery {
             query: Box::new(level.builder),
+        };
+    }
+    if !ctx.in_take_arg
+        && ctx.child.is_none()
+        && ctx.temp_collect.is_none()
+        && ctx.nest_depth == 0
+        && !ctx.corr
+        && !ctx.in_array_temp
+        && let TypedExprKind::Method {
+            base: inner,
+            name: m,
+            args: margs,
+            ..
+        } = &base.kind
+        && (m.value == "first" || m.value == "nth")
+        && let TypedExprKind::Array { elements } = &inner.kind
+        && has_scope_ident(inner)
+        && let QueryType::List(elem_ty) = &inner.ty
+        && temp_nest_ok(elem_ty)
+        && let QueryType::Optional(o) = &base.ty
+        && let QueryType::Record(RecordSource::Projection(fields)) = peel_optional(o)
+        && let Some(item) =
+            correlated_collapse_item(ctx, elements, &m.value, margs, fields, &name.value)
+    {
+        let mut query = SelectBuilder::new();
+        query.select = vec![item];
+        return SqlExpr::Subquery {
+            query: Box::new(query),
         };
     }
     let column = record_column(ctx, &base.ty, &name.value);
