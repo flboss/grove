@@ -2053,6 +2053,30 @@ fn slice_take_reduction() {
             rec(&[("t", Value::List(vec![]))]),
         ])
     );
+    assert_eq!(
+        value(r#"users { c = tags.contains(name) }"#),
+        Value::List(vec![
+            rec(&[("c", Value::Bool(false))]),
+            rec(&[("c", Value::Bool(false))]),
+            rec(&[("c", Value::Bool(false))]),
+        ])
+    );
+    assert_eq!(
+        value(r#"users { c = tags.skip(1).contains(name) }"#),
+        Value::List(vec![
+            rec(&[("c", Value::Bool(false))]),
+            rec(&[("c", Value::Bool(false))]),
+            rec(&[("c", Value::Bool(false))]),
+        ])
+    );
+    assert_eq!(
+        value("users { c = [30].contains(age) }"),
+        Value::List(vec![
+            rec(&[("c", Value::Bool(true))]),
+            rec(&[("c", Value::Bool(false))]),
+            rec(&[("c", Value::Bool(false))]),
+        ])
+    );
 }
 
 #[test]

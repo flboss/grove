@@ -13859,9 +13859,24 @@ fn derived_contains_exists(ctx: &mut Context, base: &TypedExpr, needle: &TypedEx
             depth: 0,
             column: value_col,
         }),
-        rhs: Box::new(scalar(ctx, needle)),
+        rhs: Box::new(contains_needle(ctx, needle)),
     });
     SqlExpr::Exists(Box::new(level.builder))
+}
+
+fn contains_needle(ctx: &mut Context, needle: &TypedExpr) -> SqlExpr {
+    let scoped = has_scope_ident(needle) || uses_outer(needle);
+    let plain = ctx.temp_collect.is_some() || ctx.in_array_temp || ctx.in_take_arg;
+    if scoped && !plain {
+        if ctx.child.is_some() || ctx.nest_depth >= 1 {
+            todo!("M6 correlated literal outside temp lane");
+        }
+        if !shiftable_needle(needle) {
+            todo!("M6 correlated literal outside temp lane");
+        }
+        return shift_depths(scalar(ctx, needle), 1);
+    }
+    scalar(ctx, needle)
 }
 
 fn composite_contains_exists(
@@ -13984,7 +13999,7 @@ fn contains_exists(ctx: &mut Context, base: &TypedExpr, needle: &TypedExpr) -> S
                         depth: 0,
                         column: "c0".to_string(),
                     }),
-                    rhs: Box::new(scalar(ctx, needle)),
+                    rhs: Box::new(contains_needle(ctx, needle)),
                 }];
                 return SqlExpr::Exists(Box::new(query));
             }
@@ -14088,7 +14103,7 @@ fn storage_contains_query(
             depth: 0,
             column: value_col.clone(),
         }),
-        rhs: Box::new(scalar(ctx, needle)),
+        rhs: Box::new(contains_needle(ctx, needle)),
     };
     if tails.is_empty() {
         query.where_ = vec![link_pred, value_pred];
