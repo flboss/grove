@@ -1762,16 +1762,34 @@ fn b1_optional_list(
     value: &TypedExpr,
 ) -> (Vec<SelectItem>, ResultShape, Vec<String>) {
     if matches!(&value.kind, TypedExprKind::Field { optional: true, .. }) {
+        if let Some(single) = b1_single_chain(ctx, parent, value) {
+            return single;
+        }
         return b1_chained(ctx, parent, value);
     }
-    if let TypedExprKind::Method { base, name, .. } = &value.kind
+    if let TypedExprKind::Method {
+        base, name, args, ..
+    } = &value.kind
         && (name.value == "first" || name.value == "nth")
-        && matches!(&base.kind, TypedExprKind::Array { .. })
     {
-        if has_scope_ident(base) {
-            todo!("M4b presence: optional list item");
+        if matches!(&base.kind, TypedExprKind::Array { .. }) {
+            if has_scope_ident(base) {
+                return b1_temp_collapse(ctx, parent, value, base);
+            }
+            return b1_literal(ctx, value);
         }
-        return b1_literal(ctx, value);
+        if (name.value == "first" || nth_is_zero(args))
+            && let TypedExprKind::Method {
+                base: inner,
+                name: pre,
+                args: pre_args,
+                ..
+            } = &base.kind
+            && ["take", "skip"].contains(&pre.value.as_str())
+            && matches!(&peel_some(inner).kind, TypedExprKind::Array { .. })
+        {
+            return b1_temp_collapse_prefixed(ctx, parent, inner, pre, pre_args);
+        }
     }
     if let TypedExprKind::Some { value: inner } = &value.kind {
         if matches!(inner.ty, QueryType::Optional(_)) {
@@ -1800,6 +1818,100 @@ fn b1_optional_list(
     todo!("M4b presence: optional list item")
 }
 
+fn b1_temp_collapse(
+    ctx: &mut Context,
+    parent: &mut Level,
+    value: &TypedExpr,
+    base: &TypedExpr,
+) -> (Vec<SelectItem>, ResultShape, Vec<String>) {
+    let TypedExprKind::Method { name, args, .. } = &value.kind else {
+        unreachable!("temp collapse over non-method value: callers dispatch on collapse kind")
+    };
+    if name.value != "first" && !nth_is_zero(args) {
+        todo!("M4b presence: optional list item");
+    }
+    let TypedExprKind::Array { elements } = &base.kind else {
+        unreachable!("temp collapse over non-array base: callers dispatch on array literals")
+    };
+    let (element, child) = b1_temp_levels(ctx, parent, base, elements, Vec::new());
+    let shape = ResultShape::Single {
+        element: Box::new(element),
+        child: ChildRef {
+            stmt: child.stmt,
+            parent: child.parent,
+            cardinality: Cardinality::One,
+            tag: None,
+        },
+    };
+    (Vec::new(), shape, Vec::new())
+}
+
+fn b1_temp_collapse_prefixed(
+    ctx: &mut Context,
+    parent: &mut Level,
+    array: &TypedExpr,
+    name: &grove_types::Spanned<String>,
+    args: &[TypedMethodArg],
+) -> (Vec<SelectItem>, ResultShape, Vec<String>) {
+    let TypedExprKind::Array { elements } = &peel_some(array).kind else {
+        unreachable!("prefixed collapse over non-array base: callers peel one method")
+    };
+    let methods = vec![EntryMethod::TakeSkip {
+        name: name.value.clone(),
+        args,
+    }];
+    let (element, child) = b1_temp_levels(ctx, parent, array, elements, methods);
+    let shape = ResultShape::Single {
+        element: Box::new(element),
+        child: ChildRef {
+            stmt: child.stmt,
+            parent: child.parent,
+            cardinality: Cardinality::One,
+            tag: None,
+        },
+    };
+    (Vec::new(), shape, Vec::new())
+}
+
+fn b1_temp_levels(
+    ctx: &mut Context,
+    parent: &mut Level,
+    base: &TypedExpr,
+    elements: &[TypedExpr],
+    methods: Vec<EntryMethod<'_>>,
+) -> (ResultShape, ChildRef) {
+    if ctx.child.is_some() || ctx.nest_depth >= 1 {
+        todo!("M4b presence: optional list item");
+    }
+    let inner = match &base.ty {
+        QueryType::List(inner) => inner.as_ref(),
+        _ => unreachable!(
+            "non-list array type {}: the checker types arrays as lists",
+            base.ty
+        ),
+    };
+    let Some(refs) = collect_temp_refs(ctx.schema, base, &[]) else {
+        todo!("M4b presence: optional list item");
+    };
+    if refs.iter().any(|r| r == "c0" || r == "c1" || r == "$$key") {
+        todo!("M4b presence: optional list item");
+    }
+    let (temp, temp_idx, create_outputs) = materialize_array_parent(ctx, parent, &refs);
+    swap_parent_to_temp(parent, &temp, &create_outputs);
+    let ref_tys = resolve_ref_tys(ctx, parent, &refs);
+    ctx.temp_collect = Some(TempCollect {
+        temp: temp.clone(),
+        key_col: "$$key".to_string(),
+        child_fk: "c0".to_string(),
+        refs,
+    });
+    ctx.in_array_temp = true;
+    let items: Vec<(Option<i64>, &TypedExpr)> = elements.iter().map(|e| (None, e)).collect();
+    let (element, child) = temp_array_level(ctx, &temp, temp_idx, &ref_tys, inner, items, methods);
+    ctx.in_array_temp = false;
+    ctx.temp_collect.take();
+    (element, child)
+}
 fn b1_literal(ctx: &mut Context, value: &TypedExpr) -> (Vec<SelectItem>, ResultShape, Vec<String>) {
     let mut root = rows(ctx, value);
     let hops = root.pending.take().map(drain_pending).unwrap_or_default();
@@ -1845,11 +1957,175 @@ fn b1_literal(ctx: &mut Context, value: &TypedExpr) -> (Vec<SelectItem>, ResultS
     (Vec::new(), shape, Vec::new())
 }
 
+fn b1_single_chain(
+    ctx: &mut Context,
+    parent: &mut Level,
+    value: &TypedExpr,
+) -> Option<(Vec<SelectItem>, ResultShape, Vec<String>)> {
+    let TypedExprKind::Field { base, .. } = &value.kind else {
+        return None;
+    };
+    let root = peel_some(base);
+    let TypedExprKind::Ident {
+        binding: IdentBinding::Field(root_fid),
+        ..
+    } = &root.kind
+    else {
+        return None;
+    };
+    if !matches!(&root.ty, QueryType::Optional(_)) {
+        return None;
+    }
+    let fkcol = link_parent_col(ctx.schema, *root_fid)?;
+    let TypedExprKind::Field {
+        base: tail_base,
+        name,
+        ..
+    } = &value.kind
+    else {
+        return None;
+    };
+    if !matches!(&peel_some(tail_base).kind, TypedExprKind::Ident { .. }) {
+        return None;
+    }
+    let field = &ctx.schema.structs[root_fid.struct_id().index()].fields[root_fid.local()];
+    let target = match field {
+        Field::Ref { target, .. } => *target,
+        _ => return None,
+    };
+    let tail_fid = ctx.schema.structs[target.index()]
+        .fields
+        .iter()
+        .enumerate()
+        .find(|(_, f)| f.name() == name.value)
+        .map(|(local, _)| FieldId::new(target, local));
+    let tail_fid = tail_fid?;
+    let link = resolve_tail_link(ctx, tail_fid);
+    if link.m2m_join.is_some() {
+        return None;
+    }
+    if ctx.child.is_some() || ctx.nest_depth >= 1 {
+        todo!("M4b presence: optional list item");
+    }
+    let refs = vec![fkcol.clone()];
+    let (temp, temp_idx, create_outputs) = materialize_array_parent(ctx, parent, &refs);
+    swap_parent_to_temp(parent, &temp, &create_outputs);
+    let link_reserved = ctx.statements.len() + 2;
+    let link_stmt = SelectBuilder {
+        select: vec![SelectItem::Column {
+            depth: 0,
+            column: "$$key".to_string(),
+            output: "c0".to_string(),
+            ty: None,
+        }],
+        from: Some(FromClause::Table {
+            table: temp.clone(),
+            alias: temp.clone(),
+        }),
+        where_: vec![SqlExpr::Binary {
+            op: SqlBinOp::IsNot,
+            lhs: Box::new(SqlExpr::Column {
+                depth: 0,
+                column: fkcol.clone(),
+            }),
+            rhs: Box::new(SqlExpr::Param(ParamValue::Null)),
+        }],
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        unions: Vec::new(),
+    };
+    let children = query_join_arm(
+        ctx,
+        FromClause::Table {
+            table: temp.clone(),
+            alias: temp.clone(),
+        },
+        link.child_from.clone(),
+        vec![SqlExpr::Binary {
+            op: SqlBinOp::Eq,
+            lhs: Box::new(SqlExpr::Column {
+                depth: 0,
+                column: link.child_col.clone(),
+            }),
+            rhs: Box::new(SqlExpr::Column {
+                depth: 1,
+                column: fkcol.clone(),
+            }),
+        }],
+    );
+    let outputs = builder_outputs(&children, ctx.schema);
+    let shape_cols: Vec<OutputColumn> =
+        shape_columns(builder_output_types(&children, ctx.schema), |name| {
+            name == "c0"
+        });
+    let sub = match peel_optional(&value.ty) {
+        QueryType::List(sub) => sub.as_ref().clone(),
+        _ => return None,
+    };
+    let vals = child_element(ctx.schema, None, &sub, &outputs, |name| name == "c0");
+    let child_idx = ctx.sink(
+        children,
+        StatementShape {
+            columns: shape_cols,
+            rows: RowCount::Many,
+        },
+        StatementKind::Query,
+    );
+    let link_idx = ctx.sink(
+        link_stmt,
+        StatementShape {
+            columns: vec![OutputColumn {
+                name: "c0".to_string(),
+                role: ColumnRole::Key,
+                ty: None,
+            }],
+            rows: RowCount::Many,
+        },
+        StatementKind::Query,
+    );
+    debug_assert_eq!(
+        link_idx, link_reserved,
+        "link sank at an unexpected index: sink order changed"
+    );
+    let inner = ResultShape::List {
+        element: Box::new(vals),
+        child: ChildRef {
+            stmt: child_idx,
+            parent: Some(ParentRef {
+                stmt: link_idx,
+                parent_key: "c0".to_string(),
+                child_key: "c0".to_string(),
+                negated: false,
+            }),
+            cardinality: Cardinality::Many,
+            tag: None,
+        },
+    };
+    let shape = ResultShape::Single {
+        element: Box::new(inner),
+        child: ChildRef {
+            stmt: link_idx,
+            parent: Some(ParentRef {
+                stmt: temp_idx,
+                parent_key: "$$key".to_string(),
+                child_key: "c0".to_string(),
+                negated: false,
+            }),
+            cardinality: Cardinality::One,
+            tag: None,
+        },
+    };
+    Some((Vec::new(), shape, vec!["$$key".to_string()]))
+}
 fn b1_chained(
     ctx: &mut Context,
     parent: &mut Level,
     value: &TypedExpr,
 ) -> (Vec<SelectItem>, ResultShape, Vec<String>) {
+    if root_only_refs(value) {
+        return b1_literal(ctx, value);
+    }
     let _ = parent;
     if !matches!(parent.element, QueryType::List(_))
         || parent.pending.is_some()

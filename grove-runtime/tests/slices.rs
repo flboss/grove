@@ -355,6 +355,65 @@ fn slice_optional_hops() {
     assert_eq!(value("users.manager.name"), Value::List(vec![s("Bob")]));
 }
 
+#[test]
+fn slice_optional_list_temp_collapse() {
+    assert_eq!(
+        value("users { x = [[age]].first() }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![Value::Int(30)]))]),
+            rec(&[("x", Value::List(vec![Value::Int(40)]))]),
+            rec(&[("x", Value::List(vec![Value::Int(50)]))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [[age]].nth(0) }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![Value::Int(30)]))]),
+            rec(&[("x", Value::List(vec![Value::Int(40)]))]),
+            rec(&[("x", Value::List(vec![Value::Int(50)]))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [[age]].take(1).first() }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![Value::Int(30)]))]),
+            rec(&[("x", Value::List(vec![Value::Int(40)]))]),
+            rec(&[("x", Value::List(vec![Value::Int(50)]))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [[age]].take(0).first() }"),
+        Value::List(vec![
+            rec(&[("x", Value::Null)]),
+            rec(&[("x", Value::Null)]),
+            rec(&[("x", Value::Null)]),
+        ])
+    );
+    let twolists =
+        |v: Value| Value::Tuple(vec![Value::List(vec![v.clone()]), Value::List(vec![v])]);
+    assert_eq!(
+        value("users { t = ([age], [[age]].first()) }"),
+        Value::List(vec![
+            rec(&[("t", twolists(Value::Int(30)))]),
+            rec(&[("t", twolists(Value::Int(40)))]),
+            rec(&[("t", twolists(Value::Int(50)))]),
+        ])
+    );
+}
+
+#[test]
+fn slice_optional_list_single_chain() {
+    let ord = |t: &str| Value::Record(vec![("total".to_string(), Value::Dec(dec(t)))]);
+    assert_eq!(
+        value("users { x = mentor?.orders }"),
+        Value::List(vec![
+            rec(&[("x", Value::Null)]),
+            rec(&[("x", Value::List(vec![ord("10.00"), ord("20.00")]),)]),
+            rec(&[("x", Value::Null)]),
+        ])
+    );
+}
+
 
 #[test]
 fn slice_nested_children() {
