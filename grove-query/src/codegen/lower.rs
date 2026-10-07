@@ -3094,6 +3094,7 @@ fn tail_root_ident(tail: &TypedExpr) -> Option<&IdentBinding> {
     }
 }
 
+#[derive(Debug, Clone)]
 struct ChildLink {
     child_from: FromClause,
     child_col: String,
@@ -9669,9 +9670,12 @@ fn rtemp_array_shape(
         ),
     };
     if !temp_nest_ok(inner) {
-        todo!("M6 query-valued array element");
+        return rtemp_query_array_shape(ctx, parent, tail, inner);
     }
     let Some(refs) = collect_temp_refs(ctx.schema, tail, &[]) else {
+        if tail_elements_query(tail) {
+            return rtemp_query_array_shape(ctx, parent, tail, inner);
+        }
         todo!("M6 correlated literal projection item");
     };
     if refs.iter().any(|r| r == "c0" || r == "c1" || r == "$$key") {
@@ -9701,6 +9705,690 @@ fn rtemp_array_shape(
     )
 }
 
+fn tail_elements_query(tail: &TypedExpr) -> bool {
+    let TypedExprKind::Array { elements } = &tail.kind else {
+        return false;
+    };
+    elements.iter().any(|elem| {
+        let node = peel_some(elem);
+        !matches!(
+            &node.kind,
+            TypedExprKind::Literal(_)
+                | TypedExprKind::Tuple { .. }
+                | TypedExprKind::Struct { .. }
+                | TypedExprKind::If { .. }
+        ) && !matches!(
+            &node.kind,
+            TypedExprKind::Ident { .. } if scalar_of(&node.ty).is_some()
+        )
+    })
+}
+
+fn rtemp_query_array_shape(
+    ctx: &mut Context,
+    parent: &mut Level,
+    tail: &TypedExpr,
+    inner: &QueryType,
+) -> (ResultShape, Option<String>) {
+    let TypedExprKind::Array { elements } = &tail.kind else {
+        unreachable!(
+            "rtemp query array over non-array tail: the rvalue gate admits bare arrays only"
+        )
+    };
+    let mut refs: Vec<String> = Vec::new();
+    for elem in elements {
+        if !query_ref_walk(ctx.schema, elem, &mut refs) {
+            todo!("M6 correlated literal projection item");
+        }
+    }
+    if refs.iter().any(|r| r == "c0" || r == "c1" || r == "$$key") {
+        todo!("M6 correlated literal projection item");
+    }
+    let (temp, temp_idx, create_outputs) = materialize_array_parent(ctx, parent, &refs);
+    swap_parent_to_temp(parent, &temp, &create_outputs);
+    let ref_tys = resolve_ref_tys(ctx, parent, &refs);
+    ctx.temp_collect = Some(TempCollect {
+        temp: temp.clone(),
+        key_col: "$$key".to_string(),
+        child_fk: "c0".to_string(),
+        refs,
+    });
+    ctx.in_array_temp = true;
+    let out = rtemp_query_arms(ctx, &temp, temp_idx, &ref_tys, inner, elements);
+    ctx.in_array_temp = false;
+    ctx.temp_collect.take();
+    let (element, child) = out;
+    (
+        ResultShape::List {
+            element: Box::new(element),
+            child,
+        },
+        Some("$$key".to_string()),
+    )
+}
+
+fn rtemp_query_arms(
+    ctx: &mut Context,
+    temp: &str,
+    temp_idx: usize,
+    ref_tys: &[(String, Option<ScalarType>)],
+    inner: &QueryType,
+    elements: &[TypedExpr],
+) -> (ResultShape, ChildRef) {
+    if elements
+        .iter()
+        .any(|e| matches!(peel_optional(&e.ty), QueryType::List(_)))
+    {
+        return rtemp_query_grid_level(ctx, temp, temp_idx, ref_tys, inner, elements);
+    }
+    let mut arms: Vec<SelectBuilder> = Vec::with_capacity(elements.len());
+    let mut one = false;
+    for elem in elements {
+        arms.extend(rtemp_query_flat_arm(ctx, temp, inner, elem, &mut one));
+    }
+    if arms.is_empty() {
+        let mut tys = Vec::new();
+        temp_leaf_tys(inner, &mut tys);
+        let mut layout = vec![("c0".to_string(), None)];
+        layout.extend(
+            tys.iter()
+                .enumerate()
+                .map(|(i, ty)| (format!("c{}", i + 1), Some(*ty))),
+        );
+        arms.push(false_arm(&layout));
+    }
+    let union = {
+        let mut flat: Vec<SelectBuilder> = Vec::with_capacity(arms.len());
+        for mut arm in arms {
+            let mut tails = std::mem::take(&mut arm.unions);
+            flat.push(arm);
+            flat.append(&mut tails);
+        }
+        union_builders(flat)
+    };
+    let outputs = builder_outputs(&union, ctx.schema);
+    let shape_cols: Vec<OutputColumn> =
+        shape_columns(builder_output_types(&union, ctx.schema), |name| {
+            name == "c0"
+        });
+    let element = child_element(ctx.schema, None, inner, &outputs, |name| name == "c0");
+    let idx = ctx.sink(
+        union,
+        StatementShape {
+            columns: shape_cols,
+            rows: RowCount::Many,
+        },
+        StatementKind::Query,
+    );
+    let child = ChildRef {
+        stmt: idx,
+        parent: Some(ParentRef {
+            stmt: temp_idx,
+            parent_key: "$$key".to_string(),
+            child_key: "c0".to_string(),
+            negated: false,
+        }),
+        cardinality: if one {
+            Cardinality::One
+        } else {
+            Cardinality::Many
+        },
+        tag: None,
+    };
+    (element, child)
+}
+
+fn rtemp_query_flat_arm(
+    ctx: &mut Context,
+    temp: &str,
+    inner: &QueryType,
+    elem: &TypedExpr,
+    single: &mut bool,
+) -> Vec<SelectBuilder> {
+    if !matches!(
+        peel_optional(&elem.ty),
+        QueryType::Record(RecordSource::Schema(_))
+    ) {
+        return temp_leaf_arms(ctx, temp, inner, &[(None, elem)], "$$key");
+    }
+    let node = peel_some(elem);
+    if let TypedExprKind::Method {
+        base, name, args, ..
+    } = &node.kind
+        && ["first", "nth"].contains(&name.value.as_str())
+        && args.iter().all(|arg| bound_lang_ok(&arg.expr))
+        && (name.value == "first" || nth_is_zero(args))
+        && let Some(link) = collection_link(ctx, base)
+    {
+        *single = true;
+        let match_arm = query_link_arm(ctx, temp, link.clone(), Vec::new());
+        let cols = from_columns_typed(&Some(link.child_from.clone()), ctx.schema);
+        let exists_alias = ctx.aliases.table("exists");
+        let mut null_select = vec![SelectItem::Column {
+            depth: 0,
+            column: "$$key".to_string(),
+            output: "c0".to_string(),
+            ty: None,
+        }];
+        for (name, ty) in &cols {
+            null_select.push(SelectItem::Expr {
+                expr: SqlExpr::Param(ParamValue::Null),
+                output: name.clone(),
+                ty: *ty,
+            });
+        }
+        let table = match &link.child_from {
+            FromClause::Table { table, .. } => table.clone(),
+            _ => todo!("M6 query-valued array element"),
+        };
+        let null_arm = SelectBuilder {
+            select: null_select,
+            from: Some(FromClause::Table {
+                table: temp.to_string(),
+                alias: temp.to_string(),
+            }),
+            where_: vec![SqlExpr::Not(Box::new(SqlExpr::Exists(Box::new(
+                SelectBuilder {
+                    select: vec![SelectItem::Expr {
+                        expr: SqlExpr::Param(ParamValue::Int(1)),
+                        output: "one".to_string(),
+                        ty: Some(ScalarType::Int),
+                    }],
+                    from: Some(FromClause::Table {
+                        table,
+                        alias: exists_alias,
+                    }),
+                    where_: vec![SqlExpr::Binary {
+                        op: SqlBinOp::Eq,
+                        lhs: Box::new(SqlExpr::Column {
+                            depth: 0,
+                            column: link.child_col.clone(),
+                        }),
+                        rhs: Box::new(SqlExpr::Column {
+                            depth: 1,
+                            column: link.parent_col.clone(),
+                        }),
+                    }],
+                    order_by: Vec::new(),
+                    limit: None,
+                    offset: None,
+                    unions: Vec::new(),
+                },
+            ))))],
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            unions: Vec::new(),
+        };
+        return vec![match_arm, null_arm];
+    }
+    if !root_only_refs(elem) {
+        todo!("M6 query-valued array element");
+    }
+    let builder = lower_element_rows(ctx, elem);
+    let alias = ctx.aliases.subquery();
+    vec![query_join_arm(
+        ctx,
+        FromClause::Table {
+            table: temp.to_string(),
+            alias: temp.to_string(),
+        },
+        FromClause::Subquery {
+            query: Box::new(builder),
+            alias,
+        },
+        Vec::new(),
+    )]
+}
+
+fn collection_link(ctx: &mut Context, mut base: &TypedExpr) -> Option<ChildLink> {
+    loop {
+        let node = peel_some(base);
+        match &node.kind {
+            TypedExprKind::Ident {
+                binding: IdentBinding::Field(fid),
+                ..
+            } => {
+                let link = resolve_tail_link(ctx, *fid);
+                return link.m2m_join.is_none().then_some(link);
+            }
+            TypedExprKind::Method { base: next, .. } => base = next,
+            _ => return None,
+        }
+    }
+}
+
+fn query_join_arm(
+    ctx: &mut Context,
+    left: FromClause,
+    right: FromClause,
+    extra: Vec<SqlExpr>,
+) -> SelectBuilder {
+    let cols = from_columns_typed(&Some(right.clone()), ctx.schema);
+    if cols.iter().any(|(name, _)| name == "c0") {
+        todo!("M6 query-valued array element");
+    }
+    let mut select = vec![SelectItem::Column {
+        depth: 1,
+        column: "$$key".to_string(),
+        output: "c0".to_string(),
+        ty: None,
+    }];
+    for (name, ty) in cols {
+        select.push(SelectItem::Column {
+            depth: 0,
+            column: name.clone(),
+            output: name,
+            ty,
+        });
+    }
+    SelectBuilder {
+        select,
+        from: Some(FromClause::Join {
+            left: Box::new(left),
+            right: Box::new(right),
+        }),
+        where_: extra,
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        unions: Vec::new(),
+    }
+}
+
+fn query_link_arm(
+    ctx: &mut Context,
+    temp: &str,
+    link: ChildLink,
+    extra: Vec<SqlExpr>,
+) -> SelectBuilder {
+    let mut where_ = vec![SqlExpr::Binary {
+        op: SqlBinOp::Eq,
+        lhs: Box::new(SqlExpr::Column {
+            depth: 0,
+            column: link.child_col.clone(),
+        }),
+        rhs: Box::new(SqlExpr::Column {
+            depth: 1,
+            column: link.parent_col.clone(),
+        }),
+    }];
+    where_.extend(extra);
+    query_join_arm(
+        ctx,
+        FromClause::Table {
+            table: temp.to_string(),
+            alias: temp.to_string(),
+        },
+        link.child_from,
+        where_,
+    )
+}
+
+fn lower_element_rows(ctx: &mut Context, elem: &TypedExpr) -> SelectBuilder {
+    if !take_bounds_scope_free(elem) {
+        todo!("M6 query-valued array element");
+    }
+    let was = ctx.temp_collect.take();
+    let level = rows(ctx, elem);
+    ctx.temp_collect = was;
+    if level.pending.is_some() {
+        todo!("M6 query-valued array element");
+    }
+    let mut builder = level.builder;
+    if builder.select.is_empty() {
+        builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+    }
+    builder
+}
+
+fn take_bounds_scope_free(elem: &TypedExpr) -> bool {
+    fn go(node: &TypedExpr, in_bound: bool) -> bool {
+        match &node.kind {
+            TypedExprKind::Method {
+                base, name, args, ..
+            } => {
+                let bound = ["take", "skip"].contains(&name.value.as_str());
+                go(base, in_bound)
+                    && args.iter().all(|arg| {
+                        go(&arg.expr, in_bound || bound) && (!bound || bound_scope_free(&arg.expr))
+                    })
+            }
+            TypedExprKind::Ident { binding, depth, .. } => match binding {
+                IdentBinding::Prev { .. } => false,
+                IdentBinding::Field(_) | IdentBinding::ProjectedField { .. } => {
+                    !in_bound || *depth > 1
+                }
+                IdentBinding::Root { .. } => true,
+            },
+            TypedExprKind::Field { base, .. } => go(base, in_bound),
+            TypedExprKind::Projection { base, items } => {
+                go(base, in_bound) && items.iter().all(|item| go(&item.value, in_bound))
+            }
+            TypedExprKind::Tuple { elements } | TypedExprKind::Array { elements } => {
+                elements.iter().all(|e| go(e, in_bound))
+            }
+            TypedExprKind::Struct { fields } => fields.iter().all(|(_, e)| go(e, in_bound)),
+            TypedExprKind::Binary { lhs, rhs, .. } => go(lhs, in_bound) && go(rhs, in_bound),
+            TypedExprKind::Unary { expr, .. }
+            | TypedExprKind::Cast { expr, .. }
+            | TypedExprKind::Some { value: expr } => go(expr, in_bound),
+            TypedExprKind::If { arms, default } => {
+                arms.iter()
+                    .all(|(cond, then)| go(cond, in_bound) && go(then, in_bound))
+                    && go(default, in_bound)
+            }
+            TypedExprKind::Literal(_) | TypedExprKind::TypeConstant { .. } => true,
+        }
+    }
+    go(elem, false)
+}
+
+fn bound_scope_free(bound: &TypedExpr) -> bool {
+    !any_ident(bound, &mut |e| {
+        matches!(
+            &e.kind,
+            TypedExprKind::Ident {
+                binding: IdentBinding::Field(_)
+                    | IdentBinding::ProjectedField { .. },
+                depth,
+                ..
+            } if *depth <= 1
+        )
+    })
+}
+
+fn take_over_collection(
+    ctx: &mut Context,
+    elem: &TypedExpr,
+) -> Option<(ChildLink, Option<SqlExpr>)> {
+    let node = peel_some(elem);
+    let (base, method) = match &node.kind {
+        TypedExprKind::Method {
+            base, name, args, ..
+        } => {
+            if !["take", "skip"].contains(&name.value.as_str()) {
+                return None;
+            }
+            let [arg] = args.as_slice() else {
+                unreachable!("wrong arity for take/skip: the checker enforces Fixed arg counts")
+            };
+            if !bound_scope_free(&arg.expr) {
+                return None;
+            }
+            (base.as_ref(), Some((name.value.clone(), &arg.expr)))
+        }
+        TypedExprKind::Ident { .. } => (elem, None),
+        _ => return None,
+    };
+    let base_node = peel_some(base);
+    let TypedExprKind::Ident {
+        binding: IdentBinding::Field(fid),
+        ..
+    } = &base_node.kind
+    else {
+        return None;
+    };
+    let link = resolve_tail_link(ctx, *fid);
+    if link.m2m_join.is_some() {
+        return None;
+    }
+    let Some((method, bound_expr)) = method else {
+        return Some((link, None));
+    };
+    let was = ctx.temp_collect.take();
+    let bound = scalar(ctx, bound_expr);
+    ctx.temp_collect = was;
+    let guard = SqlExpr::Case {
+        arms: vec![(
+            SqlExpr::Binary {
+                op: SqlBinOp::Ge,
+                lhs: Box::new(bound.clone()),
+                rhs: Box::new(SqlExpr::Param(ParamValue::Int(0))),
+            },
+            bound,
+        )],
+        else_: Box::new(SqlExpr::Func {
+            name: "$$panic".to_string(),
+            args: vec![SqlExpr::Param(ParamValue::String(format!(
+                "{method} requires a non-negative integer",
+            )))],
+        }),
+    };
+    let pred = SqlExpr::Binary {
+        op: if method == "take" {
+            SqlBinOp::Le
+        } else {
+            SqlBinOp::Gt
+        },
+        lhs: Box::new(SqlExpr::Column {
+            depth: 0,
+            column: "$$rn".to_string(),
+        }),
+        rhs: Box::new(guard),
+    };
+    Some((link, Some(pred)))
+}
+
+fn element_args_inner_only(elem: &TypedExpr) -> bool {
+    fn go(node: &TypedExpr) -> bool {
+        match &node.kind {
+            TypedExprKind::Method { base, args, .. } => {
+                go(base) && args.iter().all(|arg| arg_inner_only(&arg.expr))
+            }
+            TypedExprKind::If { arms, default } => {
+                arms.iter()
+                    .all(|(cond, then)| arg_inner_only(cond) && go(then))
+                    && go(default)
+            }
+            TypedExprKind::Ident { binding, .. } => !matches!(binding, IdentBinding::Prev { .. }),
+            TypedExprKind::Field { base, .. } => go(base),
+            TypedExprKind::Projection { base, items } => {
+                go(base) && items.iter().all(|item| go(&item.value))
+            }
+            TypedExprKind::Tuple { elements } | TypedExprKind::Array { elements } => {
+                elements.iter().all(go)
+            }
+            TypedExprKind::Struct { fields } => fields.iter().all(|(_, e)| go(e)),
+            TypedExprKind::Binary { lhs, rhs, .. } => go(lhs) && go(rhs),
+            TypedExprKind::Unary { expr, .. }
+            | TypedExprKind::Cast { expr, .. }
+            | TypedExprKind::Some { value: expr } => go(expr),
+            TypedExprKind::Literal(_) | TypedExprKind::TypeConstant { .. } => true,
+        }
+    }
+    fn arg_inner_only(arg: &TypedExpr) -> bool {
+        !any_ident(arg, &mut |e| {
+            matches!(
+                &e.kind,
+                TypedExprKind::Ident {
+                    binding: IdentBinding::Field(_)
+                        | IdentBinding::ProjectedField { .. }
+                        | IdentBinding::Prev { .. },
+                    depth,
+                    ..
+                } if *depth == 0
+            )
+        })
+    }
+    go(elem)
+}
+fn nth_is_zero(args: &[TypedMethodArg]) -> bool {
+    let [arg] = args else { return false };
+    matches!(
+        &peel_some(&arg.expr).kind,
+        TypedExprKind::Literal(lit) if matches!(&lit.value, Literal::Int(0))
+    )
+}
+
+fn rtemp_query_grid_level(
+    ctx: &mut Context,
+    temp: &str,
+    temp_idx: usize,
+    ref_tys: &[(String, Option<ScalarType>)],
+    inner: &QueryType,
+    elements: &[TypedExpr],
+) -> (ResultShape, ChildRef) {
+    if elements.len() != 1 {
+        todo!("M6 query-valued array element");
+    }
+    let elem = &elements[0];
+    let sub = match peel_optional(&elem.ty) {
+        QueryType::List(sub) => sub.as_ref().clone(),
+        _ => todo!("M6 query-valued array element"),
+    };
+    enum Rows {
+        Standalone(SelectBuilder),
+        Linked(ChildLink, Option<SqlExpr>),
+    }
+    let rows = if let Some((link, pred)) = take_over_collection(ctx, elem) {
+        Rows::Linked(link, pred)
+    } else if (root_only_refs(elem) || take_bounds_scope_free(elem))
+        && element_args_inner_only(elem)
+    {
+        Rows::Standalone(lower_element_rows(ctx, elem))
+    } else {
+        todo!("M6 query-valued array element");
+    };
+    let mut grid_select = vec![SelectItem::Column {
+        depth: 0,
+        column: "$$key".to_string(),
+        output: "c0".to_string(),
+        ty: None,
+    }];
+    for (name, ty) in ref_tys {
+        grid_select.push(SelectItem::Column {
+            depth: 0,
+            column: name.clone(),
+            output: name.clone(),
+            ty: *ty,
+        });
+    }
+    let grid_arm = SelectBuilder {
+        select: grid_select,
+        from: Some(FromClause::Table {
+            table: temp.to_string(),
+            alias: temp.to_string(),
+        }),
+        where_: Vec::new(),
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        unions: Vec::new(),
+    };
+    let (grid, grid_idx) = sink_arm_temp(ctx, grid_arm);
+    let arm = match rows {
+        Rows::Standalone(builder) => {
+            let alias = ctx.aliases.subquery();
+            query_join_arm(
+                ctx,
+                FromClause::Table {
+                    table: grid.clone(),
+                    alias: grid.clone(),
+                },
+                FromClause::Subquery {
+                    query: Box::new(builder),
+                    alias,
+                },
+                Vec::new(),
+            )
+        }
+        Rows::Linked(link, bound) => {
+            let alias = ctx.aliases.subquery();
+            let mut scan_select = vec![SelectItem::AllFrom { depth: 0 }];
+            if bound.is_some() {
+                scan_select.push(SelectItem::Expr {
+                    expr: SqlExpr::Window {
+                        func: "ROW_NUMBER".to_string(),
+                        partition: vec![SqlExpr::Column {
+                            depth: 0,
+                            column: link.child_col.clone(),
+                        }],
+                        order: Vec::new(),
+                    },
+                    output: "$$rn".to_string(),
+                    ty: Some(ScalarType::Int),
+                });
+            }
+            let scan = SelectBuilder {
+                select: scan_select,
+                from: Some(link.child_from.clone()),
+                where_: Vec::new(),
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
+                unions: Vec::new(),
+            };
+            let mut where_ = vec![SqlExpr::Binary {
+                op: SqlBinOp::Eq,
+                lhs: Box::new(SqlExpr::Column {
+                    depth: 0,
+                    column: link.child_col.clone(),
+                }),
+                rhs: Box::new(SqlExpr::Column {
+                    depth: 1,
+                    column: link.parent_col.clone(),
+                }),
+            }];
+            if let Some(bound) = bound {
+                where_.push(bound);
+            }
+            query_join_arm(
+                ctx,
+                FromClause::Table {
+                    table: grid.clone(),
+                    alias: grid.clone(),
+                },
+                FromClause::Subquery {
+                    query: Box::new(scan),
+                    alias,
+                },
+                where_,
+            )
+        }
+    };
+    let outputs = builder_outputs(&arm, ctx.schema);
+    let shape_cols: Vec<OutputColumn> =
+        shape_columns(builder_output_types(&arm, ctx.schema), |name| name == "c0");
+    let vals = child_element(ctx.schema, None, &sub, &outputs, |name| name == "c0");
+    let arm_idx = ctx.sink(
+        arm,
+        StatementShape {
+            columns: shape_cols,
+            rows: RowCount::Many,
+        },
+        StatementKind::Query,
+    );
+    let inner_list = ResultShape::List {
+        element: Box::new(vals),
+        child: ChildRef {
+            stmt: arm_idx,
+            parent: Some(ParentRef {
+                stmt: grid_idx,
+                parent_key: "$$key".to_string(),
+                child_key: "c0".to_string(),
+                negated: false,
+            }),
+            cardinality: Cardinality::Many,
+            tag: None,
+        },
+    };
+    let _ = inner;
+    (
+        inner_list,
+        ChildRef {
+            stmt: grid_idx,
+            parent: Some(ParentRef {
+                stmt: temp_idx,
+                parent_key: "$$key".to_string(),
+                child_key: "c0".to_string(),
+                negated: false,
+            }),
+            cardinality: Cardinality::Many,
+            tag: None,
+        },
+    )
+}
 fn rtemp_method_shape(
     ctx: &mut Context,
     parent: &mut Level,
@@ -17020,8 +17708,19 @@ fn collect_temp_refs(
             TypedExprKind::Ident { binding, depth, .. } => match binding {
                 IdentBinding::Root { .. } => true,
                 IdentBinding::Field(fid) => {
-                    if under_row || *depth != 0 || scalar_of(&elem.ty).is_none() {
+                    if under_row || *depth != 0 {
                         return false;
+                    }
+                    if scalar_of(&elem.ty).is_none() {
+                        return match link_parent_col(schema, *fid) {
+                            Some(col) => {
+                                if !out.contains(&col) {
+                                    out.push(col);
+                                }
+                                true
+                            }
+                            None => false,
+                        };
                     }
                     let field = &schema.structs[fid.struct_id().index()].fields[fid.local()];
                     match field {
@@ -17114,6 +17813,92 @@ fn collect_temp_refs(
     }
     let mut out = Vec::new();
     go(schema, tail, false, &mut out, skip).then_some(out)
+}
+
+fn query_ref_walk(schema: &ValidatedSchema, elem: &TypedExpr, out: &mut Vec<String>) -> bool {
+    fn go(schema: &ValidatedSchema, elem: &TypedExpr, out: &mut Vec<String>) -> bool {
+        match &elem.kind {
+            TypedExprKind::Ident { binding, depth, .. } => match binding {
+                IdentBinding::Root { .. } => true,
+                IdentBinding::Field(fid) => {
+                    if *depth > 1 {
+                        return true;
+                    }
+                    if scalar_of(&elem.ty).is_none() {
+                        return match link_parent_col(schema, *fid) {
+                            Some(col) => {
+                                if !out.contains(&col) {
+                                    out.push(col);
+                                }
+                                true
+                            }
+                            None => false,
+                        };
+                    }
+                    let field = &schema.structs[fid.struct_id().index()].fields[fid.local()];
+                    match field {
+                        Field::Value { columns, .. } => match columns.as_slice() {
+                            [col] => {
+                                let name = schema.column_name(*col).to_string();
+                                if !out.contains(&name) {
+                                    out.push(name);
+                                }
+                                true
+                            }
+                            _ => false,
+                        },
+                        _ => false,
+                    }
+                }
+                IdentBinding::ProjectedField { name } => {
+                    if *depth > 1 {
+                        return true;
+                    }
+                    if scalar_of(&elem.ty).is_none() {
+                        return false;
+                    }
+                    if !out.contains(name) {
+                        out.push(name.clone());
+                    }
+                    true
+                }
+                IdentBinding::Prev { .. } => false,
+            },
+            TypedExprKind::Field { base, name, .. } => {
+                if let Some(field) = struct_field_value(base, &name.value) {
+                    return go(schema, field, out);
+                }
+                if let Some(fk) = nav_root_fk(schema, elem) {
+                    if !out.contains(&fk) {
+                        out.push(fk);
+                    }
+                    return true;
+                }
+                go(schema, base, out)
+            }
+            TypedExprKind::Method { base, args, .. } => {
+                go(schema, base, out) && args.iter().all(|arg| go(schema, &arg.expr, out))
+            }
+            TypedExprKind::Projection { base, items } => {
+                go(schema, base, out) && items.iter().all(|item| go(schema, &item.value, out))
+            }
+            TypedExprKind::Tuple { elements } | TypedExprKind::Array { elements } => {
+                elements.iter().all(|e| go(schema, e, out))
+            }
+            TypedExprKind::Struct { fields } => fields.iter().all(|(_, e)| go(schema, e, out)),
+            TypedExprKind::Binary { lhs, rhs, .. } => go(schema, lhs, out) && go(schema, rhs, out),
+            TypedExprKind::Unary { expr, .. }
+            | TypedExprKind::Cast { expr, .. }
+            | TypedExprKind::Some { value: expr } => go(schema, expr, out),
+            TypedExprKind::If { arms, default } => {
+                arms.iter()
+                    .all(|(cond, then)| go(schema, cond, out) && go(schema, then, out))
+                    && go(schema, default, out)
+            }
+            TypedExprKind::Literal(_) | TypedExprKind::TypeConstant { .. } => true,
+        }
+    }
+    go(schema, elem, out)
 }
 
 fn go_arg(

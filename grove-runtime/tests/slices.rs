@@ -2496,3 +2496,95 @@ fn slice_query_valued_elements() {
         Value::List(vec![Value::Tuple(vec![Value::Int(1), Value::Int(2)])])
     );
 }
+
+#[test]
+fn slice_query_temp_elements() {
+    let ord = |t: &str| Value::Record(vec![("total".to_string(), Value::Dec(dec(t)))]);
+    assert_eq!(
+        value("users { x = [orders.take(1)] }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![Value::List(vec![ord("10.00")])]))]),
+            rec(&[("x", Value::List(vec![Value::List(vec![ord("30.00")])]))]),
+            rec(&[("x", Value::List(vec![Value::List(vec![])]))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [orders.skip(1)] }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![Value::List(vec![ord("20.00")])]))]),
+            rec(&[("x", Value::List(vec![Value::List(vec![])]))]),
+            rec(&[("x", Value::List(vec![Value::List(vec![])]))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [orders] }"),
+        Value::List(vec![
+            rec(&[(
+                "x",
+                Value::List(vec![Value::List(vec![ord("10.00"), ord("20.00")])]),
+            )]),
+            rec(&[("x", Value::List(vec![Value::List(vec![ord("30.00")])]))]),
+            rec(&[("x", Value::List(vec![Value::List(vec![])]))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [orders.first()] }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![ord("10.00")]))]),
+            rec(&[("x", Value::List(vec![ord("30.00")]))]),
+            rec(&[(
+                "x",
+                Value::List(vec![Value::Record(vec![(
+                    "total".to_string(),
+                    Value::Null,
+                )])]),
+            )]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [orders.nth(0)] }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![ord("10.00")]))]),
+            rec(&[("x", Value::List(vec![ord("30.00")]))]),
+            rec(&[(
+                "x",
+                Value::List(vec![Value::Record(vec![(
+                    "total".to_string(),
+                    Value::Null,
+                )])]),
+            )]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [(orders.first()?.total)] }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![Value::Dec(dec("10.00"))]))]),
+            rec(&[("x", Value::List(vec![Value::Dec(dec("30.00"))]))]),
+            rec(&[("x", Value::List(vec![Value::Null]))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [users.first()] }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![value("users.first()")]))]),
+            rec(&[("x", Value::List(vec![value("users.first()")]))]),
+            rec(&[("x", Value::List(vec![value("users.first()")]))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [configs.take(1)] }"),
+        Value::List(vec![
+            rec(&[("x", value("[configs.take(1)]"))]),
+            rec(&[("x", value("[configs.take(1)]"))]),
+            rec(&[("x", value("[configs.take(1)]"))]),
+        ])
+    );
+    let mut rt = fixture();
+    let err = rt
+        .execute_value(&compile_q("users { x = [orders.take(-1)] }"))
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("take requires a non-negative integer")
+    );
+}
