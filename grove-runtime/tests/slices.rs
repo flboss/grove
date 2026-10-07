@@ -2206,11 +2206,45 @@ fn slice_scalar_first_storage() {
         ])
     );
     assert_eq!(
-        value("users { c = scores.nth(1) }"),
+        value("users { x = [age, age + 1].nth(age - 30) }"),
         Value::List(vec![
-            rec(&[("c", Value::Int(7))]),
-            rec(&[("c", Value::Null)]),
-            rec(&[("c", Value::Null)]),
+            rec(&[("x", Value::Int(30))]),
+            rec(&[("x", Value::Null)]),
+            rec(&[("x", Value::Null)]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [if true {(1, 2)} else {(3, 4)}] }"),
+        Value::List(vec![
+            rec(&[(
+                "x",
+                Value::List(vec![Value::Tuple(vec![Value::Int(1), Value::Int(2)])]),
+            )]),
+            rec(&[(
+                "x",
+                Value::List(vec![Value::Tuple(vec![Value::Int(1), Value::Int(2)])]),
+            )]),
+            rec(&[(
+                "x",
+                Value::List(vec![Value::Tuple(vec![Value::Int(1), Value::Int(2)])]),
+            )]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [if active {(age, 1)} else {(0, 0)}] }"),
+        Value::List(vec![
+            rec(&[(
+                "x",
+                Value::List(vec![Value::Tuple(vec![Value::Int(30), Value::Int(1)])]),
+            )]),
+            rec(&[(
+                "x",
+                Value::List(vec![Value::Tuple(vec![Value::Int(0), Value::Int(0)])]),
+            )]),
+            rec(&[(
+                "x",
+                Value::List(vec![Value::Tuple(vec![Value::Int(50), Value::Int(1)])]),
+            )]),
         ])
     );
 }

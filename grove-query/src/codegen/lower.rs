@@ -8850,6 +8850,17 @@ fn null_cells(ty: &QueryType, out: &mut Vec<(SqlExpr, Option<ScalarType>)>) {
     }
 }
 
+fn if_branch_distributable(node: &TypedExpr) -> bool {
+    match &peel_some(node).kind {
+        TypedExprKind::If { arms, default } => {
+            arms.iter().all(|(_, then)| if_branch_distributable(then))
+                && if_branch_distributable(default)
+        }
+        TypedExprKind::Tuple { .. } => true,
+        _ => false,
+    }
+}
+
 fn temp_array_cell(
     ctx: &mut Context,
     ty: &QueryType,
@@ -8860,14 +8871,48 @@ fn temp_array_cell(
     match peel_optional(ty) {
         QueryType::Scalar(s) => out.push((scalar(ctx, node), Some(*s))),
         QueryType::Tuple(tys) => {
-            let TypedExprKind::Tuple { elements } = &node.kind else {
+            if let TypedExprKind::Tuple { elements } = &node.kind {
+                if elements.len() != tys.len() {
+                    unreachable!("tuple arity drift: the checker unifies tuple arity");
+                }
+                for (t, e) in tys.iter().zip(elements.iter()) {
+                    temp_array_cell(ctx, t, e, out);
+                }
+                return;
+            }
+            let TypedExprKind::If { arms, default } = &node.kind else {
                 todo!("M6 correlated literal projection item");
             };
-            if elements.len() != tys.len() {
-                unreachable!("tuple arity drift: the checker unifies tuple arity");
+            if !arms.iter().all(|(_, then)| if_branch_distributable(then))
+                || !if_branch_distributable(default)
+            {
+                todo!("M6 correlated literal projection item");
             }
-            for (t, e) in tys.iter().zip(elements.iter()) {
-                temp_array_cell(ctx, t, e, out);
+            for (i, t) in tys.iter().enumerate() {
+                let Some(pty) = scalar_of(t) else {
+                    todo!("M6 correlated literal projection item");
+                };
+                let mut case_arms = Vec::with_capacity(arms.len());
+                for (cond, then) in arms.iter() {
+                    let mut then_cells = Vec::new();
+                    temp_array_cell(ctx, ty, then, &mut then_cells);
+                    if then_cells.len() != tys.len() {
+                        todo!("M6 correlated literal projection item");
+                    }
+                    case_arms.push((scalar(ctx, cond), then_cells[i].0.clone()));
+                }
+                let mut else_cells = Vec::new();
+                temp_array_cell(ctx, ty, default, &mut else_cells);
+                if else_cells.len() != tys.len() {
+                    todo!("M6 correlated literal projection item");
+                }
+                out.push((
+                    SqlExpr::Case {
+                        arms: case_arms,
+                        else_: Box::new(else_cells[i].0.clone()),
+                    },
+                    Some(pty),
+                ));
             }
         }
         QueryType::Record(RecordSource::Projection(fields)) => {
@@ -15990,6 +16035,43 @@ fn leaf_computed_cells(
                 .zip(tys.iter())
                 .map(|(e, ty)| (scalar(ctx, e), scalar_of(ty)))
                 .collect(),
+            TypedExprKind::If { arms, default } => {
+                if has_scope_ident(node) || uses_outer(node) {
+                    todo!("M6 computed array elements");
+                }
+                if !arms.iter().all(|(_, then)| if_branch_distributable(then))
+                    || !if_branch_distributable(default)
+                {
+                    todo!("M6 computed array elements");
+                }
+                tys.iter()
+                    .enumerate()
+                    .map(|(i, t)| {
+                        let Some(pty) = scalar_of(t) else {
+                            todo!("M6 computed array elements");
+                        };
+                        let mut case_arms = Vec::with_capacity(arms.len());
+                        for (cond, then) in arms.iter() {
+                            let then_cells = leaf_computed_cells(ctx, then, inner);
+                            if then_cells.len() != tys.len() {
+                                todo!("M6 computed array elements");
+                            }
+                            case_arms.push((scalar(ctx, cond), then_cells[i].0.clone()));
+                        }
+                        let else_cells = leaf_computed_cells(ctx, default, inner);
+                        if else_cells.len() != tys.len() {
+                            todo!("M6 computed array elements");
+                        }
+                        (
+                            SqlExpr::Case {
+                                arms: case_arms,
+                                else_: Box::new(else_cells[i].0.clone()),
+                            },
+                            Some(pty),
+                        )
+                    })
+                    .collect()
+            }
             _ => todo!("M6 computed array elements"),
         },
         _ => vec![(scalar(ctx, node), scalar_of(inner))],
