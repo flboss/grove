@@ -2017,6 +2017,22 @@ fn slice_take_prefixed_collapse() {
             rec(&[("o", Value::Null)]),
         ])
     );
+    assert_eq!(
+        value("users { o = orders.sort(age).first() }"),
+        Value::List(vec![
+            rec(&[("o", rec(&[("total", n("10"))]))]),
+            rec(&[("o", rec(&[("total", n("30"))]))]),
+            rec(&[("o", Value::Null)]),
+        ])
+    );
+    assert_eq!(
+        value("users { t = orders.sort(age).first()?.total }"),
+        Value::List(vec![
+            rec(&[("t", n("10"))]),
+            rec(&[("t", n("30"))]),
+            rec(&[("t", Value::Null)]),
+        ])
+    );
 }
 
 #[test]

@@ -7733,7 +7733,7 @@ fn take_temp_row_collapse(
     if !matches!(&base.ty, QueryType::List(_)) {
         return None;
     }
-    if !take_bound_ident(base) {
+    if !take_bound_ident(base) && !sort_key_uses_outer(base) {
         return None;
     }
     let scope = begin_take_temp(ctx, base)?;
@@ -8191,6 +8191,9 @@ fn scalar_temp_take_agg(
     let QueryType::List(_) = &base.ty else {
         return None;
     };
+    if !take_bound_ident(base) {
+        return None;
+    }
     let Some(scope) = begin_take_temp(ctx, base) else {
         return None;
     };
@@ -8385,9 +8388,6 @@ fn begin_take_temp(ctx: &mut Context, base: &TypedExpr) -> Option<TakeTempScope>
     if ctx.nest_depth >= 1 {
         return None;
     }
-    if !take_bound_ident(base) {
-        return None;
-    }
     let fid = match tail_root_ident(base) {
         Some(IdentBinding::Field(fid)) => *fid,
         _ => return None,
@@ -8489,6 +8489,9 @@ fn scalar_temp_take_single(
         },
     };
     if tail_has_offset(base) {
+        return None;
+    }
+    if !take_bound_ident(base) && !sort_key_uses_outer(base) {
         return None;
     }
     let scope = begin_take_temp(ctx, base)?;
@@ -11018,6 +11021,20 @@ fn take_bound_ident(tail: &TypedExpr) -> bool {
         TypedExprKind::Ident { .. }
         | TypedExprKind::Literal(_)
         | TypedExprKind::TypeConstant { .. } => false,
+    }
+}
+
+fn sort_key_uses_outer(tail: &TypedExpr) -> bool {
+    match &tail.kind {
+        TypedExprKind::Method {
+            base, name, args, ..
+        } if ["sort", "sort_asc", "sort_desc"].contains(&name.value.as_str()) => {
+            args.iter().any(|a| uses_outer(&a.expr)) || sort_key_uses_outer(base)
+        }
+        TypedExprKind::Method { base, .. }
+        | TypedExprKind::Field { base, .. }
+        | TypedExprKind::Projection { base, .. } => sort_key_uses_outer(base),
+        _ => false,
     }
 }
 
