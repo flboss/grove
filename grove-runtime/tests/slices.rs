@@ -1857,6 +1857,30 @@ fn slice_over_collection_nested() {
             rec(&[("a", Value::Null)]),
         ])
     );
+    assert_eq!(
+        value("users { s = orders.sum_over(manager.orders.take(1).len()) }"),
+        Value::List(vec![
+            rec(&[("s", Value::Int(2))]),
+            rec(&[("s", Value::Int(1))]),
+            rec(&[("s", Value::Null)]),
+        ])
+    );
+    assert_eq!(
+        value("users { s = orders.sum_over(manager.orders.skip(1).len()) }"),
+        Value::List(vec![
+            rec(&[("s", Value::Int(0))]),
+            rec(&[("s", Value::Int(0))]),
+            rec(&[("s", Value::Null)]),
+        ])
+    );
+    assert_eq!(
+        value("users { s = orders.sum_over(manager.manager.orders.len()) }"),
+        Value::List(vec![
+            rec(&[("s", Value::Int(2))]),
+            rec(&[("s", Value::Int(1))]),
+            rec(&[("s", Value::Null)]),
+        ])
+    );
 }
 
 #[test]

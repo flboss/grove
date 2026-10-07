@@ -11537,17 +11537,7 @@ fn over_arg_agg(
         ));
     }
     for (j, subtree) in skipped.iter().enumerate() {
-        let parent_table = ctx.schema.tables
-            [ctx.schema.structs[fid.struct_id().index()].table.index()]
-        .name
-        .clone();
-        let Some(shell) = collection_chain_shell(
-            ctx,
-            subtree,
-            &link.child_col,
-            &parent_table,
-            &link.parent_col,
-        ) else {
+        let Some(shell) = collection_chain_shell(ctx, subtree, &link.child_col) else {
             todo!("M4b scoped navigation");
         };
         shells.push((format!("$$overlex{j}"), shell));
@@ -11556,8 +11546,6 @@ fn over_arg_agg(
         ctx: &mut Context,
         subtree: &TypedExpr,
         base_fk: &str,
-        parent_table: &str,
-        parent_pk: &str,
     ) -> Option<SqlExpr> {
         let TypedExprKind::Method {
             base: coll, name, ..
@@ -11568,16 +11556,39 @@ fn over_arg_agg(
         if name.value != "len" {
             return None;
         }
+        let mut tails: Vec<(&str, &[TypedMethodArg])> = Vec::new();
+        let mut coll = coll;
+        while let TypedExprKind::Method {
+            base: inner,
+            name: tail_name,
+            args: tail_args,
+            optional: tail_optional,
+        } = &coll.kind
+        {
+            if *tail_optional || !["take", "skip"].contains(&tail_name.value.as_str()) {
+                break;
+            }
+            if tail_args.iter().any(|a| has_scope_ident(&a.expr)) {
+                return None;
+            }
+            tails.push((tail_name.value.as_str(), tail_args.as_slice()));
+            coll = inner;
+        }
         enum CollRoot {
             Nav {
                 target: StructId,
                 coll_fid: FieldId,
-                prefix_fk: String,
+                hops: Vec<PrefixHop>,
             },
             Bare {
                 owner: StructId,
                 coll_fid: FieldId,
             },
+        }
+        struct PrefixHop {
+            table: String,
+            pk: String,
+            fk: String,
         }
         let root = match &coll.kind {
             TypedExprKind::Field {
@@ -11585,36 +11596,95 @@ fn over_arg_agg(
                 name: coll_name,
                 ..
             } => {
-                let TypedExprKind::Ident {
-                    binding: IdentBinding::Field(prefix_fid),
-                    depth: prefix_depth,
-                    ..
-                } = &prefix.kind
-                else {
-                    return None;
+                let mut names: Vec<&grove_types::Spanned<String>> = Vec::new();
+                let mut node = prefix.as_ref();
+                let prefix_fid = loop {
+                    match &node.kind {
+                        TypedExprKind::Field { base, name, .. } => {
+                            names.push(name);
+                            node = base;
+                        }
+                        TypedExprKind::Ident {
+                            binding: IdentBinding::Field(fid),
+                            depth,
+                            ..
+                        } => {
+                            if *depth != 1 {
+                                return None;
+                            }
+                            break *fid;
+                        }
+                        _ => return None,
+                    }
                 };
-                if *prefix_depth != 1 {
-                    return None;
-                }
-                let prefix_field =
-                    &ctx.schema.structs[prefix_fid.struct_id().index()].fields[prefix_fid.local()];
-                let (prefix_target, prefix_fk) = match prefix_field {
+                let mut hops: Vec<PrefixHop> = Vec::new();
+                let mut target = match &ctx.schema.structs[prefix_fid.struct_id().index()].fields
+                    [prefix_fid.local()]
+                {
                     Field::Ref {
                         target,
                         optional: _,
                         is_list: false,
                         ..
-                    } => match link_cols(ctx.schema, *prefix_fid) {
-                        LinkCols::ParentFk { parent_fk, .. } => (*target, parent_fk),
+                    } => match link_cols(ctx.schema, prefix_fid) {
+                        LinkCols::ParentFk {
+                            parent_fk,
+                            child_pk,
+                        } => {
+                            let table = ctx.schema.tables[ctx.schema.structs
+                                [prefix_fid.struct_id().index()]
+                            .table
+                            .index()]
+                            .name
+                            .clone();
+                            let target = *target;
+                            hops.push(PrefixHop {
+                                table,
+                                pk: child_pk,
+                                fk: parent_fk,
+                            });
+                            target
+                        }
                         _ => return None,
                     },
                     _ => return None,
                 };
-                let (coll_fid, _) = ctx.schema.struct_field(prefix_target, &coll_name.value)?;
+                for name in names.iter().rev() {
+                    let (next_fid, _) = ctx.schema.struct_field(target, &name.value)?;
+                    target = match &ctx.schema.structs[target.index()].fields[next_fid.local()] {
+                        Field::Ref {
+                            target: next,
+                            optional: _,
+                            is_list: false,
+                            ..
+                        } => match link_cols(ctx.schema, next_fid) {
+                            LinkCols::ParentFk {
+                                parent_fk,
+                                child_pk,
+                            } => {
+                                let table = ctx.schema.tables[ctx.schema.structs
+                                    [next_fid.struct_id().index()]
+                                .table
+                                .index()]
+                                .name
+                                .clone();
+                                hops.push(PrefixHop {
+                                    table,
+                                    pk: child_pk,
+                                    fk: parent_fk,
+                                });
+                                *next
+                            }
+                            _ => return None,
+                        },
+                        _ => return None,
+                    };
+                }
+                let (coll_fid, _) = ctx.schema.struct_field(target, &coll_name.value)?;
                 CollRoot::Nav {
-                    target: prefix_target,
+                    target,
                     coll_fid,
-                    prefix_fk,
+                    hops,
                 }
             }
             TypedExprKind::Ident {
@@ -11636,8 +11706,8 @@ fn over_arg_agg(
             CollRoot::Nav {
                 target,
                 coll_fid,
-                prefix_fk,
-            } => (target, coll_fid, Some(prefix_fk)),
+                hops,
+            } => (target, coll_fid, Some(hops)),
             CollRoot::Bare { owner, coll_fid } => (owner, coll_fid, None),
         };
         let (ctable, clink) = match &ctx.schema.structs[owner.index()].fields[coll_fid.local()] {
@@ -11666,73 +11736,86 @@ fn over_arg_agg(
             ),
             _ => return None,
         };
-        let calias = ctx.aliases.table(&ctable);
-        let mut shell = SelectBuilder::new();
-        shell.from = Some(FromClause::Table {
-            table: ctable.clone(),
-            alias: calias,
-        });
-        shell.select = vec![SelectItem::Expr {
-            expr: SqlExpr::Count,
-            output: ctx.aliases.generic(),
-            ty: None,
-        }];
+        let extra: usize = usize::from(!tails.is_empty());
         let link_rhs = match prefix {
-            Some(prefix_fk) => {
-                let fk_sub = SelectBuilder {
-                    select: vec![SelectItem::Column {
-                        depth: 0,
-                        column: prefix_fk.clone(),
-                        output: prefix_fk,
-                        ty: None,
-                    }],
-                    from: Some(FromClause::Table {
-                        table: parent_table.to_string(),
-                        alias: ctx.aliases.table(parent_table),
-                    }),
-                    where_: vec![SqlExpr::Binary {
-                        op: SqlBinOp::Eq,
-                        lhs: Box::new(SqlExpr::Column {
-                            depth: 0,
-                            column: parent_pk.to_string(),
-                        }),
-                        rhs: Box::new(SqlExpr::Column {
-                            depth: 2,
-                            column: base_fk.to_string(),
-                        }),
-                    }],
-                    order_by: Vec::new(),
-                    limit: None,
-                    offset: None,
-                    unions: Vec::new(),
+            Some(hops) => {
+                let mut inner = SqlExpr::Column {
+                    depth: hops.len() + extra + 1,
+                    column: base_fk.to_string(),
                 };
-                SqlExpr::Subquery {
-                    query: Box::new(fk_sub),
+                for hop in hops.iter() {
+                    let hop_sub = SelectBuilder {
+                        select: vec![SelectItem::Column {
+                            depth: 0,
+                            column: hop.fk.clone(),
+                            output: hop.fk.clone(),
+                            ty: None,
+                        }],
+                        from: Some(FromClause::Table {
+                            table: hop.table.clone(),
+                            alias: ctx.aliases.table(&hop.table),
+                        }),
+                        where_: vec![SqlExpr::Binary {
+                            op: SqlBinOp::Eq,
+                            lhs: Box::new(SqlExpr::Column {
+                                depth: 0,
+                                column: hop.pk.clone(),
+                            }),
+                            rhs: Box::new(inner),
+                        }],
+                        order_by: Vec::new(),
+                        limit: None,
+                        offset: None,
+                        unions: Vec::new(),
+                    };
+                    inner = SqlExpr::Subquery {
+                        query: Box::new(hop_sub),
+                    };
                 }
+                inner
             }
             None => SqlExpr::Column {
-                depth: 1,
+                depth: 1 + extra,
                 column: base_fk.to_string(),
             },
         };
         let calias = ctx.aliases.table(&ctable);
-        let mut shell = SelectBuilder::new();
-        shell.from = Some(FromClause::Table {
+        let mut inner = SelectBuilder::new();
+        inner.from = Some(FromClause::Table {
             table: ctable,
             alias: calias,
         });
-        shell.select = vec![SelectItem::Expr {
-            expr: SqlExpr::Count,
-            output: ctx.aliases.generic(),
-            ty: None,
-        }];
-        shell.where_ = vec![SqlExpr::Binary {
+        inner.select = vec![SelectItem::AllFrom { depth: 0 }];
+        inner.where_ = vec![SqlExpr::Binary {
             op: SqlBinOp::Eq,
             lhs: Box::new(SqlExpr::Column {
                 depth: 0,
                 column: clink,
             }),
             rhs: Box::new(link_rhs),
+        }];
+        if tails.is_empty() {
+            inner.select = vec![SelectItem::Expr {
+                expr: SqlExpr::Count,
+                output: ctx.aliases.generic(),
+                ty: None,
+            }];
+            return Some(SqlExpr::Subquery {
+                query: Box::new(inner),
+            });
+        }
+        for (method, args) in tails.iter().rev() {
+            compose_limit_inner(&mut inner, method, args, ctx);
+        }
+        let mut shell = SelectBuilder::new();
+        shell.from = Some(FromClause::Subquery {
+            query: Box::new(inner),
+            alias: ctx.aliases.subquery(),
+        });
+        shell.select = vec![SelectItem::Expr {
+            expr: SqlExpr::Count,
+            output: ctx.aliases.generic(),
+            ty: None,
         }];
         Some(SqlExpr::Subquery {
             query: Box::new(shell),
