@@ -1881,6 +1881,22 @@ fn slice_over_collection_nested() {
             rec(&[("s", Value::Null)]),
         ])
     );
+    assert_eq!(
+        value("users { s = orders.take(age).sum_over(manager.orders.len()) }"),
+        Value::List(vec![
+            rec(&[("s", Value::Int(2))]),
+            rec(&[("s", Value::Int(1))]),
+            rec(&[("s", Value::Null)]),
+        ])
+    );
+    assert_eq!(
+        value("users { s = orders.take(age).sum_over(tags.len()) }"),
+        Value::List(vec![
+            rec(&[("s", Value::Int(4))]),
+            rec(&[("s", Value::Int(1))]),
+            rec(&[("s", Value::Null)]),
+        ])
+    );
 }
 
 #[test]

@@ -29,6 +29,7 @@ pub struct Context<'s> {
     pub child: Option<ChildCtx>,
     pub nest_depth: usize,
     pub temp_collect: Option<TempCollect>,
+    pub in_take_temp: bool,
     pub in_array_temp: bool,
     nav_carries: Vec<(String, NavCarry)>,
     take_temp_alias: Option<(*const TypedExpr, SqlExpr)>,
@@ -85,6 +86,7 @@ impl<'s> Context<'s> {
             child: None,
             nest_depth: 0,
             temp_collect: None,
+            in_take_temp: false,
             in_array_temp: false,
             nav_carries: Vec::new(),
             take_temp_alias: None,
@@ -8304,6 +8306,7 @@ fn begin_take_temp(ctx: &mut Context, base: &TypedExpr) -> Option<TakeTempScope>
         child_fk,
         refs: Vec::new(),
     });
+    ctx.in_take_temp = true;
     Some(TakeTempScope { temp, key_col })
 }
 
@@ -8313,6 +8316,7 @@ fn finish_take_temp(ctx: &mut Context, parent: &mut Level, scope: TakeTempScope)
         .take()
         .unwrap_or_else(|| unreachable!("take temp vanished mid-lowering"))
         .refs;
+    ctx.in_take_temp = false;
     freeze_parent_temp(ctx, parent, &scope.temp, &scope.key_col, &refs, &[]);
 }
 
@@ -11493,9 +11497,11 @@ fn over_arg_agg(
         _ => unreachable!("summable scoped arg is scalar: the checker enforces it"),
     };
     let lexical_ok = ctx.child.is_none() && ctx.temp_collect.is_none() && agg_simple_base(base);
+    let temp_shell_ok =
+        ctx.in_take_temp && !ctx.in_array_temp && agg_simple_base(base) && take_bound_ident(base);
     let mut skipped: Vec<TypedExpr> = Vec::new();
     let owned;
-    let arg = if lexical_ok {
+    let arg = if lexical_ok || temp_shell_ok {
         owned = splice_lexical_collections(arg, &mut skipped);
         &owned
     } else {
@@ -11525,7 +11531,12 @@ fn over_arg_agg(
         if ctx.in_array_temp {
             todo!("M4b scoped navigation");
         }
-        return (ty, scalar(ctx, arg));
+        if skipped.is_empty() {
+            return (ty, scalar(ctx, arg));
+        }
+        if !ctx.in_take_temp {
+            todo!("M4b scoped navigation");
+        }
     }
     let link = resolve_tail_link(ctx, fid);
     let mut shells: Vec<(String, SqlExpr)> = Vec::new();
@@ -11841,7 +11852,7 @@ fn splice_lexical_collections(expr: &TypedExpr, skipped: &mut Vec<TypedExpr>) ->
                     span: expr.span,
                 },
                 binding: IdentBinding::ProjectedField { name: marker },
-                depth: 1,
+                depth: 0,
             },
             ty: expr.ty.clone(),
             span: expr.span,
@@ -12130,7 +12141,7 @@ fn subst_over_markers_at(expr: &TypedExpr, chains: &[Vec<usize>], path: &[usize]
                     span: expr.span,
                 },
                 binding: IdentBinding::ProjectedField { name: marker },
-                depth: 1,
+                depth: 0,
             },
             ty: expr.ty.clone(),
             span: expr.span,
