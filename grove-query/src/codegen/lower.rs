@@ -7613,7 +7613,10 @@ fn build_capped_level(
             );
         }
         CollapseKind::Nth(arg) => {
-            conjoin_window_bound(&mut child.builder, "nth", collapse_index(ctx, arg));
+            let was_take = std::mem::replace(&mut ctx.in_take_arg, temp.is_some());
+            let index = collapse_index(ctx, arg);
+            ctx.in_take_arg = was_take;
+            conjoin_window_bound(&mut child.builder, "nth", index);
         }
     }
     (child, parent_key, child_col)
@@ -7723,27 +7726,11 @@ fn take_temp_row_collapse(
         let [arg] = args.as_slice() else {
             return None;
         };
-        match &arg.expr.kind {
-            TypedExprKind::Literal(lit) if matches!(&lit.value, Literal::Int(_)) => {
-                CollapseKind::Nth(&arg.expr)
-            }
-            _ => return None,
-        }
+        CollapseKind::Nth(&arg.expr)
     } else {
         return None;
     };
     if !matches!(&base.ty, QueryType::List(_)) {
-        return None;
-    }
-    let TypedExprKind::Method {
-        name: tail_name,
-        optional: tail_optional,
-        ..
-    } = &base.kind
-    else {
-        return None;
-    };
-    if *tail_optional || !["take", "skip"].contains(&tail_name.value.as_str()) {
         return None;
     }
     if !take_bound_ident(base) {

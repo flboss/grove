@@ -1993,6 +1993,30 @@ fn slice_take_prefixed_collapse() {
             rec(&[("o", Value::Null)]),
         ])
     );
+    assert_eq!(
+        value("users { o = orders.take(age).nth(age - 29) }"),
+        Value::List(vec![
+            rec(&[("o", rec(&[("total", n("20"))]))]),
+            rec(&[("o", Value::Null)]),
+            rec(&[("o", Value::Null)]),
+        ])
+    );
+    assert_eq!(
+        value("users { o = orders.take(age).skip(1).first() }"),
+        Value::List(vec![
+            rec(&[("o", rec(&[("total", n("20"))]))]),
+            rec(&[("o", Value::Null)]),
+            rec(&[("o", Value::Null)]),
+        ])
+    );
+    assert_eq!(
+        value("users { o = orders.take(age).filter(age > 30).first() }"),
+        Value::List(vec![
+            rec(&[("o", Value::Null)]),
+            rec(&[("o", rec(&[("total", n("30"))]))]),
+            rec(&[("o", Value::Null)]),
+        ])
+    );
 }
 
 #[test]
