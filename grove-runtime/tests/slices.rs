@@ -2498,6 +2498,142 @@ fn slice_query_valued_elements() {
 }
 
 #[test]
+fn slice_multi_list_fork() {
+    let ab = |a: Value, b: Value| {
+        Value::List(vec![rec(&[
+            ("a", Value::List(vec![a])),
+            ("b", Value::List(vec![b])),
+        ])])
+    };
+    assert_eq!(
+        value("users { x = [{a = [age], b = [1]}] }"),
+        Value::List(vec![
+            rec(&[("x", ab(Value::Int(30), Value::Int(1)))]),
+            rec(&[("x", ab(Value::Int(40), Value::Int(1)))]),
+            rec(&[("x", ab(Value::Int(50), Value::Int(1)))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [([age], [1])] }"),
+        Value::List(vec![
+            rec(&[(
+                "x",
+                Value::List(vec![Value::Tuple(vec![
+                    Value::List(vec![Value::Int(30)]),
+                    Value::List(vec![Value::Int(1)]),
+                ])]),
+            )]),
+            rec(&[(
+                "x",
+                Value::List(vec![Value::Tuple(vec![
+                    Value::List(vec![Value::Int(40)]),
+                    Value::List(vec![Value::Int(1)]),
+                ])]),
+            )]),
+            rec(&[(
+                "x",
+                Value::List(vec![Value::Tuple(vec![
+                    Value::List(vec![Value::Int(50)]),
+                    Value::List(vec![Value::Int(1)]),
+                ])]),
+            )]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [{n = name, a = [age], b = [1]}] }"),
+        Value::List(vec![
+            rec(&[(
+                "x",
+                Value::List(vec![rec(&[
+                    ("n", s("Ada")),
+                    ("a", Value::List(vec![Value::Int(30)])),
+                    ("b", Value::List(vec![Value::Int(1)])),
+                ])]),
+            )]),
+            rec(&[(
+                "x",
+                Value::List(vec![rec(&[
+                    ("n", s("Bob")),
+                    ("a", Value::List(vec![Value::Int(40)])),
+                    ("b", Value::List(vec![Value::Int(1)])),
+                ])]),
+            )]),
+            rec(&[(
+                "x",
+                Value::List(vec![rec(&[
+                    ("n", s("Cyd")),
+                    ("a", Value::List(vec![Value::Int(50)])),
+                    ("b", Value::List(vec![Value::Int(1)])),
+                ])]),
+            )]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [{a = [age], b = [age], c = [1]}] }"),
+        Value::List(vec![
+            rec(&[(
+                "x",
+                Value::List(vec![rec(&[
+                    ("a", Value::List(vec![Value::Int(30)])),
+                    ("b", Value::List(vec![Value::Int(30)])),
+                    ("c", Value::List(vec![Value::Int(1)])),
+                ])]),
+            )]),
+            rec(&[(
+                "x",
+                Value::List(vec![rec(&[
+                    ("a", Value::List(vec![Value::Int(40)])),
+                    ("b", Value::List(vec![Value::Int(40)])),
+                    ("c", Value::List(vec![Value::Int(1)])),
+                ])]),
+            )]),
+            rec(&[(
+                "x",
+                Value::List(vec![rec(&[
+                    ("a", Value::List(vec![Value::Int(50)])),
+                    ("b", Value::List(vec![Value::Int(50)])),
+                    ("c", Value::List(vec![Value::Int(1)])),
+                ])]),
+            )]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [{a = [[age]], b = [1]}] }"),
+        Value::List(vec![
+            rec(&[(
+                "x",
+                Value::List(vec![rec(&[
+                    ("a", Value::List(vec![Value::List(vec![Value::Int(30)])])),
+                    ("b", Value::List(vec![Value::Int(1)])),
+                ])]),
+            )]),
+            rec(&[(
+                "x",
+                Value::List(vec![rec(&[
+                    ("a", Value::List(vec![Value::List(vec![Value::Int(40)])])),
+                    ("b", Value::List(vec![Value::Int(1)])),
+                ])]),
+            )]),
+            rec(&[(
+                "x",
+                Value::List(vec![rec(&[
+                    ("a", Value::List(vec![Value::List(vec![Value::Int(50)])])),
+                    ("b", Value::List(vec![Value::Int(1)])),
+                ])]),
+            )]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [{a = [age], b = [1]}].take(1) }"),
+        Value::List(vec![
+            rec(&[("x", ab(Value::Int(30), Value::Int(1)))]),
+            rec(&[("x", ab(Value::Int(40), Value::Int(1)))]),
+            rec(&[("x", ab(Value::Int(50), Value::Int(1)))]),
+        ])
+    );
+}
+
+#[test]
 fn slice_query_temp_elements() {
     let ord = |t: &str| Value::Record(vec![("total".to_string(), Value::Dec(dec(t)))]);
     assert_eq!(

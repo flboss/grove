@@ -9000,12 +9000,41 @@ fn branch_plan(ty: &QueryType, next_col: &mut usize) -> BranchPlan {
     }
 }
 
-fn branch_nested_count(plan: &BranchPlan) -> usize {
+fn branch_nested_subs(plan: &BranchPlan, out: &mut Vec<QueryType>) {
     match plan {
-        BranchPlan::Value { .. } => 0,
-        BranchPlan::Nested { .. } => 1,
-        BranchPlan::Tuple(ps) => ps.iter().map(branch_nested_count).sum(),
-        BranchPlan::Record(fs) => fs.iter().map(|(_, p)| branch_nested_count(p)).sum(),
+        BranchPlan::Value { .. } => {}
+        BranchPlan::Nested { sub } => out.push(sub.clone()),
+        BranchPlan::Tuple(ps) => ps.iter().for_each(|p| branch_nested_subs(p, out)),
+        BranchPlan::Record(fs) => fs.iter().for_each(|(_, p)| branch_nested_subs(p, out)),
+    }
+}
+
+fn mask_branch_slot(plan: &BranchPlan, slot: usize, seen: &mut usize) -> BranchPlan {
+    match plan {
+        BranchPlan::Value { col, ty } => BranchPlan::Value {
+            col: col.clone(),
+            ty: *ty,
+        },
+        BranchPlan::Nested { sub } => {
+            let keep = *seen == slot;
+            *seen += 1;
+            if keep {
+                BranchPlan::Nested { sub: sub.clone() }
+            } else {
+                BranchPlan::Value {
+                    col: String::new(),
+                    ty: ScalarType::Int,
+                }
+            }
+        }
+        BranchPlan::Tuple(ps) => {
+            BranchPlan::Tuple(ps.iter().map(|p| mask_branch_slot(p, slot, seen)).collect())
+        }
+        BranchPlan::Record(fs) => BranchPlan::Record(
+            fs.iter()
+                .map(|(name, p)| (name.clone(), mask_branch_slot(p, slot, seen)))
+                .collect(),
+        ),
     }
 }
 
@@ -9424,9 +9453,6 @@ fn temp_array_level<'a>(
     }
     let mut next_col = 2usize;
     let plan = branch_plan(elem_ty, &mut next_col);
-    if branch_nested_count(&plan) > 1 {
-        todo!("M6 multi-list correlated {}", branch_kind(&plan));
-    }
     let mut value_cols = Vec::new();
     branch_value_cols(&plan, &mut value_cols);
     let (arms, sub_items) = temp_branch_arms(ctx, temp, refs, &plan, &value_cols, &items);
@@ -9435,11 +9461,41 @@ fn temp_array_level<'a>(
         union = apply_entry_method(ctx, m, union, elem_ty);
     }
     let (next_temp, next_idx) = sink_arm_temp(ctx, union);
-    let sub = branch_nested_sub(&plan)
-        .unwrap_or_else(|| unreachable!("branch without nested slot: multi-list is gated upfront"));
-    let (sub_element, sub_child) =
-        temp_array_level(ctx, &next_temp, next_idx, refs, &sub, sub_items, Vec::new());
-    let element = shape_branch_plan(&plan, Some((&sub_element, &sub_child)));
+    let mut subs = Vec::new();
+    branch_nested_subs(&plan, &mut subs);
+    if subs.len() == 1 {
+        let sub = subs
+            .pop()
+            .unwrap_or_else(|| unreachable!("single nested sub collected above"));
+        let (sub_element, sub_child) =
+            temp_array_level(ctx, &next_temp, next_idx, refs, &sub, sub_items, Vec::new());
+        let element = shape_branch_plan(&plan, Some((&sub_element, &sub_child)));
+        let child = ChildRef {
+            stmt: next_idx,
+            parent: Some(ParentRef {
+                stmt: temp_idx,
+                parent_key: "$$key".to_string(),
+                child_key: "c0".to_string(),
+                negated: false,
+            }),
+            cardinality: Cardinality::Many,
+            tag: None,
+        };
+        return (element, child);
+    }
+    let mut nested = Vec::with_capacity(subs.len());
+    for (slot, sub) in subs.iter().enumerate() {
+        let masked = mask_branch_slot(&plan, slot, &mut 0);
+        let mut slot_items: Vec<(Option<i64>, &'a TypedExpr)> = Vec::new();
+        for (i, (filter, elem)) in items.iter().enumerate() {
+            let own = items[..i].iter().filter(|(o, _)| *o == *filter).count() as i64;
+            collect_branch_nested(&masked, elem, own, &mut slot_items);
+        }
+        let (sub_element, sub_child) =
+            temp_array_level(ctx, &next_temp, next_idx, refs, sub, slot_items, Vec::new());
+        nested.push((sub_element, sub_child));
+    }
+    let element = shape_branch_plan_fork(&plan, &nested, &mut 0);
     let child = ChildRef {
         stmt: next_idx,
         parent: Some(ParentRef {
@@ -9558,20 +9614,33 @@ fn temp_leaf_level(
     (element, child)
 }
 
-fn branch_nested_sub(plan: &BranchPlan) -> Option<QueryType> {
+fn shape_branch_plan_fork(
+    plan: &BranchPlan,
+    nested: &[(ResultShape, ChildRef)],
+    next: &mut usize,
+) -> ResultShape {
     match plan {
-        BranchPlan::Value { .. } => None,
-        BranchPlan::Nested { sub } => Some(sub.clone()),
-        BranchPlan::Tuple(ps) => ps.iter().find_map(branch_nested_sub),
-        BranchPlan::Record(fs) => fs.iter().find_map(|(_, p)| branch_nested_sub(p)),
-    }
-}
-
-fn branch_kind(plan: &BranchPlan) -> &'static str {
-    match plan {
-        BranchPlan::Record(_) => "record",
-        BranchPlan::Tuple(ps) if ps.iter().any(|p| branch_kind(p) == "record") => "record",
-        _ => "tuple",
+        BranchPlan::Value { col, .. } => ResultShape::Column(col.clone()),
+        BranchPlan::Nested { .. } => {
+            let (element, child) = nested.get(*next).unwrap_or_else(|| {
+                unreachable!("fork shape without slot sub-shape: collection walks every slot")
+            });
+            *next += 1;
+            ResultShape::List {
+                element: Box::new(element.clone()),
+                child: child.clone(),
+            }
+        }
+        BranchPlan::Tuple(ps) => ResultShape::Tuple(
+            ps.iter()
+                .map(|p| shape_branch_plan_fork(p, nested, next))
+                .collect(),
+        ),
+        BranchPlan::Record(fs) => ResultShape::Record(
+            fs.iter()
+                .map(|(name, p)| (name.clone(), shape_branch_plan_fork(p, nested, next)))
+                .collect(),
+        ),
     }
 }
 
