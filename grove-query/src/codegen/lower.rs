@@ -11487,6 +11487,19 @@ fn nth_temp_routable(tail: &TypedExpr) -> bool {
     )
 }
 
+fn root_only_refs(expr: &TypedExpr) -> bool {
+    !any_ident(expr, &mut |e| {
+        matches!(&e.kind, TypedExprKind::Ident { .. })
+            && !matches!(
+                &e.kind,
+                TypedExprKind::Ident {
+                    binding: IdentBinding::Root { .. },
+                    ..
+                }
+            )
+    })
+}
+
 fn has_scope_ident(expr: &TypedExpr) -> bool {
     any_ident(expr, &mut |e| {
         matches!(
@@ -15455,7 +15468,7 @@ fn literal_depth(inner: &QueryType) -> usize {
             }
             1
         }
-        QueryType::Record(RecordSource::Schema(_)) => todo!("M6 query-valued array element"),
+        QueryType::Record(RecordSource::Schema(_)) => 1,
         QueryType::Unknown => {
             unreachable!("un-unified literal element: the checker rejects it with AmbiguousType")
         }
@@ -16249,9 +16262,41 @@ fn register_literal_level<'a>(
     if ctx.temp_collect.is_none()
         && items
             .iter()
-            .any(|(elem, _)| has_scope_ident(elem) || uses_outer(elem))
+            .any(|(elem, _)| has_scope_ident(elem) || uses_outer(elem) && !root_only_refs(elem))
     {
         todo!("M6 correlated literal outside temp lane");
+    }
+    if matches!(
+        peel_optional(inner),
+        QueryType::Record(RecordSource::Schema(_))
+    ) {
+        return register_query_element_level(ctx, inner, items);
+    }
+    if matches!(
+        peel_optional(inner),
+        QueryType::List(_) | QueryType::Tuple(_) | QueryType::Record(_)
+    ) && items.iter().any(|(elem, _)| {
+        let kind = &peel_some(elem).kind;
+        !matches!(
+            kind,
+            TypedExprKind::Array { .. }
+                | TypedExprKind::Tuple { .. }
+                | TypedExprKind::Struct { .. }
+                | TypedExprKind::If { .. }
+        ) && !matches!(kind, TypedExprKind::Literal(lit) if matches!(&lit.value, Literal::None))
+    }) {
+        if items.iter().any(|(elem, _)| {
+            matches!(
+                &peel_some(elem).kind,
+                TypedExprKind::Array { .. }
+                    | TypedExprKind::Tuple { .. }
+                    | TypedExprKind::Struct { .. }
+                    | TypedExprKind::If { .. }
+            )
+        }) {
+            todo!("M6 query-valued array element");
+        }
+        return register_query_element_level(ctx, inner, items);
     }
     match peel_optional(inner) {
         QueryType::List(sub) => {
@@ -16445,6 +16490,265 @@ fn register_literal_level<'a>(
             }]
         }
     }
+}
+
+fn register_query_element_level(
+    ctx: &mut Context,
+    inner: &QueryType,
+    items: Vec<(&TypedExpr, Option<i64>)>,
+) -> Vec<LitLevel> {
+    if ctx.temp_collect.is_some() || ctx.child.is_some() || ctx.nest_depth >= 1 {
+        todo!("M6 query-valued array element");
+    }
+    struct Arm {
+        ordinal: i64,
+        builder: Option<SelectBuilder>,
+    }
+    let mut arms: Vec<Arm> = Vec::with_capacity(items.len());
+    for (i, (elem, _)) in items.iter().enumerate() {
+        let node = peel_some(elem);
+        if let TypedExprKind::Literal(lit) = &node.kind
+            && matches!(&lit.value, Literal::None)
+        {
+            arms.push(Arm {
+                ordinal: i as i64,
+                builder: None,
+            });
+            continue;
+        }
+        if !root_only_refs(elem) {
+            todo!("M6 query-valued array element");
+        }
+        let level = rows(ctx, elem);
+        if level.pending.is_some() {
+            todo!("M6 query-valued array element");
+        }
+        let mut builder = level.builder;
+        if builder.select.is_empty() {
+            builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+        }
+        arms.push(Arm {
+            ordinal: i as i64,
+            builder: Some(builder),
+        });
+    }
+    if matches!(
+        peel_optional(inner),
+        QueryType::Record(_) | QueryType::Tuple(_)
+    ) {
+        if arms.len() != 1 {
+            todo!("M6 query-valued array element");
+        }
+        let Some(arm) = arms.pop() else {
+            unreachable!("single arm popped from a one-element set")
+        };
+        let mut query = match arm.builder {
+            Some(builder) => builder,
+            None => {
+                todo!("M6 query-valued array element");
+            }
+        };
+        if query.select.is_empty() {
+            query.select = vec![SelectItem::AllFrom { depth: 0 }];
+        }
+        if items.first().is_some_and(|(_, p)| p.is_some()) {
+            let Some((_, Some(pkey))) = items.first() else {
+                unreachable!("keyed direct arm without a parent key")
+            };
+            let sub_outputs = builder_output_types(&query, ctx.schema);
+            if sub_outputs.iter().any(|(col, _)| col == "c0") {
+                todo!("M6 query-valued array element");
+            }
+            let alias = ctx.aliases.subquery();
+            let mut keyed_query = SelectBuilder::new();
+            keyed_query.select.push(SelectItem::Expr {
+                expr: SqlExpr::Param(ParamValue::Int(*pkey)),
+                output: "c0".to_string(),
+                ty: Some(ScalarType::Int),
+            });
+            for (col, ty) in &sub_outputs {
+                keyed_query.select.push(SelectItem::Column {
+                    depth: 0,
+                    column: col.clone(),
+                    output: col.clone(),
+                    ty: *ty,
+                });
+            }
+            keyed_query.from = Some(FromClause::Subquery {
+                query: Box::new(query),
+                alias,
+            });
+            query = keyed_query;
+        }
+        let columns: Vec<NamedColumn> = builder_output_types(&query, ctx.schema)
+            .iter()
+            .map(|(name, ty)| NamedColumn {
+                name: name.clone(),
+                ty: *ty,
+            })
+            .collect();
+        return vec![LitLevel {
+            source: LitSource::Computed {
+                query: Box::new(query),
+                alias: ctx.aliases.literal(),
+            },
+            columns,
+            middle_parts: None,
+            own_key: None,
+        }];
+    }
+    if !matches!(peel_optional(inner), QueryType::List(_)) {
+        todo!("M6 query-valued array element");
+    }
+    let keyed = items.is_empty() || items.first().is_some_and(|(_, p)| p.is_some());
+    let columns: Vec<NamedColumn> = if keyed {
+        vec![
+            NamedColumn {
+                name: "c0".to_string(),
+                ty: Some(ScalarType::Int),
+            },
+            NamedColumn {
+                name: "c1".to_string(),
+                ty: Some(ScalarType::Int),
+            },
+        ]
+    } else {
+        vec![NamedColumn {
+            name: "c0".to_string(),
+            ty: Some(ScalarType::Int),
+        }]
+    };
+    let module = if keyed {
+        "$$lit_2_II".to_string()
+    } else {
+        "$$lit_1_I".to_string()
+    };
+    let id = ctx.aliases.literal();
+    let grid: Vec<Vec<ParamValue>> = items
+        .iter()
+        .enumerate()
+        .map(|(i, (_, pkey))| {
+            let mut row = Vec::with_capacity(2);
+            if let Some(p) = pkey {
+                row.push(ParamValue::Int(*p));
+            }
+            row.push(ParamValue::Int(i as i64));
+            row
+        })
+        .collect();
+    ctx.literals.insert(id.clone(), grid);
+    let grid_level = LitLevel {
+        source: LitSource::Grid { module, id },
+        columns,
+        middle_parts: None,
+        own_key: None,
+    };
+    let positional = !matches!(
+        peel_optional(inner),
+        QueryType::List(sub) if matches!(peel_optional(sub), QueryType::Record(_))
+    );
+    let layout = arms
+        .iter()
+        .filter_map(|arm| arm.builder.as_ref())
+        .next()
+        .map(|builder| builder_output_types(builder, ctx.schema));
+    let Some(layout) = layout else {
+        todo!("M6 query-valued array element");
+    };
+    if layout.is_empty() {
+        todo!("M6 query-valued array element");
+    }
+    if !positional && layout.iter().any(|(col, _)| col == "c0") {
+        todo!("M6 query-valued array element");
+    }
+    let mut builders: Vec<SelectBuilder> = Vec::with_capacity(arms.len());
+    for arm in &arms {
+        let mut select = vec![SelectItem::Expr {
+            expr: SqlExpr::Param(ParamValue::Int(arm.ordinal)),
+            output: "c0".to_string(),
+            ty: Some(ScalarType::Int),
+        }];
+        match &arm.builder {
+            None => {
+                for (col, ty) in &layout {
+                    let output = if positional {
+                        format!("c{}", select.len())
+                    } else {
+                        col.clone()
+                    };
+                    select.push(SelectItem::Expr {
+                        expr: SqlExpr::Param(ParamValue::Null),
+                        output,
+                        ty: *ty,
+                    });
+                }
+                builders.push(SelectBuilder {
+                    select,
+                    from: None,
+                    where_: Vec::new(),
+                    order_by: Vec::new(),
+                    limit: None,
+                    offset: None,
+                    unions: Vec::new(),
+                });
+            }
+            Some(builder) => {
+                let outputs = builder_output_types(builder, ctx.schema);
+                if outputs != layout {
+                    todo!("M6 query-valued array element");
+                }
+                let alias = ctx.aliases.subquery();
+                for (i, (col, ty)) in outputs.iter().enumerate() {
+                    let output = if positional {
+                        format!("c{}", i + 1)
+                    } else {
+                        col.clone()
+                    };
+                    select.push(SelectItem::Column {
+                        depth: 0,
+                        column: col.clone(),
+                        output,
+                        ty: *ty,
+                    });
+                }
+                builders.push(SelectBuilder {
+                    select,
+                    from: Some(FromClause::Subquery {
+                        query: Box::new(builder.clone()),
+                        alias,
+                    }),
+                    where_: Vec::new(),
+                    order_by: Vec::new(),
+                    limit: None,
+                    offset: None,
+                    unions: Vec::new(),
+                });
+            }
+        }
+    }
+    let mut query = union_builders(builders);
+    if query.select.is_empty() {
+        query.select = vec![SelectItem::AllFrom { depth: 0 }];
+    }
+    let columns: Vec<NamedColumn> = builder_output_types(&query, ctx.schema)
+        .iter()
+        .map(|(name, ty)| NamedColumn {
+            name: name.clone(),
+            ty: *ty,
+        })
+        .collect();
+    vec![
+        grid_level,
+        LitLevel {
+            source: LitSource::Computed {
+                query: Box::new(query),
+                alias: ctx.aliases.literal(),
+            },
+            columns,
+            middle_parts: None,
+            own_key: None,
+        },
+    ]
 }
 
 fn rows_array(ctx: &mut Context, expr: &TypedExpr) -> Level {

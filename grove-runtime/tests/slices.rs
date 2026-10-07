@@ -2411,3 +2411,88 @@ fn slice_unions() {
         ])
     );
 }
+
+#[test]
+fn slice_query_valued_elements() {
+    let nested = || {
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![Value::List(vec![Value::Int(1)])]))]),
+            rec(&[("x", Value::List(vec![Value::List(vec![Value::Int(1)])]))]),
+            rec(&[("x", Value::List(vec![Value::List(vec![Value::Int(1)])]))]),
+        ])
+    };
+    assert_eq!(value("users { x = [[1].take(1)] }"), nested());
+    assert_eq!(
+        value("users { x = [[1].take(0)] }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![Value::List(vec![])]))]),
+            rec(&[("x", Value::List(vec![Value::List(vec![])]))]),
+            rec(&[("x", Value::List(vec![Value::List(vec![])]))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [[1].take(1), [2, 3].take(1)] }"),
+        Value::List(vec![
+            rec(&[(
+                "x",
+                Value::List(vec![
+                    Value::List(vec![Value::Int(1)]),
+                    Value::List(vec![Value::Int(2)]),
+                ]),
+            )]),
+            rec(&[(
+                "x",
+                Value::List(vec![
+                    Value::List(vec![Value::Int(1)]),
+                    Value::List(vec![Value::Int(2)]),
+                ]),
+            )]),
+            rec(&[(
+                "x",
+                Value::List(vec![
+                    Value::List(vec![Value::Int(1)]),
+                    Value::List(vec![Value::Int(2)]),
+                ]),
+            )]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [[1].take(1)].first() }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![Value::Int(1)]))]),
+            rec(&[("x", Value::List(vec![Value::Int(1)]))]),
+            rec(&[("x", Value::List(vec![Value::Int(1)]))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [(users.first()?.name)].first() }"),
+        Value::List(vec![
+            rec(&[("x", s("Ada"))]),
+            rec(&[("x", s("Ada"))]),
+            rec(&[("x", s("Ada"))]),
+        ])
+    );
+    assert_eq!(
+        value("[users.first()]"),
+        Value::List(vec![value("users.first()")])
+    );
+    assert_eq!(
+        value("[configs.take(1)]"),
+        Value::List(vec![value("configs.take(1)")])
+    );
+    assert_eq!(
+        value("[[users.first()]]"),
+        Value::List(vec![value("[users.first()]")])
+    );
+    assert_eq!(
+        value("[[(1, 2)].take(1)]"),
+        Value::List(vec![Value::List(vec![Value::Tuple(vec![
+            Value::Int(1),
+            Value::Int(2),
+        ])])])
+    );
+    assert_eq!(
+        value("[[(1, 2)].first()]"),
+        Value::List(vec![Value::Tuple(vec![Value::Int(1), Value::Int(2)])])
+    );
+}
