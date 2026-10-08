@@ -911,6 +911,28 @@ fn if_correlated_item_values() {
 }
 
 #[test]
+fn if_record_item_values() {
+    let first = || value("users.first()");
+    assert_eq!(
+        value("users { o = if active { users.first() } else { users.first() } }"),
+        Value::List(vec![
+            rec(&[("o", first())]),
+            rec(&[("o", first())]),
+            rec(&[("o", first())]),
+        ])
+    );
+    let second = || value("users.skip(1).first()");
+    assert_eq!(
+        value("users { o = if active { users.first() } else { users.skip(1).first() } }"),
+        Value::List(vec![
+            rec(&[("o", first())]),
+            rec(&[("o", second())]),
+            rec(&[("o", first())]),
+        ])
+    );
+}
+
+#[test]
 fn chained_projection_reuses_values() {
     let ord = |t: &str| Value::Record(vec![("total".to_string(), Value::Dec(dec(t)))]);
     assert_eq!(

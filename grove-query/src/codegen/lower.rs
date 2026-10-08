@@ -3493,6 +3493,9 @@ fn lower_value(
                 return (Vec::new(), shape, parent_key.into_iter().collect());
             }
             if matches!(value.kind, TypedExprKind::If { .. }) {
+                if let Some(lowered) = if_record_items(ctx, parent, value) {
+                    return lowered;
+                }
                 todo!("M7 If over records");
             }
             let (shape, parent_key) = rscalar_shape(ctx, parent, value);
@@ -3511,6 +3514,9 @@ fn lower_value(
                     return (Vec::new(), shape, parent_key.into_iter().collect());
                 }
                 if matches!(value.kind, TypedExprKind::If { .. }) {
+                    if let Some(lowered) = if_record_items(ctx, parent, value) {
+                        return lowered;
+                    }
                     todo!("M7 If over records");
                 }
                 let (shape, parent_key) = rscalar_shape(ctx, parent, value);
@@ -8910,6 +8916,82 @@ fn take_temp_row_collapse(
     ))
 }
 
+struct IfGuardTemp {
+    temp_idx: usize,
+    temp: String,
+    outputs: Vec<(String, Option<ScalarType>)>,
+    guards: Vec<SqlExpr>,
+}
+
+fn if_guard_temp(
+    ctx: &mut Context,
+    parent: &mut Level,
+    arms: &[(TypedExpr, TypedExpr)],
+) -> Option<IfGuardTemp> {
+    let mut fids: Vec<FieldId> = Vec::new();
+    for (cond, _) in arms.iter() {
+        if !guard_outer_refs(cond, &mut fids) {
+            return None;
+        }
+    }
+    if fids.is_empty() {
+        return None;
+    }
+    let mut carries: Vec<(String, Option<ScalarType>)> = Vec::new();
+    for fid in fids {
+        let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
+        let col = match field {
+            Field::Value { columns, .. } => match columns.as_slice() {
+                [col] => ctx.schema.column_name(*col).to_string(),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let ty = output_ty(&parent.builder, &col, ctx.schema)?;
+        if !carries.iter().any(|(c, _)| c == &col) {
+            carries.push((col, Some(ty)));
+        }
+    }
+    let (temp_idx, temp, outputs) = cross_cartesian_temp(ctx, parent, &carries, &[]);
+    let was_outer = std::mem::replace(&mut ctx.no_outer, false);
+    let mut conds: Vec<SqlExpr> = Vec::with_capacity(arms.len());
+    for (cond, _) in arms.iter() {
+        conds.push(scalar(ctx, cond));
+    }
+    ctx.no_outer = was_outer;
+    let mut denied: Vec<SqlExpr> = Vec::new();
+    let mut guards: Vec<SqlExpr> = Vec::with_capacity(arms.len() + 1);
+    for cond in conds {
+        let mut guard = denied.clone();
+        guard.push(cond.clone());
+        denied.push(SqlExpr::Not(Box::new(cond)));
+        guards.push(
+            guard
+                .into_iter()
+                .reduce(|acc, next| SqlExpr::Binary {
+                    op: SqlBinOp::And,
+                    lhs: Box::new(acc),
+                    rhs: Box::new(next),
+                })
+                .unwrap_or_else(|| {
+                    unreachable!("deny-chained guard is never empty: cond just pushed")
+                }),
+        );
+    }
+    let default_guard = denied.into_iter().reduce(|acc, next| SqlExpr::Binary {
+        op: SqlBinOp::And,
+        lhs: Box::new(acc),
+        rhs: Box::new(next),
+    });
+    guards.push(default_guard.unwrap_or(SqlExpr::Param(ParamValue::Bool(true))));
+    Some(IfGuardTemp {
+        temp_idx,
+        temp,
+        outputs,
+        guards,
+    })
+}
+
 fn guard_outer_refs(node: &TypedExpr, fids: &mut Vec<FieldId>) -> bool {
     match &node.kind {
         TypedExprKind::Ident { binding, depth, .. } => match binding {
@@ -8972,15 +9054,6 @@ fn union_collapse(
     if !matches!(&base.ty, QueryType::List(_)) {
         return None;
     }
-    let mut fids: Vec<FieldId> = Vec::new();
-    for (cond, _) in arms.iter() {
-        if !guard_outer_refs(cond, &mut fids) {
-            return None;
-        }
-    }
-    if fids.is_empty() {
-        return None;
-    }
     for (_, body) in arms.iter() {
         if !matches!(
             &body.kind,
@@ -9001,40 +9074,17 @@ fn union_collapse(
     ) {
         return None;
     }
-    let mut carries: Vec<(String, Option<ScalarType>)> = Vec::new();
-    for fid in fids {
-        let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
-        let col = match field {
-            Field::Value { columns, .. } => match columns.as_slice() {
-                [col] => ctx.schema.column_name(*col).to_string(),
-                _ => return None,
-            },
-            _ => return None,
-        };
-        let ty = output_ty(&parent.builder, &col, ctx.schema)?;
-        if !carries.iter().any(|(c, _)| c == &col) {
-            carries.push((col, Some(ty)));
-        }
-    }
-    let (temp_idx, temp, create_outputs) = cross_cartesian_temp(ctx, parent, &carries, &[]);
-    let was_outer = std::mem::replace(&mut ctx.no_outer, false);
-    let mut conds: Vec<SqlExpr> = Vec::with_capacity(arms.len());
-    for (cond, _) in arms.iter() {
-        conds.push(shift_depths(scalar(ctx, cond), 1));
-    }
-    ctx.no_outer = was_outer;
-    let mut denied: Vec<SqlExpr> = Vec::new();
+    let IfGuardTemp {
+        temp_idx,
+        temp,
+        outputs: create_outputs,
+        guards,
+    } = if_guard_temp(ctx, parent, arms)?;
     let mut builders: Vec<SelectBuilder> = Vec::new();
     let mut bodies: Vec<&TypedExpr> = arms.iter().map(|(_, body)| body).collect();
     bodies.push(default.as_ref());
-    for (i, body) in bodies.iter().enumerate() {
-        let mut guard = denied.clone();
-        if i < conds.len() {
-            guard.push(conds[i].clone());
-        }
-        if i < conds.len() {
-            denied.push(SqlExpr::Not(Box::new(conds[i].clone())));
-        }
+    for (body, guard) in bodies.iter().zip(guards.iter()) {
+        let guard = shift_depths(guard.clone(), 1);
         let data_from = cross_root_scan(ctx, body);
         let data_cols = from_columns_typed(&Some(data_from.clone()), ctx.schema);
         let mut arm = SelectBuilder::new();
@@ -9065,14 +9115,7 @@ fn union_collapse(
             output: "$$pkey".to_string(),
             ty: Some(ScalarType::Int),
         });
-        let mut cond = guard.into_iter().reduce(|acc, next| SqlExpr::Binary {
-            op: SqlBinOp::And,
-            lhs: Box::new(acc),
-            rhs: Box::new(next),
-        });
-        if let Some(cond) = cond.take() {
-            arm.where_ = vec![cond];
-        }
+        arm.where_ = vec![guard];
         builders.push(arm);
     }
     let first_outputs = builder_outputs(&builders[0], ctx.schema);
@@ -9199,38 +9242,16 @@ fn correlated_if_items(
         }
     }
     bodies.push(default);
-    let mut carries: Vec<(String, Option<ScalarType>)> = Vec::new();
-    for fid in fids {
-        let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
-        let col = match field {
-            Field::Value { columns, .. } => match columns.as_slice() {
-                [col] => ctx.schema.column_name(*col).to_string(),
-                _ => return None,
-            },
-            _ => return None,
-        };
-        let ty = output_ty(&parent.builder, &col, ctx.schema)?;
-        if !carries.iter().any(|(c, _)| c == &col) {
-            carries.push((col, Some(ty)));
-        }
-    }
-    let (temp_idx, temp, create_outputs) = cross_cartesian_temp(ctx, parent, &carries, &[]);
-    let was_outer = std::mem::replace(&mut ctx.no_outer, false);
-    let mut conds: Vec<SqlExpr> = Vec::with_capacity(arms.len());
-    for (cond, _) in arms.iter() {
-        conds.push(scalar(ctx, cond));
-    }
-    ctx.no_outer = was_outer;
-    let mut denied: Vec<SqlExpr> = Vec::new();
+    let IfGuardTemp {
+        temp_idx,
+        temp,
+        outputs: create_outputs,
+        guards,
+    } = if_guard_temp(ctx, parent, arms)?;
     let mut builders: Vec<SelectBuilder> = Vec::new();
-    for (i, body) in bodies.iter().enumerate() {
-        let mut guard = denied.clone();
-        if i < conds.len() {
-            guard.push(conds[i].clone());
-        }
-        if i < conds.len() {
-            denied.push(SqlExpr::Not(Box::new(conds[i].clone())));
-        }
+    let mut bodies: Vec<&TypedExpr> = arms.iter().map(|(_, body)| body).collect();
+    bodies.push(default.as_ref());
+    for (body, guard) in bodies.iter().zip(guards.iter()) {
         let TypedExprKind::Array { elements } = &body.kind else {
             unreachable!("correlated-if arm re-check: admission pins arrays")
         };
@@ -9257,14 +9278,7 @@ fn correlated_if_items(
                 output: "$$pkey".to_string(),
                 ty: Some(ScalarType::Int),
             });
-            let mut cond = guard.iter().cloned().reduce(|acc, next| SqlExpr::Binary {
-                op: SqlBinOp::And,
-                lhs: Box::new(acc),
-                rhs: Box::new(next),
-            });
-            if let Some(cond) = cond.take() {
-                row.where_ = vec![cond];
-            }
+            row.where_ = vec![guard.clone()];
             builders.push(row);
         }
     }
@@ -9319,6 +9333,141 @@ fn correlated_if_items(
         },
     };
     Some((shape, Some("$$key".to_string())))
+}
+
+fn if_record_items(
+    ctx: &mut Context,
+    parent: &mut Level,
+    value: &TypedExpr,
+) -> Option<(Vec<SelectItem>, ResultShape, Vec<String>)> {
+    let TypedExprKind::If { arms, default } = &value.kind else {
+        return None;
+    };
+    if ctx.child.is_some() || ctx.nest_depth >= 1 || ctx.temp_collect.is_some() {
+        return None;
+    }
+    let QueryType::Record(RecordSource::Schema(sid)) = peel_optional(&value.ty) else {
+        return None;
+    };
+    let sunk_before = ctx.statements.len();
+    let mut lowered: Vec<Level> = Vec::with_capacity(arms.len() + 1);
+    let mut bodies: Vec<&TypedExpr> = Vec::new();
+    for (_, body) in arms.iter() {
+        bodies.push(body);
+    }
+    bodies.push(default);
+    for body in bodies {
+        let mut level = rows(ctx, body);
+        if ctx.statements.len() != sunk_before || level.pending.is_some() {
+            return None;
+        }
+        if level.builder.select.is_empty() {
+            level.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+        }
+        lowered.push(level);
+    }
+    for level in lowered.iter() {
+        let QueryType::Record(RecordSource::Schema(arm_sid)) = peel_optional(&level.element) else {
+            return None;
+        };
+        if *arm_sid != *sid {
+            return None;
+        }
+    }
+    let IfGuardTemp {
+        temp_idx,
+        temp,
+        outputs: create_outputs,
+        guards,
+    } = if_guard_temp(ctx, parent, arms)?;
+    let mut builders: Vec<SelectBuilder> = Vec::new();
+    for (level, guard) in lowered.into_iter().zip(guards.iter()) {
+        let data_cols = builder_output_types(&level.builder, ctx.schema);
+        let mut arm = SelectBuilder::new();
+        arm.from = Some(FromClause::Join {
+            left: Box::new(FromClause::Temp {
+                name: temp.clone(),
+                columns: create_outputs
+                    .iter()
+                    .map(|(name, ty)| NamedColumn {
+                        name: name.clone(),
+                        ty: *ty,
+                    })
+                    .collect(),
+            }),
+            right: Box::new(FromClause::Subquery {
+                query: Box::new(level.builder),
+                alias: ctx.aliases.subquery(),
+            }),
+        });
+        for (name, ty) in &data_cols {
+            arm.select.push(SelectItem::Column {
+                depth: 0,
+                column: name.clone(),
+                output: name.clone(),
+                ty: *ty,
+            });
+        }
+        arm.select.push(SelectItem::Column {
+            depth: 1,
+            column: "$$key".to_string(),
+            output: "$$pkey".to_string(),
+            ty: Some(ScalarType::Int),
+        });
+        arm.where_ = vec![shift_depths(guard.clone(), 1)];
+        builders.push(arm);
+    }
+    let first_outputs = builder_outputs(&builders[0], ctx.schema);
+    for other in builders.iter().skip(1) {
+        if builder_outputs(other, ctx.schema) != first_outputs {
+            return None;
+        }
+    }
+    let item_ty = &value.ty;
+    let child = Level {
+        builder: union_builders(builders),
+        element: value.ty.clone(),
+        parent: ParentLink::Root { root_idx: 0 },
+        pending: None,
+        stmt_bound: true,
+        output_shapes: None,
+        root_parts: None,
+    };
+    let outputs = builder_outputs(&child.builder, ctx.schema);
+    let shape_cols: Vec<OutputColumn> =
+        shape_columns(builder_output_types(&child.builder, ctx.schema), |name| {
+            name == "$$pkey"
+        });
+    let element = child_element(
+        ctx.schema,
+        child.output_shapes.as_ref(),
+        item_ty,
+        &outputs,
+        |name| name == "$$pkey",
+    );
+    let idx = ctx.sink(
+        child.builder,
+        StatementShape {
+            columns: shape_cols,
+            rows: RowCount::Many,
+        },
+        StatementKind::Query,
+    );
+    let shape = ResultShape::Single {
+        element: Box::new(element),
+        child: ChildRef {
+            stmt: idx,
+            parent: Some(ParentRef {
+                stmt: temp_idx,
+                parent_key: "$$key".to_string(),
+                child_key: "$$pkey".to_string(),
+                negated: false,
+            }),
+            cardinality: Cardinality::One,
+            tag: None,
+        },
+    };
+    Some((Vec::new(), shape, vec!["$$key".to_string()]))
 }
 
 fn collapse_index(ctx: &mut Context, arg: &TypedExpr) -> SqlExpr {
