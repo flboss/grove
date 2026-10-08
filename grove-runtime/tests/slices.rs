@@ -833,6 +833,34 @@ fn nested_cross_root_scope_inner_values() {
 }
 
 #[test]
+fn nested_cross_root_deep_composition_values() {
+    let item = |sku: &str| rec(&[("sku", s(sku))]);
+    let sib = || {
+        Value::List(vec![
+            rec(&[("t", Value::List(vec![item("a"), item("b")]))]),
+            rec(&[("t", Value::List(vec![]))]),
+        ])
+    };
+    assert_eq!(
+        value("users { x = orders { s = orders { t = items } } }"),
+        Value::List(vec![
+            rec(&[(
+                "x",
+                Value::List(vec![rec(&[("s", sib())]), rec(&[("s", sib())])])
+            )]),
+            rec(&[(
+                "x",
+                Value::List(vec![rec(&[(
+                    "s",
+                    Value::List(vec![rec(&[("t", Value::List(vec![item("c")]))])]),
+                )])])
+            )]),
+            rec(&[("x", Value::List(vec![]))]),
+        ])
+    );
+}
+
+#[test]
 fn chained_projection_reuses_values() {
     let ord = |t: &str| Value::Record(vec![("total".to_string(), Value::Dec(dec(t)))]);
     assert_eq!(
