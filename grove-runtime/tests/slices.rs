@@ -692,6 +692,55 @@ fn cross_list_mixed_values() {
 }
 
 #[test]
+fn cross_corr_filter_list_inner_values() {
+    let ada = || rec(&[("s", Value::List(vec![Value::Int(5), Value::Int(7)]))]);
+    assert_eq!(
+        value("users { x = configs.filter(owner == email) { s = scores } }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![ada()]))]),
+            rec(&[("x", Value::List(vec![]))]),
+            rec(&[("x", Value::List(vec![]))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = configs.filter(owner == \"nobody\") { s = scores } }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![]))]),
+            rec(&[("x", Value::List(vec![]))]),
+            rec(&[("x", Value::List(vec![]))]),
+        ])
+    );
+}
+
+#[test]
+fn cross_corr_filter_outer_scalar_values() {
+    assert_eq!(
+        value("users { x = configs.filter(owner == email) { s = age } }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![rec(&[("s", Value::Int(30))])]))]),
+            rec(&[("x", Value::List(vec![]))]),
+            rec(&[("x", Value::List(vec![]))]),
+        ])
+    );
+}
+
+#[test]
+fn cross_corr_filter_nav_inner_values() {
+    let ord = |t: &str| rec(&[("total", Value::Dec(dec(t)))]);
+    assert_eq!(
+        value("users { x = configs.filter(owner == email) { s = manager.orders } }"),
+        Value::List(vec![
+            rec(&[(
+                "x",
+                Value::List(vec![rec(&[("s", Value::List(vec![ord("30.00")]))])])
+            )]),
+            rec(&[("x", Value::List(vec![]))]),
+            rec(&[("x", Value::List(vec![]))]),
+        ])
+    );
+}
+
+#[test]
 fn chained_projection_reuses_values() {
     let ord = |t: &str| Value::Record(vec![("total".to_string(), Value::Dec(dec(t)))]);
     assert_eq!(

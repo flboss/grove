@@ -6733,6 +6733,71 @@ fn sink_cross_child(
     (shape, Some("$$key".to_string()))
 }
 
+fn corr_filter_outer(
+    ctx: &Context,
+    parent: &Level,
+    base: &TypedExpr,
+) -> Option<Vec<(String, Option<ScalarType>)>> {
+    let TypedExprKind::Method {
+        base: inner,
+        name,
+        args,
+        ..
+    } = &base.kind
+    else {
+        return None;
+    };
+    if name.value != "filter" {
+        return None;
+    };
+    if !matches!(
+        &inner.kind,
+        TypedExprKind::Ident {
+            binding: IdentBinding::Root { .. },
+            ..
+        }
+    ) {
+        return None;
+    }
+    let mut fids = Vec::new();
+    let mut foreign = false;
+    for arg in args {
+        any_ident(&arg.expr, &mut |e| {
+            if let TypedExprKind::Ident { binding, depth, .. } = &e.kind
+                && *depth > 0
+            {
+                match binding {
+                    IdentBinding::Field(fid) if *depth == 1 => fids.push(*fid),
+                    _ => foreign = true,
+                }
+            }
+            false
+        });
+    }
+    if foreign {
+        return None;
+    }
+    let mut carries = Vec::new();
+    for fid in fids {
+        let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
+        let col = match field {
+            Field::Value { columns, .. } => match columns.as_slice() {
+                [col] => ctx.schema.column_name(*col).to_string(),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let ty = output_ty(&parent.builder, &col, ctx.schema)?;
+        if !carries
+            .iter()
+            .any(|(c, _): &(String, Option<ScalarType>)| c == &col)
+        {
+            carries.push((col, Some(ty)));
+        }
+    }
+    Some(carries)
+}
+
 fn const_proj_cross_shape(
     ctx: &mut Context,
     parent: &mut Level,
@@ -6755,7 +6820,12 @@ fn const_proj_cross_shape(
         && !ctx.in_take_arg
         && ctx.nest_depth < 1
         && const_pipeline_base(base);
-    if !bare && !pipeline {
+    let corr_outer = if !bare && !pipeline {
+        corr_filter_outer(ctx, parent, base)
+    } else {
+        None
+    };
+    if !bare && !pipeline && corr_outer.is_none() {
         return None;
     }
     let has_lists = items
@@ -6797,6 +6867,13 @@ fn const_proj_cross_shape(
             let ty = output_ty(&parent.builder, &col, ctx.schema)?;
             if !carries.iter().any(|(c, _)| c == &col) {
                 carries.push((col, Some(ty)));
+            }
+        }
+    }
+    if let Some(extra) = corr_outer {
+        for (col, ty) in extra {
+            if !carries.iter().any(|(c, _)| c == &col) {
+                carries.push((col, ty));
             }
         }
     }
