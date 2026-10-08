@@ -8907,6 +8907,247 @@ fn take_temp_row_collapse(
     ))
 }
 
+fn guard_outer_refs(node: &TypedExpr, fids: &mut Vec<FieldId>) -> bool {
+    match &node.kind {
+        TypedExprKind::Ident { binding, depth, .. } => match binding {
+            IdentBinding::Field(fid) if *depth == 0 => {
+                fids.push(*fid);
+                true
+            }
+            _ => false,
+        },
+        TypedExprKind::Literal(_) | TypedExprKind::TypeConstant { .. } => true,
+        TypedExprKind::Binary { lhs, rhs, .. } => {
+            guard_outer_refs(lhs, fids) && guard_outer_refs(rhs, fids)
+        }
+        TypedExprKind::Unary { expr, .. } | TypedExprKind::Cast { expr, .. } => {
+            guard_outer_refs(expr, fids)
+        }
+        _ => false,
+    }
+}
+
+fn union_collapse(
+    ctx: &mut Context,
+    parent: &mut Level,
+    tail: &TypedExpr,
+) -> Option<(ResultShape, Option<String>)> {
+    let TypedExprKind::Method {
+        base,
+        name,
+        args,
+        optional,
+    } = &tail.kind
+    else {
+        return None;
+    };
+    if *optional {
+        return None;
+    }
+    if ctx.child.is_some() || ctx.nest_depth >= 1 || ctx.temp_collect.is_some() {
+        return None;
+    }
+    let (method, bound) = if name.value == "first" {
+        if !args.is_empty() {
+            return None;
+        }
+        ("first", SqlExpr::Param(ParamValue::Int(1)))
+    } else if name.value == "nth" {
+        let [arg] = args.as_slice() else {
+            return None;
+        };
+        if has_scope_ident(&arg.expr) {
+            return None;
+        }
+        ("nth", collapse_index(ctx, &arg.expr))
+    } else {
+        return None;
+    };
+    let TypedExprKind::If { arms, default } = &base.kind else {
+        return None;
+    };
+    if !matches!(&base.ty, QueryType::List(_)) {
+        return None;
+    }
+    let mut fids: Vec<FieldId> = Vec::new();
+    for (cond, _) in arms.iter() {
+        if !guard_outer_refs(cond, &mut fids) {
+            return None;
+        }
+    }
+    if fids.is_empty() {
+        return None;
+    }
+    for (_, body) in arms.iter() {
+        if !matches!(
+            &body.kind,
+            TypedExprKind::Ident {
+                binding: IdentBinding::Root { .. },
+                ..
+            }
+        ) {
+            return None;
+        }
+    }
+    if !matches!(
+        &default.kind,
+        TypedExprKind::Ident {
+            binding: IdentBinding::Root { .. },
+            ..
+        }
+    ) {
+        return None;
+    }
+    let mut carries: Vec<(String, Option<ScalarType>)> = Vec::new();
+    for fid in fids {
+        let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
+        let col = match field {
+            Field::Value { columns, .. } => match columns.as_slice() {
+                [col] => ctx.schema.column_name(*col).to_string(),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let ty = output_ty(&parent.builder, &col, ctx.schema)?;
+        if !carries.iter().any(|(c, _)| c == &col) {
+            carries.push((col, Some(ty)));
+        }
+    }
+    let (temp_idx, temp, create_outputs) = cross_cartesian_temp(ctx, parent, &carries, &[]);
+    let was_outer = std::mem::replace(&mut ctx.no_outer, false);
+    let mut conds: Vec<SqlExpr> = Vec::with_capacity(arms.len());
+    for (cond, _) in arms.iter() {
+        conds.push(shift_depths(scalar(ctx, cond), 1));
+    }
+    ctx.no_outer = was_outer;
+    let mut denied: Vec<SqlExpr> = Vec::new();
+    let mut builders: Vec<SelectBuilder> = Vec::new();
+    let mut bodies: Vec<&TypedExpr> = arms.iter().map(|(_, body)| body).collect();
+    bodies.push(default.as_ref());
+    for (i, body) in bodies.iter().enumerate() {
+        let mut guard = denied.clone();
+        if i < conds.len() {
+            guard.push(conds[i].clone());
+        }
+        if i < conds.len() {
+            denied.push(SqlExpr::Not(Box::new(conds[i].clone())));
+        }
+        let data_from = cross_root_scan(ctx, body);
+        let data_cols = from_columns_typed(&Some(data_from.clone()), ctx.schema);
+        let mut arm = SelectBuilder::new();
+        arm.from = Some(FromClause::Join {
+            left: Box::new(FromClause::Temp {
+                name: temp.clone(),
+                columns: create_outputs
+                    .iter()
+                    .map(|(name, ty)| NamedColumn {
+                        name: name.clone(),
+                        ty: *ty,
+                    })
+                    .collect(),
+            }),
+            right: Box::new(data_from),
+        });
+        for (name, ty) in &data_cols {
+            arm.select.push(SelectItem::Column {
+                depth: 0,
+                column: name.clone(),
+                output: name.clone(),
+                ty: *ty,
+            });
+        }
+        arm.select.push(SelectItem::Column {
+            depth: 1,
+            column: "$$key".to_string(),
+            output: "$$pkey".to_string(),
+            ty: Some(ScalarType::Int),
+        });
+        let mut cond = guard.into_iter().reduce(|acc, next| SqlExpr::Binary {
+            op: SqlBinOp::And,
+            lhs: Box::new(acc),
+            rhs: Box::new(next),
+        });
+        if let Some(cond) = cond.take() {
+            arm.where_ = vec![cond];
+        }
+        builders.push(arm);
+    }
+    let first_outputs = builder_outputs(&builders[0], ctx.schema);
+    for other in builders.iter().skip(1) {
+        if builder_outputs(other, ctx.schema) != first_outputs {
+            return None;
+        }
+    }
+    let item_ty = match &base.ty {
+        QueryType::List(sub) => sub.as_ref(),
+        _ => &base.ty,
+    };
+    let mut child = Level {
+        builder: union_builders(builders),
+        element: base.ty.clone(),
+        parent: ParentLink::Root { root_idx: 0 },
+        pending: None,
+        stmt_bound: true,
+        output_shapes: None,
+        root_parts: None,
+    };
+    child = wrap_level(ctx, child);
+    child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+    child.builder.select.push(SelectItem::Expr {
+        expr: SqlExpr::Window {
+            func: "ROW_NUMBER".to_string(),
+            partition: vec![SqlExpr::Column {
+                depth: 0,
+                column: "$$pkey".to_string(),
+            }],
+            order: Vec::new(),
+        },
+        output: "$$rn".to_string(),
+        ty: Some(ScalarType::Int),
+    });
+    child = wrap_level(ctx, child);
+    conjoin_window_bound(&mut child.builder, method, bound);
+    if child.builder.select.is_empty() {
+        child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+    }
+    ensure_key(&mut child.builder, "$$pkey", ctx.schema);
+    let outputs = builder_outputs(&child.builder, ctx.schema);
+    let shape_cols: Vec<OutputColumn> =
+        shape_columns(builder_output_types(&child.builder, ctx.schema), |name| {
+            name == "$$pkey"
+        });
+    let element = child_element(
+        ctx.schema,
+        child.output_shapes.as_ref(),
+        item_ty,
+        &outputs,
+        |name| name == "$$pkey",
+    );
+    let idx = ctx.sink(
+        child.builder,
+        StatementShape {
+            columns: shape_cols,
+            rows: RowCount::Many,
+        },
+        StatementKind::Query,
+    );
+    let shape = ResultShape::Single {
+        element: Box::new(element),
+        child: ChildRef {
+            stmt: idx,
+            parent: Some(ParentRef {
+                stmt: temp_idx,
+                parent_key: "$$key".to_string(),
+                child_key: "$$pkey".to_string(),
+                negated: false,
+            }),
+            cardinality: Cardinality::One,
+            tag: None,
+        },
+    };
+    Some((shape, Some("$$key".to_string())))
+}
+
 fn collapse_index(ctx: &mut Context, arg: &TypedExpr) -> SqlExpr {
     match scalar(ctx, arg) {
         SqlExpr::Param(ParamValue::Int(n)) => SqlExpr::Param(ParamValue::Int(n.saturating_add(1))),
@@ -9038,6 +9279,10 @@ fn rscalar_shape(
                 && let Some(shape) = take_temp_row_collapse(ctx, parent, tail)
             {
                 return shape;
+            } else if ctx.temp_collect.is_none()
+                && let Some(shape) = union_collapse(ctx, parent, tail)
+            {
+                return shape;
             } else {
                 todo!("M4b ordered per-parent single");
             }
@@ -9074,6 +9319,12 @@ fn rscalar_shape(
             if name.value == "nth"
                 && ctx.temp_collect.is_none()
                 && let Some(shape) = take_temp_row_collapse(ctx, parent, tail)
+            {
+                return shape;
+            }
+            if name.value == "nth"
+                && ctx.temp_collect.is_none()
+                && let Some(shape) = union_collapse(ctx, parent, tail)
             {
                 return shape;
             }
@@ -19897,6 +20148,20 @@ fn rows_if(ctx: &mut Context, expr: &TypedExpr) -> Level {
     }
     let mut conds: Vec<SqlExpr> = Vec::with_capacity(arms.len());
     for (cond, _) in arms {
+        if ctx.temp_collect.is_none()
+            && any_ident(cond, &mut |e| {
+                matches!(
+                    &e.kind,
+                    TypedExprKind::Ident {
+                        binding: IdentBinding::Field(_) | IdentBinding::ProjectedField { .. },
+                        depth,
+                        ..
+                    } if *depth == 0
+                )
+            })
+        {
+            todo!("M4b ordered per-parent single");
+        }
         conds.push(scalar(ctx, cond));
     }
     let sunk_before = ctx.statements.len();

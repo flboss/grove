@@ -861,6 +861,28 @@ fn nested_cross_root_deep_composition_values() {
 }
 
 #[test]
+fn union_collapse_values() {
+    let n1 = || rec(&[("name", s("n1")), ("owner", s("a@x"))]);
+    assert_eq!(
+        value("users { x = (if active { configs } else { configs }).first() }"),
+        Value::List(vec![
+            rec(&[("x", n1())]),
+            rec(&[("x", n1())]),
+            rec(&[("x", n1())]),
+        ])
+    );
+    let n2 = || rec(&[("name", s("n2")), ("owner", s("zzz"))]);
+    assert_eq!(
+        value("users { x = (if active { configs } else { configs }).nth(1) }"),
+        Value::List(vec![
+            rec(&[("x", n2())]),
+            rec(&[("x", n2())]),
+            rec(&[("x", n2())]),
+        ])
+    );
+}
+
+#[test]
 fn chained_projection_reuses_values() {
     let ord = |t: &str| Value::Record(vec![("total".to_string(), Value::Dec(dec(t)))]);
     assert_eq!(
