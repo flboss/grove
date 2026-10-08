@@ -1816,7 +1816,7 @@ fn b1_optional_list(
         } else {
             CollapseKind::Nth(one_arg(args, name))
         };
-        return b1_nested_collapse(ctx, value, inner, collapse);
+        return b1_nested_collapse(ctx, value, inner, collapse, None);
     }
     todo!("M4b presence: optional list item")
 }
@@ -2138,6 +2138,9 @@ fn b1_chained(
         todo!("M4b presence: optional list item");
     }
     let Some((rewritten, collapse, tail_fid)) = split_opt_chain(ctx, value) else {
+        if let Some((nested, kind, hop)) = split_nested_chain(ctx, value) {
+            return b1_nested_collapse(ctx, value, nested, kind, Some((hop, &value.ty)));
+        }
         todo!("M4b presence: optional list item");
     };
     let Some(peeled) = peel_windowed_collapse(collapse, false) else {
@@ -2286,6 +2289,7 @@ fn b1_nested_collapse(
     value: &TypedExpr,
     inner: &TypedExpr,
     collapse: CollapseKind<'_>,
+    extra: Option<(PendingSplit, &QueryType)>,
 ) -> (Vec<SelectItem>, ResultShape, Vec<String>) {
     let (child_from, child_col, parent_key) = match tail_root_ident(inner) {
         Some(IdentBinding::Field(fid)) => {
@@ -2342,7 +2346,18 @@ fn b1_nested_collapse(
     let Some(pending) = child.pending.take() else {
         todo!("M4b presence: optional list item");
     };
-    let (inner_nest, child_idx) = drain_pending_chain(ctx, pending, &value.ty);
+    let (tail_hop, nest_ty): (Option<PendingSplit>, &QueryType) = match extra {
+        Some((hop, ty)) => (Some(hop), ty),
+        None => (None, &value.ty),
+    };
+    let mut pending = pending;
+    if let Some(tail_hop) = tail_hop {
+        if pending.next.is_some() {
+            todo!("M4b presence: optional list item");
+        }
+        pending.next = Some(Box::new(tail_hop));
+    }
+    let (inner_nest, child_idx) = drain_pending_chain(ctx, pending, nest_ty);
     if child.builder.select.is_empty() {
         child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
     }
@@ -2506,6 +2521,69 @@ fn split_opt_chain<'a>(
         _ => return None,
     };
     go(ctx, value, &list_ty, value.span)
+}
+
+fn split_nested_chain<'a>(
+    ctx: &mut Context,
+    value: &'a TypedExpr,
+) -> Option<(&'a TypedExpr, CollapseKind<'a>, PendingSplit)> {
+    let TypedExprKind::Field {
+        base: collapse,
+        name,
+        optional: true,
+    } = &value.kind
+    else {
+        return None;
+    };
+    let TypedExprKind::Method {
+        base: nested,
+        name: method,
+        args,
+        ..
+    } = &collapse.kind
+    else {
+        return None;
+    };
+    if method.value != "first" && method.value != "nth" {
+        return None;
+    }
+    let QueryType::List(l1) = peel_optional(&nested.ty) else {
+        return None;
+    };
+    let QueryType::List(l2) = peel_optional(l1) else {
+        return None;
+    };
+    let QueryType::Record(RecordSource::Schema(sid)) = peel_optional(l2) else {
+        return None;
+    };
+    let (tail_fid, _) = ctx.schema.struct_field(*sid, &name.value)?;
+    let QueryType::List(tail_elem) = peel_optional(&value.ty) else {
+        return None;
+    };
+    if !matches!(peel_optional(tail_elem), QueryType::List(_)) {
+        return None;
+    }
+    let tail_link = resolve_tail_link(ctx, tail_fid);
+    if tail_link.m2m_join.is_some() {
+        return None;
+    }
+    let kind = if method.value == "first" {
+        CollapseKind::First
+    } else {
+        CollapseKind::Nth(one_arg(args, method))
+    };
+    Some((
+        nested,
+        kind,
+        PendingSplit {
+            child_from: tail_link.child_from,
+            child_col: tail_link.child_col,
+            parent_col: tail_link.parent_col,
+            multi_parent: false,
+            next: None,
+            middle_parts: None,
+        },
+    ))
 }
 
 fn assert_present_rows(ctx: &mut Context, level: Level, msg: String) -> Level {
@@ -9196,6 +9274,7 @@ fn rtemp_shape(
         }
         todo!("M4b nested record item");
     }
+    let top_entry = ctx.nest_depth < 1 && ctx.child.is_none();
     let reduced_tail = beta_reduce_tail(tail);
     let tail: &TypedExpr = &reduced_tail;
     let temp = ctx.aliases.temp();
@@ -9342,6 +9421,9 @@ fn rtemp_shape(
             },
         },
     };
+    if top_entry && has_pending_parent(&shape) {
+        todo!("M4b nested list item");
+    }
     (shape, Some(pair_col))
 }
 
