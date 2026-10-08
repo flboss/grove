@@ -1227,6 +1227,9 @@ fn rows_method(
         }
         "unwrap" => assert_present_rows(ctx, level, "unwrap failed: value was none".to_string()),
         "unwrap_or" => {
+            if nth_negative_literal(base) {
+                return abort_present_rows(ctx, level, "nth requires a non-negative integer");
+            }
             match peel_optional(&level.element) {
                 QueryType::List(_) => {
                     let (level, probe_from) = match &level.pending {
@@ -2585,6 +2588,57 @@ fn assert_present_rows(ctx: &mut Context, level: Level, msg: String) -> Level {
             output_shapes,
             root_parts,
         },
+    )
+}
+
+fn const_int_lit(expr: &TypedExpr) -> Option<i64> {
+    match &peel_some(expr).kind {
+        TypedExprKind::Literal(lit) => match &lit.value {
+            crate::ast::Literal::Int(n) => Some(*n),
+            _ => None,
+        },
+        TypedExprKind::Unary { expr, .. } => const_int_lit(expr).map(|n| -n),
+        _ => None,
+    }
+}
+
+fn nth_negative_literal(base: &TypedExpr) -> bool {
+    let node = peel_some(base);
+    if let TypedExprKind::Method { name, args, .. } = &node.kind
+        && name.value == "nth"
+        && let [arg] = args.as_slice()
+    {
+        return const_int_lit(&arg.expr).is_some_and(|n| n < 0);
+    }
+    false
+}
+
+fn abort_present_rows(ctx: &mut Context, level: Level, msg: &str) -> Level {
+    let Level {
+        mut builder,
+        element,
+        parent,
+        stmt_bound,
+        output_shapes,
+        root_parts,
+        ..
+    } = level;
+    if builder.select.is_empty() {
+        builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+    }
+    let cols: Vec<(String, Option<ScalarType>)> = builder_output_types(&builder, ctx.schema);
+    assert_present_rows(
+        ctx,
+        Level {
+            builder: false_arm(&cols),
+            element,
+            parent,
+            pending: None,
+            stmt_bound,
+            output_shapes,
+            root_parts,
+        },
+        msg.to_string(),
     )
 }
 
