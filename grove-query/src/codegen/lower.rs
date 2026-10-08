@@ -8284,6 +8284,9 @@ fn rvalue_shape(
         return sink_broadcast_tail(ctx, tail);
     }
     if matches!(tail.kind, TypedExprKind::If { .. }) {
+        if let Some((shape, key)) = correlated_if_items(ctx, parent, tail) {
+            return (shape, key);
+        }
         todo!("M7 correlated If item");
     }
     if matches!(tail_root_ident(tail), Some(IdentBinding::Root { .. }))
@@ -9142,6 +9145,176 @@ fn union_collapse(
                 negated: false,
             }),
             cardinality: Cardinality::One,
+            tag: None,
+        },
+    };
+    Some((shape, Some("$$key".to_string())))
+}
+
+fn correlated_if_items(
+    ctx: &mut Context,
+    parent: &mut Level,
+    tail: &TypedExpr,
+) -> Option<(ResultShape, Option<String>)> {
+    let TypedExprKind::If { arms, default } = &tail.kind else {
+        return None;
+    };
+    if ctx.child.is_some() || ctx.nest_depth >= 1 || ctx.temp_collect.is_some() {
+        return None;
+    }
+    let QueryType::List(inner) = peel_optional(&tail.ty) else {
+        return None;
+    };
+    let elem_ty = scalar_of(inner)?;
+    let mut fids: Vec<FieldId> = Vec::new();
+    for (cond, _) in arms.iter() {
+        if !guard_outer_refs(cond, &mut fids) {
+            return None;
+        }
+    }
+    if fids.is_empty() {
+        return None;
+    }
+    let mut bodies: Vec<&TypedExpr> = Vec::new();
+    for (_, body) in arms.iter() {
+        let TypedExprKind::Array { elements } = &body.kind else {
+            return None;
+        };
+        for elem in elements {
+            if !matches!(&elem.kind, TypedExprKind::Literal(_)) {
+                return None;
+            }
+        }
+        bodies.push(body);
+    }
+    let TypedExprKind::Array {
+        elements: default_elems,
+    } = &default.kind
+    else {
+        return None;
+    };
+    for elem in default_elems {
+        if !matches!(&elem.kind, TypedExprKind::Literal(_)) {
+            return None;
+        }
+    }
+    bodies.push(default);
+    let mut carries: Vec<(String, Option<ScalarType>)> = Vec::new();
+    for fid in fids {
+        let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
+        let col = match field {
+            Field::Value { columns, .. } => match columns.as_slice() {
+                [col] => ctx.schema.column_name(*col).to_string(),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let ty = output_ty(&parent.builder, &col, ctx.schema)?;
+        if !carries.iter().any(|(c, _)| c == &col) {
+            carries.push((col, Some(ty)));
+        }
+    }
+    let (temp_idx, temp, create_outputs) = cross_cartesian_temp(ctx, parent, &carries, &[]);
+    let was_outer = std::mem::replace(&mut ctx.no_outer, false);
+    let mut conds: Vec<SqlExpr> = Vec::with_capacity(arms.len());
+    for (cond, _) in arms.iter() {
+        conds.push(scalar(ctx, cond));
+    }
+    ctx.no_outer = was_outer;
+    let mut denied: Vec<SqlExpr> = Vec::new();
+    let mut builders: Vec<SelectBuilder> = Vec::new();
+    for (i, body) in bodies.iter().enumerate() {
+        let mut guard = denied.clone();
+        if i < conds.len() {
+            guard.push(conds[i].clone());
+        }
+        if i < conds.len() {
+            denied.push(SqlExpr::Not(Box::new(conds[i].clone())));
+        }
+        let TypedExprKind::Array { elements } = &body.kind else {
+            unreachable!("correlated-if arm re-check: admission pins arrays")
+        };
+        for elem in elements {
+            let mut row = SelectBuilder::new();
+            row.from = Some(FromClause::Temp {
+                name: temp.clone(),
+                columns: create_outputs
+                    .iter()
+                    .map(|(name, ty)| NamedColumn {
+                        name: name.clone(),
+                        ty: *ty,
+                    })
+                    .collect(),
+            });
+            row.select.push(SelectItem::Expr {
+                expr: scalar(ctx, elem),
+                output: "c0".to_string(),
+                ty: Some(elem_ty),
+            });
+            row.select.push(SelectItem::Column {
+                depth: 0,
+                column: "$$key".to_string(),
+                output: "$$pkey".to_string(),
+                ty: Some(ScalarType::Int),
+            });
+            let mut cond = guard.iter().cloned().reduce(|acc, next| SqlExpr::Binary {
+                op: SqlBinOp::And,
+                lhs: Box::new(acc),
+                rhs: Box::new(next),
+            });
+            if let Some(cond) = cond.take() {
+                row.where_ = vec![cond];
+            }
+            builders.push(row);
+        }
+    }
+    if builders.is_empty() {
+        return None;
+    }
+    let item_ty = match &tail.ty {
+        QueryType::List(sub) => sub.as_ref(),
+        _ => &tail.ty,
+    };
+    let child = Level {
+        builder: union_builders(builders),
+        element: tail.ty.clone(),
+        parent: ParentLink::Root { root_idx: 0 },
+        pending: None,
+        stmt_bound: true,
+        output_shapes: None,
+        root_parts: None,
+    };
+    let outputs = builder_outputs(&child.builder, ctx.schema);
+    let shape_cols: Vec<OutputColumn> =
+        shape_columns(builder_output_types(&child.builder, ctx.schema), |name| {
+            name == "$$pkey"
+        });
+    let element = child_element(
+        ctx.schema,
+        child.output_shapes.as_ref(),
+        item_ty,
+        &outputs,
+        |name| name == "$$pkey",
+    );
+    let idx = ctx.sink(
+        child.builder,
+        StatementShape {
+            columns: shape_cols,
+            rows: RowCount::Many,
+        },
+        StatementKind::Query,
+    );
+    let shape = ResultShape::List {
+        element: Box::new(element),
+        child: ChildRef {
+            stmt: idx,
+            parent: Some(ParentRef {
+                stmt: temp_idx,
+                parent_key: "$$key".to_string(),
+                child_key: "$$pkey".to_string(),
+                negated: false,
+            }),
+            cardinality: Cardinality::Many,
             tag: None,
         },
     };

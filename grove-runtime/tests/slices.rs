@@ -883,6 +883,34 @@ fn union_collapse_values() {
 }
 
 #[test]
+fn if_correlated_item_values() {
+    assert_eq!(
+        value("users { x = if active { [1] } else { [2] } }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![Value::Int(1)]))]),
+            rec(&[("x", Value::List(vec![Value::Int(2)]))]),
+            rec(&[("x", Value::List(vec![Value::Int(1)]))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = if active { [1, 2] } else { [3] } }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+            rec(&[("x", Value::List(vec![Value::Int(3)]))]),
+            rec(&[("x", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = if active { [] } else { [2] } }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![]))]),
+            rec(&[("x", Value::List(vec![Value::Int(2)]))]),
+            rec(&[("x", Value::List(vec![]))]),
+        ])
+    );
+}
+
+#[test]
 fn chained_projection_reuses_values() {
     let ord = |t: &str| Value::Record(vec![("total".to_string(), Value::Dec(dec(t)))]);
     assert_eq!(
