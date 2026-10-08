@@ -785,6 +785,54 @@ fn nested_take_bound_inner_values() {
 }
 
 #[test]
+fn nested_cross_root_inner_values() {
+    let ord = |t: &str| rec(&[("total", Value::Dec(dec(t)))]);
+    let sib = |a: &str, b: &str| {
+        Value::List(vec![
+            rec(&[("s", Value::List(vec![ord(a), ord(b)]))]),
+            rec(&[("s", Value::List(vec![ord(a), ord(b)]))]),
+        ])
+    };
+    assert_eq!(
+        value("users { x = orders { s = orders } }"),
+        Value::List(vec![
+            rec(&[("x", sib("10.00", "20.00"))]),
+            rec(&[(
+                "x",
+                Value::List(vec![rec(&[("s", Value::List(vec![ord("30.00")]))])])
+            )]),
+            rec(&[("x", Value::List(vec![]))]),
+        ])
+    );
+}
+
+#[test]
+fn nested_cross_root_scope_inner_values() {
+    let ord = |t: &str| rec(&[("total", Value::Dec(dec(t)))]);
+    let all = || {
+        Value::List(vec![
+            Value::List(vec![ord("10.00"), ord("20.00")]),
+            Value::List(vec![ord("30.00")]),
+            Value::List(vec![]),
+        ])
+    };
+    assert_eq!(
+        value("users { x = orders { s = subordinates.orders } }"),
+        Value::List(vec![
+            rec(&[(
+                "x",
+                Value::List(vec![
+                    rec(&[("s", Value::List(vec![]))]),
+                    rec(&[("s", Value::List(vec![]))]),
+                ])
+            )]),
+            rec(&[("x", Value::List(vec![rec(&[("s", all())])]))]),
+            rec(&[("x", Value::List(vec![]))]),
+        ])
+    );
+}
+
+#[test]
 fn chained_projection_reuses_values() {
     let ord = |t: &str| Value::Record(vec![("total".to_string(), Value::Dec(dec(t)))]);
     assert_eq!(

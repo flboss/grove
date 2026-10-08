@@ -1753,6 +1753,82 @@ pub fn has_pending_parent(shape: &ResultShape) -> bool {
     }
 }
 
+fn reanchor_parts(
+    schema: &ValidatedSchema,
+    mid: StructId,
+    tail: &TypedExpr,
+) -> Option<(String, Option<String>)> {
+    let IdentBinding::Field(rfid) = tail_root_ident(tail)? else {
+        return None;
+    };
+    let owner = rfid.struct_id();
+    if owner == mid {
+        return None;
+    }
+    let rfield = &schema.structs[owner.index()].fields[rfid.local()];
+    let Field::Ref {
+        target, is_list, ..
+    } = rfield
+    else {
+        return None;
+    };
+    if !matches!(&tail.kind, TypedExprKind::Ident { .. }) && !is_list {
+        return None;
+    }
+    if m2m_parts(schema, *rfid).is_some() {
+        return None;
+    }
+    schema.relation_of_field(*rfid)?;
+    let inner_fk = if matches!(&tail.kind, TypedExprKind::Ident { .. }) {
+        let inner_table = schema.tables[schema.structs[target.index()].table.index()]
+            .name
+            .clone();
+        let inner_fk = match link_cols(schema, *rfid) {
+            LinkCols::ParentFk { parent_fk, .. } => parent_fk,
+            LinkCols::TargetFk { child_fk, .. } => child_fk,
+            LinkCols::ManyToMany => return None,
+        };
+        let found = schema.tables.iter().find(|t| t.name == inner_table)?;
+        if !found.columns.iter().any(|c| c.name == inner_fk) {
+            return None;
+        }
+        Some(inner_fk)
+    } else {
+        None
+    };
+    let middle_table = schema.tables[schema.structs[mid.index()].table.index()]
+        .name
+        .clone();
+    let mut walk = None;
+    for (local, field) in schema.structs[mid.index()].fields.iter().enumerate() {
+        let Field::Ref { target: to, .. } = field else {
+            continue;
+        };
+        if *to != owner {
+            continue;
+        }
+        let fid = FieldId::new(mid, local);
+        if schema.relation_of_field(fid).is_none() {
+            continue;
+        }
+        let middle_fk = match link_cols(schema, fid) {
+            LinkCols::ParentFk { parent_fk, .. } => parent_fk,
+            LinkCols::TargetFk { child_fk, .. } => child_fk,
+            LinkCols::ManyToMany => continue,
+        };
+        if walk.is_some() {
+            return None;
+        }
+        walk = Some(middle_fk);
+    }
+    let middle_fk = walk?;
+    let found = schema.tables.iter().find(|t| t.name == middle_table)?;
+    if !found.columns.iter().any(|c| c.name == middle_fk) {
+        return None;
+    }
+    Some((middle_fk, inner_fk))
+}
+
 fn nested_bulk_lane(parent: &Level, tail: &TypedExpr) -> bool {
     matches!(tail_root_ident(tail), Some(IdentBinding::Field(_)))
         && parent.pending.is_none()
@@ -8219,13 +8295,17 @@ fn rvalue_shape(
     let (child_from, child_col, parent_key, m2m_join) = match tail_root_ident(tail) {
         Some(IdentBinding::Field(fid)) => {
             let link = resolve_tail_link(ctx, *fid);
-            let _ = parent;
-            (
-                link.child_from,
-                link.child_col,
-                Some(link.parent_col),
-                link.m2m_join,
-            )
+            let reanchored = row_struct(&parent.element)
+                .and_then(|mid| reanchor_parts(ctx.schema, mid, tail))
+                .map(|(middle_fk, _)| {
+                    ensure_key(&mut parent.builder, &middle_fk, ctx.schema);
+                    middle_fk
+                });
+            let parent_key = match reanchored {
+                Some(middle_fk) => Some(middle_fk),
+                None => Some(link.parent_col),
+            };
+            (link.child_from, link.child_col, parent_key, link.m2m_join)
         }
         Some(IdentBinding::Root { root_idx }) => {
             let root = &ctx.schema.roots[*root_idx];
@@ -13911,10 +13991,15 @@ fn split_divert_flags(schema: &ValidatedSchema, tail: &TypedExpr) -> (bool, bool
         _ => None,
     };
     let deep = items.iter().any(|item| {
-        if matches!(item.value.ty, QueryType::List(_)) {
-            !matches!(tail_root_ident(&item.value), Some(IdentBinding::Field(fid)) if Some(fid.struct_id()) == mid_struct)
-        } else {
-            uses_outer(&item.value) || take_bound_ident(&item.value)
+        if !matches!(item.value.ty, QueryType::List(_)) {
+            return uses_outer(&item.value) || take_bound_ident(&item.value);
+        }
+        if matches!(tail_root_ident(&item.value), Some(IdentBinding::Field(fid)) if Some(fid.struct_id()) == mid_struct) {
+            return false;
+        }
+        match mid_struct {
+            Some(mid) => reanchor_parts(schema, mid, &item.value).is_none(),
+            None => true,
         }
     });
     (spine_tb, spine_outer, deep)
