@@ -2613,6 +2613,127 @@ fn nth_negative_literal(base: &TypedExpr) -> bool {
     false
 }
 
+enum PresenceOuter {
+    First,
+    Nth(i64),
+}
+
+struct PresenceTail<'a> {
+    array: &'a TypedExpr,
+    prefix: Option<(&'a str, i64)>,
+    outer: PresenceOuter,
+    default: &'a TypedExpr,
+}
+
+fn presence_tail_parts(tail: &TypedExpr) -> Option<PresenceTail<'_>> {
+    let TypedExprKind::Method {
+        base: collapse,
+        name,
+        args,
+        ..
+    } = &tail.kind
+    else {
+        return None;
+    };
+    if name.value != "unwrap_or" {
+        return None;
+    };
+    let [default_arg] = args.as_slice() else {
+        return None;
+    };
+    let default_node = peel_some(&default_arg.expr);
+    let TypedExprKind::Array {
+        elements: def_elems,
+    } = &default_node.kind
+    else {
+        return None;
+    };
+    if def_elems.is_empty() {
+        return None;
+    }
+    let cnode = peel_some(collapse);
+    let TypedExprKind::Method {
+        base, name, args, ..
+    } = &cnode.kind
+    else {
+        return None;
+    };
+    let outer = if name.value == "first" {
+        PresenceOuter::First
+    } else if name.value == "nth" {
+        let [arg] = args.as_slice() else {
+            return None;
+        };
+        PresenceOuter::Nth(const_int_lit(&arg.expr)?)
+    } else {
+        return None;
+    };
+    let (array, prefix) = match &peel_some(base).kind {
+        TypedExprKind::Array { .. } => (peel_some(base), None),
+        TypedExprKind::Method {
+            base: inner,
+            name: pre,
+            args: pre_args,
+            ..
+        } if ["take", "skip"].contains(&pre.value.as_str()) => {
+            let [barg] = pre_args.as_slice() else {
+                return None;
+            };
+            let bound = const_int_lit(&barg.expr)?;
+            if !matches!(&peel_some(inner).kind, TypedExprKind::Array { .. }) {
+                return None;
+            }
+            (peel_some(inner), Some((pre.value.as_str(), bound)))
+        }
+        _ => return None,
+    };
+    Some(PresenceTail {
+        array,
+        prefix,
+        outer,
+        default: &default_arg.expr,
+    })
+}
+
+enum PresencePick<'a> {
+    Elem(&'a TypedExpr),
+    Empty,
+    Loud,
+}
+
+fn fold_presence_pick<'a>(
+    elements: &'a [TypedExpr],
+    outer: &PresenceOuter,
+    prefix: Option<(&str, i64)>,
+) -> PresencePick<'a> {
+    let mut elems: Vec<&'a TypedExpr> = elements.iter().collect();
+    if let Some((method, bound)) = prefix {
+        if bound < 0 {
+            return PresencePick::Loud;
+        }
+        if method == "take" {
+            let n = (bound as usize).min(elems.len());
+            elems.truncate(n);
+        } else {
+            let k = (bound as usize).min(elems.len());
+            elems.drain(..k);
+        }
+    }
+    let idx = match outer {
+        PresenceOuter::First => 0,
+        PresenceOuter::Nth(n) => {
+            if *n < 0 {
+                return PresencePick::Loud;
+            }
+            *n as usize
+        }
+    };
+    if elems.len() <= idx {
+        return PresencePick::Empty;
+    }
+    PresencePick::Elem(elems[idx])
+}
+
 fn abort_present_rows(ctx: &mut Context, level: Level, msg: &str) -> Level {
     let Level {
         mut builder,
@@ -2744,17 +2865,43 @@ fn unwrap_or_record_rows(ctx: &mut Context, level: Level, default: &TypedExpr) -
     let base_inner = shift_outer_builder(base_inner, 2);
     let guard_base = shift_outer_builder(base_inner.clone(), 2);
     builder = base_inner;
-    let default_level = rows(ctx, default);
-    if default_level.pending.is_some() || !default_level.builder.unions.is_empty() {
-        todo!("M4 presence-directed unwrap over records");
-    }
+    let default_node = peel_some(default);
     let mut arm_inner = SelectBuilder::new();
+    let arm_builder = if let TypedExprKind::Struct { fields } = &default_node.kind {
+        let value_cols = builder_outputs(&builder, ctx.schema);
+        let mut select = Vec::with_capacity(value_cols.len());
+        for col in &value_cols {
+            let Some((_, field_expr)) = fields.iter().find(|(fname, _)| fname.value == *col) else {
+                todo!("M4 presence-directed unwrap over records");
+            };
+            select.push(SelectItem::Expr {
+                expr: scalar(ctx, field_expr),
+                output: col.clone(),
+                ty: None,
+            });
+        }
+        SelectBuilder {
+            select,
+            from: None,
+            where_: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            unions: Vec::new(),
+        }
+    } else {
+        let default_level = rows(ctx, default);
+        if default_level.pending.is_some() || !default_level.builder.unions.is_empty() {
+            todo!("M4 presence-directed unwrap over records");
+        }
+        let mut arm_builder = default_level.builder;
+        if arm_builder.select.is_empty() {
+            arm_builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+        }
+        arm_builder
+    };
     arm_inner.from = Some(FromClause::Subquery {
         query: Box::new({
-            let mut arm_builder = default_level.builder;
-            if arm_builder.select.is_empty() {
-                arm_builder.select = vec![SelectItem::AllFrom { depth: 0 }];
-            }
             if builder_outputs(&builder, ctx.schema) != builder_outputs(&arm_builder, ctx.schema) {
                 todo!("M4 presence-directed unwrap over records");
             }
@@ -7525,6 +7672,9 @@ fn rvalue_shape(
             {
                 return rtemp_method_shape(ctx, parent, tail);
             }
+            if let Some(pt) = presence_tail_parts(tail) {
+                return rtemp_presence_shape(ctx, parent, pt);
+            }
             todo!("M6 correlated literal projection item");
         }
         return sink_broadcast_tail(ctx, tail);
@@ -8368,9 +8518,7 @@ fn rscalar_shape(
                 None,
             )
         }
-        _ => unreachable!(
-            "exotic single tail root: If tails are rejected by callers and Field/Root tails route above; other record-typed bottoms (projected idents) rewrite through definition substitution before lanes run; remaining kinds infer non-record types (Some-of-optional is checker-rejected), contradicting the record-only callers"
-        ),
+        _ => todo!("M4 presence-directed unwrap over records"),
     };
     let keyed = parent_key.is_some();
     let mut child_builder = SelectBuilder::new();
@@ -10814,6 +10962,365 @@ fn rtemp_query_grid_level(
         },
     )
 }
+fn rtemp_presence_shape(
+    ctx: &mut Context,
+    parent: &mut Level,
+    pt: PresenceTail<'_>,
+) -> (ResultShape, Option<String>) {
+    let TypedExprKind::Array { elements: _ } = &pt.array.kind else {
+        unreachable!("presence array without elements: detection gates bare arrays")
+    };
+    let inner = match &pt.array.ty {
+        QueryType::List(inner) => inner.as_ref(),
+        _ => unreachable!(
+            "non-list array type {}: the checker types arrays as lists",
+            pt.array.ty
+        ),
+    };
+    let TypedExprKind::Array {
+        elements: def_elems,
+    } = &peel_some(pt.default).kind
+    else {
+        unreachable!("presence default without elements: detection gates arrays")
+    };
+    let mut refs: Vec<String> = Vec::new();
+    if !query_ref_walk(ctx.schema, pt.array, &mut refs) {
+        todo!("M6 correlated literal projection item");
+    }
+    for def_elem in def_elems {
+        if !query_ref_walk(ctx.schema, def_elem, &mut refs) {
+            todo!("M6 correlated literal projection item");
+        }
+    }
+    if refs.iter().any(|r| r == "c0" || r == "c1" || r == "$$key") {
+        todo!("M6 correlated literal projection item");
+    }
+    let (temp, temp_idx, create_outputs) = materialize_array_parent(ctx, parent, &refs);
+    swap_parent_to_temp(parent, &temp, &create_outputs);
+    let ref_tys = resolve_ref_tys(ctx, parent, &refs);
+    let _ = ref_tys;
+    ctx.temp_collect = Some(TempCollect {
+        temp: temp.clone(),
+        key_col: "$$key".to_string(),
+        child_fk: "c0".to_string(),
+        refs,
+    });
+    ctx.in_array_temp = true;
+    let out = rtemp_presence_arms(ctx, &temp, temp_idx, inner, &pt);
+    ctx.in_array_temp = false;
+    ctx.temp_collect.take();
+    out
+}
+
+fn rtemp_presence_arms(
+    ctx: &mut Context,
+    temp: &str,
+    temp_idx: usize,
+    inner: &QueryType,
+    pt: &PresenceTail<'_>,
+) -> (ResultShape, Option<String>) {
+    let PresenceTail {
+        array,
+        prefix,
+        outer,
+        default,
+    } = pt;
+    let TypedExprKind::Array { elements } = &array.kind else {
+        unreachable!("presence array without elements: detection gates bare arrays")
+    };
+    let TypedExprKind::Array {
+        elements: def_elems,
+    } = &peel_some(default).kind
+    else {
+        unreachable!("presence default without elements: detection gates arrays")
+    };
+    let sub = match peel_optional(inner) {
+        QueryType::List(sub) => sub.as_ref().clone(),
+        _ => todo!("M6 correlated literal projection item"),
+    };
+    let mut def_arms: Vec<Vec<(SqlExpr, Option<ScalarType>)>> = Vec::new();
+    for def_elem in def_elems {
+        let mut cells = Vec::new();
+        temp_array_cells(ctx, def_elem, &sub, &mut cells);
+        def_arms.push(cells);
+    }
+    let abort_msg: Option<&str> = match (&outer, &prefix) {
+        (PresenceOuter::Nth(n), _) if *n < 0 => Some("nth requires a non-negative integer"),
+        (_, Some(("take", b))) if *b < 0 => Some("take requires a non-negative integer"),
+        (_, Some(("skip", b))) if *b < 0 => Some("skip requires a non-negative integer"),
+        _ => None,
+    };
+    if let Some(msg) = abort_msg {
+        let mut select = vec![SelectItem::Column {
+            depth: 0,
+            column: "$$key".to_string(),
+            output: "c0".to_string(),
+            ty: None,
+        }];
+        if let Some(layout) = def_arms.first() {
+            for (i, (_, ty)) in layout.iter().enumerate() {
+                select.push(SelectItem::Expr {
+                    expr: SqlExpr::Param(ParamValue::Null),
+                    output: format!("c{}", i + 1),
+                    ty: *ty,
+                });
+            }
+        }
+        let probe_base = SelectBuilder {
+            select,
+            from: Some(FromClause::Table {
+                table: temp.to_string(),
+                alias: temp.to_string(),
+            }),
+            where_: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            unions: Vec::new(),
+        };
+        let abort = abort_present_rows(
+            ctx,
+            Level {
+                builder: probe_base,
+                element: inner.clone(),
+                parent: ParentLink::Root { root_idx: 0 },
+                pending: None,
+                stmt_bound: true,
+                output_shapes: None,
+                root_parts: None,
+            },
+            msg,
+        );
+        let mut abort_builder = abort.builder;
+        if abort_builder.select.is_empty() {
+            abort_builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+        }
+        let outputs = builder_outputs(&abort_builder, ctx.schema);
+        let shape_cols: Vec<OutputColumn> =
+            shape_columns(builder_output_types(&abort_builder, ctx.schema), |name| {
+                name == "c0"
+            });
+        let element = child_element(ctx.schema, None, &sub, &outputs, |name| name == "c0");
+        let idx = ctx.sink(
+            abort_builder,
+            StatementShape {
+                columns: shape_cols,
+                rows: RowCount::Many,
+            },
+            StatementKind::Query,
+        );
+        return (
+            ResultShape::List {
+                element: Box::new(element),
+                child: ChildRef {
+                    stmt: idx,
+                    parent: Some(ParentRef {
+                        stmt: temp_idx,
+                        parent_key: "$$key".to_string(),
+                        child_key: "c0".to_string(),
+                        negated: false,
+                    }),
+                    cardinality: Cardinality::Many,
+                    tag: None,
+                },
+            },
+            Some("$$key".to_string()),
+        );
+    }
+    let mut capped: Option<SelectBuilder> = None;
+    match fold_presence_pick(elements, outer, *prefix) {
+        PresencePick::Loud => todo!("M6 correlated literal projection item"),
+        PresencePick::Empty => {}
+        PresencePick::Elem(winner) => {
+            let node = peel_some(winner);
+            let TypedExprKind::Array { elements: items } = &node.kind else {
+                todo!("M6 query-valued array element");
+            };
+            let mut cells = Vec::new();
+            for item in items {
+                let item_node = peel_some(item);
+                if let TypedExprKind::Literal(lit) = &item_node.kind
+                    && matches!(&lit.value, Literal::None)
+                    && matches!(peel_optional(&item.ty), QueryType::List(_))
+                {
+                    todo!("M6 correlated literal projection item");
+                }
+                temp_array_cells(ctx, item, &sub, &mut cells);
+            }
+            let mut select = vec![SelectItem::Column {
+                depth: 0,
+                column: "$$key".to_string(),
+                output: "c0".to_string(),
+                ty: None,
+            }];
+            for (i, (expr, ty)) in cells.into_iter().enumerate() {
+                select.push(SelectItem::Expr {
+                    expr,
+                    output: format!("c{}", i + 1),
+                    ty,
+                });
+            }
+            capped = Some(SelectBuilder {
+                select,
+                from: Some(FromClause::Table {
+                    table: temp.to_string(),
+                    alias: temp.to_string(),
+                }),
+                where_: Vec::new(),
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
+                unions: Vec::new(),
+            });
+        }
+    }
+    if let Some(ref capped) = capped
+        && builder_has_subquery(capped)
+    {
+        todo!("M6 correlated literal projection item");
+    }
+    let mut arms: Vec<SelectBuilder> = Vec::new();
+    if let Some(capped) = capped {
+        arms.push(capped);
+    }
+    for cells in &def_arms {
+        if cells.len() + 1
+            != arms
+                .first()
+                .map(|a| builder_outputs(a, ctx.schema).len())
+                .unwrap_or(cells.len() + 1)
+        {
+            todo!("M6 correlated literal projection item");
+        }
+        let mut select = vec![SelectItem::Column {
+            depth: 0,
+            column: "$$key".to_string(),
+            output: "c0".to_string(),
+            ty: None,
+        }];
+        for (i, (expr, ty)) in cells.iter().enumerate() {
+            select.push(SelectItem::Expr {
+                expr: expr.clone(),
+                output: format!("c{}", i + 1),
+                ty: *ty,
+            });
+        }
+        let mut arm = SelectBuilder {
+            select,
+            from: Some(FromClause::Table {
+                table: temp.to_string(),
+                alias: temp.to_string(),
+            }),
+            where_: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            unions: Vec::new(),
+        };
+        if arms.is_empty() {
+        } else {
+            let probe_inner = arms[0].clone();
+            arm.where_
+                .push(SqlExpr::Not(Box::new(SqlExpr::Exists(Box::new(
+                    SelectBuilder {
+                        select: vec![SelectItem::Expr {
+                            expr: SqlExpr::Param(ParamValue::Int(1)),
+                            output: "one".to_string(),
+                            ty: Some(ScalarType::Int),
+                        }],
+                        from: Some(FromClause::Subquery {
+                            query: Box::new(probe_inner),
+                            alias: ctx.aliases.subquery(),
+                        }),
+                        where_: vec![SqlExpr::Binary {
+                            op: SqlBinOp::Eq,
+                            lhs: Box::new(SqlExpr::Column {
+                                depth: 0,
+                                column: "c0".to_string(),
+                            }),
+                            rhs: Box::new(SqlExpr::Column {
+                                depth: 1,
+                                column: "$$key".to_string(),
+                            }),
+                        }],
+                        order_by: Vec::new(),
+                        limit: None,
+                        offset: None,
+                        unions: Vec::new(),
+                    },
+                )))));
+        }
+        arms.push(arm);
+    }
+    let union = union_builders(arms);
+    let outputs = builder_outputs(&union, ctx.schema);
+    let shape_cols: Vec<OutputColumn> =
+        shape_columns(builder_output_types(&union, ctx.schema), |name| {
+            name == "c0"
+        });
+    let element = child_element(ctx.schema, None, &sub, &outputs, |name| name == "c0");
+    let idx = ctx.sink(
+        union,
+        StatementShape {
+            columns: shape_cols,
+            rows: RowCount::Many,
+        },
+        StatementKind::Query,
+    );
+    (
+        ResultShape::List {
+            element: Box::new(element),
+            child: ChildRef {
+                stmt: idx,
+                parent: Some(ParentRef {
+                    stmt: temp_idx,
+                    parent_key: "$$key".to_string(),
+                    child_key: "c0".to_string(),
+                    negated: false,
+                }),
+                cardinality: Cardinality::Many,
+                tag: None,
+            },
+        },
+        Some("$$key".to_string()),
+    )
+}
+
+fn builder_has_subquery(builder: &SelectBuilder) -> bool {
+    fn expr_has(expr: &SqlExpr, depth: usize) -> bool {
+        match expr {
+            SqlExpr::Column { depth: d, .. } => *d > depth,
+            SqlExpr::Param(_) | SqlExpr::Count => false,
+            SqlExpr::Binary { lhs, rhs, .. } => expr_has(lhs, depth) || expr_has(rhs, depth),
+            SqlExpr::Not(x) => expr_has(x, depth),
+            SqlExpr::Func { args, .. } => args.iter().any(|a| expr_has(a, depth)),
+            SqlExpr::Case { arms, else_, .. } => {
+                arms.iter()
+                    .any(|(c, t)| expr_has(c, depth) || expr_has(t, depth))
+                    || expr_has(else_, depth)
+            }
+            SqlExpr::In { expr, items, .. } => {
+                expr_has(expr, depth) || items.iter().any(|i| expr_has(i, depth))
+            }
+            SqlExpr::Coalesce(xs) => xs.iter().any(|x| expr_has(x, depth)),
+            SqlExpr::Cast { expr, .. } => expr_has(expr, depth),
+            SqlExpr::Window {
+                partition, order, ..
+            } => {
+                partition.iter().any(|p| expr_has(p, depth))
+                    || order.iter().any(|o| expr_has(&o.expr, depth))
+            }
+            SqlExpr::InSubquery { .. } | SqlExpr::Subquery { .. } | SqlExpr::Exists(_) => true,
+        }
+    }
+    builder.select.iter().any(|item| match item {
+        SelectItem::AllFrom { .. } => false,
+        SelectItem::Column { .. } => false,
+        SelectItem::Expr { expr, .. } => expr_has(expr, 0),
+    }) || builder.where_.iter().any(|w| expr_has(w, 0))
+        || builder.order_by.iter().any(|o| expr_has(&o.expr, 0))
+}
+
 fn rtemp_method_shape(
     ctx: &mut Context,
     parent: &mut Level,

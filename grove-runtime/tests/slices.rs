@@ -2693,6 +2693,134 @@ fn slice_multi_list_fork() {
 }
 
 #[test]
+fn slice_unwrap_or_presence() {
+    assert_eq!(
+        value("users { x = [[1], [2]].first().unwrap_or([0]) }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![Value::Int(1)]))]),
+            rec(&[("x", Value::List(vec![Value::Int(1)]))]),
+            rec(&[("x", Value::List(vec![Value::Int(1)]))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [[1]].take(0).first().unwrap_or([0]) }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![Value::Int(0)]))]),
+            rec(&[("x", Value::List(vec![Value::Int(0)]))]),
+            rec(&[("x", Value::List(vec![Value::Int(0)]))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [[(1, 2)]].first().unwrap_or([(0, 0)]) }"),
+        Value::List(vec![
+            rec(&[(
+                "x",
+                Value::List(vec![Value::Tuple(vec![Value::Int(1), Value::Int(2)])]),
+            )]),
+            rec(&[(
+                "x",
+                Value::List(vec![Value::Tuple(vec![Value::Int(1), Value::Int(2)])]),
+            )]),
+            rec(&[(
+                "x",
+                Value::List(vec![Value::Tuple(vec![Value::Int(1), Value::Int(2)])]),
+            )]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [[age]].first().unwrap_or([0]) }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![Value::Int(30)]))]),
+            rec(&[("x", Value::List(vec![Value::Int(40)]))]),
+            rec(&[("x", Value::List(vec![Value::Int(50)]))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [[age]].take(0).first().unwrap_or([0]) }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![Value::Int(0)]))]),
+            rec(&[("x", Value::List(vec![Value::Int(0)]))]),
+            rec(&[("x", Value::List(vec![Value::Int(0)]))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [[age]].nth(5).unwrap_or([0]) }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![Value::Int(0)]))]),
+            rec(&[("x", Value::List(vec![Value::Int(0)]))]),
+            rec(&[("x", Value::List(vec![Value::Int(0)]))]),
+        ])
+    );
+    let mut rt = fixture();
+    let err = rt
+        .execute_value(&compile_q("users { x = [[1]].nth(-1).unwrap_or([0]) }"))
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("nth requires a non-negative integer")
+    );
+    let mut rt = fixture();
+    let err = rt
+        .execute_value(&compile_q("users { x = [[age]].nth(-1).unwrap_or([0]) }"))
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("nth requires a non-negative integer")
+    );
+}
+
+#[test]
+fn slice_unwrap_or_records() {
+    let cfg = |n: &str, o: &str| {
+        Value::Record(vec![
+            ("name".to_string(), s(n)),
+            ("owner".to_string(), s(o)),
+        ])
+    };
+    assert_eq!(
+        value("users { x = configs.take(1).first().unwrap_or({name = \"d\", owner = \"e\"}) }"),
+        Value::List(vec![
+            rec(&[("x", cfg("n1", "a@x"))]),
+            rec(&[("x", cfg("n1", "a@x"))]),
+            rec(&[("x", cfg("n1", "a@x"))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = configs.take(0).first().unwrap_or({name = \"d\", owner = \"e\"}) }"),
+        Value::List(vec![
+            rec(&[("x", cfg("d", "e"))]),
+            rec(&[("x", cfg("d", "e"))]),
+            rec(&[("x", cfg("d", "e"))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = configs.take(1).first().unwrap_or({owner = \"e\", name = \"d\"}) }"),
+        Value::List(vec![
+            rec(&[("x", cfg("n1", "a@x"))]),
+            rec(&[("x", cfg("n1", "a@x"))]),
+            rec(&[("x", cfg("n1", "a@x"))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [[{a = 1}]].first().unwrap_or([{a = 0}]) }"),
+        Value::List(vec![
+            rec(&[(
+                "x",
+                Value::List(vec![Value::Record(vec![("a".to_string(), Value::Int(1))])]),
+            )]),
+            rec(&[(
+                "x",
+                Value::List(vec![Value::Record(vec![("a".to_string(), Value::Int(1))])]),
+            )]),
+            rec(&[(
+                "x",
+                Value::List(vec![Value::Record(vec![("a".to_string(), Value::Int(1))])]),
+            )]),
+        ])
+    );
+}
+
+#[test]
 fn slice_query_temp_elements() {
     let ord = |t: &str| Value::Record(vec![("total".to_string(), Value::Dec(dec(t)))]);
     assert_eq!(
