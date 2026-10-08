@@ -442,6 +442,33 @@ fn slice_nested_collapse_chain() {
 }
 
 #[test]
+fn slice_nested_collapse_chain_value() {
+    let item = |sku: &str| rec(&[("sku", s(sku))]);
+    let ada_pick = Value::List(vec![
+        Value::List(vec![item("a"), item("b")]),
+        Value::List(vec![]),
+    ]);
+    let bob_pick = Value::List(vec![Value::List(vec![item("c")])]);
+    let cyd_pick = Value::List(vec![]);
+    let Value::List(rows) = value("users { o = subordinates.orders.first()?.items }") else {
+        panic!("root is a list");
+    };
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0], rec(&[("o", Value::Null)]));
+    assert_eq!(rows[2], rec(&[("o", Value::Null)]));
+    let Value::Record(bob_fields) = &rows[1] else {
+        panic!("row is a record");
+    };
+    assert_eq!(bob_fields.len(), 1);
+    assert_eq!(bob_fields[0].0, "o");
+    assert!(
+        bob_fields[0].1 == ada_pick || bob_fields[0].1 == bob_pick || bob_fields[0].1 == cyd_pick,
+        "unexpected Bob pick: {:?}",
+        bob_fields[0].1
+    );
+}
+
+#[test]
 fn slice_nested_scalar_temp_arms() {
     let t = |v: i64| rec(&[("t", Value::Int(v))]);
     assert_eq!(
