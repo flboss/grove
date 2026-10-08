@@ -2655,12 +2655,34 @@ fn fold_literal_pick(base: &TypedExpr) -> Option<Option<TypedExpr>> {
     if name.value != "first" && name.value != "nth" {
         return None;
     }
+    let mut arr = arr;
+    loop {
+        if let TypedExprKind::Method {
+            base, name, args, ..
+        } = &arr.kind
+            && ["take", "skip"].contains(&name.value.as_str())
+        {
+            let [arg] = args.as_slice() else {
+                return None;
+            };
+            let zero = matches!(
+                &arg.expr.kind,
+                TypedExprKind::Literal(lit) if matches!(&lit.value, crate::ast::Literal::Int(0))
+            );
+            if !zero {
+                return None;
+            }
+            if name.value == "take" {
+                return Some(None);
+            }
+            arr = base;
+            continue;
+        }
+        break;
+    }
     let TypedExprKind::Array { elements } = &arr.kind else {
         return None;
     };
-    if has_scope_ident(base) || uses_outer(base) || take_bound_ident(base) {
-        return None;
-    }
     let idx = if name.value == "first" {
         0
     } else {
@@ -2675,10 +2697,14 @@ fn fold_literal_pick(base: &TypedExpr) -> Option<Option<TypedExpr>> {
             _ => return None,
         }
     };
-    let Some(elem) = elements.get(idx) else {
+    if elements.len() <= idx {
         return Some(None);
-    };
-    if !matches!(&elem.ty, QueryType::List(inner) if matches!(inner.as_ref(), QueryType::Scalar(_)))
+    }
+    if has_scope_ident(base) || uses_outer(base) || take_bound_ident(base) {
+        return None;
+    }
+    let elem = &elements[idx];
+    if !matches!(&elem.ty, QueryType::List(inner) if matches!(inner.as_ref(), QueryType::Scalar(_) | QueryType::Tuple(_) | QueryType::Record(_)))
     {
         return None;
     }
