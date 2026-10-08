@@ -1791,6 +1791,15 @@ fn b1_optional_list(
             && ["take", "skip"].contains(&pre.value.as_str())
             && matches!(&peel_some(inner).kind, TypedExprKind::Array { .. })
         {
+            if let TypedExprKind::Array { elements } = &peel_some(inner).kind
+                && let Some(element) = single_collection_element(value, elements)
+            {
+                let methods = vec![EntryMethod::TakeSkip {
+                    name: pre.value.clone(),
+                    args: pre_args,
+                }];
+                return b1_temp_collection(ctx, parent, element, methods);
+            }
             return b1_temp_collapse_prefixed(ctx, parent, inner, pre, pre_args);
         }
     }
@@ -1821,6 +1830,211 @@ fn b1_optional_list(
     todo!("M4b presence: optional list item")
 }
 
+fn single_collection_element<'a>(
+    value: &TypedExpr,
+    elements: &'a [TypedExpr],
+) -> Option<&'a TypedExpr> {
+    let [element] = elements else {
+        return None;
+    };
+    if !matches!(
+        &element.kind,
+        TypedExprKind::Ident {
+            binding: IdentBinding::Field(_),
+            ..
+        }
+    ) {
+        return None;
+    }
+    if !matches!(peel_optional(&element.ty), QueryType::List(_)) {
+        return None;
+    }
+    if peel_optional(&value.ty) != peel_optional(&element.ty) {
+        return None;
+    }
+    Some(element)
+}
+
+fn b1_temp_collection(
+    ctx: &mut Context,
+    parent: &mut Level,
+    element: &TypedExpr,
+    methods: Vec<EntryMethod<'_>>,
+) -> (Vec<SelectItem>, ResultShape, Vec<String>) {
+    let TypedExprKind::Ident {
+        binding: IdentBinding::Field(fid),
+        ..
+    } = &element.kind
+    else {
+        unreachable!("single-collection dispatch guarantees a field ident")
+    };
+    let link = resolve_tail_link(ctx, *fid);
+    if link.m2m_join.is_some() {
+        todo!("M4 many-to-many navigation");
+    }
+    let parent_table = match &parent.builder.from {
+        Some(FromClause::Table { table, .. }) => table.clone(),
+        _ => todo!("M4b nested list item"),
+    };
+    if !parent.builder.unions.is_empty() {
+        todo!("M4b nested list item");
+    }
+    let parent_alias = ctx.aliases.table(&parent_table);
+    let mut create_q = SelectBuilder::new();
+    create_q.select = vec![SelectItem::AllFrom { depth: 0 }];
+    create_q.from = Some(FromClause::Table {
+        table: parent_table,
+        alias: parent_alias,
+    });
+    create_q.select.push(SelectItem::Expr {
+        expr: SqlExpr::Window {
+            func: "ROW_NUMBER".to_string(),
+            partition: Vec::new(),
+            order: Vec::new(),
+        },
+        output: "$$key".to_string(),
+        ty: Some(ScalarType::Int),
+    });
+    let create_outputs = builder_output_types(&create_q, ctx.schema);
+    let temp = ctx.aliases.temp();
+    let _temp_idx = ctx.sink(
+        create_q,
+        StatementShape {
+            columns: shape_columns(create_outputs.clone(), |name| name == "$$key"),
+            rows: RowCount::Many,
+        },
+        StatementKind::Temp { name: temp.clone() },
+    );
+    let mut link_builder = SelectBuilder::new();
+    link_builder.select.push(SelectItem::Column {
+        depth: 0,
+        column: "$$key".to_string(),
+        output: "c0".to_string(),
+        ty: None,
+    });
+    link_builder.select.push(SelectItem::Column {
+        depth: 0,
+        column: link.parent_col.clone(),
+        output: link.parent_col.clone(),
+        ty: None,
+    });
+    link_builder.from = Some(FromClause::Temp {
+        name: temp.clone(),
+        columns: create_outputs
+            .iter()
+            .map(|(name, ty)| NamedColumn {
+                name: name.clone(),
+                ty: *ty,
+            })
+            .collect(),
+    });
+    let data_from = link.child_from.clone();
+    let mut arm = SelectBuilder::new();
+    arm.from = Some(FromClause::Join {
+        left: Box::new(FromClause::Temp {
+            name: temp.clone(),
+            columns: create_outputs
+                .iter()
+                .map(|(name, ty)| NamedColumn {
+                    name: name.clone(),
+                    ty: *ty,
+                })
+                .collect(),
+        }),
+        right: Box::new(data_from.clone()),
+    });
+    arm.select.push(SelectItem::Expr {
+        expr: SqlExpr::Column {
+            depth: 1,
+            column: "$$key".to_string(),
+        },
+        output: "c0".to_string(),
+        ty: None,
+    });
+    for (name, ty) in from_columns_typed(&Some(data_from), ctx.schema) {
+        arm.select.push(SelectItem::Column {
+            depth: 0,
+            column: name.clone(),
+            output: name,
+            ty,
+        });
+    }
+    arm.where_ = vec![SqlExpr::Binary {
+        op: SqlBinOp::Eq,
+        lhs: Box::new(SqlExpr::Column {
+            depth: 0,
+            column: link.child_col.clone(),
+        }),
+        rhs: Box::new(SqlExpr::Column {
+            depth: 1,
+            column: link.parent_col.clone(),
+        }),
+    }];
+    let mut union = union_builders(vec![arm]);
+    for m in methods {
+        union = apply_entry_method(ctx, m, union, &element.ty);
+    }
+    let outputs = builder_outputs(&union, ctx.schema);
+    let shape_cols: Vec<OutputColumn> =
+        shape_columns(builder_output_types(&union, ctx.schema), |name| {
+            name == "c0"
+        });
+    let element_shape = child_element(ctx.schema, None, &element.ty, &outputs, |name| name == "c0");
+    let arm_idx = ctx.sink(
+        union,
+        StatementShape {
+            columns: shape_cols,
+            rows: RowCount::Many,
+        },
+        StatementKind::Query,
+    );
+    let link_shape_cols: Vec<OutputColumn> =
+        shape_columns(builder_output_types(&link_builder, ctx.schema), |name| {
+            name == "c0" || name == link.parent_col
+        });
+    let link_idx = ctx.sink(
+        link_builder,
+        StatementShape {
+            columns: link_shape_cols,
+            rows: RowCount::Many,
+        },
+        StatementKind::Query,
+    );
+    let list = ResultShape::List {
+        element: Box::new(element_shape),
+        child: ChildRef {
+            stmt: arm_idx,
+            parent: Some(ParentRef {
+                stmt: link_idx,
+                parent_key: "c0".to_string(),
+                child_key: "c0".to_string(),
+                negated: false,
+            }),
+            cardinality: Cardinality::Many,
+            tag: None,
+        },
+    };
+    let shape = ResultShape::Single {
+        element: Box::new(list),
+        child: ChildRef {
+            stmt: link_idx,
+            parent: Some(ParentRef {
+                stmt: if ctx.child.is_some() {
+                    PENDING_PARENT_STMT
+                } else {
+                    0
+                },
+                parent_key: link.parent_col.clone(),
+                child_key: link.parent_col.clone(),
+                negated: false,
+            }),
+            cardinality: Cardinality::One,
+            tag: None,
+        },
+    };
+    (Vec::new(), shape, Vec::new())
+}
+
 fn b1_temp_collapse(
     ctx: &mut Context,
     parent: &mut Level,
@@ -1836,6 +2050,9 @@ fn b1_temp_collapse(
     let TypedExprKind::Array { elements } = &base.kind else {
         unreachable!("temp collapse over non-array base: callers dispatch on array literals")
     };
+    if let Some(element) = single_collection_element(value, elements) {
+        return b1_temp_collection(ctx, parent, element, Vec::new());
+    }
     let (element, child) = b1_temp_levels(ctx, parent, base, elements, Vec::new());
     let shape = ResultShape::Single {
         element: Box::new(element),
@@ -4368,6 +4585,146 @@ fn shift_nest_from(from: FromClause) -> FromClause {
         FromClause::Join { left, right } => FromClause::Join {
             left: Box::new(shift_nest_from(*left)),
             right: Box::new(shift_nest_from(*right)),
+        },
+        from => from,
+    }
+}
+
+fn shift_arm_expr(expr: SqlExpr, floor: usize) -> SqlExpr {
+    match expr {
+        SqlExpr::Column { depth, column } if depth >= floor => SqlExpr::Column {
+            depth: depth + 1,
+            column,
+        },
+        SqlExpr::InSubquery { expr, query } => SqlExpr::InSubquery {
+            expr: Box::new(shift_arm_expr(*expr, floor)),
+            query: Box::new(shift_arm_builder(*query, floor + 1)),
+        },
+        SqlExpr::Subquery { query } => SqlExpr::Subquery {
+            query: Box::new(shift_arm_builder(*query, floor + 1)),
+        },
+        SqlExpr::Exists(query) => SqlExpr::Exists(Box::new(shift_arm_builder(*query, floor + 1))),
+        SqlExpr::Binary { op, lhs, rhs } => SqlExpr::Binary {
+            op,
+            lhs: Box::new(shift_arm_expr(*lhs, floor)),
+            rhs: Box::new(shift_arm_expr(*rhs, floor)),
+        },
+        SqlExpr::Not(x) => SqlExpr::Not(Box::new(shift_arm_expr(*x, floor))),
+        SqlExpr::Func { name, args } => SqlExpr::Func {
+            name,
+            args: args.into_iter().map(|a| shift_arm_expr(a, floor)).collect(),
+        },
+        SqlExpr::Case { arms, else_ } => SqlExpr::Case {
+            arms: arms
+                .into_iter()
+                .map(|(c, t)| (shift_arm_expr(c, floor), shift_arm_expr(t, floor)))
+                .collect(),
+            else_: Box::new(shift_arm_expr(*else_, floor)),
+        },
+        SqlExpr::In { expr, items } => SqlExpr::In {
+            expr: Box::new(shift_arm_expr(*expr, floor)),
+            items: items
+                .into_iter()
+                .map(|i| shift_arm_expr(i, floor))
+                .collect(),
+        },
+        SqlExpr::Cast { expr, target } => SqlExpr::Cast {
+            expr: Box::new(shift_arm_expr(*expr, floor)),
+            target,
+        },
+        SqlExpr::Coalesce(values) => SqlExpr::Coalesce(
+            values
+                .into_iter()
+                .map(|v| shift_arm_expr(v, floor))
+                .collect(),
+        ),
+        SqlExpr::Window {
+            func,
+            partition,
+            order,
+        } => SqlExpr::Window {
+            func,
+            partition: partition
+                .into_iter()
+                .map(|p| shift_arm_expr(p, floor))
+                .collect(),
+            order: order
+                .into_iter()
+                .map(|item| OrderItem {
+                    expr: shift_arm_expr(item.expr, floor),
+                    dir: item.dir,
+                })
+                .collect(),
+        },
+        other => other,
+    }
+}
+
+fn shift_arm_builder(mut builder: SelectBuilder, floor: usize) -> SelectBuilder {
+    builder.select = builder
+        .select
+        .into_iter()
+        .map(|item| match item {
+            SelectItem::AllFrom { depth } if depth >= floor => {
+                SelectItem::AllFrom { depth: depth + 1 }
+            }
+            SelectItem::Column {
+                depth,
+                column,
+                output,
+                ty,
+            } if depth >= floor => SelectItem::Column {
+                depth: depth + 1,
+                column,
+                output,
+                ty,
+            },
+            SelectItem::Expr { expr, output, ty } => SelectItem::Expr {
+                expr: shift_arm_expr(expr, floor),
+                output,
+                ty,
+            },
+            item => item,
+        })
+        .collect();
+    builder.where_ = builder
+        .where_
+        .into_iter()
+        .map(|w| shift_arm_expr(w, floor))
+        .collect();
+    builder.order_by = builder
+        .order_by
+        .into_iter()
+        .map(|item| OrderItem {
+            expr: shift_arm_expr(item.expr, floor),
+            dir: item.dir,
+        })
+        .collect();
+    if let Some(limit) = builder.limit.take() {
+        builder.limit = Some(shift_arm_expr(limit, floor));
+    }
+    if let Some(offset) = builder.offset.take() {
+        builder.offset = Some(shift_arm_expr(offset, floor));
+    }
+    builder.unions = builder
+        .unions
+        .into_iter()
+        .map(|arm| {
+            let floor = nest_floor(&arm.from);
+            shift_arm_builder(arm, floor)
+        })
+        .collect();
+    if let Some(from) = builder.from.take() {
+        builder.from = Some(shift_arm_from(from));
+    }
+    builder
+}
+
+fn shift_arm_from(from: FromClause) -> FromClause {
+    match from {
+        FromClause::Join { left, right } => FromClause::Join {
+            left: Box::new(shift_arm_from(*left)),
+            right: Box::new(shift_arm_from(*right)),
         },
         from => from,
     }
@@ -18170,7 +18527,7 @@ fn register_literal_level<'a>(
                     exprs.extend(
                         leaf_computed_cells(ctx, elem, inner)
                             .into_iter()
-                            .map(|(expr, _)| expr),
+                            .map(|(expr, _)| shift_arm_expr(expr, 0)),
                     );
                     arms.push(computed_arm(&columns, exprs));
                 }
@@ -18466,9 +18823,6 @@ fn rows_array(ctx: &mut Context, expr: &TypedExpr) -> Level {
         ),
     };
     literal_depth(inner);
-    if ctx.temp_collect.is_some() && (ctx.child.is_some() || ctx.nest_depth >= 1) {
-        todo!("M6 correlated literal projection item");
-    }
     let items: Vec<(&TypedExpr, Option<i64>)> = elements.iter().map(|e| (e, None)).collect();
     let mut chain = register_literal_level(ctx, inner, items);
     let this = chain.remove(0);

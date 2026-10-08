@@ -441,6 +441,67 @@ fn slice_nested_collapse_chain() {
     );
 }
 
+#[test]
+fn slice_nested_scalar_temp_arms() {
+    let t = |v: i64| rec(&[("t", Value::Int(v))]);
+    assert_eq!(
+        value("users { o = orders { t = [age].first() } }"),
+        Value::List(vec![
+            rec(&[("o", Value::List(vec![t(30), t(30)]))]),
+            rec(&[("o", Value::List(vec![t(40)]))]),
+            rec(&[("o", Value::List(vec![]))]),
+        ])
+    );
+    let s = |v: &str| rec(&[("s", n(v))]);
+    assert_eq!(
+        value("users { o = orders.take(age) { s = [total].first() } }"),
+        Value::List(vec![
+            rec(&[("o", Value::List(vec![s("10"), s("20")]))]),
+            rec(&[("o", Value::List(vec![s("30")]))]),
+            rec(&[("o", Value::List(vec![]))]),
+        ])
+    );
+}
+
+#[test]
+fn slice_nested_collection_temp_arms() {
+    let it = |sku: &str, order_id: i64| rec(&[("sku", s(sku)), ("order_id", Value::Int(order_id))]);
+    assert_eq!(
+        value("users { o = orders { t = [items].first() } }"),
+        Value::List(vec![
+            rec(&[(
+                "o",
+                Value::List(vec![
+                    rec(&[("t", Value::List(vec![it("a", 10), it("b", 10)]))]),
+                    rec(&[("t", Value::List(vec![]))]),
+                ]),
+            )]),
+            rec(&[(
+                "o",
+                Value::List(vec![rec(&[("t", Value::List(vec![it("c", 12)]))])]),
+            )]),
+            rec(&[("o", Value::List(vec![]))]),
+        ])
+    );
+    assert_eq!(
+        value("users { o = orders { t = [items].take(1).first() } }"),
+        Value::List(vec![
+            rec(&[(
+                "o",
+                Value::List(vec![
+                    rec(&[("t", Value::List(vec![it("a", 10)]))]),
+                    rec(&[("t", Value::List(vec![]))]),
+                ]),
+            )]),
+            rec(&[(
+                "o",
+                Value::List(vec![rec(&[("t", Value::List(vec![it("c", 12)]))])]),
+            )]),
+            rec(&[("o", Value::List(vec![]))]),
+        ])
+    );
+}
+
 
 #[test]
 fn slice_nested_children() {
