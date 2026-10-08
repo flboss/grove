@@ -14030,6 +14030,24 @@ fn collapse_parks_split(mut node: &TypedExpr) -> bool {
     }
 }
 
+fn presence_base(mut node: &TypedExpr) -> Option<&TypedExpr> {
+    loop {
+        match &node.kind {
+            TypedExprKind::Field { base, .. } => node = base,
+            TypedExprKind::Method {
+                base, name, args, ..
+            } => {
+                if name.value == "first" || (name.value == "nth" && nth_is_zero(args)) {
+                    node = base;
+                } else {
+                    return None;
+                }
+            }
+            _ => return Some(node),
+        }
+    }
+}
+
 enum AggOp {
     Len,
     Bare(BareAgg, ScalarType),
@@ -15748,6 +15766,13 @@ fn scalar_method(
                 }
                 "is_some" => {
                     if collapse_parks_split(base) {
+                        if let Some(bottom) = presence_base(base) {
+                            return SqlExpr::Exists(Box::new(single_row_query(
+                                ctx,
+                                bottom,
+                                vec![SelectItem::AllFrom { depth: 0 }],
+                            )));
+                        }
                         todo!("M4 list-optional mechanics");
                     }
                     SqlExpr::Exists(Box::new(single_row_query(
@@ -15758,6 +15783,15 @@ fn scalar_method(
                 }
                 "is_none" => {
                     if collapse_parks_split(base) {
+                        if let Some(bottom) = presence_base(base) {
+                            return SqlExpr::Not(Box::new(SqlExpr::Exists(Box::new(
+                                single_row_query(
+                                    ctx,
+                                    bottom,
+                                    vec![SelectItem::AllFrom { depth: 0 }],
+                                ),
+                            ))));
+                        }
                         todo!("M4 list-optional mechanics");
                     }
                     SqlExpr::Not(Box::new(SqlExpr::Exists(Box::new(single_row_query(

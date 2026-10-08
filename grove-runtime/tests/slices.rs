@@ -464,6 +464,24 @@ fn slice_nested_scalar_temp_arms() {
 }
 
 #[test]
+fn slice_nested_collapse_presence() {
+    let b = |v: bool| rec(&[("o", Value::Bool(v))]);
+    assert_eq!(
+        value("users { o = subordinates.orders.first()?.items.is_some() }"),
+        Value::List(vec![b(false), b(true), b(false)])
+    );
+    assert_eq!(
+        value("users { o = subordinates.orders.first()?.items.is_none() }"),
+        Value::List(vec![b(true), b(false), b(true)])
+    );
+    let h = |n: &str, v: bool| rec(&[("name", s(n)), ("h", Value::Bool(v))]);
+    assert_eq!(
+        value("users { name, h = users.orders.first().is_some() }"),
+        Value::List(vec![h("Ada", true), h("Bob", true), h("Cyd", true),])
+    );
+}
+
+#[test]
 fn slice_nested_collection_temp_arms() {
     let it = |sku: &str, order_id: i64| rec(&[("sku", s(sku)), ("order_id", Value::Int(order_id))]);
     assert_eq!(
