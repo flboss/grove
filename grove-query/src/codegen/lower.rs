@@ -20470,33 +20470,18 @@ fn rows_if(ctx: &mut Context, expr: &TypedExpr) -> Level {
     }
     let mut conds: Vec<SqlExpr> = Vec::with_capacity(arms.len());
     for (cond, _) in arms {
-        if ctx.temp_collect.is_none()
-            && any_ident(cond, &mut |e| {
-                matches!(
-                    &e.kind,
-                    TypedExprKind::Ident {
-                        binding: IdentBinding::Field(_) | IdentBinding::ProjectedField { .. },
-                        depth,
-                        ..
-                    } if *depth == 0
-                )
-            })
-        {
-            todo!("M4b ordered per-parent single");
-        }
         conds.push(scalar(ctx, cond));
     }
     let sunk_before = ctx.statements.len();
     let mut lowered: Vec<IfArm> = Vec::with_capacity(arms.len() + 1);
     let mut denied: Vec<SqlExpr> = Vec::new();
+    let mut any_sunk = false;
     for ((_, body), cond) in arms.iter().zip(conds.iter()) {
         let mut guard = denied.clone();
         guard.push(cond.clone());
         let mut level = rows(ctx, body);
         let pending = level.pending.take();
-        if ctx.statements.len() != sunk_before {
-            todo!("M7 multi-statement If branches");
-        }
+        any_sunk = any_sunk || ctx.statements.len() != sunk_before;
         if level.builder.select.is_empty() {
             level.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
         }
@@ -20514,9 +20499,7 @@ fn rows_if(ctx: &mut Context, expr: &TypedExpr) -> Level {
         let guard = denied.clone();
         let mut level = rows(ctx, default);
         let pending = level.pending.take();
-        if ctx.statements.len() != sunk_before {
-            todo!("M7 multi-statement If branches");
-        }
+        any_sunk = any_sunk || ctx.statements.len() != sunk_before;
         if level.builder.select.is_empty() {
             level.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
         }
@@ -20528,6 +20511,44 @@ fn rows_if(ctx: &mut Context, expr: &TypedExpr) -> Level {
             guard,
             pending,
         });
+    }
+    let any_pending = lowered.iter().any(|arm| arm.pending.is_some());
+    if any_sunk && !any_pending {
+        let const_conds = arms.iter().all(|(cond, _)| {
+            let mut found = false;
+            any_ident(cond, &mut |e| {
+                if matches!(&e.kind, TypedExprKind::Ident { .. }) {
+                    found = true;
+                }
+                false
+            });
+            !found
+        });
+        if const_conds && ctx.child.is_none() && ctx.nest_depth == 0 && ctx.temp_collect.is_none() {
+            return union_multistatement(ctx, lowered, sunk_before, expr.ty.clone());
+        }
+        todo!("M7 multi-statement If branches");
+    }
+    if ctx.temp_collect.is_none()
+        && arms.iter().any(|(cond, _)| {
+            let mut found = false;
+            any_ident(cond, &mut |e| {
+                if matches!(
+                    &e.kind,
+                    TypedExprKind::Ident {
+                        binding: IdentBinding::Field(_) | IdentBinding::ProjectedField { .. },
+                        depth,
+                        ..
+                    } if *depth == 0
+                ) {
+                    found = true;
+                }
+                false
+            });
+            found
+        })
+    {
+        todo!("M4b ordered per-parent single");
     }
     if lowered.iter().all(|arm| arm.pending.is_none()) {
         let mut branches: Vec<SelectBuilder> =
@@ -20553,6 +20574,271 @@ fn rows_if(ctx: &mut Context, expr: &TypedExpr) -> Level {
     union_branches(ctx, lowered, expr.ty.clone())
 }
 
+fn union_multistatement(
+    ctx: &mut Context,
+    arms: Vec<IfArm>,
+    sunk_before: usize,
+    ty: QueryType,
+) -> Level {
+    let drained: Vec<usize> = ((sunk_before + 1)..=ctx.statements.len()).collect();
+    let mut snapshotted: Vec<(usize, SelectBuilder)> = Vec::with_capacity(drained.len());
+    let mut has_temp = false;
+    for &idx in drained.iter() {
+        let Some(sunk) = ctx.statements.get(idx - 1) else {
+            unreachable!("drained index outside sunk statements: range derives from them")
+        };
+        if matches!(sunk.kind, StatementKind::Temp { .. }) {
+            has_temp = true;
+        }
+        snapshotted.push((idx, sunk.builder.clone()));
+    }
+    let mut shapes: Vec<Vec<(String, Option<ResultShape>)>> = Vec::with_capacity(arms.len());
+    let mut builders: Vec<SelectBuilder> = Vec::with_capacity(arms.len());
+    let mut arm_guards: Vec<Vec<SqlExpr>> = Vec::with_capacity(arms.len());
+    for arm in arms {
+        let Some(output_shapes) = arm.level.output_shapes else {
+            todo!("M7 multi-statement If branches");
+        };
+        shapes.push(output_shapes);
+        builders.push(arm.level.builder);
+        arm_guards.push(arm.guard);
+    }
+    let first_outputs = builder_outputs(&builders[0], ctx.schema);
+    for branch in builders.iter().skip(1) {
+        if builder_outputs(branch, ctx.schema) != first_outputs {
+            todo!("M7 mismatched If branch outputs");
+        }
+    }
+    if !has_temp {
+        ctx.statements.truncate(sunk_before);
+    }
+    let first = shapes.remove(0);
+    let rest: Vec<Vec<(String, Option<ResultShape>)>> = shapes;
+    let mut merged: Vec<(String, Option<ResultShape>)> = Vec::with_capacity(first.len());
+    for (alias, shape) in first {
+        let mut group: Vec<Option<ResultShape>> = vec![shape];
+        for other in rest.iter() {
+            let Some((_, other_shape)) = other.iter().find(|(name, _)| name == &alias) else {
+                todo!("M7 mismatched If branch outputs");
+            };
+            group.push(other_shape.clone());
+        }
+        merged.push((
+            alias,
+            merge_union_shapes(ctx, &drained, &snapshotted, &arm_guards, group),
+        ));
+    }
+    let mut first_builder = builders.remove(0);
+    first_builder.unions = builders;
+    Level {
+        builder: first_builder,
+        element: ty,
+        parent: ParentLink::Root { root_idx: 0 },
+        pending: None,
+        stmt_bound: true,
+        output_shapes: Some(merged),
+        root_parts: None,
+    }
+}
+
+fn merge_union_shapes(
+    ctx: &mut Context,
+    drained: &[usize],
+    snapshotted: &[(usize, SelectBuilder)],
+    arm_guards: &[Vec<SqlExpr>],
+    group: Vec<Option<ResultShape>>,
+) -> Option<ResultShape> {
+    let mut kinds = group.iter().map(|shape| match shape {
+        None => 0u8,
+        Some(ResultShape::Column(_)) => 1,
+        Some(ResultShape::Tuple(_)) => 2,
+        Some(ResultShape::Record(_)) => 3,
+        Some(ResultShape::List { .. }) => 4,
+        Some(ResultShape::Single { .. }) => 5,
+    });
+    let first_kind = kinds.next().unwrap_or(0);
+    if kinds.any(|kind| kind != first_kind) {
+        todo!("M7 mismatched If branch outputs");
+    }
+    match first_kind {
+        0 => None,
+        1 => {
+            let names: Vec<&str> = group
+                .iter()
+                .map(|shape| match shape {
+                    Some(ResultShape::Column(name)) => name.as_str(),
+                    _ => unreachable!("merge kind drift: checked above"),
+                })
+                .collect();
+            if names.iter().any(|name| *name != names[0]) {
+                todo!("M7 mismatched If branch outputs");
+            }
+            group.into_iter().next().flatten()
+        }
+        2 => {
+            let elements: Vec<Vec<ResultShape>> = group
+                .into_iter()
+                .map(|shape| match shape {
+                    Some(ResultShape::Tuple(elements)) => elements,
+                    _ => unreachable!("merge kind drift: checked above"),
+                })
+                .collect();
+            let len = elements[0].len();
+            if elements.iter().any(|els| els.len() != len) {
+                todo!("M7 mismatched If branch outputs");
+            }
+            let mut merged = Vec::with_capacity(len);
+            for i in 0..len {
+                let position: Vec<Option<ResultShape>> =
+                    elements.iter().map(|els| Some(els[i].clone())).collect();
+                merged.push(
+                    merge_union_shapes(ctx, drained, snapshotted, arm_guards, position)
+                        .unwrap_or_else(|| {
+                            unreachable!("merge position went missing: lengths checked above")
+                        }),
+                );
+            }
+            Some(ResultShape::Tuple(merged))
+        }
+        3 => {
+            let fields: Vec<Vec<(String, ResultShape)>> = group
+                .into_iter()
+                .map(|shape| match shape {
+                    Some(ResultShape::Record(fields)) => fields,
+                    _ => unreachable!("merge kind drift: checked above"),
+                })
+                .collect();
+            let names: Vec<Vec<&str>> = fields
+                .iter()
+                .map(|fs| fs.iter().map(|(name, _)| name.as_str()).collect())
+                .collect();
+            if names.iter().any(|ns| *ns != names[0]) {
+                todo!("M7 mismatched If branch outputs");
+            }
+            let mut merged = Vec::with_capacity(names[0].len());
+            for (i, name) in names[0].iter().enumerate() {
+                let position: Vec<Option<ResultShape>> =
+                    fields.iter().map(|fs| Some(fs[i].1.clone())).collect();
+                merged.push((
+                    name.to_string(),
+                    merge_union_shapes(ctx, drained, snapshotted, arm_guards, position)
+                        .unwrap_or_else(|| {
+                            unreachable!("merge field went missing: names checked above")
+                        }),
+                ));
+            }
+            Some(ResultShape::Record(merged))
+        }
+        _ => {
+            let single = matches!(group[0], Some(ResultShape::Single { .. }));
+            let mut elements: Vec<ResultShape> = Vec::with_capacity(group.len());
+            let mut children: Vec<ChildRef> = Vec::with_capacity(group.len());
+            for shape in group {
+                match shape {
+                    Some(ResultShape::List { element, child }) if !single => {
+                        elements.push(*element);
+                        children.push(child);
+                    }
+                    Some(ResultShape::Single { element, child }) if single => {
+                        elements.push(*element);
+                        children.push(child);
+                    }
+                    _ => todo!("M7 mismatched If branch outputs"),
+                }
+            }
+            let stmts: Vec<usize> = children.iter().map(|child| child.stmt).collect();
+            let merged_child = if stmts.iter().all(|stmt| drained.contains(stmt)) {
+                let first = &children[0];
+                let first_parent = first.parent.as_ref();
+                for other in children.iter().skip(1) {
+                    let same_keys = match (first_parent, other.parent.as_ref()) {
+                        (None, None) => true,
+                        (Some(a), Some(b)) => {
+                            a.parent_key == b.parent_key
+                                && a.child_key == b.child_key
+                                && a.negated == b.negated
+                        }
+                        _ => false,
+                    };
+                    if !same_keys
+                        || other.cardinality != first.cardinality
+                        || other.tag != first.tag
+                    {
+                        todo!("M7 mismatched If branch outputs");
+                    }
+                }
+                let mut builders: Vec<SelectBuilder> = Vec::with_capacity(stmts.len());
+                for (i, stmt) in stmts.iter().enumerate() {
+                    let Some((_, builder)) = snapshotted.iter().find(|(idx, _)| idx == stmt) else {
+                        unreachable!("merge child outside snapshot: membership checked above")
+                    };
+                    let mut builder = builder.clone();
+                    for cond in arm_guards[i].iter() {
+                        builder.where_.push(cond.clone());
+                    }
+                    builders.push(builder);
+                }
+                let first_outputs = builder_outputs(&builders[0], ctx.schema);
+                for branch in builders.iter().skip(1) {
+                    if builder_outputs(branch, ctx.schema) != first_outputs {
+                        todo!("M7 mismatched If branch outputs");
+                    }
+                }
+                let merged = union_builders(builders);
+                let child_key = first_parent.map(|parent| parent.child_key.clone());
+                let shape_cols: Vec<OutputColumn> =
+                    shape_columns(builder_output_types(&merged, ctx.schema), |name| {
+                        child_key.as_ref().is_some_and(|key| name == key)
+                    });
+                let idx = ctx.sink(
+                    merged,
+                    StatementShape {
+                        columns: shape_cols,
+                        rows: RowCount::Many,
+                    },
+                    StatementKind::Query,
+                );
+                ChildRef {
+                    stmt: idx,
+                    parent: first_parent.map(|parent| ParentRef {
+                        stmt: 0,
+                        parent_key: parent.parent_key.clone(),
+                        child_key: parent.child_key.clone(),
+                        negated: parent.negated,
+                    }),
+                    cardinality: first.cardinality,
+                    tag: first.tag.clone(),
+                }
+            } else if stmts.iter().all(|stmt| !drained.contains(stmt)) {
+                let first = &children[0];
+                for other in children.iter().skip(1) {
+                    if other != first {
+                        todo!("M7 mismatched If branch outputs");
+                    }
+                }
+                first.clone()
+            } else {
+                todo!("M7 mismatched If branch outputs");
+            };
+            let positions: Vec<Option<ResultShape>> = elements.into_iter().map(Some).collect();
+            let element = merge_union_shapes(ctx, drained, snapshotted, arm_guards, positions)
+                .unwrap_or_else(|| {
+                    unreachable!("merge element went missing: elements were all present")
+                });
+            if single {
+                Some(ResultShape::Single {
+                    element: Box::new(element),
+                    child: merged_child,
+                })
+            } else {
+                Some(ResultShape::List {
+                    element: Box::new(element),
+                    child: merged_child,
+                })
+            }
+        }
+    }
+}
 fn union_branches(ctx: &mut Context, arms: Vec<IfArm>, ty: QueryType) -> Level {
     let mut builders: Vec<SelectBuilder> = Vec::with_capacity(arms.len());
     let mut guards: Vec<Vec<SqlExpr>> = Vec::with_capacity(arms.len());
