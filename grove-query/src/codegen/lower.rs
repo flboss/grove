@@ -33,6 +33,7 @@ pub struct Context<'s> {
     pub in_array_temp: bool,
     nav_carries: Vec<(String, NavCarry)>,
     take_temp_alias: Option<(*const TypedExpr, SqlExpr)>,
+    corr_bound_walk: Vec<CorrBoundWalk>,
 }
 
 pub struct ChildCtx {
@@ -90,6 +91,7 @@ impl<'s> Context<'s> {
             in_array_temp: false,
             nav_carries: Vec::new(),
             take_temp_alias: None,
+            corr_bound_walk: Vec::new(),
         }
     }
 
@@ -3388,7 +3390,11 @@ fn lower_value(
         QueryType::List(_) => {
             if ctx.child.is_some() {
                 if !nested_bulk_lane(parent, value) {
-                    todo!("M4b nested list item");
+                    if let Some(walk) = corr_bound_walk(ctx.schema, Some(parent), value, true) {
+                        ctx.corr_bound_walk.push(walk);
+                    } else {
+                        todo!("M4b nested list item");
+                    }
                 }
                 ctx.nest_depth += 1;
                 let result = rvalue_shape(ctx, parent, value);
@@ -8145,14 +8151,21 @@ fn rvalue_shape(
     let reduced_tail = beta_reduce_tail(tail);
     let tail: &TypedExpr = &reduced_tail;
     let keyed = matches!(tail_root_ident(tail), Some(IdentBinding::Field(_)));
-    if ctx.nest_depth >= 1 && !nested_bulk_lane(parent, tail) {
+    if ctx.nest_depth >= 1 && !nested_bulk_lane(parent, tail) && ctx.corr_bound_walk.is_empty() {
         todo!("M4b nested list item");
     }
-    if ctx.nest_depth < 1
-        && keyed
-        && (!parent.stmt_bound || tail_uses_outer(tail) || take_bound_ident(tail))
+    let (spine_tb, spine_outer, deep_divert) = split_divert_flags(ctx.schema, tail);
+    if ctx.nest_depth < 1 && keyed && (!parent.stmt_bound || spine_outer || spine_tb || deep_divert)
     {
-        return rtemp_shape(ctx, parent, tail, Cardinality::Many);
+        if spine_tb {
+            if let Some(walk) = corr_bound_walk(ctx.schema, None, tail, false) {
+                ctx.corr_bound_walk.push(walk);
+            } else {
+                return rtemp_shape(ctx, parent, tail, Cardinality::Many);
+            }
+        } else {
+            return rtemp_shape(ctx, parent, tail, Cardinality::Many);
+        }
     }
     if ctx.nest_depth < 1 && !keyed && tail_uses_outer(tail) {
         if matches!(tail.kind, TypedExprKind::Array { .. }) {
@@ -13578,6 +13591,335 @@ fn take_bound_ident(tail: &TypedExpr) -> bool {
     }
 }
 
+#[derive(Clone)]
+struct CorrBoundWalk {
+    bound_fid: FieldId,
+    outer_table: String,
+    outer_pk: String,
+    outer_col: String,
+    middle_table: String,
+    middle_pk: String,
+    middle_fk: String,
+    grand_fk: String,
+    chained: bool,
+}
+
+fn corr_bound_walk(
+    schema: &ValidatedSchema,
+    parent: Option<&Level>,
+    tail: &TypedExpr,
+    inner: bool,
+) -> Option<CorrBoundWalk> {
+    let mut node = tail;
+    let mut bound: Option<FieldId> = None;
+    loop {
+        match &node.kind {
+            TypedExprKind::Projection { base, .. } | TypedExprKind::Field { base, .. } => {
+                node = base
+            }
+            TypedExprKind::Method {
+                base, name, args, ..
+            } => {
+                if (name.value == "take" || name.value == "skip")
+                    && let [arg] = args.as_slice()
+                    && has_scope_ident(&arg.expr)
+                {
+                    let TypedExprKind::Ident {
+                        binding: IdentBinding::Field(fid),
+                        ..
+                    } = &arg.expr.kind
+                    else {
+                        return None;
+                    };
+                    if bound.is_some() {
+                        return None;
+                    }
+                    bound = Some(*fid);
+                }
+                if name.value == "nth" && args.iter().any(|a| has_scope_ident(&a.expr)) {
+                    return None;
+                }
+                node = base;
+            }
+            TypedExprKind::Ident { .. } => break,
+            _ => return None,
+        }
+    }
+    let bound_fid = bound?;
+    let outer_struct = bound_fid.struct_id();
+    let Field::Value { columns, .. } =
+        &schema.structs[outer_struct.index()].fields[bound_fid.local()]
+    else {
+        return None;
+    };
+    let [col] = columns.as_slice() else {
+        return None;
+    };
+    let outer_col = schema.column_name(*col).to_string();
+    let outer_table = schema.tables[schema.structs[outer_struct.index()].table.index()]
+        .name
+        .clone();
+    let Some(IdentBinding::Field(root_fid)) = tail_root_ident(tail) else {
+        return None;
+    };
+    let (mid_struct, grand_fk, middle_pk, grand_table) = if inner {
+        let mid_struct = root_fid.struct_id();
+        if let Some(parent) = parent
+            && row_struct(&parent.element) != Some(mid_struct)
+        {
+            return None;
+        }
+        let root_field = &schema.structs[mid_struct.index()].fields[root_fid.local()];
+        let (grand_fk, middle_pk, grand_table) = match root_field {
+            Field::Array { storage, link, .. } => (
+                schema.column_name(storage.key).to_string(),
+                schema.column_name(*link).to_string(),
+                schema.tables[storage.table.index()].name.clone(),
+            ),
+            Field::Ref {
+                is_list, target, ..
+            } if *is_list => {
+                if m2m_parts(schema, *root_fid).is_some() {
+                    return None;
+                }
+                schema.relation_of_field(*root_fid)?;
+                let (grand_fk, middle_pk) = match link_cols(schema, *root_fid) {
+                    LinkCols::ParentFk {
+                        parent_fk,
+                        child_pk,
+                    } => (child_pk, parent_fk),
+                    LinkCols::TargetFk {
+                        child_fk,
+                        parent_pk,
+                    } => (child_fk, parent_pk),
+                    LinkCols::ManyToMany => return None,
+                };
+                (
+                    grand_fk,
+                    middle_pk,
+                    schema.tables[schema.structs[target.index()].table.index()]
+                        .name
+                        .clone(),
+                )
+            }
+            _ => return None,
+        };
+        (mid_struct, grand_fk, middle_pk, Some(grand_table))
+    } else {
+        let TypedExprKind::Projection { items, .. } = &tail.kind else {
+            return None;
+        };
+        if !items
+            .iter()
+            .any(|item| matches!(item.value.ty, QueryType::List(_)))
+        {
+            return None;
+        }
+        let Field::Ref { target, .. } =
+            &schema.structs[root_fid.struct_id().index()].fields[root_fid.local()]
+        else {
+            return None;
+        };
+        for item in items {
+            if !matches!(item.value.ty, QueryType::List(_)) {
+                continue;
+            }
+            if !matches!(tail_root_ident(&item.value), Some(IdentBinding::Field(fid)) if fid.struct_id() == *target)
+                || (take_bound_ident(&item.value)
+                    && corr_bound_walk(schema, None, &item.value, true).is_none())
+            {
+                return None;
+            }
+        }
+        (*target, String::new(), String::new(), None)
+    };
+    let middle_table = schema.tables[schema.structs[mid_struct.index()].table.index()]
+        .name
+        .clone();
+    let mut walk = None;
+    for (local, field) in schema.structs[mid_struct.index()].fields.iter().enumerate() {
+        let Field::Ref { target, .. } = field else {
+            continue;
+        };
+        if *target != outer_struct {
+            continue;
+        }
+        let fid = FieldId::new(mid_struct, local);
+        if schema.relation_of_field(fid).is_none() {
+            continue;
+        }
+        let (middle_fk, outer_pk) = match link_cols(schema, fid) {
+            LinkCols::ParentFk {
+                parent_fk,
+                child_pk,
+            } => (parent_fk, child_pk),
+            LinkCols::TargetFk {
+                child_fk,
+                parent_pk,
+            } => (child_fk, parent_pk),
+            LinkCols::ManyToMany => continue,
+        };
+        if walk.is_some() {
+            return None;
+        }
+        walk = Some((middle_fk, outer_pk));
+    }
+    let (middle_fk, outer_pk) = walk?;
+    let mut needed = vec![
+        (&outer_table, &outer_col),
+        (&outer_table, &outer_pk),
+        (&middle_table, &middle_fk),
+        (&middle_table, &middle_pk),
+    ];
+    if !inner {
+        needed.pop();
+    }
+    for (table, col) in needed {
+        let found = schema.tables.iter().find(|t| &t.name == table)?;
+        if !found.columns.iter().any(|c| &c.name == col) {
+            return None;
+        }
+    }
+    if let Some(grand_table) = &grand_table {
+        let found = schema.tables.iter().find(|t| &t.name == grand_table)?;
+        if !found.columns.iter().any(|c| c.name == *grand_fk) {
+            return None;
+        }
+    }
+    Some(CorrBoundWalk {
+        bound_fid,
+        outer_table,
+        outer_pk,
+        outer_col,
+        middle_table,
+        middle_pk,
+        middle_fk,
+        grand_fk,
+        chained: inner,
+    })
+}
+
+fn corr_bound_subquery(ctx: &mut Context, walk: &CorrBoundWalk) -> SqlExpr {
+    let outer_alias = ctx.aliases.table(&walk.outer_table);
+    let mut query = SelectBuilder::new();
+    query.select = vec![SelectItem::Column {
+        depth: 0,
+        column: walk.outer_col.clone(),
+        output: walk.outer_col.clone(),
+        ty: table_column_ty(ctx.schema, &walk.outer_table, &walk.outer_col),
+    }];
+    if walk.chained {
+        let middle_alias = ctx.aliases.table(&walk.middle_table);
+        let mut middle_q = SelectBuilder::new();
+        middle_q.select = vec![SelectItem::Column {
+            depth: 0,
+            column: walk.middle_fk.clone(),
+            output: walk.middle_fk.clone(),
+            ty: table_column_ty(ctx.schema, &walk.middle_table, &walk.middle_fk),
+        }];
+        middle_q.from = Some(FromClause::Table {
+            table: walk.middle_table.clone(),
+            alias: middle_alias,
+        });
+        middle_q.where_ = vec![SqlExpr::Binary {
+            op: SqlBinOp::Eq,
+            lhs: Box::new(SqlExpr::Column {
+                depth: 0,
+                column: walk.middle_pk.clone(),
+            }),
+            rhs: Box::new(SqlExpr::Column {
+                depth: 2,
+                column: walk.grand_fk.clone(),
+            }),
+        }];
+        query.from = Some(FromClause::Table {
+            table: walk.outer_table.clone(),
+            alias: outer_alias,
+        });
+        query.where_ = vec![SqlExpr::Binary {
+            op: SqlBinOp::Eq,
+            lhs: Box::new(SqlExpr::Column {
+                depth: 0,
+                column: walk.outer_pk.clone(),
+            }),
+            rhs: Box::new(SqlExpr::Subquery {
+                query: Box::new(middle_q),
+            }),
+        }];
+    } else {
+        query.from = Some(FromClause::Table {
+            table: walk.outer_table.clone(),
+            alias: outer_alias,
+        });
+        query.where_ = vec![SqlExpr::Binary {
+            op: SqlBinOp::Eq,
+            lhs: Box::new(SqlExpr::Column {
+                depth: 0,
+                column: walk.outer_pk.clone(),
+            }),
+            rhs: Box::new(SqlExpr::Column {
+                depth: 1,
+                column: walk.middle_fk.clone(),
+            }),
+        }];
+    }
+    SqlExpr::Subquery {
+        query: Box::new(query),
+    }
+}
+
+fn split_divert_flags(schema: &ValidatedSchema, tail: &TypedExpr) -> (bool, bool, bool) {
+    let (base, items) = match &tail.kind {
+        TypedExprKind::Projection { base, items } => (base.as_ref(), items.as_slice()),
+        _ => {
+            return (take_bound_ident(tail), tail_uses_outer(tail), false);
+        }
+    };
+    let mut spine_tb = false;
+    let mut spine_outer = false;
+    let mut node = base;
+    loop {
+        match &node.kind {
+            TypedExprKind::Field { base: next, .. } => node = next,
+            TypedExprKind::Method {
+                base: next,
+                name,
+                args,
+                ..
+            } => {
+                if ["take", "skip", "nth"].contains(&name.value.as_str())
+                    && args.iter().any(|a| has_scope_ident(&a.expr))
+                {
+                    spine_tb = true;
+                }
+                if args.iter().any(|a| uses_outer(&a.expr)) {
+                    spine_outer = true;
+                }
+                node = next;
+            }
+            TypedExprKind::Ident { .. } => break,
+            _ => return (true, true, false),
+        }
+    }
+    let mid_struct = match tail_root_ident(tail) {
+        Some(IdentBinding::Field(fid)) => {
+            match &schema.structs[fid.struct_id().index()].fields[fid.local()] {
+                Field::Ref { target, .. } => Some(*target),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let deep = items.iter().any(|item| {
+        if matches!(item.value.ty, QueryType::List(_)) {
+            !matches!(tail_root_ident(&item.value), Some(IdentBinding::Field(fid)) if Some(fid.struct_id()) == mid_struct)
+        } else {
+            uses_outer(&item.value) || take_bound_ident(&item.value)
+        }
+    });
+    (spine_tb, spine_outer, deep)
+}
+
 fn sort_key_uses_outer(tail: &TypedExpr) -> bool {
     match &tail.kind {
         TypedExprKind::Method {
@@ -14002,6 +14344,14 @@ fn scalar_ident(ctx: &mut Context, binding: &IdentBinding, depth: usize) -> SqlE
     {
         if ctx.temp_collect.is_some() {
             return scalar_ident_temp(ctx, binding);
+        }
+        let admitted = matches!(binding, IdentBinding::Field(fid)
+            if ctx
+                .corr_bound_walk
+                .last()
+                .is_some_and(|walk| *fid == walk.bound_fid));
+        if admitted && let Some(walk) = ctx.corr_bound_walk.pop() {
+            return corr_bound_subquery(ctx, &walk);
         }
         todo!("M4b temp-bound per-row limit");
     }

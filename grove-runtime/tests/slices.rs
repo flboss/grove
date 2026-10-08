@@ -741,6 +741,50 @@ fn cross_corr_filter_nav_inner_values() {
 }
 
 #[test]
+fn nested_take_bound_middle_values() {
+    let item = |sku: &str| rec(&[("sku", s(sku))]);
+    assert_eq!(
+        value("users { o = orders.take(age) { s = items } }"),
+        Value::List(vec![
+            rec(&[(
+                "o",
+                Value::List(vec![
+                    rec(&[("s", Value::List(vec![item("a"), item("b")]))]),
+                    rec(&[("s", Value::List(vec![]))]),
+                ])
+            )]),
+            rec(&[(
+                "o",
+                Value::List(vec![rec(&[("s", Value::List(vec![item("c")]))])])
+            )]),
+            rec(&[("o", Value::List(vec![]))]),
+        ])
+    );
+}
+
+#[test]
+fn nested_take_bound_inner_values() {
+    let item = |sku: &str| rec(&[("sku", s(sku))]);
+    assert_eq!(
+        value("users { o = orders { s = items.take(age) } }"),
+        Value::List(vec![
+            rec(&[(
+                "o",
+                Value::List(vec![
+                    rec(&[("s", Value::List(vec![item("a"), item("b")]))]),
+                    rec(&[("s", Value::List(vec![]))]),
+                ])
+            )]),
+            rec(&[(
+                "o",
+                Value::List(vec![rec(&[("s", Value::List(vec![item("c")]))])])
+            )]),
+            rec(&[("o", Value::List(vec![]))]),
+        ])
+    );
+}
+
+#[test]
 fn chained_projection_reuses_values() {
     let ord = |t: &str| Value::Record(vec![("total".to_string(), Value::Dec(dec(t)))]);
     assert_eq!(
