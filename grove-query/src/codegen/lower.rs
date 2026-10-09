@@ -1182,7 +1182,9 @@ fn rows_method(
                 level = wrap_narrow_rn(ctx, level);
             }
             let new_keys = sort_order_items(ctx, &mut level, args, default);
-            level.builder.order_by.extend(new_keys);
+            if !new_keys.is_empty() {
+                level.builder.order_by = new_keys;
+            }
             level
         }
         "take" | "skip" | "first" | "nth" => {
@@ -1499,6 +1501,9 @@ fn wrap_level(ctx: &mut Context, level: Level) -> Level {
 }
 
 fn sort_keys(ctx: &mut Context, parent: &Level, expr: &TypedExpr, dir: OrderDir) -> Vec<OrderItem> {
+    if matches!(expr.kind, TypedExprKind::Literal(_)) {
+        return Vec::new();
+    }
     if !matches!(expr.ty, QueryType::Tuple(_)) {
         return vec![OrderItem {
             expr: scalar(ctx, expr),
