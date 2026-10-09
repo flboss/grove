@@ -1054,6 +1054,19 @@ fn union_cross_middle_values() {
 }
 
 #[test]
+fn nested_sort_flatten_values() {
+    let ord = |t: &str| rec(&[("total", Value::Dec(dec(t)))]);
+    assert_eq!(
+        value("users.orders.sort(total).flatten()"),
+        Value::List(vec![ord("10.00"), ord("20.00"), ord("30.00")])
+    );
+    assert_eq!(
+        value("users.orders.sort_desc(total).flatten()"),
+        Value::List(vec![ord("20.00"), ord("10.00"), ord("30.00")])
+    );
+}
+
+#[test]
 fn chained_projection_reuses_values() {
     let ord = |t: &str| Value::Record(vec![("total".to_string(), Value::Dec(dec(t)))]);
     assert_eq!(

@@ -34,6 +34,7 @@ pub struct Context<'s> {
     nav_carries: Vec<(String, NavCarry)>,
     take_temp_alias: Option<(*const TypedExpr, SqlExpr)>,
     corr_bound_walk: Vec<CorrBoundWalk>,
+    pending_order: Option<Vec<OrderItem>>,
 }
 
 pub struct ChildCtx {
@@ -92,6 +93,7 @@ impl<'s> Context<'s> {
             nav_carries: Vec::new(),
             take_temp_alias: None,
             corr_bound_walk: Vec::new(),
+            pending_order: None,
         }
     }
 
@@ -1156,53 +1158,35 @@ fn rows_method(
             level
         }
         "sort" | "sort_asc" | "sort_desc" => {
-            if let Some(pending) = level.pending.as_ref() {
-                if pending.multi_parent {
-                    todo!("H1 QT0028: sort over nested lists");
+            let default = if name.value == "sort_desc" {
+                OrderDir::Desc
+            } else {
+                OrderDir::Asc
+            };
+            let pending_multi = level
+                .pending
+                .as_ref()
+                .map(|pending| (pending.multi_parent, pending.next.is_some()));
+            if let Some((multi_parent, chained)) = pending_multi {
+                if multi_parent {
+                    if chained {
+                        todo!("H1 QT0028: sort over nested lists");
+                    }
+                    let keys = sort_order_items(ctx, &mut level, args, default);
+                    ctx.pending_order = Some(keys);
+                    return level;
                 }
                 todo!("M4 per-parent sort over single-row parent");
             }
             if needs_wrap(&level) {
                 level = wrap_narrow_rn(ctx, level);
             }
-            let default = if name.value == "sort_desc" {
-                OrderDir::Desc
-            } else {
-                OrderDir::Asc
-            };
-            let mut new_keys = Vec::new();
-            for arg in args {
-                let dir = match &arg.direction {
-                    Some(dir) => match dir.value {
-                        SortDir::Asc => OrderDir::Asc,
-                        SortDir::Desc => OrderDir::Desc,
-                    },
-                    None => default,
-                };
-                if take_bound_ident(&arg.expr)
-                    && level.builder.order_by.is_empty()
-                    && level.builder.limit.is_none()
-                    && level.builder.offset.is_none()
-                    && let Some(expr) = scalar_take_temp_expr(ctx, &mut level, &arg.expr)
-                {
-                    new_keys.push(OrderItem { expr, dir });
-                    continue;
-                }
-                if has_scope_ident(&arg.expr)
-                    && level.builder.order_by.is_empty()
-                    && level.builder.limit.is_none()
-                    && level.builder.offset.is_none()
-                    && let Some(expr) = scalar_array_temp_expr(ctx, &mut level, &arg.expr)
-                {
-                    new_keys.push(OrderItem { expr, dir });
-                    continue;
-                }
-                new_keys.extend(sort_keys(ctx, &level, &arg.expr, dir));
-            }
+            let new_keys = sort_order_items(ctx, &mut level, args, default);
             level.builder.order_by.extend(new_keys);
             level
         }
         "take" | "skip" | "first" | "nth" => {
+            let _ = ctx.pending_order.take();
             if let Some(fk) = ctx
                 .child
                 .as_ref()
@@ -1302,6 +1286,17 @@ fn rows_method(
                     }
                 }
                 level.pending = next.map(|boxed| *boxed);
+                if let Some(keys) = ctx.pending_order.take() {
+                    let mut order = vec![OrderItem {
+                        expr: SqlExpr::Column {
+                            depth: 0,
+                            column: child_col.clone(),
+                        },
+                        dir: OrderDir::Asc,
+                    }];
+                    order.extend(keys);
+                    level.builder.order_by.extend(order);
+                }
                 level
             }
             None => {
@@ -1405,6 +1400,44 @@ fn rows_method(
             name.value
         ),
     }
+}
+
+fn sort_order_items(
+    ctx: &mut Context,
+    level: &mut Level,
+    args: &[TypedMethodArg],
+    default: OrderDir,
+) -> Vec<OrderItem> {
+    let mut new_keys = Vec::new();
+    for arg in args {
+        let dir = match &arg.direction {
+            Some(dir) => match dir.value {
+                SortDir::Asc => OrderDir::Asc,
+                SortDir::Desc => OrderDir::Desc,
+            },
+            None => default,
+        };
+        if take_bound_ident(&arg.expr)
+            && level.builder.order_by.is_empty()
+            && level.builder.limit.is_none()
+            && level.builder.offset.is_none()
+            && let Some(expr) = scalar_take_temp_expr(ctx, level, &arg.expr)
+        {
+            new_keys.push(OrderItem { expr, dir });
+            continue;
+        }
+        if has_scope_ident(&arg.expr)
+            && level.builder.order_by.is_empty()
+            && level.builder.limit.is_none()
+            && level.builder.offset.is_none()
+            && let Some(expr) = scalar_array_temp_expr(ctx, level, &arg.expr)
+        {
+            new_keys.push(OrderItem { expr, dir });
+            continue;
+        }
+        new_keys.extend(sort_keys(ctx, level, &arg.expr, dir));
+    }
+    new_keys
 }
 
 fn needs_wrap(level: &Level) -> bool {
@@ -17577,6 +17610,7 @@ fn scalar_method(
                 scalar_aggregate(ctx, base, AggOp::Over(OverAgg::Avg, ty, arg))
             }
             "max_by" | "min_by" => {
+                let _ = ctx.pending_order.take();
                 unreachable!("max_by/min_by return records: callers never enter scalar demand")
             }
             "first" | "nth" => {
