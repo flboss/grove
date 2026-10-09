@@ -13266,8 +13266,146 @@ pub fn lower_query(ctx: &mut Context, result: &TypedExpr) -> RootPlan {
     if matches!(result.kind, TypedExprKind::Struct { .. }) {
         return lower_struct_result(ctx, result);
     }
+    if let Some(plan) = lower_literal_fork(ctx, result) {
+        return plan;
+    }
     let level = rows(ctx, result);
     finalize_level(ctx, level)
+}
+
+fn lower_literal_fork(ctx: &mut Context, result: &TypedExpr) -> Option<RootPlan> {
+    let TypedExprKind::Array { elements } = &result.kind else {
+        return None;
+    };
+    let [element] = elements.as_slice() else {
+        return None;
+    };
+    let element = peel_some(element);
+    let positions: Vec<(Option<String>, &TypedExpr)> = match &element.kind {
+        TypedExprKind::Tuple { elements } => elements.iter().map(|elem| (None, elem)).collect(),
+        TypedExprKind::Struct { fields } => fields
+            .iter()
+            .map(|(name, elem)| (Some(name.value.clone()), elem))
+            .collect(),
+        _ => return None,
+    };
+    let mut lists = 0usize;
+    for (_, node) in positions.iter() {
+        let node = peel_some(node);
+        let QueryType::List(_) = peel_optional(&node.ty) else {
+            return None;
+        };
+        let TypedExprKind::Array { elements } = &node.kind else {
+            return None;
+        };
+        if elements.is_empty() {
+            return None;
+        }
+        for elem in elements {
+            if !matches!(&elem.kind, TypedExprKind::Literal(_)) {
+                return None;
+            }
+        }
+        lists += 1;
+    }
+    if lists < 2 {
+        return None;
+    }
+    let sunk_before = ctx.statements.len();
+    let mut root_builder = SelectBuilder::new();
+    root_builder.select = vec![SelectItem::Expr {
+        expr: SqlExpr::Param(ParamValue::Int(0)),
+        output: "c0".to_string(),
+        ty: Some(ScalarType::Int),
+    }];
+    let root_shape = StatementShape {
+        columns: shape_columns(builder_output_types(&root_builder, ctx.schema), |_| false),
+        rows: RowCount::Many,
+    };
+    let mut shapes: Vec<(Option<String>, ResultShape)> = Vec::with_capacity(positions.len());
+    for (name, node) in positions {
+        let mut level = rows(ctx, node);
+        if level.pending.is_some() {
+            return None;
+        }
+        if level.builder.select.is_empty() {
+            level.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+        }
+        let outputs = builder_outputs(&level.builder, ctx.schema);
+        let [_] = outputs.as_slice() else {
+            return None;
+        };
+        let item_ty = match peel_optional(&node.ty) {
+            QueryType::List(sub) => sub.as_ref(),
+            _ => &node.ty,
+        };
+        let element = child_element(
+            ctx.schema,
+            level.output_shapes.as_ref(),
+            item_ty,
+            &outputs,
+            |_| false,
+        );
+        let shape_cols: Vec<OutputColumn> =
+            shape_columns(builder_output_types(&level.builder, ctx.schema), |_| false);
+        let idx = ctx.sink(
+            level.builder,
+            StatementShape {
+                columns: shape_cols,
+                rows: RowCount::Many,
+            },
+            StatementKind::Query,
+        );
+        shapes.push((
+            name,
+            ResultShape::List {
+                element: Box::new(element),
+                child: ChildRef {
+                    stmt: idx,
+                    parent: None,
+                    cardinality: Cardinality::Many,
+                    tag: None,
+                },
+            },
+        ));
+    }
+    debug_assert_eq!(
+        sunk_before + shapes.len(),
+        ctx.statements.len(),
+        "literal fork sank inside rows(): positions must stay sink-free"
+    );
+    let element = match &peel_some(element).kind {
+        TypedExprKind::Tuple { .. } => {
+            ResultShape::Tuple(shapes.into_iter().map(|(_, shape)| shape).collect())
+        }
+        TypedExprKind::Struct { .. } => ResultShape::Record(
+            shapes
+                .into_iter()
+                .map(|(name, shape)| {
+                    (
+                        name.unwrap_or_else(|| {
+                            unreachable!("struct fork position without field name")
+                        }),
+                        shape,
+                    )
+                })
+                .collect(),
+        ),
+        _ => unreachable!("fork element shape drift: admission pins tuples/structs"),
+    };
+    Some(RootPlan {
+        builder: root_builder,
+        shape: root_shape,
+        result: ResultShape::List {
+            element: Box::new(element),
+            child: ChildRef {
+                stmt: 0,
+                parent: None,
+                cardinality: Cardinality::Many,
+                tag: None,
+            },
+        },
+    })
 }
 
 fn finalize_level(ctx: &mut Context, level: Level) -> RootPlan {

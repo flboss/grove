@@ -1018,6 +1018,24 @@ fn schema_tuple_nested_values() {
 }
 
 #[test]
+fn lit_multi_list_values() {
+    assert_eq!(
+        value("[([1], [2])]"),
+        Value::List(vec![Value::Tuple(vec![
+            Value::List(vec![Value::Int(1)]),
+            Value::List(vec![Value::Int(2)]),
+        ])])
+    );
+    assert_eq!(
+        value("[{ a = [1], b = [2] }]"),
+        Value::List(vec![rec(&[
+            ("a", Value::List(vec![Value::Int(1)])),
+            ("b", Value::List(vec![Value::Int(2)])),
+        ])])
+    );
+}
+
+#[test]
 fn chained_projection_reuses_values() {
     let ord = |t: &str| Value::Record(vec![("total".to_string(), Value::Dec(dec(t)))]);
     assert_eq!(
