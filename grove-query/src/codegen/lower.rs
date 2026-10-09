@@ -507,6 +507,57 @@ fn single_hop_parts(ctx: &mut Context, tail: &TypedExpr) -> Option<SingleHop> {
     }
 }
 
+fn middle_col(level: &Level, name: &str) -> Option<String> {
+    if level.pending.is_some() {
+        return None;
+    }
+    fn leaf(parts: &[MiddlePart], name: &str) -> Option<String> {
+        for part in parts {
+            match part {
+                MiddlePart::Value { name: Some(n), col } if n == name => return Some(col.clone()),
+                MiddlePart::Record { fields, .. } => {
+                    if let Some(col) = leaf(fields, name) {
+                        return Some(col);
+                    }
+                }
+                MiddlePart::Tuple(items) => {
+                    if let Some(col) = leaf(items, name) {
+                        return Some(col);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+    let parts = match level.builder.from.as_ref() {
+        Some(FromClause::Literal { middle_parts, .. }) => middle_parts.as_ref()?,
+        Some(FromClause::Computed { middle_parts, .. }) => middle_parts.as_ref()?,
+        _ => return None,
+    };
+    leaf(parts, name)
+}
+
+fn lit_has_nested_split(level: &Level) -> bool {
+    fn nested(parts: &[MiddlePart]) -> bool {
+        parts.iter().any(|part| match part {
+            MiddlePart::Nested { .. } => true,
+            MiddlePart::Record { fields, .. } => nested(fields),
+            MiddlePart::Tuple(items) => nested(items),
+            _ => false,
+        })
+    }
+    match level.builder.from.as_ref() {
+        Some(FromClause::Literal { middle_parts, .. }) => {
+            middle_parts.as_ref().is_none_or(|parts| nested(parts))
+        }
+        Some(FromClause::Computed { middle_parts, .. }) => {
+            middle_parts.as_ref().is_none_or(|parts| nested(parts))
+        }
+        _ => false,
+    }
+}
+
 fn rows_field(
     ctx: &mut Context,
     base: &TypedExpr,
@@ -607,6 +658,12 @@ fn rows_field(
             }
         }
         QueryType::Record(RecordSource::Projection(fields)) => {
+            if builder_outputs(&level.builder, ctx.schema)
+                .iter()
+                .any(|c| c == &name.value)
+            {
+                return level;
+            }
             let field = fields
                 .iter()
                 .find(|f| f.name == name.value)
@@ -635,7 +692,13 @@ fn rows_field(
             }
             level.builder.select.push(SelectItem::Column {
                 depth: 0,
-                column: name.value.clone(),
+                column: match middle_col(&level, &name.value) {
+                    Some(col) => col,
+                    None if lit_has_nested_split(&level) => {
+                        todo!("M6 query-valued array element");
+                    }
+                    None => name.value.clone(),
+                },
                 output: name.value.clone(),
                 ty: scalar_of(&field.ty),
             });

@@ -1080,6 +1080,18 @@ fn nested_contains_values() {
 }
 
 #[test]
+fn lit_record_field_access_values() {
+    assert_eq!(
+        value("[{x = 1}, {x = 2}].x"),
+        Value::List(vec![Value::Int(1), Value::Int(2)])
+    );
+    assert_eq!(
+        value("[{x = 1, y = 2}].y"),
+        Value::List(vec![Value::Int(2)])
+    );
+}
+
+#[test]
 fn chained_projection_reuses_values() {
     let ord = |t: &str| Value::Record(vec![("total".to_string(), Value::Dec(dec(t)))]);
     assert_eq!(
