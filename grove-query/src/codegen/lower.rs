@@ -648,6 +648,68 @@ fn rows_field(
     }
 }
 
+fn m2m_join_subquery(ctx: &mut Context, parts: &M2mParts) -> Option<SelectBuilder> {
+    let junction_alias = ctx.aliases.table(&parts.junction_table);
+    let target_alias = ctx.aliases.table(&parts.target_table);
+    let target_table = ctx
+        .schema
+        .tables
+        .iter()
+        .find(|t| t.name == parts.target_table);
+    let int_or = |ty: Option<ScalarType>| ty.or(Some(ScalarType::Int));
+    let target_cols: Vec<(String, Option<ScalarType>)> = target_table
+        .map(|t| {
+            t.columns
+                .iter()
+                .map(|c| (c.name.clone(), int_or(c.ty)))
+                .collect()
+        })
+        .unwrap_or_default();
+    if target_cols
+        .iter()
+        .any(|(col, _)| col == &parts.junction_parent_col || col == &parts.junction_target_col)
+    {
+        return None;
+    }
+    let mut shell = SelectBuilder::new();
+    shell.from = Some(FromClause::Join {
+        left: Box::new(FromClause::Table {
+            table: parts.junction_table.clone(),
+            alias: junction_alias.clone(),
+        }),
+        right: Box::new(FromClause::Table {
+            table: parts.target_table.clone(),
+            alias: target_alias.clone(),
+        }),
+    });
+    shell.select.push(SelectItem::Column {
+        depth: 1,
+        column: parts.junction_parent_col.clone(),
+        output: parts.junction_parent_col.clone(),
+        ty: Some(ScalarType::Int),
+    });
+    for (col, ty) in target_cols {
+        shell.select.push(SelectItem::Column {
+            depth: 0,
+            column: col.clone(),
+            output: col,
+            ty,
+        });
+    }
+    shell.where_ = vec![SqlExpr::Binary {
+        op: SqlBinOp::Eq,
+        lhs: Box::new(SqlExpr::Column {
+            depth: 1,
+            column: parts.junction_target_col.clone(),
+        }),
+        rhs: Box::new(SqlExpr::Column {
+            depth: 0,
+            column: parts.target_pk.clone(),
+        }),
+    }];
+    Some(shell)
+}
+
 fn navigate_ref(
     ctx: &mut Context,
     mut level: Level,
@@ -663,20 +725,39 @@ fn navigate_ref(
     let table = ctx.schema.tables[ctx.schema.structs[target.index()].table.index()]
         .name
         .clone();
-    let child_from = FromClause::Table {
-        table: table.clone(),
-        alias: ctx.aliases.table(&table),
-    };
-    let (child_col, parent_col) = match link_cols(ctx.schema, fid) {
-        LinkCols::ParentFk {
-            parent_fk,
-            child_pk,
-        } => (child_pk, parent_fk),
-        LinkCols::TargetFk {
-            child_fk,
-            parent_pk,
-        } => (child_fk, parent_pk),
-        LinkCols::ManyToMany => todo!("M4 many-to-many navigation"),
+    let (child_from, child_col, parent_col) = match m2m_parts(ctx.schema, fid) {
+        Some(parts) => {
+            let Some(shell) = m2m_join_subquery(ctx, &parts) else {
+                todo!("M4 many-to-many navigation");
+            };
+            let alias = ctx.aliases.subquery();
+            (
+                FromClause::Subquery {
+                    query: Box::new(shell),
+                    alias,
+                },
+                parts.junction_parent_col.clone(),
+                parts.parent_pk.clone(),
+            )
+        }
+        None => {
+            let child_from = FromClause::Table {
+                table: table.clone(),
+                alias: ctx.aliases.table(&table),
+            };
+            let (child_col, parent_col) = match link_cols(ctx.schema, fid) {
+                LinkCols::ParentFk {
+                    parent_fk,
+                    child_pk,
+                } => (child_pk, parent_fk),
+                LinkCols::TargetFk {
+                    child_fk,
+                    parent_pk,
+                } => (child_fk, parent_pk),
+                LinkCols::ManyToMany => todo!("M4 many-to-many navigation"),
+            };
+            (child_from, child_col, parent_col)
+        }
     };
     if is_list {
         if field_optional {
@@ -1825,11 +1906,18 @@ fn reanchor_parts(
     if !matches!(&tail.kind, TypedExprKind::Ident { .. }) && !is_list {
         return None;
     }
-    if m2m_parts(schema, *rfid).is_some() {
-        return None;
-    }
-    schema.relation_of_field(*rfid)?;
-    let inner_fk = if matches!(&tail.kind, TypedExprKind::Ident { .. }) {
+    let inner_fk = if m2m_parts(schema, *rfid).is_some() {
+        if !matches!(&tail.kind, TypedExprKind::Ident { .. }) {
+            return None;
+        }
+        Some(
+            m2m_parts(schema, *rfid)
+                .unwrap_or_else(|| unreachable!("m2m parts vanished mid-validation"))
+                .junction_parent_col
+                .clone(),
+        )
+    } else if matches!(&tail.kind, TypedExprKind::Ident { .. }) {
+        schema.relation_of_field(*rfid)?;
         let inner_table = schema.tables[schema.structs[target.index()].table.index()]
             .name
             .clone();
@@ -15442,6 +15530,24 @@ fn hop_shell_at(
         Field::Ref { target, .. } => *target,
         _ => unreachable!("hop over non-reference field"),
     };
+    if let Some(parts) = m2m_parts(ctx.schema, fid) {
+        let Some(mut shell) = m2m_join_subquery(ctx, &parts) else {
+            todo!("M4 many-to-many navigation");
+        };
+        let parent_rhs = SqlExpr::Column {
+            depth: depth + 1,
+            column: parts.parent_pk.clone(),
+        };
+        shell.where_.push(SqlExpr::Binary {
+            op: SqlBinOp::Eq,
+            lhs: Box::new(SqlExpr::Column {
+                depth: 1,
+                column: parts.junction_parent_col.clone(),
+            }),
+            rhs: Box::new(parent_rhs),
+        });
+        return (target, shell);
+    }
     let (child_col, parent_col) = hop_link_cols(ctx.schema, fid);
     let parent_rhs = SqlExpr::Column {
         depth,

@@ -1900,6 +1900,128 @@ fn m2m_b1_collapse_tail_values() {
 }
 
 #[test]
+fn m2m_nested_chain_values() {
+    let role =
+        |name: &str| Value::Record(vec![("name".to_string(), Value::String(name.to_string()))]);
+    assert_eq!(
+        value("users { s = subordinates.roles }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "s".to_string(),
+                Value::List(vec![Value::List(vec![role("dev")])])
+            )]),
+            Value::Record(vec![(
+                "s".to_string(),
+                Value::List(vec![Value::List(vec![role("admin"), role("dev")])])
+            )]),
+        ])
+    );
+}
+
+#[test]
+fn m2m_double_chain_values() {
+    fn names(v: &Value) -> Vec<Vec<Vec<String>>> {
+        match v {
+            Value::List(rows) => rows
+                .iter()
+                .map(|r| match r {
+                    Value::Record(fields) => match fields.iter().find(|(n, _)| n == "r") {
+                        Some((_, Value::List(roles))) => roles
+                            .iter()
+                            .map(|role| match role {
+                                Value::List(users) => users
+                                    .iter()
+                                    .map(|u| match u {
+                                        Value::Record(fs) => {
+                                            match fs.iter().find(|(n, _)| n == "name") {
+                                                Some((_, Value::String(n))) => n.clone(),
+                                                other => panic!("name field, got {other:?}"),
+                                            }
+                                        }
+                                        other => panic!("user record, got {other:?}"),
+                                    })
+                                    .collect(),
+                                other => panic!("role list, got {other:?}"),
+                            })
+                            .collect(),
+                        other => panic!("r field, got {other:?}"),
+                    },
+                    other => panic!("outer record, got {other:?}"),
+                })
+                .collect(),
+            other => panic!("root list, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        names(&value("users { r = roles.users }")),
+        vec![
+            vec![
+                vec!["Ada".to_string()],
+                vec!["Ada".to_string(), "Bob".to_string()]
+            ],
+            vec![vec!["Ada".to_string(), "Bob".to_string()]],
+        ]
+    );
+}
+
+#[test]
+fn m2m_scalar_chain_values() {
+    assert_eq!(
+        value("users { a = roles.first()?.name }"),
+        Value::List(vec![
+            Value::Record(vec![("a".to_string(), Value::String("admin".to_string()))]),
+            Value::Record(vec![("a".to_string(), Value::String("dev".to_string()))]),
+        ])
+    );
+}
+
+#[test]
+fn m2m_reanchored_inner_values() {
+    let role =
+        |name: &str| Value::Record(vec![("name".to_string(), Value::String(name.to_string()))]);
+    assert_eq!(
+        value("users { o = orders { r = roles } }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "o".to_string(),
+                Value::List(vec![
+                    Value::Record(vec![(
+                        "r".to_string(),
+                        Value::List(vec![role("admin"), role("dev")])
+                    )]),
+                    Value::Record(vec![(
+                        "r".to_string(),
+                        Value::List(vec![role("admin"), role("dev")])
+                    )]),
+                ])
+            )]),
+            Value::Record(vec![(
+                "o".to_string(),
+                Value::List(vec![Value::Record(vec![(
+                    "r".to_string(),
+                    Value::List(vec![role("dev")])
+                )])])
+            )]),
+        ])
+    );
+}
+
+#[test]
+fn m2m_flatten_values() {
+    assert_eq!(
+        value("users.roles.flatten()"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "name".to_string(),
+                Value::String("admin".to_string())
+            )]),
+            Value::Record(vec![("name".to_string(), Value::String("dev".to_string()))]),
+            Value::Record(vec![("name".to_string(), Value::String("dev".to_string()))]),
+        ])
+    );
+}
+
+#[test]
 fn m2m_reverse_bare_values() {
     fn names(v: Value) -> Vec<String> {
         match v {
