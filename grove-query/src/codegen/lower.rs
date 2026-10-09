@@ -6138,6 +6138,9 @@ fn rcross_shape(
     if let Some((shape, key)) = const_proj_cross_shape(ctx, parent, tail, cardinality) {
         return (shape, key);
     }
+    if let Some((shape, key)) = union_middle(ctx, parent, tail, cardinality) {
+        return (shape, key);
+    }
     let bare = match &parent.builder.from {
         Some(FromClause::Table { .. }) => {
             parent.builder.where_.is_empty()
@@ -9139,6 +9142,7 @@ fn if_guard_temp(
     ctx: &mut Context,
     parent: &mut Level,
     arms: &[(TypedExpr, TypedExpr)],
+    allow_const: bool,
 ) -> Option<IfGuardTemp> {
     let mut fids: Vec<FieldId> = Vec::new();
     for (cond, _) in arms.iter() {
@@ -9146,7 +9150,7 @@ fn if_guard_temp(
             return None;
         }
     }
-    if fids.is_empty() {
+    if fids.is_empty() && !allow_const {
         return None;
     }
     let mut carries: Vec<(String, Option<ScalarType>)> = Vec::new();
@@ -9224,6 +9228,201 @@ fn guard_outer_refs(node: &TypedExpr, fids: &mut Vec<FieldId>) -> bool {
     }
 }
 
+fn union_middle(
+    ctx: &mut Context,
+    parent: &mut Level,
+    tail: &TypedExpr,
+    cardinality: Cardinality,
+) -> Option<(ResultShape, Option<String>)> {
+    let TypedExprKind::If { arms, default } = &tail.kind else {
+        return None;
+    };
+    if !matches!(cardinality, Cardinality::Many | Cardinality::One) {
+        return None;
+    }
+    if ctx.child.is_some() || ctx.nest_depth >= 1 || ctx.temp_collect.is_some() {
+        return None;
+    }
+    if !matches!(&tail.ty, QueryType::List(_)) {
+        return None;
+    }
+    #[derive(Clone, Copy, PartialEq)]
+    enum ArmKind {
+        Table,
+        Literal,
+    }
+    let arm_kind = |body: &TypedExpr| -> Option<ArmKind> {
+        match &body.kind {
+            TypedExprKind::Ident {
+                binding: IdentBinding::Root { .. },
+                ..
+            } => Some(ArmKind::Table),
+            TypedExprKind::Array { elements }
+                if elements.iter().all(|elem| {
+                    matches!(&elem.kind, TypedExprKind::Literal(_)) && elem.ty.is_scalar()
+                }) =>
+            {
+                Some(ArmKind::Literal)
+            }
+            _ => None,
+        }
+    };
+    let mut bodies: Vec<&TypedExpr> = Vec::new();
+    for (_, body) in arms.iter() {
+        bodies.push(body);
+    }
+    bodies.push(default);
+    let mut kinds = bodies.iter().map(|body| arm_kind(body));
+    let first_kind = kinds.next().flatten()?;
+    if matches!(first_kind, ArmKind::Literal) {
+        let QueryType::List(inner) = peel_optional(&tail.ty) else {
+            return None;
+        };
+        scalar_of(inner)?;
+    }
+    for kind in kinds {
+        match (kind, &first_kind) {
+            (Some(ArmKind::Table), ArmKind::Table) | (Some(ArmKind::Literal), ArmKind::Literal) => {
+            }
+            _ => return None,
+        }
+    }
+    let IfGuardTemp {
+        temp_idx,
+        temp,
+        outputs: create_outputs,
+        guards,
+    } = if_guard_temp(ctx, parent, arms, true)?;
+    let mut builders: Vec<SelectBuilder> = Vec::new();
+    for (body, guard) in bodies.iter().zip(guards.iter()) {
+        match first_kind {
+            ArmKind::Table => {
+                let guard = shift_depths(guard.clone(), 1);
+                let data_from = cross_root_scan(ctx, body);
+                let data_cols = from_columns_typed(&Some(data_from.clone()), ctx.schema);
+                let mut arm = SelectBuilder::new();
+                arm.from = Some(FromClause::Join {
+                    left: Box::new(FromClause::Temp {
+                        name: temp.clone(),
+                        columns: create_outputs
+                            .iter()
+                            .map(|(name, ty)| NamedColumn {
+                                name: name.clone(),
+                                ty: *ty,
+                            })
+                            .collect(),
+                    }),
+                    right: Box::new(data_from),
+                });
+                for (name, ty) in &data_cols {
+                    arm.select.push(SelectItem::Column {
+                        depth: 0,
+                        column: name.clone(),
+                        output: name.clone(),
+                        ty: *ty,
+                    });
+                }
+                arm.select.push(SelectItem::Column {
+                    depth: 1,
+                    column: "$$key".to_string(),
+                    output: "$$pkey".to_string(),
+                    ty: Some(ScalarType::Int),
+                });
+                arm.where_ = vec![guard];
+                builders.push(arm);
+            }
+            ArmKind::Literal => {
+                let TypedExprKind::Array { elements } = &body.kind else {
+                    unreachable!("union literal arm re-check: admission pins arrays")
+                };
+                for elem in elements {
+                    let mut row = SelectBuilder::new();
+                    row.from = Some(FromClause::Temp {
+                        name: temp.clone(),
+                        columns: create_outputs
+                            .iter()
+                            .map(|(name, ty)| NamedColumn {
+                                name: name.clone(),
+                                ty: *ty,
+                            })
+                            .collect(),
+                    });
+                    row.select.push(SelectItem::Expr {
+                        expr: scalar(ctx, elem),
+                        output: "c0".to_string(),
+                        ty: scalar_of(&elem.ty),
+                    });
+                    row.select.push(SelectItem::Column {
+                        depth: 0,
+                        column: "$$key".to_string(),
+                        output: "$$pkey".to_string(),
+                        ty: Some(ScalarType::Int),
+                    });
+                    row.where_ = vec![guard.clone()];
+                    builders.push(row);
+                }
+            }
+        }
+    }
+    if builders.is_empty() {
+        return None;
+    }
+    let first_outputs = builder_outputs(&builders[0], ctx.schema);
+    for other in builders.iter().skip(1) {
+        if builder_outputs(other, ctx.schema) != first_outputs {
+            return None;
+        }
+    }
+    let item_ty = match &tail.ty {
+        QueryType::List(sub) => sub.as_ref(),
+        _ => &tail.ty,
+    };
+    let child = Level {
+        builder: union_builders(builders),
+        element: tail.ty.clone(),
+        parent: ParentLink::Root { root_idx: 0 },
+        pending: None,
+        stmt_bound: true,
+        output_shapes: None,
+        root_parts: None,
+    };
+    let outputs = builder_outputs(&child.builder, ctx.schema);
+    let shape_cols: Vec<OutputColumn> =
+        shape_columns(builder_output_types(&child.builder, ctx.schema), |name| {
+            name == "$$pkey"
+        });
+    let element = child_element(
+        ctx.schema,
+        child.output_shapes.as_ref(),
+        item_ty,
+        &outputs,
+        |name| name == "$$pkey",
+    );
+    let idx = ctx.sink(
+        child.builder,
+        StatementShape {
+            columns: shape_cols,
+            rows: RowCount::Many,
+        },
+        StatementKind::Query,
+    );
+    let shape = ResultShape::List {
+        element: Box::new(element),
+        child: ChildRef {
+            stmt: idx,
+            parent: Some(ParentRef {
+                stmt: temp_idx,
+                parent_key: "$$key".to_string(),
+                child_key: "$$pkey".to_string(),
+                negated: false,
+            }),
+            cardinality,
+            tag: None,
+        },
+    };
+    Some((shape, Some("$$key".to_string())))
+}
+
 fn union_collapse(
     ctx: &mut Context,
     parent: &mut Level,
@@ -9291,7 +9490,7 @@ fn union_collapse(
         temp,
         outputs: create_outputs,
         guards,
-    } = if_guard_temp(ctx, parent, arms)?;
+    } = if_guard_temp(ctx, parent, arms, false)?;
     let mut builders: Vec<SelectBuilder> = Vec::new();
     let mut bodies: Vec<&TypedExpr> = arms.iter().map(|(_, body)| body).collect();
     bodies.push(default.as_ref());
@@ -9459,7 +9658,7 @@ fn correlated_if_items(
         temp,
         outputs: create_outputs,
         guards,
-    } = if_guard_temp(ctx, parent, arms)?;
+    } = if_guard_temp(ctx, parent, arms, false)?;
     let mut builders: Vec<SelectBuilder> = Vec::new();
     let mut bodies: Vec<&TypedExpr> = arms.iter().map(|(_, body)| body).collect();
     bodies.push(default.as_ref());
@@ -9591,7 +9790,7 @@ fn if_record_items(
         temp,
         outputs: create_outputs,
         guards,
-    } = if_guard_temp(ctx, parent, arms)?;
+    } = if_guard_temp(ctx, parent, arms, false)?;
     let mut builders: Vec<SelectBuilder> = Vec::new();
     for (level, guard) in lowered.into_iter().zip(guards.iter()) {
         let data_cols = builder_output_types(&level.builder, ctx.schema);

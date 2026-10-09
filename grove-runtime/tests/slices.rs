@@ -1036,6 +1036,24 @@ fn lit_multi_list_values() {
 }
 
 #[test]
+fn union_cross_middle_values() {
+    let both = || {
+        Value::List(vec![
+            rec(&[("name", s("n1")), ("owner", s("a@x"))]),
+            rec(&[("name", s("n2")), ("owner", s("zzz"))]),
+        ])
+    };
+    assert_eq!(
+        value("users { x = if active { configs } else { configs } }"),
+        Value::List(vec![
+            rec(&[("x", both())]),
+            rec(&[("x", both())]),
+            rec(&[("x", both())]),
+        ])
+    );
+}
+
+#[test]
 fn chained_projection_reuses_values() {
     let ord = |t: &str| Value::Record(vec![("total".to_string(), Value::Dec(dec(t)))]);
     assert_eq!(
