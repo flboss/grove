@@ -949,6 +949,36 @@ fn if_sunk_branches_values() {
 }
 
 #[test]
+fn if_mismatched_branch_nesting_values() {
+    assert_eq!(
+        value("if true { [[1]] } else { users.scores }"),
+        Value::List(vec![Value::List(vec![Value::Int(1)])])
+    );
+    assert_eq!(
+        value("if false { [[1]] } else { users.scores }"),
+        value("users.scores")
+    );
+}
+
+#[test]
+fn if_sunk_branches_global_cond_values() {
+    let ord = |t: &str| rec(&[("total", Value::Dec(dec(t)))]);
+    assert_eq!(
+        value(
+            "if users.len() > 0 { users { name, o = orders } } else { users { name, o = orders } }"
+        ),
+        Value::List(vec![
+            rec(&[
+                ("name", s("Ada")),
+                ("o", Value::List(vec![ord("10.00"), ord("20.00")]))
+            ]),
+            rec(&[("name", s("Bob")), ("o", Value::List(vec![ord("30.00")]))]),
+            rec(&[("name", s("Cyd")), ("o", Value::List(vec![]))]),
+        ])
+    );
+}
+
+#[test]
 fn chained_projection_reuses_values() {
     let ord = |t: &str| Value::Record(vec![("total".to_string(), Value::Dec(dec(t)))]);
     assert_eq!(

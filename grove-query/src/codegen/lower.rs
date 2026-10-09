@@ -20463,6 +20463,24 @@ fn rows_if(ctx: &mut Context, expr: &TypedExpr) -> Level {
     let TypedExprKind::If { arms, default } = &expr.kind else {
         unreachable!("rows_if on non-if node: callers dispatch on node kind")
     };
+    let mut live: Option<&TypedExpr> = None;
+    let mut all_false = true;
+    for (cond, body) in arms.iter() {
+        if let TypedExprKind::Literal(lit) = &cond.kind {
+            if matches!(&lit.value, Literal::Bool(true)) {
+                live = Some(body);
+                break;
+            }
+            continue;
+        }
+        all_false = false;
+    }
+    if let Some(live) = live {
+        return rows(ctx, live);
+    }
+    if all_false && !arms.is_empty() {
+        return rows(ctx, default);
+    }
     match &expr.ty {
         QueryType::List(_) => {}
         QueryType::Record(_) | QueryType::Optional(_) => todo!("M7 If over records"),
@@ -20514,17 +20532,23 @@ fn rows_if(ctx: &mut Context, expr: &TypedExpr) -> Level {
     }
     let any_pending = lowered.iter().any(|arm| arm.pending.is_some());
     if any_sunk && !any_pending {
-        let const_conds = arms.iter().all(|(cond, _)| {
-            let mut found = false;
+        let outer_free = arms.iter().all(|(cond, _)| {
+            let mut outer = false;
             any_ident(cond, &mut |e| {
-                if matches!(&e.kind, TypedExprKind::Ident { .. }) {
-                    found = true;
+                if matches!(
+                    &e.kind,
+                    TypedExprKind::Ident {
+                        binding: IdentBinding::Field(_) | IdentBinding::ProjectedField { .. },
+                        ..
+                    }
+                ) {
+                    outer = true;
                 }
                 false
             });
-            !found
+            !outer
         });
-        if const_conds && ctx.child.is_none() && ctx.nest_depth == 0 && ctx.temp_collect.is_none() {
+        if outer_free && ctx.child.is_none() && ctx.nest_depth == 0 && ctx.temp_collect.is_none() {
             return union_multistatement(ctx, lowered, sunk_before, expr.ty.clone());
         }
         todo!("M7 multi-statement If branches");
