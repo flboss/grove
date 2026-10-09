@@ -979,6 +979,19 @@ fn if_sunk_branches_global_cond_values() {
 }
 
 #[test]
+fn tuple_field_branch_values() {
+    let tup = |a: f64, b: f64| Value::Tuple(vec![Value::Float(a), Value::Float(b)]);
+    assert_eq!(
+        value("users { t = if active { (1.0f, 2.0f) } else { pos } }"),
+        Value::List(vec![
+            rec(&[("t", tup(1.0, 2.0))]),
+            rec(&[("t", tup(3.0, 4.0))]),
+            rec(&[("t", tup(1.0, 2.0))]),
+        ])
+    );
+}
+
+#[test]
 fn chained_projection_reuses_values() {
     let ord = |t: &str| Value::Record(vec![("total".to_string(), Value::Dec(dec(t)))]);
     assert_eq!(

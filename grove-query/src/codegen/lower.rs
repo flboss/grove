@@ -3606,7 +3606,18 @@ fn lower_value(
                         Some(synthetic) => {
                             return lower_value(ctx, parent, prefix, &synthetic);
                         }
-                        None => todo!("M7 non-literal tuple value"),
+                        None => match distribute_if_tuple_fields(
+                            ctx,
+                            prefix.as_str(),
+                            arms,
+                            default,
+                            tys,
+                        ) {
+                            Some((select, shapes)) => {
+                                return (select, ResultShape::Tuple(shapes), Vec::new());
+                            }
+                            None => todo!("M7 non-literal tuple value"),
+                        },
                     }
                 }
                 if let TypedExprKind::Method {
@@ -8088,6 +8099,107 @@ fn distribute_if_tuple(
         ty,
         span,
     })
+}
+fn distribute_if_tuple_fields(
+    ctx: &mut Context,
+    prefix: &str,
+    arms: &[(TypedExpr, TypedExpr)],
+    default: &TypedExpr,
+    tys: &[QueryType],
+) -> Option<(Vec<SelectItem>, Vec<ResultShape>)> {
+    if !tys.iter().all(|ty| ty.is_scalar()) {
+        return None;
+    }
+    fn branch_sql_positions(
+        ctx: &mut Context,
+        node: &TypedExpr,
+        arity: usize,
+    ) -> Option<Vec<SqlExpr>> {
+        match &node.kind {
+            TypedExprKind::Tuple { elements } if elements.len() == arity => {
+                let mut out = Vec::with_capacity(arity);
+                for elem in elements {
+                    if !elem.ty.is_scalar() {
+                        return None;
+                    }
+                    out.push(scalar(ctx, elem));
+                }
+                Some(out)
+            }
+            TypedExprKind::Ident {
+                binding: IdentBinding::Field(fid),
+                depth,
+                ..
+            } => {
+                let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
+                let Field::Value { columns, .. } = field else {
+                    return None;
+                };
+                if columns.len() != arity {
+                    return None;
+                }
+                Some(
+                    columns
+                        .iter()
+                        .map(|col| SqlExpr::Column {
+                            depth: *depth,
+                            column: ctx.schema.column_name(*col).to_string(),
+                        })
+                        .collect(),
+                )
+            }
+            TypedExprKind::If {
+                arms: inner_arms,
+                default: inner_default,
+            } => {
+                let mut positions: Vec<Vec<(SqlExpr, SqlExpr)>> = Vec::with_capacity(arity);
+                for _ in 0..arity {
+                    positions.push(Vec::with_capacity(inner_arms.len()));
+                }
+                for (cond, body) in inner_arms {
+                    let cells = branch_sql_positions(ctx, body, arity)?;
+                    let cond = scalar(ctx, cond);
+                    for (i, cell) in cells.into_iter().enumerate() {
+                        positions[i].push((cond.clone(), cell));
+                    }
+                }
+                let defaults = branch_sql_positions(ctx, inner_default, arity)?;
+                let mut out = Vec::with_capacity(arity);
+                for (i, arms) in positions.into_iter().enumerate() {
+                    out.push(fold_case(arms, defaults[i].clone()));
+                }
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+    fn fold_case(arms: Vec<(SqlExpr, SqlExpr)>, default: SqlExpr) -> SqlExpr {
+        SqlExpr::Case {
+            arms,
+            else_: Box::new(default),
+        }
+    }
+    let mut branch_cells: Vec<Vec<SqlExpr>> = Vec::with_capacity(arms.len() + 1);
+    for (_, body) in arms.iter() {
+        branch_cells.push(branch_sql_positions(ctx, body, tys.len())?);
+    }
+    branch_cells.push(branch_sql_positions(ctx, default, tys.len())?);
+    let mut select = Vec::with_capacity(tys.len());
+    let mut shapes = Vec::with_capacity(tys.len());
+    for (i, ty) in tys.iter().enumerate() {
+        let mut position_arms: Vec<(SqlExpr, SqlExpr)> = Vec::with_capacity(arms.len());
+        for (j, (cond, _)) in arms.iter().enumerate() {
+            position_arms.push((scalar(ctx, cond), branch_cells[j][i].clone()));
+        }
+        let output = format!("{prefix}_c{i}");
+        select.push(SelectItem::Expr {
+            expr: fold_case(position_arms, branch_cells[arms.len()][i].clone()),
+            output: output.clone(),
+            ty: scalar_of(ty),
+        });
+        shapes.push(ResultShape::Column(output));
+    }
+    Some((select, shapes))
 }
 fn m2m_seed_selects(schema: &ValidatedSchema, builder: &mut SelectBuilder, child_col: &str) {
     let target_from = match builder.from.as_ref() {
