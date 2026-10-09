@@ -713,6 +713,57 @@ fn rows_field(
     }
 }
 
+fn m2m_shadow_alias(col: &str) -> String {
+    format!("$$j_{col}")
+}
+
+fn m2m_shadowed(schema: &ValidatedSchema, target_table: &str, col: &str) -> bool {
+    schema
+        .tables
+        .iter()
+        .any(|t| t.name == target_table && t.columns.iter().any(|c| c.name == col))
+}
+
+fn m2m_pairing_output(schema: &ValidatedSchema, parts: &M2mParts) -> String {
+    if m2m_shadowed(schema, &parts.target_table, &parts.junction_parent_col) {
+        m2m_shadow_alias(&parts.junction_parent_col)
+    } else {
+        parts.junction_parent_col.clone()
+    }
+}
+
+fn m2m_effective_output(schema: &ValidatedSchema, from: &Option<FromClause>, col: &str) -> String {
+    let shadowed = match from {
+        Some(FromClause::Join { right, .. }) => match right.as_ref() {
+            FromClause::Table { table, .. } => m2m_shadowed(schema, table, col),
+            _ => false,
+        },
+        _ => false,
+    };
+    if shadowed {
+        m2m_shadow_alias(col)
+    } else {
+        col.to_string()
+    }
+}
+
+fn m2m_shadowed_tail(tail: &TypedExpr) -> bool {
+    let mut node = tail;
+    loop {
+        match &node.kind {
+            TypedExprKind::Method { base, name, .. }
+                if ["take", "skip", "first", "nth", "max_by"].contains(&name.value.as_str()) =>
+            {
+                return true;
+            }
+            TypedExprKind::Method { base, .. }
+            | TypedExprKind::Field { base, .. }
+            | TypedExprKind::Projection { base, .. } => node = base,
+            _ => return false,
+        }
+    }
+}
+
 fn m2m_join_subquery(ctx: &mut Context, parts: &M2mParts) -> Option<SelectBuilder> {
     let junction_alias = ctx.aliases.table(&parts.junction_table);
     let target_alias = ctx.aliases.table(&parts.target_table);
@@ -730,12 +781,6 @@ fn m2m_join_subquery(ctx: &mut Context, parts: &M2mParts) -> Option<SelectBuilde
                 .collect()
         })
         .unwrap_or_default();
-    if target_cols
-        .iter()
-        .any(|(col, _)| col == &parts.junction_parent_col || col == &parts.junction_target_col)
-    {
-        return None;
-    }
     let mut shell = SelectBuilder::new();
     shell.from = Some(FromClause::Join {
         left: Box::new(FromClause::Table {
@@ -750,7 +795,7 @@ fn m2m_join_subquery(ctx: &mut Context, parts: &M2mParts) -> Option<SelectBuilde
     shell.select.push(SelectItem::Column {
         depth: 1,
         column: parts.junction_parent_col.clone(),
-        output: parts.junction_parent_col.clone(),
+        output: m2m_pairing_output(ctx.schema, parts),
         ty: Some(ScalarType::Int),
     });
     for (col, ty) in target_cols {
@@ -801,7 +846,7 @@ fn navigate_ref(
                     query: Box::new(shell),
                     alias,
                 },
-                parts.junction_parent_col.clone(),
+                m2m_pairing_output(ctx.schema, &parts),
                 parts.parent_pk.clone(),
             )
         }
@@ -2007,16 +2052,11 @@ fn reanchor_parts(
     if !matches!(&tail.kind, TypedExprKind::Ident { .. }) && !is_list {
         return None;
     }
-    let inner_fk = if m2m_parts(schema, *rfid).is_some() {
+    let inner_fk = if let Some(parts) = m2m_parts(schema, *rfid) {
         if !matches!(&tail.kind, TypedExprKind::Ident { .. }) {
             return None;
         }
-        Some(
-            m2m_parts(schema, *rfid)
-                .unwrap_or_else(|| unreachable!("m2m parts vanished mid-validation"))
-                .junction_parent_col
-                .clone(),
-        )
+        Some(m2m_pairing_output(schema, &parts))
     } else if matches!(&tail.kind, TypedExprKind::Ident { .. }) {
         schema.relation_of_field(*rfid)?;
         let inner_table = schema.tables[schema.structs[target.index()].table.index()]
@@ -8498,8 +8538,12 @@ fn m2m_seed_selects(schema: &ValidatedSchema, builder: &mut SelectBuilder, child
         Some(FromClause::Join { right, .. }) => Some((**right).clone()),
         _ => unreachable!("M2M child without a junction join"),
     };
+    let shadowed = match &target_from {
+        Some(FromClause::Table { table, .. }) => m2m_shadowed(schema, table, child_col),
+        _ => false,
+    };
     for (name, ty) in from_columns_typed(&target_from, schema) {
-        if name == child_col {
+        if name == child_col && !shadowed {
             todo!("M4 many-to-many navigation");
         }
         builder.select.push(SelectItem::Column {
@@ -8512,7 +8556,7 @@ fn m2m_seed_selects(schema: &ValidatedSchema, builder: &mut SelectBuilder, child
     builder.select.push(SelectItem::Column {
         depth: 1,
         column: child_col.to_string(),
-        output: child_col.to_string(),
+        output: m2m_effective_output(schema, &builder.from, child_col),
         ty: None,
     });
 }
@@ -8756,6 +8800,12 @@ fn rvalue_shape(
         }
         _ => todo!("M4b projected root inside child tail"),
     };
+    if m2m_join.is_some()
+        && m2m_effective_output(ctx.schema, &Some(child_from.clone()), &child_col) != child_col
+        && m2m_shadowed_tail(tail)
+    {
+        todo!("M4 many-to-many navigation");
+    }
     let keyed = parent_key.is_some();
     let mut child_builder = SelectBuilder::new();
     child_builder.from = Some(child_from);
@@ -8828,6 +8878,7 @@ fn rvalue_shape(
     if child.builder.select.is_empty() && m2m_join.is_none() {
         child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
     }
+    let pair_out = m2m_effective_output(ctx.schema, &child.builder.from, &child_col);
     if keyed {
         if m2m_join.is_some() {
             if child.builder.select.is_empty() {
@@ -8843,14 +8894,14 @@ fn rvalue_shape(
             let served = child.builder.select.iter().any(|item| match item {
                 SelectItem::AllFrom { .. } => false,
                 SelectItem::Column { output, .. } | SelectItem::Expr { output, .. } => {
-                    output == &child_col
+                    output == &pair_out
                 }
             });
             if !served && matches!(child.builder.from, Some(FromClause::Join { .. })) {
                 child.builder.select.push(SelectItem::Column {
                     depth: 1,
                     column: child_col.clone(),
-                    output: child_col.clone(),
+                    output: pair_out.clone(),
                     ty: None,
                 });
             }
@@ -8861,7 +8912,7 @@ fn rvalue_shape(
     let outputs = builder_outputs(&child.builder, ctx.schema);
     let shape_cols: Vec<OutputColumn> =
         shape_columns(builder_output_types(&child.builder, ctx.schema), |name| {
-            keyed && name == child_col
+            keyed && name == pair_out
         });
     let item_ty = match &tail.ty {
         QueryType::List(sub) => sub.as_ref(),
@@ -8874,7 +8925,7 @@ fn rvalue_shape(
             child.output_shapes.as_ref(),
             item_ty,
             &outputs,
-            |name| keyed && name == child_col,
+            |name| keyed && name == pair_out,
         ),
     };
     let idx = ctx.sink(
@@ -8903,7 +8954,7 @@ fn rvalue_shape(
                     0
                 },
                 parent_key,
-                child_key: child_col,
+                child_key: pair_out.clone(),
                 negated: false,
             }),
             cardinality: Cardinality::Many,
@@ -9188,6 +9239,12 @@ fn windowed_collapse(
     collapse: CollapseKind<'_>,
     prefix: Option<CollapsePrefix<'_>>,
 ) -> (ResultShape, Option<String>) {
+    if let Some(IdentBinding::Field(fid)) = tail_root_ident(base)
+        && let Some(parts) = m2m_parts(ctx.schema, *fid)
+        && m2m_pairing_output(ctx.schema, &parts) != parts.junction_parent_col
+    {
+        todo!("M4 many-to-many navigation");
+    }
     let _ = parent;
     let (mut child, parent_key, child_col) = build_capped_level(
         ctx,
@@ -10470,6 +10527,12 @@ fn rscalar_shape(
         }
         _ => todo!("M4 presence-directed unwrap over records"),
     };
+    if m2m_join.is_some()
+        && m2m_effective_output(ctx.schema, &Some(child_from.clone()), &child_col) != child_col
+        && m2m_shadowed_tail(tail)
+    {
+        todo!("M4 many-to-many navigation");
+    }
     let keyed = parent_key.is_some();
     let mut child_builder = SelectBuilder::new();
     child_builder.from = Some(child_from);
