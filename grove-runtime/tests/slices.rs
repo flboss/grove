@@ -1092,6 +1092,60 @@ fn lit_record_field_access_values() {
 }
 
 #[test]
+fn union_middle_tails_values() {
+    let n1 = || rec(&[("name", s("n1")), ("owner", s("a@x"))]);
+    let n2 = || rec(&[("name", s("n2")), ("owner", s("zzz"))]);
+    let one = || Value::List(vec![n1()]);
+    let both = || Value::List(vec![n1(), n2()]);
+    let both_desc = || Value::List(vec![n2(), n1()]);
+    let q = |t: &str| {
+        value(&format!(
+            "users {{ x = (if active {{ configs }} else {{ configs }}).{t} }}"
+        ))
+    };
+    assert_eq!(
+        q("filter(name == \"n1\")"),
+        Value::List(vec![
+            rec(&[("x", one())]),
+            rec(&[("x", one())]),
+            rec(&[("x", one())]),
+        ])
+    );
+    assert_eq!(
+        q("sort(name)"),
+        Value::List(vec![
+            rec(&[("x", both())]),
+            rec(&[("x", both())]),
+            rec(&[("x", both())]),
+        ])
+    );
+    assert_eq!(
+        q("sort_desc(name)"),
+        Value::List(vec![
+            rec(&[("x", both_desc())]),
+            rec(&[("x", both_desc())]),
+            rec(&[("x", both_desc())]),
+        ])
+    );
+    assert_eq!(
+        q("take(1)"),
+        Value::List(vec![
+            rec(&[("x", one())]),
+            rec(&[("x", one())]),
+            rec(&[("x", one())]),
+        ])
+    );
+    assert_eq!(
+        q("filter(owner == \"a@x\").sort(name)"),
+        Value::List(vec![
+            rec(&[("x", one())]),
+            rec(&[("x", one())]),
+            rec(&[("x", one())]),
+        ])
+    );
+}
+
+#[test]
 fn per_parent_contains_values() {
     assert_eq!(
         value("users { x = subordinates.contains(manager) }"),

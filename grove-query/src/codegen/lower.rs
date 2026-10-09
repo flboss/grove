@@ -9417,12 +9417,222 @@ fn guard_outer_refs(node: &TypedExpr, fids: &mut Vec<FieldId>) -> bool {
     }
 }
 
+fn finish_union_middle(
+    ctx: &mut Context,
+    child: Level,
+    temp_idx: usize,
+    item_ty: &QueryType,
+    cardinality: Cardinality,
+) -> (ResultShape, Option<String>) {
+    let outputs = builder_outputs(&child.builder, ctx.schema);
+    let shape_cols: Vec<OutputColumn> =
+        shape_columns(builder_output_types(&child.builder, ctx.schema), |name| {
+            name == "$$pkey"
+        });
+    let element = child_element(
+        ctx.schema,
+        child.output_shapes.as_ref(),
+        item_ty,
+        &outputs,
+        |name| name == "$$pkey",
+    );
+    let idx = ctx.sink(
+        child.builder,
+        StatementShape {
+            columns: shape_cols,
+            rows: RowCount::Many,
+        },
+        StatementKind::Query,
+    );
+    let shape = ResultShape::List {
+        element: Box::new(element),
+        child: ChildRef {
+            stmt: idx,
+            parent: Some(ParentRef {
+                stmt: temp_idx,
+                parent_key: "$$key".to_string(),
+                child_key: "$$pkey".to_string(),
+                negated: false,
+            }),
+            cardinality,
+            tag: None,
+        },
+    };
+    (shape, Some("$$key".to_string()))
+}
+
+enum UnionTail<'a> {
+    Filter(&'a TypedExpr),
+    Sort(OrderDir, &'a [TypedMethodArg]),
+    TakeSkip(&'a str, &'a [TypedMethodArg]),
+}
+
+fn union_tail_scope(ctx: &Context, outputs: &[String], expr: &TypedExpr) -> bool {
+    match &expr.kind {
+        TypedExprKind::Ident {
+            binding: IdentBinding::Field(fid),
+            depth,
+            ..
+        } => {
+            if *depth != 0 {
+                return false;
+            }
+            let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
+            match field {
+                Field::Value { columns, .. } => match columns.as_slice() {
+                    [col] => outputs.iter().any(|c| *c == ctx.schema.column_name(*col)),
+                    _ => false,
+                },
+                _ => false,
+            }
+        }
+        TypedExprKind::Literal(_) => true,
+        TypedExprKind::Binary { lhs, rhs, .. } => {
+            union_tail_scope(ctx, outputs, lhs) && union_tail_scope(ctx, outputs, rhs)
+        }
+        TypedExprKind::Unary { expr, .. } => union_tail_scope(ctx, outputs, expr),
+        TypedExprKind::Cast { expr, .. } => union_tail_scope(ctx, outputs, expr),
+        _ => false,
+    }
+}
+
 fn union_middle(
     ctx: &mut Context,
     parent: &mut Level,
     tail: &TypedExpr,
     cardinality: Cardinality,
 ) -> Option<(ResultShape, Option<String>)> {
+    let mut tails: Vec<UnionTail> = Vec::new();
+    let mut base = tail;
+    loop {
+        match &base.kind {
+            TypedExprKind::Method {
+                base: b,
+                name,
+                args,
+                ..
+            } if name.value == "filter" => {
+                tails.push(UnionTail::Filter(one_arg(args, name)));
+                base = b;
+            }
+            TypedExprKind::Method {
+                base: b,
+                name,
+                args,
+                ..
+            } if ["sort", "sort_asc", "sort_desc"].contains(&name.value.as_str()) => {
+                let default = if name.value == "sort_desc" {
+                    OrderDir::Desc
+                } else {
+                    OrderDir::Asc
+                };
+                tails.push(UnionTail::Sort(default, args));
+                base = b;
+            }
+            TypedExprKind::Method {
+                base: b,
+                name,
+                args,
+                ..
+            } if ["take", "skip"].contains(&name.value.as_str()) => {
+                tails.push(UnionTail::TakeSkip(name.value.as_str(), args));
+                base = b;
+            }
+            _ => break,
+        }
+    }
+    let (mut child, temp_idx) = union_middle_bare(ctx, parent, base, cardinality)?;
+    let out_tys = builder_output_types(&child.builder, ctx.schema);
+    if !tails.is_empty() {
+        let mut wrapped = SelectBuilder::new();
+        wrapped.from = Some(FromClause::Subquery {
+            query: Box::new(child.builder),
+            alias: ctx.aliases.subquery(),
+        });
+        wrapped.select = out_tys
+            .iter()
+            .map(|(name, ty)| SelectItem::Column {
+                depth: 0,
+                column: name.clone(),
+                output: name.clone(),
+                ty: *ty,
+            })
+            .collect();
+        child.builder = wrapped;
+    }
+    for t in tails.iter().rev() {
+        match t {
+            UnionTail::Filter(pred) => {
+                let outputs = builder_outputs(&child.builder, ctx.schema);
+                if !union_tail_scope(ctx, &outputs, pred) {
+                    return None;
+                }
+                child.builder.where_.push(scalar(ctx, pred));
+            }
+            UnionTail::Sort(default, args) => {
+                let outputs = builder_outputs(&child.builder, ctx.schema);
+                let mut keys = vec![OrderItem {
+                    expr: SqlExpr::Column {
+                        depth: 0,
+                        column: "$$pkey".to_string(),
+                    },
+                    dir: OrderDir::Asc,
+                }];
+                for arg in args.iter() {
+                    let dir = match &arg.direction {
+                        Some(dir) => match dir.value {
+                            SortDir::Asc => OrderDir::Asc,
+                            SortDir::Desc => OrderDir::Desc,
+                        },
+                        None => *default,
+                    };
+                    if !union_tail_scope(ctx, &outputs, &arg.expr) {
+                        return None;
+                    }
+                    keys.extend(sort_keys(ctx, &child, &arg.expr, dir));
+                }
+                child.builder.order_by = keys;
+            }
+            UnionTail::TakeSkip(method, args) => {
+                let [arg] = args else {
+                    return None;
+                };
+                if !matches!(arg.expr.kind, TypedExprKind::Literal(_)) {
+                    return None;
+                }
+                let bound = lower_take_bound(ctx, method, args);
+                child = window_take_bound(ctx, child, "$$pkey", method, bound);
+                child.builder.select = out_tys
+                    .iter()
+                    .map(|(name, ty)| SelectItem::Column {
+                        depth: 0,
+                        column: name.clone(),
+                        output: name.clone(),
+                        ty: *ty,
+                    })
+                    .collect();
+            }
+        }
+    }
+    let item_ty = match &tail.ty {
+        QueryType::List(sub) => sub.as_ref(),
+        _ => &tail.ty,
+    };
+    Some(finish_union_middle(
+        ctx,
+        child,
+        temp_idx,
+        item_ty,
+        cardinality,
+    ))
+}
+
+fn union_middle_bare(
+    ctx: &mut Context,
+    parent: &mut Level,
+    tail: &TypedExpr,
+    cardinality: Cardinality,
+) -> Option<(Level, usize)> {
     let TypedExprKind::If { arms, default } = &tail.kind else {
         return None;
     };
@@ -9562,10 +9772,6 @@ fn union_middle(
             return None;
         }
     }
-    let item_ty = match &tail.ty {
-        QueryType::List(sub) => sub.as_ref(),
-        _ => &tail.ty,
-    };
     let child = Level {
         builder: union_builders(builders),
         element: tail.ty.clone(),
@@ -9575,41 +9781,7 @@ fn union_middle(
         output_shapes: None,
         root_parts: None,
     };
-    let outputs = builder_outputs(&child.builder, ctx.schema);
-    let shape_cols: Vec<OutputColumn> =
-        shape_columns(builder_output_types(&child.builder, ctx.schema), |name| {
-            name == "$$pkey"
-        });
-    let element = child_element(
-        ctx.schema,
-        child.output_shapes.as_ref(),
-        item_ty,
-        &outputs,
-        |name| name == "$$pkey",
-    );
-    let idx = ctx.sink(
-        child.builder,
-        StatementShape {
-            columns: shape_cols,
-            rows: RowCount::Many,
-        },
-        StatementKind::Query,
-    );
-    let shape = ResultShape::List {
-        element: Box::new(element),
-        child: ChildRef {
-            stmt: idx,
-            parent: Some(ParentRef {
-                stmt: temp_idx,
-                parent_key: "$$key".to_string(),
-                child_key: "$$pkey".to_string(),
-                negated: false,
-            }),
-            cardinality,
-            tag: None,
-        },
-    };
-    Some((shape, Some("$$key".to_string())))
+    Some((child, temp_idx))
 }
 
 fn union_collapse(
