@@ -1190,6 +1190,19 @@ fn take_bound_contains_values() {
 }
 
 #[test]
+fn subquery_needle_contains_values() {
+    let b = |v: bool| rec(&[("x", Value::Bool(v))]);
+    assert_eq!(
+        value("users { x = scores.contains(manager.age) }"),
+        Value::List(vec![b(false), b(false), b(false)])
+    );
+    assert_eq!(
+        value("users { x = tags.contains(manager.name) }"),
+        Value::List(vec![b(false), b(false), b(false)])
+    );
+}
+
+#[test]
 fn chained_projection_reuses_values() {
     let ord = |t: &str| Value::Record(vec![("total".to_string(), Value::Dec(dec(t)))]);
     assert_eq!(

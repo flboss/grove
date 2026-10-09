@@ -18029,12 +18029,34 @@ fn derived_contains_exists(ctx: &mut Context, base: &TypedExpr, needle: &TypedEx
             depth: 0,
             column: value_col,
         }),
-        rhs: Box::new(contains_needle(ctx, needle)),
+        rhs: Box::new(contains_needle(ctx, needle, has_scope_ident(base))),
     });
     SqlExpr::Exists(Box::new(level.builder))
 }
 
-fn contains_needle(ctx: &mut Context, needle: &TypedExpr) -> SqlExpr {
+fn reroot_nav_spine(needle: &TypedExpr) -> Option<TypedExpr> {
+    fn bump(expr: &mut TypedExpr) -> bool {
+        match &mut expr.kind {
+            TypedExprKind::Field { base, .. } => bump(base),
+            TypedExprKind::Ident {
+                binding: IdentBinding::Field(_),
+                depth,
+                ..
+            } => {
+                if *depth != 0 {
+                    return false;
+                }
+                *depth += 1;
+                true
+            }
+            _ => false,
+        }
+    }
+    let mut out = needle.clone();
+    if bump(&mut out) { Some(out) } else { None }
+}
+
+fn contains_needle(ctx: &mut Context, needle: &TypedExpr, base_scoped: bool) -> SqlExpr {
     let scoped = has_scope_ident(needle) || uses_outer(needle);
     let plain = ctx.temp_collect.is_some() || ctx.in_array_temp || ctx.in_take_arg;
     if scoped && !plain {
@@ -18042,6 +18064,14 @@ fn contains_needle(ctx: &mut Context, needle: &TypedExpr) -> SqlExpr {
             todo!("M6 correlated literal outside temp lane");
         }
         if !shiftable_needle(needle) {
+            if base_scoped && let Some(rerooted) = reroot_nav_spine(needle) {
+                let sunk = ctx.statements.len();
+                let frag = scalar(ctx, &rerooted);
+                if ctx.statements.len() != sunk {
+                    todo!("M6 correlated literal outside temp lane");
+                }
+                return frag;
+            }
             todo!("M6 correlated literal outside temp lane");
         }
         return shift_depths(scalar(ctx, needle), 1);
@@ -18594,7 +18624,7 @@ fn contains_exists(ctx: &mut Context, base: &TypedExpr, needle: &TypedExpr) -> S
                         depth: 0,
                         column: "c0".to_string(),
                     }),
-                    rhs: Box::new(contains_needle(ctx, needle)),
+                    rhs: Box::new(contains_needle(ctx, needle, has_scope_ident(base))),
                 }];
                 return SqlExpr::Exists(Box::new(query));
             }
@@ -18698,7 +18728,7 @@ fn storage_contains_query(
             depth: 0,
             column: value_col.clone(),
         }),
-        rhs: Box::new(contains_needle(ctx, needle)),
+        rhs: Box::new(contains_needle(ctx, needle, true)),
     };
     if tails.is_empty() {
         query.where_ = vec![link_pred, value_pred];
@@ -18818,7 +18848,7 @@ fn storage_contains_windowed(
                 depth: 0,
                 column: value_col.clone(),
             }),
-            rhs: Box::new(contains_needle(ctx, needle)),
+            rhs: Box::new(contains_needle(ctx, needle, true)),
         },
     ];
     Some(query)
