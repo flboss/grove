@@ -458,6 +458,9 @@ fn single_hop_parts(ctx: &mut Context, tail: &TypedExpr) -> Option<SingleHop> {
             {
                 node = base;
             }
+            TypedExprKind::Projection { base, .. } => {
+                node = base;
+            }
             TypedExprKind::Field { base, name, .. } => {
                 let TypedExprKind::Ident {
                     binding: IdentBinding::Field(mid_fid),
@@ -17678,6 +17681,49 @@ fn reanchored_level(ctx: &mut Context, base: &TypedExpr) -> Option<Level> {
     })
 }
 
+fn single_hop_scalar_level(ctx: &mut Context, base: &TypedExpr) -> Option<Level> {
+    if ctx.child.is_some() || ctx.nest_depth >= 1 || ctx.temp_collect.is_some() || ctx.in_take_arg {
+        return None;
+    }
+    let TypedExprKind::Field { base: mid_base, .. } = &base.kind else {
+        return None;
+    };
+    let TypedExprKind::Ident {
+        binding: IdentBinding::Field(_),
+        depth,
+        ..
+    } = &mid_base.kind
+    else {
+        return None;
+    };
+    let parts = single_hop_parts(ctx, base)?;
+    let FromClause::Table { table, alias } = parts.child_from.clone() else {
+        return None;
+    };
+    let mut builder = SelectBuilder::new();
+    builder.from = Some(FromClause::Table { table, alias });
+    builder.where_ = vec![SqlExpr::Binary {
+        op: SqlBinOp::Eq,
+        lhs: Box::new(SqlExpr::Column {
+            depth: 0,
+            column: parts.child_col,
+        }),
+        rhs: Box::new(SqlExpr::Column {
+            depth: *depth + 1,
+            column: parts.middle_fk,
+        }),
+    }];
+    Some(Level {
+        builder,
+        element: base.ty.clone(),
+        parent: ParentLink::Root { root_idx: 0 },
+        pending: None,
+        stmt_bound: true,
+        output_shapes: None,
+        root_parts: None,
+    })
+}
+
 fn scalar_aggregate(ctx: &mut Context, base: &TypedExpr, agg: AggOp) -> SqlExpr {
     let corr = has_row_setting_ident(base) || tail_uses_outer(base);
     if corr && ctx.in_take_arg {
@@ -17686,6 +17732,13 @@ fn scalar_aggregate(ctx: &mut Context, base: &TypedExpr, agg: AggOp) -> SqlExpr 
     let was_corr = std::mem::replace(&mut ctx.corr, corr);
     let was_outer = std::mem::replace(&mut ctx.no_outer, !corr);
     let level = if corr {
+        if matches!(agg, AggOp::Len | AggOp::Bare(..))
+            && let Some(level) = single_hop_scalar_level(ctx, base)
+        {
+            ctx.corr = was_corr;
+            ctx.no_outer = was_outer;
+            return finish_scalar_aggregate(ctx, base, level, agg);
+        }
         match reanchored_level(ctx, base) {
             Some(level) => level,
             None => rows(ctx, base),

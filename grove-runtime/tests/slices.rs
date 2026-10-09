@@ -1190,6 +1190,27 @@ fn take_bound_contains_values() {
 }
 
 #[test]
+fn single_hop_project_and_scalar_values() {
+    let s30 = || rec(&[("s", Value::Dec(dec("30.00")))]);
+    assert_eq!(
+        value("users { x = manager.orders { s = total } }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![s30()]))]),
+            rec(&[("x", Value::List(vec![s30()]))]),
+            rec(&[("x", Value::List(vec![s30()]))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = manager.orders.len() }"),
+        Value::List(vec![
+            rec(&[("x", Value::Int(1))]),
+            rec(&[("x", Value::Int(1))]),
+            rec(&[("x", Value::Int(1))]),
+        ])
+    );
+}
+
+#[test]
 fn subquery_needle_contains_values() {
     let b = |v: bool| rec(&[("x", Value::Bool(v))]);
     assert_eq!(
