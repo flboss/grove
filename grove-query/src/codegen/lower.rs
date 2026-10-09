@@ -18724,12 +18724,112 @@ fn storage_contains_query(
     outer
 }
 
+fn storage_contains_windowed(
+    ctx: &mut Context,
+    fid: FieldId,
+    needle: &TypedExpr,
+    method: &str,
+    args: &[TypedMethodArg],
+) -> Option<SelectBuilder> {
+    let [arg] = args else {
+        return None;
+    };
+    if !shiftable_needle(&arg.expr) {
+        return None;
+    }
+    let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
+    let (storage, link) = match field {
+        Field::Array { storage, link, .. } => (storage, link),
+        _ => return None,
+    };
+    let table = ctx.schema.tables[storage.table.index()].name.clone();
+    let alias = ctx.aliases.table(&table);
+    let key_col = ctx.schema.column_name(storage.key).to_string();
+    let value_col = match storage.value.as_slice() {
+        [col] => ctx.schema.column_name(*col).to_string(),
+        _ => return None,
+    };
+    let mut inner = SelectBuilder::new();
+    inner.from = Some(FromClause::Table { table, alias });
+    inner.select = vec![
+        SelectItem::Column {
+            depth: 0,
+            column: key_col.clone(),
+            output: key_col.clone(),
+            ty: Some(ScalarType::Int),
+        },
+        SelectItem::Column {
+            depth: 0,
+            column: value_col.clone(),
+            output: value_col.clone(),
+            ty: None,
+        },
+        SelectItem::Expr {
+            expr: SqlExpr::Window {
+                func: "ROW_NUMBER".to_string(),
+                partition: vec![SqlExpr::Column {
+                    depth: 0,
+                    column: key_col.clone(),
+                }],
+                order: Vec::new(),
+            },
+            output: "$$rn".to_string(),
+            ty: Some(ScalarType::Int),
+        },
+    ];
+    let mut query = SelectBuilder::new();
+    query.from = Some(FromClause::Subquery {
+        query: Box::new(inner),
+        alias: ctx.aliases.subquery(),
+    });
+    query.select = vec![SelectItem::Column {
+        depth: 0,
+        column: key_col.clone(),
+        output: key_col.clone(),
+        ty: Some(ScalarType::Int),
+    }];
+    query.where_ = vec![
+        SqlExpr::Binary {
+            op: SqlBinOp::Eq,
+            lhs: Box::new(SqlExpr::Column {
+                depth: 0,
+                column: key_col,
+            }),
+            rhs: Box::new(SqlExpr::Column {
+                depth: 1,
+                column: ctx.schema.column_name(*link).to_string(),
+            }),
+        },
+        SqlExpr::Binary {
+            op: if method == "skip" {
+                SqlBinOp::Gt
+            } else {
+                SqlBinOp::Le
+            },
+            lhs: Box::new(SqlExpr::Column {
+                depth: 0,
+                column: "$$rn".to_string(),
+            }),
+            rhs: Box::new(shift_depths(scalar(ctx, &arg.expr), 1)),
+        },
+        SqlExpr::Binary {
+            op: SqlBinOp::Eq,
+            lhs: Box::new(SqlExpr::Column {
+                depth: 0,
+                column: value_col.clone(),
+            }),
+            rhs: Box::new(contains_needle(ctx, needle)),
+        },
+    ];
+    Some(query)
+}
+
 fn storage_contains_tailed(
     ctx: &mut Context,
     base: &TypedExpr,
     needle: &TypedExpr,
 ) -> Option<SelectBuilder> {
-    let mut tails: Vec<(&str, &[TypedMethodArg])> = Vec::new();
+    let mut tails: Vec<(&str, &[TypedMethodArg], bool)> = Vec::new();
     let mut node = base;
     while let TypedExprKind::Method {
         base: inner,
@@ -18741,11 +18841,16 @@ fn storage_contains_tailed(
         if *optional || !["take", "skip"].contains(&name.value.as_str()) {
             break;
         }
-        if args.iter().any(|a| has_scope_ident(&a.expr)) {
-            return None;
-        }
-        tails.push((name.value.as_str(), args.as_slice()));
+        tails.push((
+            name.value.as_str(),
+            args.as_slice(),
+            args.iter().any(|a| has_scope_ident(&a.expr)),
+        ));
         node = inner.as_ref();
+    }
+    let windowed = tails.len() == 1 && tails[0].2;
+    if !windowed && tails.iter().any(|t| t.2) {
+        return None;
     }
     if tails.is_empty() {
         return None;
@@ -18763,7 +18868,11 @@ fn storage_contains_tailed(
     ) {
         return None;
     }
-    let query = storage_contains_query(ctx, *fid, needle, &tails);
+    if windowed {
+        return storage_contains_windowed(ctx, *fid, needle, tails[0].0, tails[0].1);
+    }
+    let plain: Vec<(&str, &[TypedMethodArg])> = tails.iter().map(|(m, a, _)| (*m, *a)).collect();
+    let query = storage_contains_query(ctx, *fid, needle, &plain);
     Some(query)
 }
 

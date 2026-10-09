@@ -1169,6 +1169,27 @@ fn per_parent_contains_values() {
 }
 
 #[test]
+fn take_bound_contains_values() {
+    let b = |v: bool| rec(&[("x", Value::Bool(v))]);
+    assert_eq!(
+        value("users { x = tags.take(age).contains(\"x\") }"),
+        Value::List(vec![b(true), b(false), b(false)])
+    );
+    assert_eq!(
+        value("users { x = tags.take(age - 29).contains(\"y\") }"),
+        Value::List(vec![b(false), b(false), b(false)])
+    );
+    assert_eq!(
+        value("users { x = tags.skip(age - 30).contains(\"y\") }"),
+        Value::List(vec![b(true), b(false), b(false)])
+    );
+    assert_eq!(
+        value("users { x = tags.take(1).contains(\"x\") }"),
+        Value::List(vec![b(true), b(false), b(false)])
+    );
+}
+
+#[test]
 fn chained_projection_reuses_values() {
     let ord = |t: &str| Value::Record(vec![("total".to_string(), Value::Dec(dec(t)))]);
     assert_eq!(
