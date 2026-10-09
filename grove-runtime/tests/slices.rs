@@ -1092,6 +1092,29 @@ fn lit_record_field_access_values() {
 }
 
 #[test]
+fn per_parent_contains_values() {
+    assert_eq!(
+        value("users { x = subordinates.contains(manager) }"),
+        Value::List(vec![
+            rec(&[("x", Value::Bool(false))]),
+            rec(&[("x", Value::Bool(true))]),
+            rec(&[("x", Value::Bool(false))]),
+        ])
+    );
+    assert_eq!(
+        value("users.filter(name == \"Ada\") { x = orders.contains(orders.first().unwrap()) }"),
+        Value::List(vec![rec(&[("x", Value::Bool(true))])])
+    );
+    let mut rt = fixture();
+    let err = rt
+        .execute_value(&compile_q(
+            "users { x = orders.contains(orders.first().unwrap()) }",
+        ))
+        .unwrap_err();
+    assert!(err.to_string().contains("unwrap failed"));
+}
+
+#[test]
 fn chained_projection_reuses_values() {
     let ord = |t: &str| Value::Record(vec![("total".to_string(), Value::Dec(dec(t)))]);
     assert_eq!(

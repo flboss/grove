@@ -14010,11 +14010,9 @@ fn nest_layers(
             .filter(|name| name.as_str() != inner.pref.child_key)
             .cloned()
             .collect();
-        debug_assert_eq!(
-            kept.len(),
-            1,
-            "position leaf serves one scalar besides its pairing key"
-        );
+        if kept.len() != 1 {
+            todo!("M7 multi-list tuple literal");
+        }
         match kept.as_slice() {
             [col] => ResultShape::Column(col.clone()),
             kept => ResultShape::Record(
@@ -17879,6 +17877,162 @@ fn contains_needle(ctx: &mut Context, needle: &TypedExpr) -> SqlExpr {
     scalar(ctx, needle)
 }
 
+fn per_parent_contains(ctx: &mut Context, base: &TypedExpr, needle: &TypedExpr) -> Option<SqlExpr> {
+    if ctx.temp_collect.is_some() || ctx.in_array_temp || ctx.child.is_some() {
+        return None;
+    }
+    let mut inner = needle;
+    let mut abort = false;
+    loop {
+        match &inner.kind {
+            TypedExprKind::Method {
+                base: b,
+                name,
+                args,
+                ..
+            } if name.value == "unwrap" && args.is_empty() => {
+                abort = true;
+                inner = b;
+            }
+            TypedExprKind::Some { value } => {
+                inner = value;
+            }
+            _ => break,
+        }
+    }
+    let sunk_before = ctx.statements.len();
+    let corr = has_row_setting_ident(base) || tail_uses_outer(base);
+    let was_corr = std::mem::replace(&mut ctx.corr, corr);
+    let was_outer = std::mem::replace(&mut ctx.no_outer, !corr);
+    let mut level = rows(ctx, base);
+    ctx.corr = was_corr;
+    ctx.no_outer = was_outer;
+    if level.pending.is_some() || ctx.statements.len() != sunk_before {
+        return None;
+    }
+    if !level.builder.select.is_empty() || !level.builder.unions.is_empty() {
+        level = wrap_level(ctx, level);
+    }
+    if level.builder.select.is_empty() {
+        level.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+    }
+    let cols = builder_outputs(&level.builder, ctx.schema);
+    if cols.is_empty() {
+        return None;
+    }
+    let mut needle_q = match &inner.kind {
+        TypedExprKind::Ident {
+            binding: IdentBinding::Field(fid),
+            depth,
+            ..
+        } if *depth == 0 => {
+            let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
+            let target = match field {
+                Field::Ref {
+                    target,
+                    is_list: false,
+                    ..
+                } => *target,
+                _ => return None,
+            };
+            ctx.schema.relation_of_field(*fid)?;
+            let (target_key, enclosing_fk) = match link_cols(ctx.schema, *fid) {
+                LinkCols::ParentFk {
+                    parent_fk,
+                    child_pk,
+                } => (child_pk, parent_fk),
+                LinkCols::TargetFk {
+                    child_fk,
+                    parent_pk,
+                } => (parent_pk, child_fk),
+                LinkCols::ManyToMany => return None,
+            };
+            let target_table = ctx.schema.tables[ctx.schema.structs[target.index()].table.index()]
+                .name
+                .clone();
+            let mut q = SelectBuilder::new();
+            q.from = Some(FromClause::Table {
+                table: target_table.clone(),
+                alias: ctx.aliases.table(&target_table),
+            });
+            q.select = vec![SelectItem::AllFrom { depth: 0 }];
+            q.where_ = vec![SqlExpr::Binary {
+                op: SqlBinOp::Eq,
+                lhs: Box::new(SqlExpr::Column {
+                    depth: 0,
+                    column: target_key,
+                }),
+                rhs: Box::new(SqlExpr::Column {
+                    depth: 1,
+                    column: enclosing_fk,
+                }),
+            }];
+            q
+        }
+        _ => {
+            let n_sunk = ctx.statements.len();
+            let q = single_row_query(ctx, inner, vec![SelectItem::AllFrom { depth: 0 }]);
+            if ctx.statements.len() != n_sunk {
+                return None;
+            }
+            q
+        }
+    };
+    let ncols = builder_outputs(&needle_q, ctx.schema);
+    if !cols.iter().all(|c| ncols.contains(c)) {
+        return None;
+    }
+    if abort {
+        let needle_level = Level {
+            builder: needle_q,
+            element: inner.ty.clone(),
+            parent: ParentLink::Root { root_idx: 0 },
+            pending: None,
+            stmt_bound: false,
+            output_shapes: None,
+            root_parts: None,
+        };
+        needle_q = assert_present_rows(
+            ctx,
+            needle_level,
+            "unwrap failed: value was none".to_string(),
+        )
+        .builder;
+        needle_q.select = ncols
+            .iter()
+            .map(|column| SelectItem::Column {
+                depth: 0,
+                column: column.clone(),
+                output: column.clone(),
+                ty: None,
+            })
+            .collect();
+    }
+    let base_from = level.builder.from.take()?;
+    level.builder = shift_outer_builder(level.builder, 1);
+    level.builder.from = Some(FromClause::Join {
+        left: Box::new(FromClause::Subquery {
+            query: Box::new(shift_outer_builder(needle_q, 2)),
+            alias: ctx.aliases.subquery(),
+        }),
+        right: Box::new(base_from),
+    });
+    for col in &cols {
+        level.builder.where_.push(SqlExpr::Binary {
+            op: SqlBinOp::Is,
+            lhs: Box::new(SqlExpr::Column {
+                depth: 0,
+                column: col.clone(),
+            }),
+            rhs: Box::new(SqlExpr::Column {
+                depth: 1,
+                column: col.clone(),
+            }),
+        });
+    }
+    Some(SqlExpr::Exists(Box::new(level.builder)))
+}
+
 fn composite_contains_exists(
     ctx: &mut Context,
     base: &TypedExpr,
@@ -17942,7 +18096,7 @@ fn composite_contains_exists(
         }
         QueryType::Record(_) => {
             let TypedExprKind::Struct { fields: values } = &needle.kind else {
-                return None;
+                return per_parent_contains(ctx, base, needle);
             };
             let mut terms = Vec::with_capacity(values.len());
             for (name, vexpr) in values {
