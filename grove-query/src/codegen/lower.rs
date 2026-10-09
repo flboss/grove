@@ -3611,22 +3611,32 @@ fn lower_value(
                 let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
                 match field {
                     Field::Value { columns, .. } => {
-                        if columns.len() != tys.len() || tys.iter().any(|t| !t.is_scalar()) {
-                            todo!("M7 schema tuple with collection element");
+                        let mut cursor = columns.iter();
+                        let mut select = Vec::new();
+                        let mut shapes = Vec::new();
+                        let mut ok = true;
+                        for (i, ty) in tys.iter().enumerate() {
+                            match expand_tuple_field(
+                                ctx.schema,
+                                &mut cursor,
+                                ty,
+                                *depth,
+                                &format!("{prefix}_c{i}"),
+                            ) {
+                                Some((mut sub_select, mut sub_shapes)) => {
+                                    select.append(&mut sub_select);
+                                    shapes.append(&mut sub_shapes);
+                                }
+                                None => {
+                                    ok = false;
+                                    break;
+                                }
+                            }
                         }
-                        let mut select = Vec::with_capacity(columns.len());
-                        let mut shapes = Vec::with_capacity(columns.len());
-                        for (i, column) in columns.iter().enumerate() {
-                            let output = format!("{prefix}_c{i}");
-                            select.push(SelectItem::Column {
-                                depth: *depth,
-                                column: ctx.schema.column_name(*column).to_string(),
-                                output: output.clone(),
-                                ty: tys.get(i).and_then(scalar_of),
-                            });
-                            shapes.push(ResultShape::Column(output));
+                        if ok && cursor.next().is_none() {
+                            return (select, ResultShape::Tuple(shapes), Vec::new());
                         }
-                        return (select, ResultShape::Tuple(shapes), Vec::new());
+                        todo!("M7 schema tuple with collection element");
                     }
                     _ => unreachable!("tuple-typed non-value field: schema tuples are value-typed"),
                 }
@@ -8250,6 +8260,46 @@ fn distribute_if_tuple_fields(
         shapes.push(ResultShape::Column(output));
     }
     Some((select, shapes))
+}
+
+fn expand_tuple_field(
+    schema: &ValidatedSchema,
+    cursor: &mut std::slice::Iter<'_, grove_schema::validated::ColumnId>,
+    ty: &QueryType,
+    depth: usize,
+    prefix: &str,
+) -> Option<(Vec<SelectItem>, Vec<ResultShape>)> {
+    match ty {
+        QueryType::Tuple(subtys) => {
+            let mut select = Vec::new();
+            let mut sub_shapes = Vec::with_capacity(subtys.len());
+            for (i, sub) in subtys.iter().enumerate() {
+                let (mut sub_select, mut sub_shape) =
+                    expand_tuple_field(schema, cursor, sub, depth, &format!("{prefix}_c{i}"))?;
+                select.append(&mut sub_select);
+                if sub_shape.len() != 1 {
+                    return None;
+                }
+                sub_shapes.push(sub_shape.remove(0));
+            }
+            Some((select, vec![ResultShape::Tuple(sub_shapes)]))
+        }
+        _ => {
+            let ty = scalar_of(ty)?;
+            let col = cursor.next()?;
+            let column = schema.column_name(*col).to_string();
+            let output = prefix.to_string();
+            Some((
+                vec![SelectItem::Column {
+                    depth,
+                    column,
+                    output: output.clone(),
+                    ty: Some(ty),
+                }],
+                vec![ResultShape::Column(output)],
+            ))
+        }
+    }
 }
 fn m2m_seed_selects(schema: &ValidatedSchema, builder: &mut SelectBuilder, child_col: &str) {
     let target_from = match builder.from.as_ref() {

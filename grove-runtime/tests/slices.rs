@@ -1000,6 +1000,24 @@ fn lit_flatten_record_values() {
 }
 
 #[test]
+fn schema_tuple_nested_values() {
+    let trio = |a: i64, b: i64, c: i64| {
+        Value::Tuple(vec![
+            Value::Int(a),
+            Value::Tuple(vec![Value::Int(b), Value::Int(c)]),
+        ])
+    };
+    assert_eq!(
+        value("users { t = trio }"),
+        Value::List(vec![
+            rec(&[("t", trio(1, 2, 3))]),
+            rec(&[("t", trio(4, 5, 6))]),
+            rec(&[("t", trio(7, 8, 9))]),
+        ])
+    );
+}
+
+#[test]
 fn chained_projection_reuses_values() {
     let ord = |t: &str| Value::Record(vec![("total".to_string(), Value::Dec(dec(t)))]);
     assert_eq!(
