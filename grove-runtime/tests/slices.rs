@@ -992,6 +992,14 @@ fn tuple_field_branch_values() {
 }
 
 #[test]
+fn lit_flatten_record_values() {
+    assert_eq!(
+        value("[[{ a = 1 }]].flatten()"),
+        Value::List(vec![rec(&[("a", Value::Int(1))])])
+    );
+}
+
+#[test]
 fn chained_projection_reuses_values() {
     let ord = |t: &str| Value::Record(vec![("total".to_string(), Value::Dec(dec(t)))]);
     assert_eq!(

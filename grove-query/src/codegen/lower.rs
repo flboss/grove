@@ -844,6 +844,45 @@ fn merge_navigate(
     }
 }
 
+fn named_merge_selects(
+    columns: &[NamedColumn],
+    child_col: &str,
+    middle_parts: &Option<Vec<MiddlePart>>,
+) -> Option<Vec<SelectItem>> {
+    let parts = middle_parts.as_ref()?;
+    if !parts
+        .iter()
+        .all(|part| matches!(part, MiddlePart::Value { name: Some(_), .. }))
+    {
+        return None;
+    }
+    let mut values = columns.iter().filter(|col| col.name != child_col);
+    let mut select = Vec::with_capacity(parts.len());
+    for part in parts {
+        let MiddlePart::Value {
+            name: Some(name),
+            col,
+        } = part
+        else {
+            return None;
+        };
+        let served = values.next()?;
+        if served.name != *col {
+            return None;
+        }
+        select.push(SelectItem::Column {
+            depth: 0,
+            column: served.name.clone(),
+            output: name.clone(),
+            ty: served.ty,
+        });
+    }
+    if values.next().is_some() {
+        return None;
+    }
+    Some(select)
+}
+
 fn parts_named(parts: &[MiddlePart]) -> bool {
     parts.iter().any(|part| match part {
         MiddlePart::Value { name, .. } | MiddlePart::Nested { name, .. } => name.is_some(),
@@ -890,23 +929,34 @@ fn merge_builder(
             .as_ref()
             .is_some_and(|parts| parts_named(parts))
         {
-            todo!("M7 flatten over record literals");
-        }
-        child.select = columns
-            .iter()
-            .filter(|c| c.name != child_col)
-            .enumerate()
-            .map(|(i, column)| SelectItem::Column {
-                depth: 0,
-                column: column.name.clone(),
-                output: format!("c{i}"),
-                ty: column.ty,
-            })
-            .collect();
-        if child.select.is_empty() {
-            unreachable!(
-                "merge over a key-only literal level: the depth guard keeps merges on leaves"
-            );
+            match named_merge_selects(columns, &child_col, middle_parts) {
+                Some(select) => {
+                    child.select = select;
+                    if child.select.is_empty() {
+                        unreachable!(
+                            "merge over a key-only literal level: the depth guard keeps merges on leaves"
+                        );
+                    }
+                }
+                None => todo!("M7 flatten over record literals"),
+            }
+        } else {
+            child.select = columns
+                .iter()
+                .filter(|c| c.name != child_col)
+                .enumerate()
+                .map(|(i, column)| SelectItem::Column {
+                    depth: 0,
+                    column: column.name.clone(),
+                    output: format!("c{i}"),
+                    ty: column.ty,
+                })
+                .collect();
+            if child.select.is_empty() {
+                unreachable!(
+                    "merge over a key-only literal level: the depth guard keeps merges on leaves"
+                );
+            }
         }
     } else if project_values {
         child.select = from_columns_typed(&Some(child_from.clone()), schema)
