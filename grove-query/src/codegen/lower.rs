@@ -18445,7 +18445,7 @@ fn number_side(ctx: &mut Context, rows: SelectBuilder, cols: &[String]) -> ListS
     }
 }
 
-fn first_inner_side(ctx: &mut Context, needle: &TypedExpr, cols: &[String]) -> Option<ListSide> {
+fn pick_inner_side(ctx: &mut Context, needle: &TypedExpr, cols: &[String]) -> Option<ListSide> {
     let TypedExprKind::Method {
         base: unwrap_base,
         name: unwrap_name,
@@ -18467,9 +18467,20 @@ fn first_inner_side(ctx: &mut Context, needle: &TypedExpr, cols: &[String]) -> O
     else {
         return None;
     };
-    if first_name.value != "first" || !first_args.is_empty() {
-        return None;
-    }
+    let offset = match first_name.value.as_str() {
+        "first" if first_args.is_empty() => None,
+        "nth" => match first_args.as_slice() {
+            [arg] => match &arg.expr.kind {
+                TypedExprKind::Literal(lit) => match &lit.value {
+                    Literal::Int(n) if *n >= 0 => Some(*n),
+                    _ => return None,
+                },
+                _ => return None,
+            },
+            _ => return None,
+        },
+        _ => return None,
+    };
     let (_, n_owner, n_fid) = root_nav_field(ctx.schema, first_base)?;
     let n_side = nav_list_side(ctx.schema, n_owner, n_fid)?;
     if n_side.cols != cols {
@@ -18487,6 +18498,9 @@ fn first_inner_side(ctx: &mut Context, needle: &TypedExpr, cols: &[String]) -> O
         ty: None,
     }];
     first_outer.limit = Some(SqlExpr::Param(ParamValue::Int(1)));
+    if let Some(n) = offset {
+        first_outer.offset = Some(SqlExpr::Param(ParamValue::Int(n)));
+    }
     let mut rows = SelectBuilder::new();
     rows.from = Some(FromClause::Table {
         table: n_side.inner_table.clone(),
@@ -18511,7 +18525,31 @@ fn first_inner_side(ctx: &mut Context, needle: &TypedExpr, cols: &[String]) -> O
             query: Box::new(first_outer),
         }),
     }];
-    Some(number_side(ctx, shift_outer_builder(rows, 2), cols))
+    let rows = assert_present_rows(
+        ctx,
+        Level {
+            builder: shift_outer_builder(rows, 2),
+            element: needle.ty.clone(),
+            parent: ParentLink::Root { root_idx: 0 },
+            pending: None,
+            stmt_bound: false,
+            output_shapes: None,
+            root_parts: None,
+        },
+        "unwrap failed: value was none".to_string(),
+    )
+    .builder;
+    let mut rows = rows;
+    rows.select = cols
+        .iter()
+        .map(|column| SelectItem::Column {
+            depth: 0,
+            column: column.clone(),
+            output: column.clone(),
+            ty: None,
+        })
+        .collect();
+    Some(number_side(ctx, rows, cols))
 }
 
 fn nested_contains_exists(
@@ -18570,7 +18608,7 @@ fn nested_contains_exists(
             list_sides_equal(ctx, &a, &b)
         }
         _ => {
-            let b = first_inner_side(ctx, needle, &side.cols)?;
+            let b = pick_inner_side(ctx, needle, &side.cols)?;
             if a.cols.len() != b.cols.len() {
                 return None;
             }

@@ -1200,6 +1200,17 @@ fn subquery_needle_contains_values() {
         value("users { x = tags.contains(manager.name) }"),
         Value::List(vec![b(false), b(false), b(false)])
     );
+    assert_eq!(
+        value("users.scores.contains(users.scores.nth(1).unwrap())"),
+        Value::Bool(true)
+    );
+    let mut rt = fixture();
+    let err = rt
+        .execute_value(&compile_q(
+            "users.scores.contains(users.scores.nth(5).unwrap())",
+        ))
+        .unwrap_err();
+    assert!(err.to_string().contains("unwrap failed"));
 }
 
 #[test]
