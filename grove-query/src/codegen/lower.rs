@@ -15,7 +15,7 @@ use crate::typecheck::types::{
     TypedMethodArg, TypedProjectionItem,
 };
 use grove_schema::validated::{
-    Field, FieldId, Relation, ScalarType, StructId, ValidatedSchema, ValueType,
+    Field, FieldId, Relation, ScalarType, StructId, TableId, ValidatedSchema, ValueType,
 };
 
 pub struct Context<'s> {
@@ -17653,7 +17653,11 @@ fn scalar_method(
                 }
             }
             "contains" if matches!(inner.as_ref(), QueryType::List(_)) => {
-                todo!("H1 QT0028: membership over nested lists")
+                if let Some(exists) = nested_contains_exists(ctx, base, one_arg(args, name)) {
+                    exists
+                } else {
+                    todo!("H1 QT0028: membership over nested lists")
+                }
             }
             "contains" => contains_exists(ctx, base, one_arg(args, name)),
             other => {
@@ -17898,6 +17902,275 @@ fn composite_contains_exists(
     };
     level.builder.where_.append(&mut where_);
     Some(SqlExpr::Exists(Box::new(level.builder)))
+}
+
+fn root_nav_field<'a>(
+    schema: &'a ValidatedSchema,
+    expr: &'a TypedExpr,
+) -> Option<(&'a TypedExpr, StructId, FieldId)> {
+    let TypedExprKind::Field { base, name, .. } = &expr.kind else {
+        return None;
+    };
+    let TypedExprKind::Ident {
+        binding: IdentBinding::Root { root_idx },
+        ..
+    } = &base.kind
+    else {
+        return None;
+    };
+    let owner = schema.roots[*root_idx].struct_id;
+    let local = schema.structs[owner.index()]
+        .fields
+        .iter()
+        .position(|f| f.name() == name.value.as_str())?;
+    Some((base, owner, FieldId::new(owner, local)))
+}
+
+struct NavListSide {
+    outer_table: String,
+    outer_pk: String,
+    inner_table: String,
+    inner_fk: String,
+    cols: Vec<String>,
+}
+
+fn nav_list_side(schema: &ValidatedSchema, owner: StructId, fid: FieldId) -> Option<NavListSide> {
+    let table_name = |t: TableId| schema.tables[t.index()].name.clone();
+    let outer_table = table_name(schema.structs[owner.index()].table);
+    match &schema.structs[owner.index()].fields[fid.local()] {
+        Field::Ref {
+            target,
+            is_list: true,
+            ..
+        } => {
+            if m2m_parts(schema, fid).is_some() {
+                return None;
+            }
+            schema.relation_of_field(fid)?;
+            let (inner_fk, outer_pk) = match link_cols(schema, fid) {
+                LinkCols::TargetFk {
+                    child_fk,
+                    parent_pk,
+                } => (child_fk, parent_pk),
+                _ => return None,
+            };
+            let inner_table = table_name(schema.structs[target.index()].table);
+            let cols = schema.tables[schema.structs[target.index()].table.index()]
+                .columns
+                .iter()
+                .map(|c| c.name.clone())
+                .collect();
+            Some(NavListSide {
+                outer_table,
+                outer_pk,
+                inner_table,
+                inner_fk,
+                cols,
+            })
+        }
+        Field::Array { storage, link, .. } => {
+            let value = match storage.value.as_slice() {
+                [col] => schema.column_name(*col).to_string(),
+                _ => return None,
+            };
+            Some(NavListSide {
+                outer_table,
+                outer_pk: schema.column_name(*link).to_string(),
+                inner_table: table_name(storage.table),
+                inner_fk: schema.column_name(storage.key).to_string(),
+                cols: vec![value],
+            })
+        }
+        _ => None,
+    }
+}
+
+fn number_side(ctx: &mut Context, rows: SelectBuilder, cols: &[String]) -> ListSide {
+    let mut rn = ctx.aliases.generic();
+    while cols.contains(&rn) {
+        rn = ctx.aliases.generic();
+    }
+    let mut select: Vec<SelectItem> = cols
+        .iter()
+        .map(|column| SelectItem::Column {
+            depth: 0,
+            column: column.clone(),
+            output: column.clone(),
+            ty: None,
+        })
+        .collect();
+    select.push(SelectItem::Expr {
+        expr: SqlExpr::Window {
+            func: "ROW_NUMBER".to_string(),
+            partition: Vec::new(),
+            order: Vec::new(),
+        },
+        output: rn.clone(),
+        ty: None,
+    });
+    ListSide {
+        numbered: SelectBuilder {
+            select,
+            from: Some(FromClause::Subquery {
+                query: Box::new(rows),
+                alias: ctx.aliases.subquery(),
+            }),
+            where_: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            unions: Vec::new(),
+        },
+        cols: cols.to_vec(),
+        rn,
+    }
+}
+
+fn first_inner_side(ctx: &mut Context, needle: &TypedExpr, cols: &[String]) -> Option<ListSide> {
+    let TypedExprKind::Method {
+        base: unwrap_base,
+        name: unwrap_name,
+        args: unwrap_args,
+        ..
+    } = &needle.kind
+    else {
+        return None;
+    };
+    if unwrap_name.value != "unwrap" || !unwrap_args.is_empty() {
+        return None;
+    }
+    let TypedExprKind::Method {
+        base: first_base,
+        name: first_name,
+        args: first_args,
+        ..
+    } = &unwrap_base.kind
+    else {
+        return None;
+    };
+    if first_name.value != "first" || !first_args.is_empty() {
+        return None;
+    }
+    let (_, n_owner, n_fid) = root_nav_field(ctx.schema, first_base)?;
+    let n_side = nav_list_side(ctx.schema, n_owner, n_fid)?;
+    if n_side.cols != cols {
+        return None;
+    }
+    let mut first_outer = SelectBuilder::new();
+    first_outer.from = Some(FromClause::Table {
+        table: n_side.outer_table.clone(),
+        alias: ctx.aliases.table(&n_side.outer_table),
+    });
+    first_outer.select = vec![SelectItem::Column {
+        depth: 0,
+        column: n_side.outer_pk.clone(),
+        output: ctx.aliases.generic(),
+        ty: None,
+    }];
+    first_outer.limit = Some(SqlExpr::Param(ParamValue::Int(1)));
+    let mut rows = SelectBuilder::new();
+    rows.from = Some(FromClause::Table {
+        table: n_side.inner_table.clone(),
+        alias: ctx.aliases.table(&n_side.inner_table),
+    });
+    rows.select = cols
+        .iter()
+        .map(|column| SelectItem::Column {
+            depth: 0,
+            column: column.clone(),
+            output: column.clone(),
+            ty: None,
+        })
+        .collect();
+    rows.where_ = vec![SqlExpr::Binary {
+        op: SqlBinOp::Eq,
+        lhs: Box::new(SqlExpr::Column {
+            depth: 0,
+            column: n_side.inner_fk.clone(),
+        }),
+        rhs: Box::new(SqlExpr::Subquery {
+            query: Box::new(first_outer),
+        }),
+    }];
+    Some(number_side(ctx, shift_outer_builder(rows, 2), cols))
+}
+
+fn nested_contains_exists(
+    ctx: &mut Context,
+    base: &TypedExpr,
+    needle: &TypedExpr,
+) -> Option<SqlExpr> {
+    if ctx.temp_collect.is_some() || ctx.in_array_temp || ctx.child.is_some() {
+        return None;
+    }
+    if has_scope_ident(needle) || uses_outer(needle) {
+        return None;
+    }
+    let (outer_base, owner, fid) = root_nav_field(ctx.schema, base)?;
+    let side = nav_list_side(ctx.schema, owner, fid)?;
+    let mut u_rows = SelectBuilder::new();
+    u_rows.from = Some(FromClause::Table {
+        table: side.inner_table.clone(),
+        alias: ctx.aliases.table(&side.inner_table),
+    });
+    u_rows.select = side
+        .cols
+        .iter()
+        .map(|column| SelectItem::Column {
+            depth: 0,
+            column: column.clone(),
+            output: column.clone(),
+            ty: None,
+        })
+        .collect();
+    u_rows.where_ = vec![SqlExpr::Binary {
+        op: SqlBinOp::Eq,
+        lhs: Box::new(SqlExpr::Column {
+            depth: 0,
+            column: side.inner_fk.clone(),
+        }),
+        rhs: Box::new(SqlExpr::Column {
+            depth: 1,
+            column: side.outer_pk.clone(),
+        }),
+    }];
+    let a = number_side(ctx, shift_outer_builder(u_rows, 2), &side.cols);
+    let matched = match &needle.kind {
+        TypedExprKind::Array { elements } if elements.is_empty() => {
+            SqlExpr::Binary {
+                op: SqlBinOp::Eq,
+                lhs: Box::new(list_side_len(ctx, &a)),
+                rhs: Box::new(SqlExpr::Param(ParamValue::Int(0))),
+            }
+        }
+        TypedExprKind::Array { elements } => {
+            let b = literal_side_query(ctx, elements)?;
+            if a.cols.len() != b.cols.len() {
+                return None;
+            }
+            list_sides_equal(ctx, &a, &b)
+        }
+        _ => {
+            let b = first_inner_side(ctx, needle, &side.cols)?;
+            if a.cols.len() != b.cols.len() {
+                return None;
+            }
+            list_sides_equal(ctx, &a, &b)
+        }
+    };
+    let sunk_before = ctx.statements.len();
+    let mut outer = rows(ctx, outer_base);
+    if outer.pending.is_some() || ctx.statements.len() != sunk_before {
+        return None;
+    }
+    if !outer.builder.select.is_empty() || !outer.builder.unions.is_empty() {
+        outer = wrap_level(ctx, outer);
+    }
+    if outer.builder.select.is_empty() {
+        outer.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+    }
+    outer.builder.where_.push(matched);
+    Some(SqlExpr::Exists(Box::new(outer.builder)))
 }
 
 fn contains_exists(ctx: &mut Context, base: &TypedExpr, needle: &TypedExpr) -> SqlExpr {
@@ -18694,8 +18967,12 @@ fn list_equality(ctx: &mut Context, lhs: &TypedExpr, rhs: &TypedExpr) -> Option<
     if a.cols.len() != b.cols.len() {
         return None;
     }
-    let count_a = list_side_len(ctx, &a);
-    let count_b = list_side_len(ctx, &b);
+    Some(list_sides_equal(ctx, &a, &b))
+}
+
+fn list_sides_equal(ctx: &mut Context, a: &ListSide, b: &ListSide) -> SqlExpr {
+    let count_a = list_side_len(ctx, a);
+    let count_b = list_side_len(ctx, b);
     let len_eq = SqlExpr::Binary {
         op: SqlBinOp::Eq,
         lhs: Box::new(count_a),
@@ -18728,7 +19005,7 @@ fn list_equality(ctx: &mut Context, lhs: &TypedExpr, rhs: &TypedExpr) -> Option<
     let inner = SelectBuilder {
         select: vec![SelectItem::AllFrom { depth: 0 }],
         from: Some(FromClause::Subquery {
-            query: Box::new(shift_outer_builder(b.numbered, 1)),
+            query: Box::new(shift_outer_builder(b.numbered.clone(), 1)),
             alias: ctx.aliases.subquery(),
         }),
         where_: inner_where,
@@ -18740,7 +19017,7 @@ fn list_equality(ctx: &mut Context, lhs: &TypedExpr, rhs: &TypedExpr) -> Option<
     let outer = SelectBuilder {
         select: vec![SelectItem::AllFrom { depth: 0 }],
         from: Some(FromClause::Subquery {
-            query: Box::new(a.numbered),
+            query: Box::new(a.numbered.clone()),
             alias: ctx.aliases.subquery(),
         }),
         where_: vec![SqlExpr::Not(Box::new(SqlExpr::Exists(Box::new(inner))))],
@@ -18749,10 +19026,10 @@ fn list_equality(ctx: &mut Context, lhs: &TypedExpr, rhs: &TypedExpr) -> Option<
         offset: None,
         unions: Vec::new(),
     };
-    Some(and_sql(
+    and_sql(
         len_eq,
         SqlExpr::Not(Box::new(SqlExpr::Exists(Box::new(outer)))),
-    ))
+    )
 }
 
 fn literal_list_equality(

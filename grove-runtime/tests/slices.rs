@@ -1067,6 +1067,19 @@ fn nested_sort_flatten_values() {
 }
 
 #[test]
+fn nested_contains_values() {
+    assert_eq!(
+        value("users.orders.contains(users.orders.first().unwrap())"),
+        Value::Bool(true)
+    );
+    assert_eq!(value("users.scores.contains([9])"), Value::Bool(true));
+    assert_eq!(value("users.scores.contains([5])"), Value::Bool(false));
+    assert_eq!(value("users.scores.contains([5, 9])"), Value::Bool(false));
+    assert_eq!(value("users.scores.contains([7, 5])"), Value::Bool(false));
+    assert_eq!(value("users.scores.contains([])"), Value::Bool(true));
+}
+
+#[test]
 fn chained_projection_reuses_values() {
     let ord = |t: &str| Value::Record(vec![("total".to_string(), Value::Dec(dec(t)))]);
     assert_eq!(
