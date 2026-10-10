@@ -1080,15 +1080,39 @@ fn union_cross_middle_values() {
 }
 
 #[test]
-fn nested_sort_flatten_values() {
-    let ord = |t: &str| rec(&[("total", Value::Dec(dec(t)))]);
+fn scalar_sort_storage_values() {
+    let sorted_three = || Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
     assert_eq!(
-        value("users.orders.sort(total).flatten()"),
-        Value::List(vec![ord("10.00"), ord("20.00"), ord("30.00")])
+        value("users { x = scores.sort() }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![Value::Int(5), Value::Int(7)]))]),
+            rec(&[("x", Value::List(vec![Value::Int(9)]))]),
+            rec(&[("x", Value::List(vec![]))]),
+        ])
     );
     assert_eq!(
-        value("users.orders.sort_desc(total).flatten()"),
-        Value::List(vec![ord("20.00"), ord("10.00"), ord("30.00")])
+        value("users { x = scores.sort_desc() }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![Value::Int(7), Value::Int(5)]))]),
+            rec(&[("x", Value::List(vec![Value::Int(9)]))]),
+            rec(&[("x", Value::List(vec![]))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = tags.sort() }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![s("x"), s("y")]))]),
+            rec(&[("x", Value::List(vec![s("z")]))]),
+            rec(&[("x", Value::List(vec![]))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [3, 1, 2].sort() }"),
+        Value::List(vec![
+            rec(&[("x", sorted_three())]),
+            rec(&[("x", sorted_three())]),
+            rec(&[("x", sorted_three())]),
+        ])
     );
 }
 
@@ -2103,7 +2127,15 @@ fn slice_temp_method_tails() {
         ])
     );
     assert_eq!(
-        value("users { x = [age, age + 1].sort_desc(age) }"),
+        value("users { x = [age, age + 1].sort() }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![Value::Int(30), Value::Int(31)]))]),
+            rec(&[("x", Value::List(vec![Value::Int(40), Value::Int(41)]))]),
+            rec(&[("x", Value::List(vec![Value::Int(50), Value::Int(51)]))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [age, age + 1].sort_desc() }"),
         Value::List(vec![
             rec(&[("x", Value::List(vec![Value::Int(31), Value::Int(30)]))]),
             rec(&[("x", Value::List(vec![Value::Int(41), Value::Int(40)]))]),
@@ -2157,7 +2189,7 @@ fn slice_temp_method_tails() {
         ])
     );
     assert_eq!(
-        value("users { x = [age, age + 1].take(1).sort_asc(age) }"),
+        value("users { x = [age, age + 1].take(1).sort() }"),
         Value::List(vec![
             rec(&[("x", Value::List(vec![Value::Int(30)]))]),
             rec(&[("x", Value::List(vec![Value::Int(40)]))]),
@@ -2299,7 +2331,7 @@ fn slice_temp_method_chains() {
         ])
     );
     assert_eq!(
-        value("users { x = [age, age + 1, age + 2].sort_desc(age).take(1) }"),
+        value("users { x = [age, age + 1, age + 2].sort_desc().take(1) }"),
         Value::List(vec![
             rec(&[("x", Value::List(vec![Value::Int(32)]))]),
             rec(&[("x", Value::List(vec![Value::Int(42)]))]),
@@ -2327,7 +2359,7 @@ fn slice_chained_scalar_temp() {
         ])
     );
     assert_eq!(
-        value("users { x = [age + 2, age].sort_asc(age).first() }"),
+        value("users { x = [age + 2, age].sort().first() }"),
         Value::List(vec![
             rec(&[("x", Value::Int(30))]),
             rec(&[("x", Value::Int(40))]),

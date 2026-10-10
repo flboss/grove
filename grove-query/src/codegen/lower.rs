@@ -34,7 +34,6 @@ pub struct Context<'s> {
     nav_carries: Vec<(String, NavCarry)>,
     take_temp_alias: Option<(*const TypedExpr, SqlExpr)>,
     corr_bound_walk: Vec<CorrBoundWalk>,
-    pending_order: Option<Vec<OrderItem>>,
 }
 
 pub struct ChildCtx {
@@ -93,7 +92,6 @@ impl<'s> Context<'s> {
             nav_carries: Vec::new(),
             take_temp_alias: None,
             corr_bound_walk: Vec::new(),
-            pending_order: None,
         }
     }
 
@@ -259,7 +257,57 @@ fn kind_name(expr: &TypedExpr) -> &'static str {
     }
 }
 
+fn literal_cmp(a: &Literal, b: &Literal) -> Option<std::cmp::Ordering> {
+    match (a, b) {
+        (Literal::Int(x), Literal::Int(y)) => Some(x.cmp(y)),
+        (Literal::Float(x), Literal::Float(y)) => Some(x.total_cmp(y)),
+        (Literal::String(x), Literal::String(y)) => Some(x.cmp(y)),
+        (Literal::Bool(x), Literal::Bool(y)) => Some(x.cmp(y)),
+        (Literal::Dec(x), Literal::Dec(y)) => Some(x.cmp(y)),
+        (Literal::Duration(x), Literal::Duration(y)) => Some(x.cmp(y)),
+        (Literal::Instant(x), Literal::Instant(y)) => Some(x.cmp(y)),
+        _ => None,
+    }
+}
+
+fn sorted_literal_elements(elements: &[TypedExpr], desc: bool) -> Option<Vec<TypedExpr>> {
+    let mut lits = Vec::with_capacity(elements.len());
+    for elem in elements {
+        let TypedExprKind::Literal(lit) = &elem.kind else {
+            return None;
+        };
+        lits.push(&lit.value);
+    }
+    let mut order: Vec<usize> = (0..elements.len()).collect();
+    let mut comparable = true;
+    order.sort_by(|&i, &j| {
+        literal_cmp(lits[i], lits[j]).unwrap_or_else(|| {
+            comparable = false;
+            std::cmp::Ordering::Equal
+        })
+    });
+    if !comparable {
+        return None;
+    }
+    if desc {
+        order.reverse();
+    }
+    Some(order.into_iter().map(|i| elements[i].clone()).collect())
+}
+
 pub fn rows(ctx: &mut Context, expr: &TypedExpr) -> Level {
+    if let TypedExprKind::Method {
+        base, name, args, ..
+    } = &expr.kind
+        && ["sort", "sort_asc", "sort_desc"].contains(&name.value.as_str())
+        && args.is_empty()
+        && let TypedExprKind::Array { elements } = &base.kind
+        && let Some(sorted) = sorted_literal_elements(elements, name.value == "sort_desc")
+    {
+        let mut rewritten = (**base).clone();
+        rewritten.kind = TypedExprKind::Array { elements: sorted };
+        return rows(ctx, &rewritten);
+    }
     let mut level = match &expr.kind {
         TypedExprKind::Ident { binding, .. } => rows_ident(ctx, binding, &expr.ty),
         TypedExprKind::Field {
@@ -1247,6 +1295,59 @@ fn global_first_hop(
     )
 }
 
+fn scalar_sort_no_arg(
+    ctx: &mut Context,
+    base: &TypedExpr,
+    mut level: Level,
+    dir: OrderDir,
+) -> Level {
+    let column = match &base.kind {
+        TypedExprKind::Ident {
+            binding: IdentBinding::Field(fid),
+            ..
+        } => {
+            let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
+            match field {
+                Field::Array {
+                    element, storage, ..
+                } => match element {
+                    grove_schema::validated::ValueType::Scalar(_) => {
+                        match storage.value.as_slice() {
+                            [col] => Some(ctx.schema.column_name(*col).to_string()),
+                            _ => unreachable!(
+                                "multi-column via array in scalar sort: via clauses carry exactly key+value columns"
+                            ),
+                        }
+                    }
+                    _ => unreachable!(
+                        "non-scalar array in scalar sort: the checker admits flat scalar lists only"
+                    ),
+                },
+                _ => unreachable!(
+                    "non-array field in scalar sort: the checker admits flat scalar lists only"
+                ),
+            }
+        }
+        TypedExprKind::Method {
+            base: inner, name, ..
+        } if ["take", "skip", "sort", "sort_asc", "sort_desc"].contains(&name.value.as_str()) => {
+            return scalar_sort_no_arg(ctx, inner, level, dir);
+        }
+        _ => None,
+    };
+    let Some(column) = column else {
+        todo!("M4b scalar sort over derived rows");
+    };
+    if needs_wrap(&level) {
+        level = wrap_narrow_rn(ctx, level);
+    }
+    level.builder.order_by = vec![OrderItem {
+        expr: SqlExpr::Column { depth: 0, column },
+        dir,
+    }];
+    level
+}
+
 fn rows_method(
     ctx: &mut Context,
     base: &TypedExpr,
@@ -1298,16 +1399,16 @@ fn rows_method(
                 .pending
                 .as_ref()
                 .map(|pending| (pending.multi_parent, pending.next.is_some()));
-            if let Some((multi_parent, chained)) = pending_multi {
+            if let Some((multi_parent, _chained)) = pending_multi {
                 if multi_parent {
-                    if chained {
-                        todo!("H1 QT0028: sort over nested lists");
-                    }
-                    let keys = sort_order_items(ctx, &mut level, args, default);
-                    ctx.pending_order = Some(keys);
-                    return level;
+                    unreachable!(
+                        "sort over nested lists is checker-rejected: sort admits List[Record] (record keys) and flat List[Scalar] (no-arg) only"
+                    );
                 }
                 todo!("M4 per-parent sort over single-row parent");
+            }
+            if args.is_empty() {
+                return scalar_sort_no_arg(ctx, base, level, default);
             }
             if needs_wrap(&level) {
                 level = wrap_narrow_rn(ctx, level);
@@ -1319,7 +1420,6 @@ fn rows_method(
             level
         }
         "take" | "skip" | "first" | "nth" => {
-            let _ = ctx.pending_order.take();
             if let Some(fk) = ctx
                 .child
                 .as_ref()
@@ -1421,17 +1521,6 @@ fn rows_method(
                     }
                 }
                 level.pending = next.map(|boxed| *boxed);
-                if let Some(keys) = ctx.pending_order.take() {
-                    let mut order = vec![OrderItem {
-                        expr: SqlExpr::Column {
-                            depth: 0,
-                            column: child_col.clone(),
-                        },
-                        dir: OrderDir::Asc,
-                    }];
-                    order.extend(keys);
-                    level.builder.order_by.extend(order);
-                }
                 level
             }
             None => {
@@ -12318,21 +12407,47 @@ fn apply_entry_method(
             if wrap {
                 level = wrap_level(ctx, level);
             }
-            let was_take = std::mem::replace(&mut ctx.in_take_arg, scope);
-            let mut keys = Vec::new();
-            for arg in args {
-                let dir = match &arg.direction {
-                    Some(dir) => match dir.value {
-                        SortDir::Asc => OrderDir::Asc,
-                        SortDir::Desc => OrderDir::Desc,
+            if args.is_empty() {
+                if !matches!(peel_optional(elem_ty), QueryType::Scalar(_)) {
+                    unreachable!(
+                        "keyless sort over non-scalar arms: the checker admits no-arg sorts over flat scalar lists only"
+                    );
+                }
+                let mut wrapped = wrap_level(ctx, level);
+                wrapped.builder.order_by.extend([
+                    OrderItem {
+                        expr: SqlExpr::Column {
+                            depth: 0,
+                            column: "c0".to_string(),
+                        },
+                        dir: OrderDir::Asc,
                     },
-                    None => default,
-                };
-                keys.extend(sort_keys(ctx, &level, &arg.expr, dir));
+                    OrderItem {
+                        expr: SqlExpr::Column {
+                            depth: 0,
+                            column: "c1".to_string(),
+                        },
+                        dir: default,
+                    },
+                ]);
+                wrapped.builder
+            } else {
+                let was_take = std::mem::replace(&mut ctx.in_take_arg, scope);
+                let mut keys = Vec::new();
+                for arg in args {
+                    let dir = match &arg.direction {
+                        Some(dir) => match dir.value {
+                            SortDir::Asc => OrderDir::Asc,
+                            SortDir::Desc => OrderDir::Desc,
+                        },
+                        None => default,
+                    };
+                    keys.extend(sort_keys(ctx, &level, &arg.expr, dir));
+                }
+                ctx.in_take_arg = was_take;
+                level.builder.order_by.extend(keys);
+                level.builder
             }
-            ctx.in_take_arg = was_take;
-            level.builder.order_by.extend(keys);
-            level.builder
         }
         EntryMethod::Filter { pred } => {
             let mut wrapped = wrap_level(ctx, level);
@@ -14802,9 +14917,6 @@ fn emit_split(
     root_ty: &QueryType,
     root_parts: Option<Vec<MiddlePart>>,
 ) -> RootPlan {
-    if ctx.pending_order.take().is_some() {
-        todo!("H1 QT0028: sort over nested lists");
-    }
     let hops = drain_pending(pending);
     let mut parent_q = parent_builder;
     let parent_shape = split_parent_shape(&mut parent_q, &hops, ctx.schema, &root_parts);
@@ -14838,9 +14950,6 @@ fn anchor_split(
     ty: &QueryType,
     root_parts: Option<Vec<MiddlePart>>,
 ) -> ResultShape {
-    if ctx.pending_order.take().is_some() {
-        todo!("H1 QT0028: sort over nested lists");
-    }
     let hops = drain_pending(pending);
     let mut parent_q = level_builder;
     let parent_shape = split_parent_shape(&mut parent_q, &hops, ctx.schema, &root_parts);
@@ -18374,7 +18483,6 @@ fn scalar_method(
                 scalar_aggregate(ctx, base, AggOp::Over(OverAgg::Avg, ty, arg))
             }
             "max_by" | "min_by" => {
-                let _ = ctx.pending_order.take();
                 unreachable!("max_by/min_by return records: callers never enter scalar demand")
             }
             "first" | "nth" => {
