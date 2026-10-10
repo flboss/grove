@@ -1132,11 +1132,16 @@ fn method_signature(base: &QueryType, method: &str) -> Option<MethodSig> {
             "max" | "min" if inner.has_defined_order() => {
                 Some(MethodSig::no_args(inner.clone().wrap_optional()))
             }
-            "sort" | "sort_asc" | "sort_desc" => Some(MethodSig::scoped_at_least(
-                QueryType::List(inner.clone()),
-                1,
-                QueryType::has_defined_order,
-            )),
+            "sort" | "sort_asc" | "sort_desc" if matches!(inner.as_ref(), QueryType::Scalar(_)) => {
+                Some(MethodSig::no_args(QueryType::List(inner.clone())))
+            }
+            "sort" | "sort_asc" | "sort_desc" if matches!(inner.as_ref(), QueryType::Record(_)) => {
+                Some(MethodSig::scoped_at_least(
+                    QueryType::List(inner.clone()),
+                    1,
+                    QueryType::has_defined_order,
+                ))
+            }
             "take" | "skip" => Some(MethodSig::one_arg(
                 QueryType::List(inner.clone()),
                 QueryType::Scalar(Int),
