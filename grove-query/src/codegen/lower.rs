@@ -8564,13 +8564,318 @@ fn m2m_seed_selects(schema: &ValidatedSchema, builder: &mut SelectBuilder, child
     });
 }
 
+fn parent_serves_col(parent: &Level, schema: &ValidatedSchema, col: &str) -> bool {
+    match parent.builder.from.as_ref() {
+        Some(FromClause::Table { table, .. }) => schema
+            .tables
+            .iter()
+            .any(|t| t.name == *table && t.columns.iter().any(|c| c.name == col)),
+        Some(FromClause::Subquery { query, .. }) => {
+            builder_outputs(query, schema).iter().any(|c| c == col)
+        }
+        Some(FromClause::Temp { columns, .. }) => columns.iter().any(|c| c.name == col),
+        _ => false,
+    }
+}
+
+fn single_hop_take_routed(ctx: &Context, parent: &Level, tail: &TypedExpr) -> bool {
+    if ctx.nest_depth >= 1 || ctx.child.is_some() || ctx.temp_collect.is_some() || ctx.in_take_arg {
+        return false;
+    }
+    let TypedExprKind::Method {
+        base,
+        name,
+        args,
+        optional,
+    } = &tail.kind
+    else {
+        return false;
+    };
+    if *optional || !["take", "skip"].contains(&name.value.as_str()) {
+        return false;
+    }
+    let TypedExprKind::Field {
+        base: mid_base,
+        name: leaf_name,
+        ..
+    } = &base.kind
+    else {
+        return false;
+    };
+    let TypedExprKind::Ident {
+        binding: IdentBinding::Field(mid_fid),
+        depth,
+        ..
+    } = &mid_base.kind
+    else {
+        return false;
+    };
+    if *depth != 0 {
+        return false;
+    }
+    let mid_field = &ctx.schema.structs[mid_fid.struct_id().index()].fields[mid_fid.local()];
+    let mid_target = match mid_field {
+        Field::Ref {
+            target,
+            is_list: false,
+            optional: false,
+            ..
+        } => *target,
+        _ => return false,
+    };
+    let Some((leaf_fid, leaf_field)) = ctx.schema.struct_field(mid_target, &leaf_name.value) else {
+        return false;
+    };
+    match leaf_field {
+        Field::Ref { is_list: true, .. } => {}
+        _ => return false,
+    }
+    if m2m_parts(ctx.schema, leaf_fid).is_some() {
+        return false;
+    }
+    let middle_fk = match link_cols(ctx.schema, *mid_fid) {
+        LinkCols::ParentFk { parent_fk, .. } => parent_fk,
+        LinkCols::TargetFk { parent_pk, .. } => parent_pk,
+        LinkCols::ManyToMany => return false,
+    };
+    let [arg] = args.as_slice() else {
+        return false;
+    };
+    let bound_col = match &arg.expr.kind {
+        TypedExprKind::Ident {
+            binding: IdentBinding::Field(fid),
+            depth,
+            ..
+        } if *depth == 0 => {
+            let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
+            match field {
+                Field::Value { columns, .. } => match columns.as_slice() {
+                    [col] => ctx.schema.column_name(*col).to_string(),
+                    _ => return false,
+                },
+                _ => return false,
+            }
+        }
+        _ => return false,
+    };
+    if !matches!(scalar_of(&arg.expr.ty), Some(ScalarType::Int)) {
+        return false;
+    }
+    for col in [middle_fk, bound_col] {
+        if !parent_serves_col(parent, ctx.schema, &col) {
+            return false;
+        }
+    }
+    true
+}
+
+fn single_hop_take_bound(
+    ctx: &mut Context,
+    parent: &mut Level,
+    tail: &TypedExpr,
+    parts: &SingleHop,
+    cardinality: Cardinality,
+) -> Option<(ResultShape, Option<String>)> {
+    if ctx.nest_depth >= 1 || ctx.child.is_some() || ctx.temp_collect.is_some() || ctx.in_take_arg {
+        return None;
+    }
+    let TypedExprKind::Method {
+        base,
+        name,
+        args,
+        optional,
+    } = &tail.kind
+    else {
+        return None;
+    };
+    if *optional || !["take", "skip"].contains(&name.value.as_str()) {
+        return None;
+    }
+    if !matches!(&base.kind, TypedExprKind::Field { .. }) {
+        return None;
+    }
+    let [arg] = args.as_slice() else {
+        return None;
+    };
+    let bound_col = match &arg.expr.kind {
+        TypedExprKind::Ident {
+            binding: IdentBinding::Field(fid),
+            depth,
+            ..
+        } if *depth == 0 => {
+            let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
+            match field {
+                Field::Value { columns, .. } => match columns.as_slice() {
+                    [col] => ctx.schema.column_name(*col).to_string(),
+                    _ => return None,
+                },
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    if !matches!(scalar_of(&arg.expr.ty), Some(ScalarType::Int)) {
+        return None;
+    }
+    for col in [&parts.middle_fk, &bound_col] {
+        if !parent_serves_col(parent, ctx.schema, col) {
+            return None;
+        }
+    }
+    let (temp_idx, temp, _) = cross_cartesian_temp(
+        ctx,
+        parent,
+        &[
+            (parts.middle_fk.clone(), Some(ScalarType::Int)),
+            (bound_col.clone(), Some(ScalarType::Int)),
+        ],
+        &[],
+    );
+    let leaf_table = match &parts.child_from {
+        FromClause::Table { table, .. } => table.clone(),
+        _ => todo!("M4b navigation from single-record base"),
+    };
+    let leaf_cols: Vec<(String, Option<ScalarType>)> = ctx
+        .schema
+        .tables
+        .iter()
+        .find(|t| t.name == leaf_table)
+        .map(|t| {
+            t.columns
+                .iter()
+                .map(|c| (c.name.clone(), c.ty.or(Some(ScalarType::Int))))
+                .collect()
+        })
+        .unwrap_or_default();
+    if leaf_cols.is_empty() {
+        todo!("M4b navigation from single-record base");
+    }
+    let temp_alias = ctx.aliases.table(&temp);
+    let leaf_alias = ctx.aliases.table(&leaf_table);
+    let mut numbered = SelectBuilder::new();
+    numbered.from = Some(FromClause::Join {
+        left: Box::new(FromClause::Table {
+            table: temp.clone(),
+            alias: temp_alias,
+        }),
+        right: Box::new(FromClause::Table {
+            table: leaf_table,
+            alias: leaf_alias,
+        }),
+    });
+    numbered.where_ = vec![SqlExpr::Binary {
+        op: SqlBinOp::Eq,
+        lhs: Box::new(SqlExpr::Column {
+            depth: 0,
+            column: parts.child_col.clone(),
+        }),
+        rhs: Box::new(SqlExpr::Column {
+            depth: 1,
+            column: parts.middle_fk.clone(),
+        }),
+    }];
+    numbered.select = leaf_cols
+        .iter()
+        .map(|(name, ty)| SelectItem::Column {
+            depth: 0,
+            column: name.clone(),
+            output: name.clone(),
+            ty: *ty,
+        })
+        .chain([
+            SelectItem::Column {
+                depth: 1,
+                column: "$$key".to_string(),
+                output: "$$pkey".to_string(),
+                ty: Some(ScalarType::Int),
+            },
+            SelectItem::Column {
+                depth: 1,
+                column: bound_col,
+                output: "$$bnd".to_string(),
+                ty: Some(ScalarType::Int),
+            },
+            SelectItem::Expr {
+                expr: SqlExpr::Window {
+                    func: "ROW_NUMBER".to_string(),
+                    partition: vec![SqlExpr::Column {
+                        depth: 1,
+                        column: "$$key".to_string(),
+                    }],
+                    order: Vec::new(),
+                },
+                output: "$$rn".to_string(),
+                ty: Some(ScalarType::Int),
+            },
+        ])
+        .collect();
+    let mut outer = SelectBuilder::new();
+    outer.from = Some(FromClause::Subquery {
+        query: Box::new(numbered),
+        alias: ctx.aliases.subquery(),
+    });
+    outer.select = leaf_cols
+        .iter()
+        .map(|(name, ty)| SelectItem::Column {
+            depth: 0,
+            column: name.clone(),
+            output: name.clone(),
+            ty: *ty,
+        })
+        .chain([SelectItem::Column {
+            depth: 0,
+            column: "$$pkey".to_string(),
+            output: "$$pkey".to_string(),
+            ty: Some(ScalarType::Int),
+        }])
+        .collect();
+    outer.where_ = vec![SqlExpr::Binary {
+        op: if name.value == "skip" {
+            SqlBinOp::Gt
+        } else {
+            SqlBinOp::Le
+        },
+        lhs: Box::new(SqlExpr::Column {
+            depth: 0,
+            column: "$$rn".to_string(),
+        }),
+        rhs: Box::new(SqlExpr::Column {
+            depth: 0,
+            column: "$$bnd".to_string(),
+        }),
+    }];
+    let child = Level {
+        builder: outer,
+        element: tail.ty.clone(),
+        parent: ParentLink::Root { root_idx: 0 },
+        pending: None,
+        stmt_bound: true,
+        output_shapes: None,
+        root_parts: None,
+    };
+    let item_ty = match &tail.ty {
+        QueryType::List(sub) => sub.as_ref(),
+        _ => &tail.ty,
+    };
+    Some(finish_union_middle(
+        ctx,
+        child,
+        temp_idx,
+        item_ty,
+        cardinality,
+    ))
+}
+
 fn single_hop_shape(
     ctx: &mut Context,
-    _parent: &mut Level,
+    parent: &mut Level,
     tail: &TypedExpr,
     parts: SingleHop,
     cardinality: Cardinality,
 ) -> (ResultShape, Option<String>) {
+    if let Some(shape) = single_hop_take_bound(ctx, parent, tail, &parts, cardinality) {
+        return shape;
+    }
     let SingleHop {
         middle_fk,
         child_from,
@@ -8688,7 +8993,10 @@ fn rvalue_shape(
         todo!("M4b nested list item");
     }
     let (spine_tb, spine_outer, deep_divert) = split_divert_flags(ctx.schema, tail);
-    if ctx.nest_depth < 1 && keyed && (!parent.stmt_bound || spine_outer || spine_tb || deep_divert)
+    if ctx.nest_depth < 1
+        && keyed
+        && (!parent.stmt_bound || spine_outer || spine_tb || deep_divert)
+        && !single_hop_take_routed(ctx, parent, tail)
     {
         if spine_tb {
             if let Some(walk) = corr_bound_walk(ctx.schema, None, tail, false) {

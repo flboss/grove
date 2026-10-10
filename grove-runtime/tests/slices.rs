@@ -1211,6 +1211,27 @@ fn single_hop_project_and_scalar_values() {
 }
 
 #[test]
+fn single_hop_take_bound_values() {
+    let o30 = || Value::List(vec![rec(&[("total", Value::Dec(dec("30.00")))])]);
+    assert_eq!(
+        value("users { x = manager.orders.take(age) }"),
+        Value::List(vec![
+            rec(&[("x", o30())]),
+            rec(&[("x", o30())]),
+            rec(&[("x", o30())]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = manager.orders.skip(age) }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![]))]),
+            rec(&[("x", Value::List(vec![]))]),
+            rec(&[("x", Value::List(vec![]))]),
+        ])
+    );
+}
+
+#[test]
 fn subquery_needle_contains_values() {
     let b = |v: bool| rec(&[("x", Value::Bool(v))]);
     assert_eq!(
