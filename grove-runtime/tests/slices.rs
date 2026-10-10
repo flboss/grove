@@ -1333,6 +1333,34 @@ fn projected_list_agg_values() {
 }
 
 #[test]
+fn via_flatten_nav_agg_values() {
+    assert_eq!(
+        value("users { x = subordinates.scores.flatten().len() }"),
+        Value::List(vec![
+            rec(&[("x", Value::Int(0))]),
+            rec(&[("x", Value::Int(3))]),
+            rec(&[("x", Value::Int(0))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = subordinates.scores.flatten().sum() }"),
+        Value::List(vec![
+            rec(&[("x", Value::Null)]),
+            rec(&[("x", Value::Int(21))]),
+            rec(&[("x", Value::Null)]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = subordinates.scores.flatten().max() }"),
+        Value::List(vec![
+            rec(&[("x", Value::Null)]),
+            rec(&[("x", Value::Int(9))]),
+            rec(&[("x", Value::Null)]),
+        ])
+    );
+}
+
+#[test]
 fn projected_records_nav_values() {
     assert_eq!(
         value("users { m = manager } { x = m.name }"),

@@ -1347,6 +1347,8 @@ fn rows_method(
                     }
                     _ => None,
                 };
+                let floor = nest_floor(&level.builder.from);
+                level.builder = shift_nest_builder(level.builder, floor);
                 let mut level = merge_navigate(
                     ctx,
                     child_from,
@@ -17817,6 +17819,27 @@ fn scalar_list_col(ctx: &mut Context, base: &TypedExpr) -> String {
         }
         TypedExprKind::Method { base, name, .. } if name.value == "flatten" => match &base.kind {
             TypedExprKind::Array { .. } | TypedExprKind::Method { .. } => "c0".to_string(),
+            TypedExprKind::Field {
+                base: nav_base,
+                name: field_name,
+                ..
+            } => {
+                let field = row_struct(&nav_base.ty).and_then(|sid| {
+                    ctx.schema
+                        .struct_field(sid, &field_name.value)
+                        .map(|(_, field)| field)
+                });
+                match field {
+                    Some(Field::Array {
+                        element, storage, ..
+                    }) if matches!(element, grove_schema::validated::ValueType::Scalar(_))
+                        && matches!(storage.value.as_slice(), [_]) =>
+                    {
+                        ctx.schema.column_name(storage.value[0]).to_string()
+                    }
+                    _ => todo!("M4b scalar aggregation over derived rows"),
+                }
+            }
             _ => todo!("M4b scalar aggregation over derived rows"),
         },
         TypedExprKind::Array { .. } => match &base.ty {
