@@ -14802,6 +14802,9 @@ fn emit_split(
     root_ty: &QueryType,
     root_parts: Option<Vec<MiddlePart>>,
 ) -> RootPlan {
+    if ctx.pending_order.take().is_some() {
+        todo!("H1 QT0028: sort over nested lists");
+    }
     let hops = drain_pending(pending);
     let mut parent_q = parent_builder;
     let parent_shape = split_parent_shape(&mut parent_q, &hops, ctx.schema, &root_parts);
@@ -14835,6 +14838,9 @@ fn anchor_split(
     ty: &QueryType,
     root_parts: Option<Vec<MiddlePart>>,
 ) -> ResultShape {
+    if ctx.pending_order.take().is_some() {
+        todo!("H1 QT0028: sort over nested lists");
+    }
     let hops = drain_pending(pending);
     let mut parent_q = level_builder;
     let parent_shape = split_parent_shape(&mut parent_q, &hops, ctx.schema, &root_parts);
