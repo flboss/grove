@@ -18503,6 +18503,61 @@ fn contains_needle(ctx: &mut Context, needle: &TypedExpr, base_scoped: bool) -> 
     scalar(ctx, needle)
 }
 
+fn single_hop_first_needle(ctx: &mut Context, needle: &TypedExpr) -> Option<SelectBuilder> {
+    let TypedExprKind::Method {
+        base, name, args, ..
+    } = &needle.kind
+    else {
+        return None;
+    };
+    let offset = match name.value.as_str() {
+        "first" if args.is_empty() => None,
+        "nth" => match args.as_slice() {
+            [arg] => match &arg.expr.kind {
+                TypedExprKind::Literal(lit) => match &lit.value {
+                    Literal::Int(n) if *n >= 0 => Some(*n),
+                    _ => return None,
+                },
+                _ => return None,
+            },
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let TypedExprKind::Field { base: mid_base, .. } = &base.kind else {
+        return None;
+    };
+    let TypedExprKind::Ident { depth, .. } = &mid_base.kind else {
+        return None;
+    };
+    if *depth != 0 {
+        return None;
+    }
+    let parts = single_hop_parts(ctx, base)?;
+    let FromClause::Table { table, alias } = parts.child_from.clone() else {
+        return None;
+    };
+    let mut q = SelectBuilder::new();
+    q.from = Some(FromClause::Table { table, alias });
+    q.select = vec![SelectItem::AllFrom { depth: 0 }];
+    q.where_ = vec![SqlExpr::Binary {
+        op: SqlBinOp::Eq,
+        lhs: Box::new(SqlExpr::Column {
+            depth: 0,
+            column: parts.child_col,
+        }),
+        rhs: Box::new(SqlExpr::Column {
+            depth: 1,
+            column: parts.middle_fk,
+        }),
+    }];
+    q.limit = Some(SqlExpr::Param(ParamValue::Int(1)));
+    if let Some(n) = offset {
+        q.offset = Some(SqlExpr::Param(ParamValue::Int(n)));
+    }
+    Some(q)
+}
+
 fn per_parent_contains(ctx: &mut Context, base: &TypedExpr, needle: &TypedExpr) -> Option<SqlExpr> {
     if ctx.temp_collect.is_some() || ctx.in_array_temp || ctx.child.is_some() {
         return None;
@@ -18595,6 +18650,7 @@ fn per_parent_contains(ctx: &mut Context, base: &TypedExpr, needle: &TypedExpr) 
             }];
             q
         }
+        _ if let Some(q) = single_hop_first_needle(ctx, inner) => q,
         _ => {
             let n_sunk = ctx.statements.len();
             let q = single_row_query(ctx, inner, vec![SelectItem::AllFrom { depth: 0 }]);

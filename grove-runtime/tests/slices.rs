@@ -1169,6 +1169,19 @@ fn per_parent_contains_values() {
 }
 
 #[test]
+fn per_parent_nav_needle_values() {
+    let b = |v: bool| rec(&[("x", Value::Bool(v))]);
+    assert_eq!(
+        value("users { x = orders.contains(manager.orders.first().unwrap()) }"),
+        Value::List(vec![b(false), b(true), b(false)])
+    );
+    assert_eq!(
+        value("users { x = orders.contains(manager.orders.nth(0).unwrap()) }"),
+        Value::List(vec![b(false), b(true), b(false)])
+    );
+}
+
+#[test]
 fn take_bound_contains_values() {
     let b = |v: bool| rec(&[("x", Value::Bool(v))]);
     assert_eq!(
