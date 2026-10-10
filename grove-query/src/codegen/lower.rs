@@ -750,6 +750,26 @@ fn m2m_effective_output(schema: &ValidatedSchema, from: &Option<FromClause>, col
     }
 }
 
+fn m2m_scope_take_bound(tail: &TypedExpr) -> bool {
+    let mut node = tail;
+    loop {
+        match &node.kind {
+            TypedExprKind::Method {
+                base, name, args, ..
+            } if ["take", "skip", "nth"].contains(&name.value.as_str()) => {
+                if args.iter().any(|a| has_scope_ident(&a.expr)) {
+                    return true;
+                }
+                node = base;
+            }
+            TypedExprKind::Method { base, .. }
+            | TypedExprKind::Field { base, .. }
+            | TypedExprKind::Projection { base, .. } => node = base,
+            _ => return false,
+        }
+    }
+}
+
 fn m2m_shadowed_tail(tail: &TypedExpr) -> bool {
     let mut node = tail;
     loop {
@@ -9113,9 +9133,15 @@ fn rvalue_shape(
         }
         _ => todo!("M4b projected root inside child tail"),
     };
+    let pair_col = if m2m_join.is_some() {
+        m2m_effective_output(ctx.schema, &Some(child_from.clone()), &child_col)
+    } else {
+        child_col.clone()
+    };
     if m2m_join.is_some()
-        && m2m_effective_output(ctx.schema, &Some(child_from.clone()), &child_col) != child_col
+        && pair_col != child_col
         && m2m_shadowed_tail(tail)
+        && m2m_scope_take_bound(tail)
     {
         todo!("M4 many-to-many navigation");
     }
@@ -9178,7 +9204,7 @@ fn rvalue_shape(
         tail,
         child_level,
         keyed,
-        keyed.then(|| child_col.clone()),
+        keyed.then(|| pair_col.clone()),
         true,
     );
     let mut nested: Option<ResultShape> = None;
@@ -9191,7 +9217,7 @@ fn rvalue_shape(
     if child.builder.select.is_empty() && m2m_join.is_none() {
         child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
     }
-    let pair_out = m2m_effective_output(ctx.schema, &child.builder.from, &child_col);
+    let pair_out = pair_col.clone();
     if keyed {
         if m2m_join.is_some() {
             if child.builder.select.is_empty() {
@@ -9210,13 +9236,29 @@ fn rvalue_shape(
                     output == &pair_out
                 }
             });
-            if !served && matches!(child.builder.from, Some(FromClause::Join { .. })) {
-                child.builder.select.push(SelectItem::Column {
-                    depth: 1,
-                    column: child_col.clone(),
-                    output: pair_out.clone(),
-                    ty: None,
-                });
+            if !served {
+                if matches!(child.builder.from, Some(FromClause::Join { .. })) {
+                    child.builder.select.push(SelectItem::Column {
+                        depth: 1,
+                        column: child_col.clone(),
+                        output: pair_out.clone(),
+                        ty: None,
+                    });
+                } else if matches!(child.builder.from, Some(FromClause::Subquery { .. }))
+                    && !child
+                        .builder
+                        .select
+                        .iter()
+                        .any(|item| matches!(item, SelectItem::AllFrom { .. }))
+                    && from_columns(&child.builder.from, ctx.schema).contains(&pair_out)
+                {
+                    child.builder.select.push(SelectItem::Column {
+                        depth: 0,
+                        column: pair_out.clone(),
+                        output: pair_out.clone(),
+                        ty: None,
+                    });
+                }
             }
         } else {
             ensure_key(&mut child.builder, &child_col, ctx.schema);
@@ -9267,7 +9309,7 @@ fn rvalue_shape(
                     0
                 },
                 parent_key,
-                child_key: pair_out.clone(),
+                child_key: pair_col,
                 negated: false,
             }),
             cardinality: Cardinality::Many,
@@ -9430,6 +9472,11 @@ fn build_capped_level(
         }
         _ => unreachable!("exotic windowed collapse base: peel admits keyed field tails only"),
     };
+    let pair_col = if m2m_join.is_some() {
+        m2m_effective_output(ctx.schema, &Some(child_from.clone()), &child_col)
+    } else {
+        child_col.clone()
+    };
     let child_level = Level {
         builder: {
             let mut child_builder = SelectBuilder::new();
@@ -9497,11 +9544,11 @@ fn build_capped_level(
         output_shapes: None,
         root_parts: None,
     };
-    let mut child = lower_tail(ctx, base, child_level, true, Some(child_col.clone()), false);
+    let mut child = lower_tail(ctx, base, child_level, true, Some(pair_col.clone()), false);
     if child.builder.select.is_empty() {
         child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
     }
-    ensure_key(&mut child.builder, &child_col, ctx.schema);
+    ensure_key(&mut child.builder, &pair_col, ctx.schema);
     let mut order = Vec::new();
     if let Some(CollapsePrefix::Sort(keys)) = &prefix {
         for (expr, dir) in keys {
@@ -9514,7 +9561,7 @@ fn build_capped_level(
         } else if has_window_bound(&child.builder) {
             child
         } else {
-            window_wrap(ctx, child, &child_col, order)
+            window_wrap(ctx, child, &pair_col, order)
         };
     if let Some(prefix) = &prefix {
         match prefix {
@@ -9542,7 +9589,19 @@ fn build_capped_level(
             conjoin_window_bound(&mut child.builder, "nth", index);
         }
     }
-    (child, parent_key, child_col)
+    (child, parent_key, pair_col)
+}
+
+fn collapse_bounds_have_scope(prefix: &Option<CollapsePrefix>, collapse: &CollapseKind) -> bool {
+    let prefix_scope = match prefix {
+        Some(CollapsePrefix::Take(arg) | CollapsePrefix::Skip(arg)) => has_scope_ident(arg),
+        _ => false,
+    };
+    let collapse_scope = match collapse {
+        CollapseKind::Nth(arg) => has_scope_ident(arg),
+        CollapseKind::First => false,
+    };
+    prefix_scope || collapse_scope
 }
 
 fn windowed_collapse(
@@ -9555,6 +9614,7 @@ fn windowed_collapse(
     if let Some(IdentBinding::Field(fid)) = tail_root_ident(base)
         && let Some(parts) = m2m_parts(ctx.schema, *fid)
         && m2m_pairing_output(ctx.schema, &parts) != parts.junction_parent_col
+        && collapse_bounds_have_scope(&prefix, &collapse)
     {
         todo!("M4 many-to-many navigation");
     }
@@ -10843,9 +10903,15 @@ fn rscalar_shape(
     if m2m_join.is_some()
         && m2m_effective_output(ctx.schema, &Some(child_from.clone()), &child_col) != child_col
         && m2m_shadowed_tail(tail)
+        && m2m_scope_take_bound(tail)
     {
         todo!("M4 many-to-many navigation");
     }
+    let pair_col = if m2m_join.is_some() {
+        m2m_effective_output(ctx.schema, &Some(child_from.clone()), &child_col)
+    } else {
+        child_col.clone()
+    };
     let keyed = parent_key.is_some();
     let mut child_builder = SelectBuilder::new();
     child_builder.from = Some(child_from);
@@ -10903,19 +10969,19 @@ fn rscalar_shape(
         eff,
         child_level,
         keyed,
-        keyed.then(|| child_col.clone()),
+        keyed.then(|| pair_col.clone()),
         false,
     );
     if child.builder.select.is_empty() {
         child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
     }
     if keyed {
-        ensure_key(&mut child.builder, &child_col, ctx.schema);
+        ensure_key(&mut child.builder, &pair_col, ctx.schema);
     }
     let outputs = builder_outputs(&child.builder, ctx.schema);
     let shape_cols: Vec<OutputColumn> =
         shape_columns(builder_output_types(&child.builder, ctx.schema), |name| {
-            keyed && name == child_col
+            keyed && name == pair_col
         });
     let item_ty = match &eff.ty {
         QueryType::List(sub) => sub.as_ref(),
@@ -10926,7 +10992,7 @@ fn rscalar_shape(
         child.output_shapes.as_ref(),
         item_ty,
         &outputs,
-        |name| keyed && name == child_col,
+        |name| keyed && name == pair_col,
     );
     let idx = ctx.sink(
         child.builder,
@@ -10948,7 +11014,7 @@ fn rscalar_shape(
                     0
                 },
                 parent_key,
-                child_key: child_col,
+                child_key: pair_col,
                 negated: false,
             }),
             cardinality: Cardinality::One,
@@ -11523,6 +11589,13 @@ fn rtemp_shape(
         todo!("M4b nested record item");
     }
     let top_entry = ctx.nest_depth < 1 && ctx.child.is_none();
+    if let Some(IdentBinding::Field(fid)) = tail_root_ident(tail)
+        && let Some(parts) = m2m_parts(ctx.schema, *fid)
+        && m2m_pairing_output(ctx.schema, &parts) != parts.junction_parent_col
+        && m2m_scope_take_bound(tail)
+    {
+        todo!("M4 many-to-many navigation");
+    }
     let reduced_tail = beta_reduce_tail(tail);
     let tail: &TypedExpr = &reduced_tail;
     let temp = ctx.aliases.temp();

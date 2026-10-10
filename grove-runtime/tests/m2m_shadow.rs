@@ -6,6 +6,7 @@ const SCHEMA_SRC: &str = r#"
     root roles: Role;
     struct User {
         name: String,
+        age: Int,
         roles: &List<Role>,
     }
     struct Role {
@@ -35,16 +36,16 @@ fn fixture() -> Runtime {
     let rt = Runtime::open_in_memory().unwrap();
     rt.conn()
         .execute_batch(
-            "CREATE TABLE users(id INTEGER, name TEXT);
+            "CREATE TABLE users(id INTEGER, name TEXT, age INTEGER);
              CREATE TABLE roles(id INTEGER, name TEXT, user_id INTEGER);
              CREATE TABLE user_roles(user_id INTEGER, role_id INTEGER);",
         )
         .unwrap();
-    for (id, name) in [(1, "Ada"), (2, "Bob"), (3, "Cyd")] {
+    for (id, name, age) in [(1, "Ada", 30), (2, "Bob", 40), (3, "Cyd", 50)] {
         rt.conn()
             .execute(
-                "INSERT INTO users(id, name) VALUES (?, ?)",
-                rusqlite::params![id, name],
+                "INSERT INTO users(id, name, age) VALUES (?, ?, ?)",
+                rusqlite::params![id, name, age],
             )
             .unwrap();
     }
@@ -133,7 +134,75 @@ fn shadowed_scalar_and_values() {
 }
 
 #[test]
-#[should_panic]
-fn shadowed_take_tail_stays_loud() {
-    compile("users { r = roles.take(1) }");
+fn shadowed_take_skip_values() {
+    assert_eq!(
+        value("users { r = roles.take(1) }"),
+        Value::List(vec![
+            Value::Record(vec![("r".to_string(), Value::List(vec![role("admin")]))]),
+            Value::Record(vec![("r".to_string(), Value::List(vec![role("dev")]))]),
+            Value::Record(vec![("r".to_string(), Value::List(vec![]))]),
+        ])
+    );
+    assert_eq!(
+        value("users { r = roles.skip(1) }"),
+        Value::List(vec![
+            Value::Record(vec![("r".to_string(), Value::List(vec![role("dev")]))]),
+            Value::Record(vec![("r".to_string(), Value::List(vec![]))]),
+            Value::Record(vec![("r".to_string(), Value::List(vec![]))]),
+        ])
+    );
+    assert_eq!(
+        value("users { r = roles.take(1) { name } }"),
+        Value::List(vec![
+            Value::Record(vec![(
+                "r".to_string(),
+                Value::List(vec![Value::Record(vec![(
+                    "name".to_string(),
+                    Value::String("admin".to_string())
+                )])])
+            )]),
+            Value::Record(vec![(
+                "r".to_string(),
+                Value::List(vec![Value::Record(vec![(
+                    "name".to_string(),
+                    Value::String("dev".to_string())
+                )])])
+            )]),
+            Value::Record(vec![("r".to_string(), Value::List(vec![]))]),
+        ])
+    );
+}
+
+#[test]
+fn shadowed_collapse_values() {
+    assert_eq!(
+        value("users { r = roles.first() }"),
+        Value::List(vec![
+            Value::Record(vec![("r".to_string(), role("admin"))]),
+            Value::Record(vec![("r".to_string(), role("dev"))]),
+            Value::Record(vec![("r".to_string(), Value::Null)]),
+        ])
+    );
+    assert_eq!(
+        value("users { r = roles.nth(1) }"),
+        Value::List(vec![
+            Value::Record(vec![("r".to_string(), role("dev"))]),
+            Value::Record(vec![("r".to_string(), Value::Null)]),
+            Value::Record(vec![("r".to_string(), Value::Null)]),
+        ])
+    );
+    assert_eq!(
+        value("users { r = roles.max_by(name) }"),
+        Value::List(vec![
+            Value::Record(vec![("r".to_string(), role("dev"))]),
+            Value::Record(vec![("r".to_string(), role("dev"))]),
+            Value::Record(vec![("r".to_string(), Value::Null)]),
+        ])
+    );
+}
+
+#[test]
+#[should_panic(expected = "M4 many-to-many navigation")]
+fn shadowed_scope_take_stays_loud() {
+    compile("users { r = roles.take(age) }");
 }
