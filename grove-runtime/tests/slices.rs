@@ -785,6 +785,32 @@ fn nested_take_bound_inner_values() {
 }
 
 #[test]
+fn lit_take_bound_nav_values() {
+    let two = || Value::List(vec![Value::Int(1), Value::Int(2)]);
+    let three = || Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+    assert_eq!(
+        value("users { x = [1, 2, 3].take(manager.age - 38) }"),
+        Value::List(vec![
+            rec(&[("x", two())]),
+            rec(&[("x", two())]),
+            rec(&[("x", two())]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = [1, 2, 3].skip(manager.age - 40) }"),
+        Value::List(vec![
+            rec(&[("x", three())]),
+            rec(&[("x", three())]),
+            rec(&[("x", three())]),
+        ])
+    );
+    assert_eq!(
+        value("users[age > 100] { x = [1, 2, 3].take(manager.age) }"),
+        Value::List(vec![])
+    );
+}
+
+#[test]
 fn nested_cross_root_inner_values() {
     let ord = |t: &str| rec(&[("total", Value::Dec(dec(t)))]);
     let sib = |a: &str, b: &str| {

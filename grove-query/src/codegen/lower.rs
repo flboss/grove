@@ -15157,7 +15157,7 @@ fn scalar_field(
     let (next_source, first_shell) = match global_parent {
         Some(parent) => global_first_hop(ctx, *parent, source, first_fid),
         None if ctx.temp_collect.is_some()
-            && !ctx.in_array_temp
+            && (!ctx.in_array_temp || ctx.in_take_arg)
             && ((ctx.in_take_arg && enclosing_depth == Some(0))
                 || (!ctx.in_take_arg && enclosing_depth == Some(1))) =>
         {
