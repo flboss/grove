@@ -1292,6 +1292,30 @@ fn single_hop_take_bound_values() {
             rec(&[("x", Value::List(vec![]))]),
         ])
     );
+    assert_eq!(
+        value("users { x = manager.orders.take(age - 30) }"),
+        Value::List(vec![
+            rec(&[("x", Value::List(vec![]))]),
+            rec(&[("x", o30())]),
+            rec(&[("x", o30())]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = manager.orders.skip(age - 40) }"),
+        Value::List(vec![
+            rec(&[("x", o30())]),
+            rec(&[("x", o30())]),
+            rec(&[("x", Value::List(vec![]))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = manager.orders.take(manager.age - 35) }"),
+        Value::List(vec![
+            rec(&[("x", o30())]),
+            rec(&[("x", o30())]),
+            rec(&[("x", o30())]),
+        ])
+    );
 }
 
 #[test]

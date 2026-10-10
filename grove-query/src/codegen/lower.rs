@@ -8752,7 +8752,7 @@ fn single_hop_take_routed(ctx: &Context, parent: &Level, tail: &TypedExpr) -> bo
     let [arg] = args.as_slice() else {
         return false;
     };
-    let bound_col = match &arg.expr.kind {
+    let bound_col: Option<String> = match &arg.expr.kind {
         TypedExprKind::Ident {
             binding: IdentBinding::Field(fid),
             depth,
@@ -8761,21 +8761,30 @@ fn single_hop_take_routed(ctx: &Context, parent: &Level, tail: &TypedExpr) -> bo
             let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
             match field {
                 Field::Value { columns, .. } => match columns.as_slice() {
-                    [col] => ctx.schema.column_name(*col).to_string(),
+                    [col] => Some(ctx.schema.column_name(*col).to_string()),
                     _ => return false,
                 },
                 _ => return false,
             }
         }
-        _ => return false,
+        TypedExprKind::Literal(_) => return false,
+        _ => {
+            if !matches!(scalar_of(&arg.expr.ty), Some(ScalarType::Int)) || uses_outer(&arg.expr) {
+                return false;
+            }
+            None
+        }
     };
     if !matches!(scalar_of(&arg.expr.ty), Some(ScalarType::Int)) {
         return false;
     }
-    for col in [middle_fk, bound_col] {
-        if !parent_serves_col(parent, ctx.schema, &col) {
-            return false;
-        }
+    if !parent_serves_col(parent, ctx.schema, &middle_fk) {
+        return false;
+    }
+    if let Some(bound_col) = &bound_col
+        && !parent_serves_col(parent, ctx.schema, bound_col)
+    {
+        return false;
     }
     true
 }
@@ -8808,7 +8817,11 @@ fn single_hop_take_bound(
     let [arg] = args.as_slice() else {
         return None;
     };
-    let bound_col = match &arg.expr.kind {
+    enum HopBound {
+        Column(String),
+        Computed(SqlExpr),
+    }
+    let bound = match &arg.expr.kind {
         TypedExprKind::Ident {
             binding: IdentBinding::Field(fid),
             depth,
@@ -8817,31 +8830,51 @@ fn single_hop_take_bound(
             let field = &ctx.schema.structs[fid.struct_id().index()].fields[fid.local()];
             match field {
                 Field::Value { columns, .. } => match columns.as_slice() {
-                    [col] => ctx.schema.column_name(*col).to_string(),
+                    [col] => HopBound::Column(ctx.schema.column_name(*col).to_string()),
                     _ => return None,
                 },
                 _ => return None,
             }
         }
-        _ => return None,
+        TypedExprKind::Literal(_) => return None,
+        _ => {
+            if !matches!(scalar_of(&arg.expr.ty), Some(ScalarType::Int)) || uses_outer(&arg.expr) {
+                todo!("M4b navigation from single-record base");
+            }
+            let was_take = std::mem::replace(&mut ctx.in_take_arg, false);
+            let lowered = scalar(ctx, &arg.expr);
+            ctx.in_take_arg = was_take;
+            if free_columns(&lowered, 0)
+                .iter()
+                .any(|c| output_ty(&parent.builder, c, ctx.schema).is_none())
+            {
+                todo!("M4b navigation from single-record base");
+            }
+            HopBound::Computed(lowered)
+        }
     };
     if !matches!(scalar_of(&arg.expr.ty), Some(ScalarType::Int)) {
         return None;
     }
-    for col in [&parts.middle_fk, &bound_col] {
-        if !parent_serves_col(parent, ctx.schema, col) {
-            return None;
-        }
+    if !parent_serves_col(parent, ctx.schema, &parts.middle_fk) {
+        return None;
     }
-    let (temp_idx, temp, _) = cross_cartesian_temp(
-        ctx,
-        parent,
-        &[
-            (parts.middle_fk.clone(), Some(ScalarType::Int)),
-            (bound_col.clone(), Some(ScalarType::Int)),
-        ],
-        &[],
-    );
+    let mut extra = vec![(parts.middle_fk.clone(), Some(ScalarType::Int))];
+    let mut extra_computed = Vec::new();
+    let bound_src_col = match bound {
+        HopBound::Column(col) => {
+            if !parent_serves_col(parent, ctx.schema, &col) {
+                return None;
+            }
+            extra.push((col.clone(), Some(ScalarType::Int)));
+            col
+        }
+        HopBound::Computed(expr) => {
+            extra_computed.push(("$$bndc".to_string(), expr, ScalarType::Int));
+            "$$bndc".to_string()
+        }
+    };
+    let (temp_idx, temp, _) = cross_cartesian_temp(ctx, parent, &extra, &extra_computed);
     let leaf_table = match &parts.child_from {
         FromClause::Table { table, .. } => table.clone(),
         _ => todo!("M4b navigation from single-record base"),
@@ -8902,7 +8935,7 @@ fn single_hop_take_bound(
             },
             SelectItem::Column {
                 depth: 1,
-                column: bound_col,
+                column: bound_src_col,
                 output: "$$bnd".to_string(),
                 ty: Some(ScalarType::Int),
             },
