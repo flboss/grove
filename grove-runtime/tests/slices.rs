@@ -1311,6 +1311,103 @@ fn single_hop_project_and_scalar_values() {
     );
 }
 
+const CHAIN_SCHEMA_SRC: &str = r#"
+    root users: User;
+    struct User {
+        name: String,
+        age: Int,
+        manager: &User,
+        subordinates: &List<User>,
+        orders: List<Order>,
+    }
+    struct Order {
+        total: Dec,
+        user: &User,
+    }
+    rel Order.user <<-> User.orders (orders.user_id -> users.id);
+    rel User.manager <<-> User.subordinates (users.manager_id -> users.id);
+"#;
+
+fn chain_value(query: &str) -> Value {
+    let schema = grove_schema::validate(
+        grove_schema::parse_schema(CHAIN_SCHEMA_SRC)
+            .0
+            .expect("invalid chain schema"),
+    )
+    .0
+    .expect("invalid chain schema");
+    let (file, parse_diags) = grove_query::parse_query(query);
+    assert!(parse_diags.is_empty(), "{query}");
+    let (typed, type_diags) = grove_query::typecheck::typecheck(file.unwrap(), &schema);
+    assert!(type_diags.is_empty(), "{query}");
+    let compiled = grove_query::codegen::codegen(&typed.unwrap(), &schema);
+    let mut rt = Runtime::open_in_memory().unwrap();
+    rt.conn()
+        .execute_batch(
+            "CREATE TABLE users(id INTEGER, name TEXT, age INTEGER, manager_id INTEGER);
+             CREATE TABLE orders(id INTEGER, total BLOB, user_id INTEGER);",
+        )
+        .unwrap();
+    for (id, name, age, manager_id) in [
+        (1, "Ada", 30, 2),
+        (2, "Bob", 40, 2),
+        (3, "Cyd", 50, 2),
+        (4, "Dave", 60, 1),
+    ] {
+        rt.conn()
+            .execute(
+                "INSERT INTO users(id, name, age, manager_id) VALUES (?, ?, ?, ?)",
+                rusqlite::params![id, name, age, manager_id],
+            )
+            .unwrap();
+    }
+    let order = |id: i64, total: &str, user_id: i64| {
+        rt.conn()
+            .execute(
+                "INSERT INTO orders(id, total, user_id) VALUES (?, ?, ?)",
+                rusqlite::params![id, encode_dec(&dec(total)).to_vec(), user_id],
+            )
+            .unwrap();
+    };
+    order(10, "10.00", 1);
+    order(11, "20.00", 1);
+    order(12, "30.00", 2);
+    rt.execute_value(&compiled).unwrap()
+}
+
+#[test]
+fn multi_hop_single_scalar_values() {
+    let n = |v: i64| rec(&[("n", Value::Int(v))]);
+    assert_eq!(
+        value("users { n = manager.manager.orders.len() }"),
+        Value::List(vec![n(1), n(1), n(1)])
+    );
+    assert_eq!(
+        value("users { n = manager.manager.manager.orders.len() }"),
+        Value::List(vec![n(1), n(1), n(1)])
+    );
+    assert_eq!(
+        chain_value("users { n = manager.orders.len() }"),
+        Value::List(vec![n(1), n(1), n(1), n(2)])
+    );
+    assert_eq!(
+        chain_value("users { n = manager.manager.orders.len() }"),
+        Value::List(vec![n(1), n(1), n(1), n(1)])
+    );
+    assert_eq!(
+        chain_value("users { n = manager.manager.manager.orders.len() }"),
+        Value::List(vec![n(1), n(1), n(1), n(1)])
+    );
+    assert_eq!(
+        chain_value("users.filter(manager.manager.orders.len() > 1) { n = name }"),
+        Value::List(vec![])
+    );
+    assert_eq!(
+        chain_value("users.filter(manager.orders.len() > 1) { n = name }"),
+        Value::List(vec![rec(&[("n", Value::String("Dave".to_string()))])])
+    );
+}
+
 #[test]
 fn single_hop_take_bound_values() {
     let o30 = || Value::List(vec![rec(&[("total", Value::Dec(dec("30.00")))])]);

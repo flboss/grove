@@ -558,6 +558,106 @@ fn single_hop_parts(ctx: &mut Context, tail: &TypedExpr) -> Option<SingleHop> {
     }
 }
 
+struct MultiHop {
+    root_depth: usize,
+    hops: Vec<(StructId, FieldId)>,
+    leaf: ChildLink,
+}
+
+fn multi_hop_parts(ctx: &mut Context, base: &TypedExpr) -> Option<MultiHop> {
+    let TypedExprKind::Field {
+        base: mid,
+        name: leaf,
+        optional,
+    } = &base.kind
+    else {
+        return None;
+    };
+    if *optional {
+        return None;
+    }
+    let mut rev: Vec<(StructId, FieldId)> = Vec::new();
+    let mut cursor = mid.as_ref();
+    let (root_struct, root_fid, root_depth) = loop {
+        match &cursor.kind {
+            TypedExprKind::Field {
+                base: next,
+                name: hop,
+                optional,
+            } => {
+                if *optional {
+                    return None;
+                }
+                let QueryType::Record(_) = &cursor.ty else {
+                    return None;
+                };
+                let sid = record_struct(&cursor.ty);
+                let (fid, field) = ctx.schema.struct_field(sid, &hop.value).unwrap_or_else(|| {
+                    unreachable!("resolved field {} vanished from the schema", hop.value)
+                });
+                match field {
+                    Field::Ref {
+                        is_list: false,
+                        optional: false,
+                        ..
+                    } => {}
+                    _ => return None,
+                }
+                if m2m_parts(ctx.schema, fid).is_some() {
+                    return None;
+                }
+                rev.push((sid, fid));
+                cursor = next;
+            }
+            TypedExprKind::Ident {
+                binding: IdentBinding::Field(fid),
+                depth,
+                ..
+            } => break (fid.struct_id(), *fid, *depth),
+            _ => return None,
+        }
+    };
+    if rev.is_empty() {
+        return None;
+    }
+    rev.reverse();
+    let mut hops = vec![(root_struct, root_fid)];
+    match &ctx.schema.structs[root_struct.index()].fields[root_fid.local()] {
+        Field::Ref {
+            is_list: false,
+            optional: false,
+            ..
+        } => {}
+        _ => return None,
+    }
+    if m2m_parts(ctx.schema, root_fid).is_some() {
+        return None;
+    }
+    hops.extend(rev);
+    let (_, last_fid) = hops[hops.len() - 1];
+    let last_target =
+        match &ctx.schema.structs[hops[hops.len() - 1].0.index()].fields[last_fid.local()] {
+            Field::Ref { target, .. } => *target,
+            _ => return None,
+        };
+    let (leaf_fid, leaf_field) = ctx
+        .schema
+        .struct_field(last_target, &leaf.value)
+        .unwrap_or_else(|| unreachable!("resolved field {} vanished from the schema", leaf.value));
+    match leaf_field {
+        Field::Ref { is_list: true, .. } => {}
+        _ => return None,
+    }
+    let link = resolve_tail_link(ctx, leaf_fid);
+    if link.m2m_join.is_some() {
+        return None;
+    }
+    Some(MultiHop {
+        root_depth,
+        hops,
+        leaf: link,
+    })
+}
 fn middle_col(level: &Level, name: &str) -> Option<String> {
     if level.pending.is_some() {
         return None;
@@ -18561,6 +18661,15 @@ fn single_hop_scalar_level(ctx: &mut Context, base: &TypedExpr) -> Option<Level>
     let TypedExprKind::Field { base: mid_base, .. } = &base.kind else {
         return None;
     };
+    if !matches!(
+        &mid_base.kind,
+        TypedExprKind::Ident {
+            binding: IdentBinding::Field(_),
+            ..
+        }
+    ) {
+        return multi_hop_scalar_level(ctx, base);
+    }
     let TypedExprKind::Ident {
         binding: IdentBinding::Field(_),
         depth,
@@ -18584,6 +18693,63 @@ fn single_hop_scalar_level(ctx: &mut Context, base: &TypedExpr) -> Option<Level>
         rhs: Box::new(SqlExpr::Column {
             depth: *depth + 1,
             column: parts.middle_fk,
+        }),
+    }];
+    Some(Level {
+        builder,
+        element: base.ty.clone(),
+        parent: ParentLink::Root { root_idx: 0 },
+        pending: None,
+        stmt_bound: true,
+        output_shapes: None,
+        root_parts: None,
+    })
+}
+
+fn multi_hop_scalar_level(ctx: &mut Context, base: &TypedExpr) -> Option<Level> {
+    let multi = multi_hop_parts(ctx, base)?;
+    let FromClause::Table { table, alias } = multi.leaf.child_from.clone() else {
+        return None;
+    };
+    let mut source = multi.hops[0].0;
+    let (next_source, first_shell) =
+        hop_shell_at(ctx, source, multi.hops[0].1, multi.root_depth + 2);
+    source = next_source;
+    let mut shells = vec![first_shell];
+    for (_, fid) in &multi.hops[1..] {
+        let (next, shell) = hop_shell(ctx, source, *fid);
+        shells.push(shell);
+        source = next;
+    }
+    let mut inner = shells
+        .pop()
+        .unwrap_or_else(|| unreachable!("multi-hop chain with no hops"));
+    inner.select = vec![SelectItem::Column {
+        depth: 0,
+        column: multi.leaf.parent_col.clone(),
+        output: ctx.aliases.generic(),
+        ty: None,
+    }];
+    while let Some(mut outer) = shells.pop() {
+        outer.select = vec![SelectItem::Expr {
+            expr: SqlExpr::Subquery {
+                query: Box::new(inner),
+            },
+            output: ctx.aliases.generic(),
+            ty: None,
+        }];
+        inner = outer;
+    }
+    let mut builder = SelectBuilder::new();
+    builder.from = Some(FromClause::Table { table, alias });
+    builder.where_ = vec![SqlExpr::Binary {
+        op: SqlBinOp::Eq,
+        lhs: Box::new(SqlExpr::Column {
+            depth: 0,
+            column: multi.leaf.child_col,
+        }),
+        rhs: Box::new(SqlExpr::Subquery {
+            query: Box::new(inner),
         }),
     }];
     Some(Level {
