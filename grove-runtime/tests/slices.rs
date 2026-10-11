@@ -509,6 +509,28 @@ fn slice_nested_collapse_presence() {
 }
 
 #[test]
+fn nested_scalar_tail_values() {
+    let t = |v: &str| Value::Dec(dec(v));
+    let x = |v: Value| rec(&[("x", v)]);
+    assert_eq!(
+        value("users { x = subordinates.orders.first()?.total }"),
+        Value::List(vec![
+            x(Value::Null),
+            x(Value::List(vec![t("10.00"), t("20.00")])),
+            x(Value::Null),
+        ])
+    );
+    assert_eq!(
+        value("users { x = subordinates.orders.nth(1)?.total }"),
+        Value::List(vec![
+            x(Value::Null),
+            x(Value::List(vec![t("30.00")])),
+            x(Value::Null),
+        ])
+    );
+}
+
+#[test]
 fn slice_nested_collection_temp_arms() {
     let it = |sku: &str, order_id: i64| rec(&[("sku", s(sku)), ("order_id", Value::Int(order_id))]);
     assert_eq!(

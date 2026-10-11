@@ -2306,7 +2306,7 @@ fn b1_optional_list(
         } else {
             CollapseKind::Nth(one_arg(args, name))
         };
-        return b1_nested_collapse(ctx, value, inner, collapse, None);
+        return b1_nested_collapse(ctx, value, inner, collapse, None, None);
     }
     todo!("M4b presence: optional list item")
 }
@@ -2837,7 +2837,10 @@ fn b1_chained(
     }
     let Some((rewritten, collapse, tail_fid)) = split_opt_chain(ctx, value) else {
         if let Some((nested, kind, hop)) = split_nested_chain(ctx, value) {
-            return b1_nested_collapse(ctx, value, nested, kind, Some((hop, &value.ty)));
+            return b1_nested_collapse(ctx, value, nested, kind, Some((hop, &value.ty)), None);
+        }
+        if let Some((nested, kind, nest_ty, col)) = split_nested_scalar(ctx, value) {
+            return b1_nested_collapse(ctx, value, nested, kind, None, Some((nest_ty, col)));
         }
         todo!("M4b presence: optional list item");
     };
@@ -2988,29 +2991,68 @@ fn b1_nested_collapse(
     inner: &TypedExpr,
     collapse: CollapseKind<'_>,
     extra: Option<(PendingSplit, &QueryType)>,
+    scalar_nest: Option<(&QueryType, String)>,
 ) -> (Vec<SelectItem>, ResultShape, Vec<String>) {
-    let (child_from, child_col, parent_key) = match tail_root_ident(inner) {
+    let (child_from, child_col, parent_key, m2m_join) = match tail_root_ident(inner) {
         Some(IdentBinding::Field(fid)) => {
             let link = resolve_tail_link(ctx, *fid);
-            if link.m2m_join.is_some() {
-                todo!("M4 many-to-many navigation");
-            }
-            (link.child_from, link.child_col, Some(link.parent_col))
+            (
+                link.child_from,
+                link.child_col,
+                Some(link.parent_col),
+                link.m2m_join,
+            )
         }
         _ => unreachable!("exotic nested collapse base: the b1 arm admits keyed field tails only"),
+    };
+    let pair_col = if m2m_join.is_some() {
+        m2m_effective_output(ctx.schema, &Some(child_from.clone()), &child_col)
+    } else {
+        child_col.clone()
     };
     let child_level = Level {
         builder: {
             let mut child_builder = SelectBuilder::new();
             child_builder.from = Some(child_from);
-            child_builder.where_ = vec![SqlExpr::InSubquery {
-                expr: Box::new(SqlExpr::Column {
-                    depth: 0,
-                    column: child_col.clone(),
-                }),
-                query: Box::new(bulk_query()),
-            }];
-            child_builder
+            if let Some((target_pk, junction_target_col)) = &m2m_join {
+                child_builder.where_ = vec![
+                    SqlExpr::InSubquery {
+                        expr: Box::new(SqlExpr::Column {
+                            depth: 1,
+                            column: child_col.clone(),
+                        }),
+                        query: Box::new(bulk_query()),
+                    },
+                    SqlExpr::Binary {
+                        op: SqlBinOp::Eq,
+                        lhs: Box::new(SqlExpr::Column {
+                            depth: 0,
+                            column: target_pk.clone(),
+                        }),
+                        rhs: Box::new(SqlExpr::Column {
+                            depth: 1,
+                            column: junction_target_col.clone(),
+                        }),
+                    },
+                ];
+                m2m_seed_selects(ctx.schema, &mut child_builder, &child_col);
+                let alias = ctx.aliases.subquery();
+                let mut outer = SelectBuilder::new();
+                outer.from = Some(FromClause::Subquery {
+                    query: Box::new(child_builder),
+                    alias,
+                });
+                outer
+            } else {
+                child_builder.where_ = vec![SqlExpr::InSubquery {
+                    expr: Box::new(SqlExpr::Column {
+                        depth: 0,
+                        column: child_col.clone(),
+                    }),
+                    query: Box::new(bulk_query()),
+                }];
+                child_builder
+            }
         },
         element: inner.ty.clone(),
         parent: ParentLink::Root { root_idx: 0 },
@@ -3019,15 +3061,15 @@ fn b1_nested_collapse(
         output_shapes: None,
         root_parts: None,
     };
-    let mut child = lower_tail(ctx, inner, child_level, true, Some(child_col.clone()), true);
+    let mut child = lower_tail(ctx, inner, child_level, true, Some(pair_col.clone()), true);
     if child.builder.select.is_empty() {
         child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
     }
-    ensure_key(&mut child.builder, &child_col, ctx.schema);
+    ensure_key(&mut child.builder, &pair_col, ctx.schema);
     let mut child = if has_window_bound(&child.builder) {
         child
     } else {
-        window_wrap(ctx, child, &child_col, Vec::new())
+        window_wrap(ctx, child, &pair_col, Vec::new())
     };
     match collapse {
         CollapseKind::First => {
@@ -3048,6 +3090,10 @@ fn b1_nested_collapse(
         Some((hop, ty)) => (Some(hop), ty),
         None => (None, &value.ty),
     };
+    let nest_ty = match &scalar_nest {
+        Some((ty, _)) => ty,
+        None => nest_ty,
+    };
     let mut pending = pending;
     if let Some(tail_hop) = tail_hop {
         if pending.next.is_some() {
@@ -3056,12 +3102,20 @@ fn b1_nested_collapse(
         pending.next = Some(Box::new(tail_hop));
     }
     let (inner_nest, child_idx) = drain_pending_chain(ctx, pending, nest_ty);
+    let inner_nest = match (&scalar_nest, inner_nest) {
+        (Some((_, col)), ResultShape::List { child, .. }) => ResultShape::List {
+            element: Box::new(ResultShape::Column(col.clone())),
+            child,
+        },
+        (Some(_), _) => todo!("M4b presence: optional list item"),
+        (None, inner_nest) => inner_nest,
+    };
     if child.builder.select.is_empty() {
         child.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
     }
     let shape_cols: Vec<OutputColumn> =
         shape_columns(builder_output_types(&child.builder, ctx.schema), |name| {
-            name == child_col
+            name == pair_col
         });
     let idx_outer = ctx.sink(
         child.builder,
@@ -3086,7 +3140,7 @@ fn b1_nested_collapse(
                     0
                 },
                 parent_key,
-                child_key: child_col,
+                child_key: pair_col,
                 negated: false,
             }),
             cardinality: Cardinality::One,
@@ -3282,6 +3336,55 @@ fn split_nested_chain<'a>(
             middle_parts: None,
         },
     ))
+}
+
+fn split_nested_scalar<'a>(
+    ctx: &mut Context,
+    value: &'a TypedExpr,
+) -> Option<(&'a TypedExpr, CollapseKind<'a>, &'a QueryType, String)> {
+    let TypedExprKind::Field {
+        base: collapse,
+        name,
+        optional: true,
+    } = &value.kind
+    else {
+        return None;
+    };
+    let TypedExprKind::Method {
+        base: nested,
+        name: method,
+        args,
+        ..
+    } = &collapse.kind
+    else {
+        return None;
+    };
+    if method.value != "first" && method.value != "nth" {
+        return None;
+    }
+    let QueryType::List(l1) = peel_optional(&nested.ty) else {
+        return None;
+    };
+    let QueryType::List(l2) = peel_optional(l1) else {
+        return None;
+    };
+    let QueryType::Record(RecordSource::Schema(sid)) = peel_optional(l2) else {
+        return None;
+    };
+    let (_tail_fid, tail_field) = ctx.schema.struct_field(*sid, &name.value)?;
+    let col = match tail_field {
+        Field::Value { columns, .. } => match columns.as_slice() {
+            [col] => ctx.schema.column_name(*col).to_string(),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let kind = if method.value == "first" {
+        CollapseKind::First
+    } else {
+        CollapseKind::Nth(one_arg(args, method))
+    };
+    Some((nested, kind, &collapse.ty, col))
 }
 
 fn assert_present_rows(ctx: &mut Context, level: Level, msg: String) -> Level {
@@ -15206,16 +15309,14 @@ fn child_element(
                     unreachable!("mirror without shape: constructors always build one")
                 });
             }
-            debug_assert!(
-                !matches!(
-                    peel_optional(element_ty),
-                    QueryType::Scalar(_)
-                        | QueryType::Tuple(_)
-                        | QueryType::Record(RecordSource::Projection(_))
-                ),
-                "composite element over {} kept columns: type/row mismatch",
-                kept.len(),
-            );
+            if matches!(
+                peel_optional(element_ty),
+                QueryType::Scalar(_)
+                    | QueryType::Tuple(_)
+                    | QueryType::Record(RecordSource::Projection(_))
+            ) {
+                todo!("M7 scalar tail over multi-column rows");
+            }
             ResultShape::Record(
                 kept.into_iter()
                     .map(|name| (name.clone(), ResultShape::Column(name.clone())))

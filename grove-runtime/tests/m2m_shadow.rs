@@ -202,6 +202,22 @@ fn shadowed_collapse_values() {
 }
 
 #[test]
+fn shadowed_nested_scalar_tail_values() {
+    let n = |v: &str| Value::String(v.to_string());
+    assert_eq!(
+        value("users { r = roles.users.first()?.name }"),
+        Value::List(vec![
+            Value::Record(vec![("r".to_string(), Value::List(vec![n("Ada")]))]),
+            Value::Record(vec![(
+                "r".to_string(),
+                Value::List(vec![n("Ada"), n("Bob")])
+            )]),
+            Value::Record(vec![("r".to_string(), Value::Null)]),
+        ])
+    );
+}
+
+#[test]
 #[should_panic(expected = "M4 many-to-many navigation")]
 fn shadowed_scope_take_stays_loud() {
     compile("users { r = roles.take(age) }");
