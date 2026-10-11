@@ -3690,6 +3690,30 @@ fn slice_unwrap_or_records() {
         value("users { x = [{a = 1}].nth(5).unwrap_or({a = 0}) }"),
         Value::List(vec![xa(0), xa(0), xa(0)])
     );
+    assert_eq!(
+        value("users { x = [{a = 1}].take(1).first().unwrap_or({a = 0}) }"),
+        Value::List(vec![xa(1), xa(1), xa(1)])
+    );
+    assert_eq!(
+        value("users { x = [{a = 1}].take(0).first().unwrap_or({a = 0}) }"),
+        Value::List(vec![xa(0), xa(0), xa(0)])
+    );
+    assert_eq!(
+        value("users { x = [{a = 1}, {a = 2}].skip(1).first().unwrap_or({a = 0}) }"),
+        Value::List(vec![xa(2), xa(2), xa(2)])
+    );
+    assert_eq!(
+        value("users { x = [{a = 1}].skip(9).first().unwrap_or({a = 0}) }"),
+        Value::List(vec![xa(0), xa(0), xa(0)])
+    );
+    assert_eq!(
+        value("users { x = [{a = 1}, {a = 2}].take(2).nth(1).unwrap_or({a = 0}) }"),
+        Value::List(vec![xa(2), xa(2), xa(2)])
+    );
+    assert_eq!(
+        value("users { x = [{a = 1}, {a = 2}].take(1).nth(1).unwrap_or({a = 0}) }"),
+        Value::List(vec![xa(0), xa(0), xa(0)])
+    );
 }
 
 #[test]

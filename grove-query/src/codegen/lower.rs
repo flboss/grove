@@ -11039,7 +11039,25 @@ fn broadcast_collapse_unwrap_level(
     if collapse.value != "first" && collapse.value != "nth" {
         return None;
     }
-    if !matches!(&arr_base.kind, TypedExprKind::Array { .. }) || has_scope_ident(arr_base) {
+    let (array, prefix) = match &arr_base.kind {
+        TypedExprKind::Array { .. } => (arr_base.as_ref(), None),
+        TypedExprKind::Method {
+            base: inner,
+            name: pre,
+            args: pre_args,
+            ..
+        } if ["take", "skip"].contains(&pre.value.as_str())
+            && matches!(&peel_some(inner).kind, TypedExprKind::Array { .. }) =>
+        {
+            let [bound] = pre_args.as_slice() else {
+                return None;
+            };
+            const_int_lit(&bound.expr)?;
+            (peel_some(inner), Some((pre.value.as_str(), pre_args)))
+        }
+        _ => return None,
+    };
+    if has_scope_ident(array) {
         return None;
     }
     if collapse.value == "nth" {
@@ -11063,11 +11081,14 @@ fn broadcast_collapse_unwrap_level(
     {
         return None;
     }
-    let mut level = rows(ctx, arr_base);
+    let mut level = rows(ctx, array);
     if level.pending.is_some() {
         todo!("M6 correlated literal projection item");
     }
     project_literal_record_cells(ctx, &mut level, fields);
+    if let Some((method, method_args)) = prefix {
+        compose_limit(&mut level.builder, method, method_args, ctx);
+    }
     compose_limit(&mut level.builder, &collapse.value, collapse_args, ctx);
     let default = one_arg(args, name);
     let mut level = unwrap_or_record_rows(ctx, level, default);
