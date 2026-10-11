@@ -1759,6 +1759,7 @@ mod tests {
             active: Bool,
             created: Instant,
             profile: ?Profile,
+            maybe_pos: ?Tuple<Float, Float>@(mlat, mlng),
         }
         struct Profile {
             user: &User,
@@ -2356,6 +2357,29 @@ mod tests {
             let (file, _diags) = crate::parse_query(query);
             assert!(infer(&file.unwrap().result, &mut env).is_err(), "{query}");
         }
+    }
+
+    #[test]
+    fn tuple_access_optional_tuple() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _diags) = crate::parse_query("[(\"a\", 1)].first()?.1");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(
+            result.ty,
+            QueryType::Optional(Box::new(QueryType::Scalar(ScalarType::String)))
+        );
+    }
+
+    #[test]
+    fn tuple_access_optional_schema_field() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _diags) = crate::parse_query("users { x = maybe_pos?.1 }");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert!(matches!(result.ty, QueryType::List(_)));
+        let (file, _diags) = crate::parse_query("users { x = maybe_pos.1 }");
+        assert!(infer(&file.unwrap().result, &mut env).is_err());
     }
 
     #[test]

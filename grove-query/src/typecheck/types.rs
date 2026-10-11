@@ -185,9 +185,6 @@ impl QueryType {
     pub fn wrap_optional(self) -> QueryType {
         match self {
             QueryType::Optional(_) => self,
-            QueryType::Tuple(elems) => {
-                QueryType::Tuple(elems.into_iter().map(QueryType::wrap_optional).collect())
-            }
             other => QueryType::Optional(Box::new(other)),
         }
     }
