@@ -1132,10 +1132,12 @@ fn method_signature(base: &QueryType, method: &str) -> Option<MethodSig> {
             "max" | "min" if inner.has_defined_order() => {
                 Some(MethodSig::no_args(inner.clone().wrap_optional()))
             }
-            "sort" | "sort_asc" | "sort_desc" if matches!(inner.as_ref(), QueryType::Scalar(_)) => {
+            "sort" | "sort_asc" | "sort_desc" if inner.has_defined_order() => {
                 Some(MethodSig::no_args(QueryType::List(inner.clone())))
             }
-            "sort" | "sort_asc" | "sort_desc" if matches!(inner.as_ref(), QueryType::Record(_)) => {
+            "sort_over" | "sort_asc_over" | "sort_desc_over"
+                if matches!(inner.as_ref(), QueryType::Record(_)) =>
+            {
                 Some(MethodSig::scoped_at_least(
                     QueryType::List(inner.clone()),
                     1,
@@ -2198,9 +2200,48 @@ mod tests {
     fn method_arg_constraint_invalid() {
         let schema = test_schema();
         let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("users.sort_asc(profile)");
+        let (file, _diags) = crate::parse_query("users.sort_asc_over(profile)");
         let result = infer(&file.unwrap().result, &mut env);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn sort_no_arg_over_ordered() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _diags) = crate::parse_query("[3, 1, 2].sort()");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(
+            result.ty,
+            QueryType::List(Box::new(QueryType::Scalar(ScalarType::Int)))
+        );
+    }
+
+    #[test]
+    fn sort_no_arg_over_tuple() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _diags) = crate::parse_query("[(\"b\", 1), (\"a\", 2)].sort()");
+        assert!(infer(&file.unwrap().result, &mut env).is_ok());
+    }
+
+    #[test]
+    fn sort_no_arg_over_records_rejected() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _diags) = crate::parse_query("users.sort()");
+        assert!(infer(&file.unwrap().result, &mut env).is_err());
+    }
+
+    #[test]
+    fn sort_over_single_and_multi_key() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _diags) = crate::parse_query("users.sort_over(age)");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert!(matches!(result.ty, QueryType::List(_)));
+        let (file, _diags) = crate::parse_query("users.sort_desc_over(age, name)");
+        assert!(infer(&file.unwrap().result, &mut env).is_ok());
     }
 
     #[test]
