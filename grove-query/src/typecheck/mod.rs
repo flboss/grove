@@ -707,33 +707,73 @@ fn infer_method(
         },
     }
 
-    let is_scoped = matches!(&signature.args, ArgCheck::Scoped { .. });
-    let pushed_scope = is_scoped && env.push_record_fields(&resolve_ty);
+    let pushed_scope = match (&signature.args, name.value.as_str()) {
+        (ArgCheck::Scoped { .. }, "map") => {
+            env.push_scope();
+            if let QueryType::List(inner) = &resolve_ty {
+                env.define(
+                    "$".to_string(),
+                    inner.as_ref().clone(),
+                    IdentBinding::ListElement,
+                );
+            }
+            true
+        }
+        (ArgCheck::Scoped { .. }, _) => {
+            let pushed = env.push_record_fields(&resolve_ty);
+            let element_is_record = matches!(&resolve_ty, QueryType::List(inner) if matches!(inner.as_ref(), QueryType::Record(_)));
+            if !element_is_record {
+                if !pushed {
+                    env.push_scope();
+                }
+                if let QueryType::List(inner) = &resolve_ty {
+                    env.define(
+                        "$".to_string(),
+                        inner.as_ref().clone(),
+                        IdentBinding::ListElement,
+                    );
+                }
+                true
+            } else {
+                pushed
+            }
+        }
+        _ => false,
+    };
 
     let mut typed_args = Vec::new();
+    let mut arg_error = None;
     for (i, arg) in args.iter().enumerate() {
-        let mut typed = infer(&arg.expr, env)?;
+        let mut typed = match infer(&arg.expr, env) {
+            Ok(typed) => typed,
+            Err(err) => {
+                arg_error = Some(err);
+                break;
+            }
+        };
         match &mut signature.args {
             ArgCheck::Fixed(expected) => {
                 if let Some(exp_ty) = expected.get_mut(i)
                     && !types_compatible(&mut typed.ty, exp_ty, env.schema())
                 {
-                    return Err(TypeError::ArgTypeMismatch {
+                    arg_error = Some(TypeError::ArgTypeMismatch {
                         method: name.value.clone(),
                         expected: exp_ty.to_string(),
                         got: typed.ty.to_string(),
                         span: arg.expr.span(),
                     });
+                    break;
                 }
             }
             ArgCheck::Scoped { constraint, .. } => {
                 if !constraint(&typed.ty) {
-                    return Err(TypeError::ArgTypeMismatch {
+                    arg_error = Some(TypeError::ArgTypeMismatch {
                         method: name.value.clone(),
                         expected: "valid argument type".into(),
                         got: typed.ty.to_string(),
                         span: arg.expr.span(),
                     });
+                    break;
                 }
             }
         }
@@ -745,6 +785,9 @@ fn infer_method(
 
     if pushed_scope {
         env.pop_scope();
+    }
+    if let Some(err) = arg_error {
+        return Err(err);
     }
 
     let return_ty = match signature.return_type {
@@ -759,6 +802,9 @@ fn infer_method(
             if matches!(inner.as_ref(), QueryType::Scalar(ScalarType::Int)) =>
         {
             QueryType::Scalar(ScalarType::Float).wrap_optional()
+        }
+        ("map", _) if !typed_args.is_empty() => {
+            QueryType::List(Box::new(typed_args[0].expr.ty.clone()))
         }
         (_, ty) => ty,
     };
@@ -1182,6 +1228,12 @@ fn method_signature(base: &QueryType, method: &str) -> Option<MethodSig> {
             "filter" if matches!(inner.as_ref(), QueryType::Record(_)) => Some(
                 MethodSig::scoped_fixed(QueryType::List(inner.clone()), 1, QueryType::is_bool),
             ),
+            "filter" => Some(MethodSig::scoped_fixed(
+                QueryType::List(inner.clone()),
+                1,
+                QueryType::is_bool,
+            )),
+            "map" => Some(MethodSig::scoped_fixed(QueryType::Unknown, 1, |_| true)),
             "sum" if inner.is_summable() => Some(MethodSig::no_args(inner.clone().wrap_optional())),
             "avg"
                 if inner.is_summable()
@@ -1195,29 +1247,25 @@ fn method_signature(base: &QueryType, method: &str) -> Option<MethodSig> {
             "sort" | "sort_asc" | "sort_desc" if inner.has_defined_order() => {
                 Some(MethodSig::no_args(QueryType::List(inner.clone())))
             }
-            "sort_over" | "sort_asc_over" | "sort_desc_over"
-                if matches!(inner.as_ref(), QueryType::Record(_)) =>
-            {
-                Some(MethodSig::scoped_at_least(
-                    QueryType::List(inner.clone()),
-                    1,
-                    QueryType::has_defined_order,
-                ))
-            }
+            "sort_over" | "sort_asc_over" | "sort_desc_over" => Some(MethodSig::scoped_at_least(
+                QueryType::List(inner.clone()),
+                1,
+                QueryType::has_defined_order,
+            )),
             "take" | "skip" => Some(MethodSig::one_arg(
                 QueryType::List(inner.clone()),
                 QueryType::Scalar(Int),
             )),
-            "sum_over" | "avg_over" if matches!(inner.as_ref(), QueryType::Record(_)) => Some(
-                MethodSig::scoped_fixed(QueryType::Unknown, 1, QueryType::is_summable),
-            ),
-            "max_by" | "min_by" if matches!(inner.as_ref(), QueryType::Record(_)) => {
-                Some(MethodSig::scoped_fixed(
-                    inner.clone().wrap_optional(),
-                    1,
-                    QueryType::has_defined_order,
-                ))
-            }
+            "sum_over" | "avg_over" => Some(MethodSig::scoped_fixed(
+                QueryType::Unknown,
+                1,
+                QueryType::is_summable,
+            )),
+            "max_by" | "min_by" => Some(MethodSig::scoped_fixed(
+                inner.clone().wrap_optional(),
+                1,
+                QueryType::has_defined_order,
+            )),
             _ => None,
         },
         _ => None,
@@ -2389,6 +2437,120 @@ mod tests {
         let (file, _diags) = crate::parse_query("users { x = (\"a\", age).2 }");
         let result = infer(&file.unwrap().result, &mut env).unwrap();
         assert!(matches!(result.ty, QueryType::List(_)));
+    }
+
+    #[test]
+    fn dollar_sum_over() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _diags) = crate::parse_query("[1, 2, 3].sum_over($ + 1)");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(
+            result.ty,
+            QueryType::Optional(Box::new(QueryType::Scalar(ScalarType::Int)))
+        );
+    }
+
+    #[test]
+    fn dollar_filter() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _diags) = crate::parse_query("[-1, -2, 2, 3][$ > 0]");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(
+            result.ty,
+            QueryType::List(Box::new(QueryType::Scalar(ScalarType::Int)))
+        );
+    }
+
+    #[test]
+    fn dollar_map_transformation() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _diags) = crate::parse_query("[1, 2, 3].map($ - 1)");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(
+            result.ty,
+            QueryType::List(Box::new(QueryType::Scalar(ScalarType::Int)))
+        );
+        let (file, _diags) = crate::parse_query("[1, 2].map(($, $))");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert!(matches!(result.ty, QueryType::List(inner)
+            if matches!(inner.as_ref(), QueryType::Tuple(_))));
+    }
+
+    #[test]
+    fn dollar_over_family() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        for (query, check) in [
+            ("[1, 2, 3].avg_over($ + 3)", "?float"),
+            ("[3, 1, 2].max_by($ + 2)", "?int"),
+            ("[3, 1, 2].sort_over($ + 1, -$)", "list"),
+        ] {
+            let (file, _diags) = crate::parse_query(query);
+            let result = infer(&file.unwrap().result, &mut env).unwrap();
+            match check {
+                "?float" => assert_eq!(
+                    result.ty,
+                    QueryType::Optional(Box::new(QueryType::Scalar(ScalarType::Float)))
+                ),
+                "?int" => assert_eq!(
+                    result.ty,
+                    QueryType::Optional(Box::new(QueryType::Scalar(ScalarType::Int)))
+                ),
+                _ => assert!(matches!(result.ty, QueryType::List(_))),
+            }
+        }
+    }
+
+    #[test]
+    fn dollar_binds_element() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _diags) = crate::parse_query("[1, 2].map($)");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        let TypedExprKind::Method { args, .. } = &result.kind else {
+            panic!("expected method");
+        };
+        let TypedExprKind::Ident { name, binding, .. } = &args[0].expr.kind else {
+            panic!("expected ident");
+        };
+        assert_eq!(name.value, "$");
+        assert_eq!(*binding, IdentBinding::ListElement);
+        let (file, _diags) = crate::parse_query("[[1, 2], [3]].map($.map($ + 1))");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(
+            result.ty,
+            QueryType::List(Box::new(QueryType::List(Box::new(QueryType::Scalar(
+                ScalarType::Int
+            )))))
+        );
+    }
+
+    #[test]
+    fn dollar_not_in_record_scope() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _diags) = crate::parse_query("users.filter($)");
+        assert!(infer(&file.unwrap().result, &mut env).is_err());
+        let (file, _diags) = crate::parse_query("users.filter(age > 0)");
+        assert!(infer(&file.unwrap().result, &mut env).is_ok());
+        let (file, _diags) = crate::parse_query("users.map(name)");
+        assert!(infer(&file.unwrap().result, &mut env).is_err());
+        let (file, _diags) = crate::parse_query("users.map($)");
+        assert!(infer(&file.unwrap().result, &mut env).is_ok());
+    }
+
+    #[test]
+    fn dollar_outside_scope_rejected() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _diags) = crate::parse_query("$ + 1");
+        assert!(infer(&file.unwrap().result, &mut env).is_err());
+        let (file, _diags) = crate::parse_query("[].map($)");
+        let (typed, diags) = typecheck(file.unwrap(), &schema);
+        assert!(typed.is_none() && !diags.is_empty());
     }
 
     #[test]

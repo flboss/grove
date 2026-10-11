@@ -122,6 +122,7 @@ pub enum IdentBinding {
     Field(FieldId),
     ProjectedField { name: String },
     Prev { struct_id: StructId },
+    ListElement,
 }
 
 #[derive(Debug, Clone, PartialEq)]
