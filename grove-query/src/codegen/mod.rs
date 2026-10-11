@@ -1,4 +1,6 @@
 pub mod builder;
+#[cfg(test)]
+mod corpus;
 mod lower;
 pub mod model;
 pub mod render;
