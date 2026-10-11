@@ -18658,7 +18658,22 @@ fn single_hop_scalar_level(ctx: &mut Context, base: &TypedExpr) -> Option<Level>
     if ctx.child.is_some() || ctx.nest_depth >= 1 || ctx.temp_collect.is_some() || ctx.in_take_arg {
         return None;
     }
-    let TypedExprKind::Field { base: mid_base, .. } = &base.kind else {
+    let (core, prefix) = match &base.kind {
+        TypedExprKind::Method {
+            base: inner,
+            name,
+            args,
+            ..
+        } if ["take", "skip"].contains(&name.value.as_str()) => {
+            let [bound] = args.as_slice() else {
+                return None;
+            };
+            const_int_lit(&bound.expr)?;
+            (inner.as_ref(), Some((name.value.as_str(), args)))
+        }
+        _ => (base, None),
+    };
+    let TypedExprKind::Field { base: mid_base, .. } = &core.kind else {
         return None;
     };
     if !matches!(
@@ -18668,7 +18683,11 @@ fn single_hop_scalar_level(ctx: &mut Context, base: &TypedExpr) -> Option<Level>
             ..
         }
     ) {
-        return multi_hop_scalar_level(ctx, base);
+        let mut level = multi_hop_scalar_level(ctx, core)?;
+        if let Some((method, method_args)) = prefix {
+            compose_limit(&mut level.builder, method, method_args, ctx);
+        }
+        return Some(level);
     }
     let TypedExprKind::Ident {
         binding: IdentBinding::Field(_),
@@ -18678,7 +18697,7 @@ fn single_hop_scalar_level(ctx: &mut Context, base: &TypedExpr) -> Option<Level>
     else {
         return None;
     };
-    let parts = single_hop_parts(ctx, base)?;
+    let parts = single_hop_parts(ctx, core)?;
     let FromClause::Table { table, alias } = parts.child_from.clone() else {
         return None;
     };
@@ -18695,15 +18714,19 @@ fn single_hop_scalar_level(ctx: &mut Context, base: &TypedExpr) -> Option<Level>
             column: parts.middle_fk,
         }),
     }];
-    Some(Level {
+    let mut level = Level {
         builder,
-        element: base.ty.clone(),
+        element: core.ty.clone(),
         parent: ParentLink::Root { root_idx: 0 },
         pending: None,
         stmt_bound: true,
         output_shapes: None,
         root_parts: None,
-    })
+    };
+    if let Some((method, method_args)) = prefix {
+        compose_limit(&mut level.builder, method, method_args, ctx);
+    }
+    Some(level)
 }
 
 fn multi_hop_scalar_level(ctx: &mut Context, base: &TypedExpr) -> Option<Level> {

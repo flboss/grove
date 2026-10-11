@@ -1309,6 +1309,30 @@ fn single_hop_project_and_scalar_values() {
             rec(&[("x", Value::Int(1))]),
         ])
     );
+    assert_eq!(
+        value("users { x = manager.orders.take(1).len() }"),
+        Value::List(vec![
+            rec(&[("x", Value::Int(1))]),
+            rec(&[("x", Value::Int(1))]),
+            rec(&[("x", Value::Int(1))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = manager.orders.skip(1).len() }"),
+        Value::List(vec![
+            rec(&[("x", Value::Int(0))]),
+            rec(&[("x", Value::Int(0))]),
+            rec(&[("x", Value::Int(0))]),
+        ])
+    );
+    assert_eq!(
+        value("users { x = manager.orders.take(0).len() }"),
+        Value::List(vec![
+            rec(&[("x", Value::Int(0))]),
+            rec(&[("x", Value::Int(0))]),
+            rec(&[("x", Value::Int(0))]),
+        ])
+    );
 }
 
 const CHAIN_SCHEMA_SRC: &str = r#"
@@ -1405,6 +1429,22 @@ fn multi_hop_single_scalar_values() {
     assert_eq!(
         chain_value("users.filter(manager.orders.len() > 1) { n = name }"),
         Value::List(vec![rec(&[("n", Value::String("Dave".to_string()))])])
+    );
+    assert_eq!(
+        chain_value("users { n = manager.orders.take(1).len() }"),
+        Value::List(vec![n(1), n(1), n(1), n(1)])
+    );
+    assert_eq!(
+        chain_value("users { n = manager.orders.skip(1).len() }"),
+        Value::List(vec![n(0), n(0), n(0), n(1)])
+    );
+    assert_eq!(
+        chain_value("users { n = manager.orders.take(0).len() }"),
+        Value::List(vec![n(0), n(0), n(0), n(0)])
+    );
+    assert_eq!(
+        chain_value("users { n = manager.manager.orders.take(1).len() }"),
+        Value::List(vec![n(1), n(1), n(1), n(1)])
     );
 }
 
