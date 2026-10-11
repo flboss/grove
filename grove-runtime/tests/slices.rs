@@ -3676,6 +3676,20 @@ fn slice_unwrap_or_records() {
             )]),
         ])
     );
+    let a = |v: i64| rec(&[("a", Value::Int(v))]);
+    let xa = |v: i64| rec(&[("x", a(v))]);
+    assert_eq!(
+        value("users { x = [{a = 1}].first().unwrap_or({a = 0}) }"),
+        Value::List(vec![xa(1), xa(1), xa(1)])
+    );
+    assert_eq!(
+        value("users { x = [{a = 1}, {a = 2}].nth(1).unwrap_or({a = 0}) }"),
+        Value::List(vec![xa(2), xa(2), xa(2)])
+    );
+    assert_eq!(
+        value("users { x = [{a = 1}].nth(5).unwrap_or({a = 0}) }"),
+        Value::List(vec![xa(0), xa(0), xa(0)])
+    );
 }
 
 #[test]

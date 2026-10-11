@@ -1585,6 +1585,20 @@ fn rows_method(
             level
         }
         "unwrap_or" if matches!(peel_optional(&level.element), QueryType::Record(_)) => {
+            if let TypedExprKind::Method {
+                base: collapse_base,
+                name: method,
+                ..
+            } = &base.kind
+                && (method.value == "first" || method.value == "nth")
+                && matches!(&collapse_base.kind, TypedExprKind::Array { .. })
+                && let QueryType::Record(RecordSource::Projection(fields)) = peel_optional(&base.ty)
+                && !args
+                    .iter()
+                    .any(|a| has_scope_ident(&a.expr) || uses_outer(&a.expr))
+            {
+                project_literal_record_cells(ctx, &mut level, fields);
+            }
             unwrap_or_record_rows(ctx, level, one_arg(args, name))
         }
         "unwrap" => assert_present_rows(ctx, level, "unwrap failed: value was none".to_string()),
@@ -2613,6 +2627,31 @@ fn b1_temp_levels(
     ctx.temp_collect.take();
     (element, child)
 }
+fn project_literal_record_cells(
+    ctx: &Context,
+    level: &mut Level,
+    fields: &[ProjectionField],
+) -> bool {
+    if level.builder.select.is_empty() {
+        level.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+    }
+    let served = builder_outputs(&level.builder, ctx.schema);
+    let positional: Vec<String> = (0..fields.len()).map(|i| format!("c{i}")).collect();
+    if served != positional {
+        return false;
+    }
+    level.builder.select = fields
+        .iter()
+        .map(|field| SelectItem::Column {
+            depth: 0,
+            column: literal_field_col(&served, fields, &field.name),
+            output: field.name.clone(),
+            ty: scalar_of(&field.ty),
+        })
+        .collect();
+    true
+}
+
 fn b1_literal(ctx: &mut Context, value: &TypedExpr) -> (Vec<SelectItem>, ResultShape, Vec<String>) {
     let mut root = rows(ctx, value);
     let hops = root.pending.take().map(drain_pending).unwrap_or_default();
@@ -3753,6 +3792,9 @@ fn unwrap_or_record_rows(ctx: &mut Context, level: Level, default: &TypedExpr) -
             let Some((_, field_expr)) = fields.iter().find(|(fname, _)| fname.value == *col) else {
                 todo!("M4 presence-directed unwrap over records");
             };
+            if !field_expr.ty.is_scalar() {
+                todo!("M4 presence-directed unwrap over records");
+            }
             select.push(SelectItem::Expr {
                 expr: scalar(ctx, field_expr),
                 output: col.clone(),
@@ -10943,22 +10985,7 @@ fn broadcast_first(ctx: &mut Context, base: &TypedExpr) -> (ResultShape, Option<
         _ => &base.ty,
     };
     if let QueryType::Record(RecordSource::Projection(fields)) = peel_optional(item_ty) {
-        if level.builder.select.is_empty() {
-            level.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
-        }
-        let served = builder_outputs(&level.builder, ctx.schema);
-        let positional: Vec<String> = (0..fields.len()).map(|i| format!("c{i}")).collect();
-        if served == positional {
-            level.builder.select = fields
-                .iter()
-                .map(|field| SelectItem::Column {
-                    depth: 0,
-                    column: literal_field_col(&served, fields, &field.name),
-                    output: field.name.clone(),
-                    ty: scalar_of(&field.ty),
-                })
-                .collect();
-        }
+        project_literal_record_cells(ctx, &mut level, fields);
     }
     compose_limit(&mut level.builder, "first", &[], ctx);
     if level.builder.select.is_empty() {
@@ -10992,6 +11019,103 @@ fn broadcast_first(ctx: &mut Context, base: &TypedExpr) -> (ResultShape, Option<
         },
     };
     (shape, None)
+}
+
+fn broadcast_collapse_unwrap_level(
+    ctx: &mut Context,
+    base: &TypedExpr,
+    args: &[TypedMethodArg],
+    name: &grove_types::Spanned<String>,
+) -> Option<Level> {
+    let TypedExprKind::Method {
+        base: arr_base,
+        name: collapse,
+        args: collapse_args,
+        ..
+    } = &base.kind
+    else {
+        return None;
+    };
+    if collapse.value != "first" && collapse.value != "nth" {
+        return None;
+    }
+    if !matches!(&arr_base.kind, TypedExprKind::Array { .. }) || has_scope_ident(arr_base) {
+        return None;
+    }
+    if collapse.value == "nth" {
+        let [index] = collapse_args.as_slice() else {
+            return None;
+        };
+        if has_scope_ident(&index.expr) || uses_outer(&index.expr) {
+            return None;
+        }
+    }
+    let item_ty = match &base.ty {
+        QueryType::List(sub) => sub.as_ref(),
+        _ => &base.ty,
+    };
+    let QueryType::Record(RecordSource::Projection(fields)) = peel_optional(item_ty) else {
+        return None;
+    };
+    if args
+        .iter()
+        .any(|a| has_scope_ident(&a.expr) || uses_outer(&a.expr))
+    {
+        return None;
+    }
+    let mut level = rows(ctx, arr_base);
+    if level.pending.is_some() {
+        todo!("M6 correlated literal projection item");
+    }
+    project_literal_record_cells(ctx, &mut level, fields);
+    compose_limit(&mut level.builder, &collapse.value, collapse_args, ctx);
+    let default = one_arg(args, name);
+    let mut level = unwrap_or_record_rows(ctx, level, default);
+    if level.builder.select.is_empty() {
+        level.builder.select = vec![SelectItem::AllFrom { depth: 0 }];
+    }
+    Some(level)
+}
+
+fn broadcast_collapse_unwrap(
+    ctx: &mut Context,
+    base: &TypedExpr,
+    args: &[TypedMethodArg],
+    name: &grove_types::Spanned<String>,
+) -> Option<(ResultShape, Option<String>)> {
+    let level = broadcast_collapse_unwrap_level(ctx, base, args, name)?;
+    let item_ty = match &base.ty {
+        QueryType::List(sub) => sub.as_ref(),
+        _ => &base.ty,
+    };
+    let outputs = builder_outputs(&level.builder, ctx.schema);
+    let shape_cols: Vec<OutputColumn> =
+        shape_columns(builder_output_types(&level.builder, ctx.schema), |_| false);
+    let element = child_element(
+        ctx.schema,
+        level.output_shapes.as_ref(),
+        item_ty,
+        &outputs,
+        |_| false,
+    );
+    let idx = ctx.sink(
+        level.builder,
+        StatementShape {
+            columns: shape_cols,
+            rows: RowCount::ZeroOrOne,
+        },
+        StatementKind::Query,
+    );
+    let shape = ResultShape::Single {
+        element: Box::new(element),
+        child: ChildRef {
+            stmt: idx,
+            parent: None,
+            cardinality: Cardinality::One,
+            tag: None,
+        },
+    };
+    Some((shape, None))
 }
 
 fn rscalar_shape(
@@ -11089,6 +11213,14 @@ fn rscalar_shape(
             }
             if name.value != "nth" || !nth_temp_routable(tail) {
                 todo!("M4b ordered per-parent single")
+            }
+            tail
+        }
+        TypedExprKind::Method {
+            base, name, args, ..
+        } if name.value == "unwrap_or" => {
+            if let Some(shape) = broadcast_collapse_unwrap(ctx, base, args, name) {
+                return shape;
             }
             tail
         }
@@ -14538,6 +14670,40 @@ pub fn lower_query(ctx: &mut Context, result: &TypedExpr) -> RootPlan {
     }
     if let Some(plan) = lower_literal_fork(ctx, result) {
         return plan;
+    }
+    if matches!(&result.ty, QueryType::Record(_))
+        && let TypedExprKind::Method {
+            base, name, args, ..
+        } = &result.kind
+        && name.value == "unwrap_or"
+        && let Some(level) = broadcast_collapse_unwrap_level(ctx, base, args, name)
+    {
+        let outputs = builder_outputs(&level.builder, ctx.schema);
+        let shape_cols: Vec<OutputColumn> =
+            shape_columns(builder_output_types(&level.builder, ctx.schema), |_| false);
+        let element = child_element(
+            ctx.schema,
+            level.output_shapes.as_ref(),
+            &result.ty,
+            &outputs,
+            |_| false,
+        );
+        return RootPlan {
+            builder: level.builder,
+            shape: StatementShape {
+                columns: shape_cols,
+                rows: RowCount::ZeroOrOne,
+            },
+            result: ResultShape::Single {
+                element: Box::new(element),
+                child: ChildRef {
+                    stmt: 0,
+                    parent: None,
+                    cardinality: Cardinality::One,
+                    tag: None,
+                },
+            },
+        };
     }
     let level = rows(ctx, result);
     finalize_level(ctx, level)
