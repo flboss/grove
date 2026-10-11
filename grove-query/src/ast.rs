@@ -91,6 +91,12 @@ pub enum Expr {
         optional: bool,
         span: Span,
     },
+    TupleAccess {
+        base: Box<Expr>,
+        index: Spanned<i64>,
+        optional: bool,
+        span: Span,
+    },
     Method {
         base: Box<Expr>,
         name: Spanned<String>,
@@ -123,6 +129,7 @@ impl Expr {
             | Expr::Binary { span, .. }
             | Expr::Cast { span, .. }
             | Expr::Field { span, .. }
+            | Expr::TupleAccess { span, .. }
             | Expr::Method { span, .. }
             | Expr::Projection { span, .. } => *span,
         }

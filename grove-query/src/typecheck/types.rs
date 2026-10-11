@@ -54,6 +54,11 @@ pub enum TypedExprKind {
         name: Spanned<String>,
         optional: bool,
     },
+    TupleAccess {
+        base: Box<TypedExpr>,
+        index: usize,
+        optional: bool,
+    },
     Method {
         base: Box<TypedExpr>,
         name: Spanned<String>,

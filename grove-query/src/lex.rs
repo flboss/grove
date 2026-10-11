@@ -11,6 +11,7 @@ pub struct Lexer<'src> {
     peeked: Option<Token>,
     peeked2: Option<Token>,
     diagnostics: Vec<Diagnostic>,
+    after_dot: bool,
 }
 
 impl<'src> Lexer<'src> {
@@ -21,15 +22,19 @@ impl<'src> Lexer<'src> {
             peeked: None,
             peeked2: None,
             diagnostics: Vec::new(),
+            after_dot: false,
         }
     }
 
     pub fn next_token(&mut self) -> Token {
-        if let Some(tok) = self.peeked.take() {
+        let tok = if let Some(tok) = self.peeked.take() {
             self.peeked = self.peeked2.take();
-            return tok;
-        }
-        self.advance()
+            tok
+        } else {
+            self.advance_inner()
+        };
+        self.after_dot = matches!(tok.value, TokenKind::Dot | TokenKind::QuestionDot);
+        tok
     }
 
     pub fn peek(&mut self) -> &Token {
@@ -52,6 +57,12 @@ impl<'src> Lexer<'src> {
     }
 
     fn advance(&mut self) -> Token {
+        let tok = self.advance_inner();
+        self.after_dot = matches!(tok.value, TokenKind::Dot | TokenKind::QuestionDot);
+        tok
+    }
+
+    fn advance_inner(&mut self) -> Token {
         loop {
             self.skip_whitespace_and_comments();
             let start = self.pos;
@@ -90,7 +101,12 @@ impl<'src> Lexer<'src> {
                 ':' => self.scan_colon_or_error(start),
                 '"' => self.scan_string(start),
                 '`' => self.scan_backtick_ident(start),
-                '0'..='9' => return self.scan_number(start),
+                '0'..='9' => {
+                    if self.after_dot {
+                        return self.scan_postdot_int(start);
+                    }
+                    return self.scan_number(start);
+                }
                 '@' => return self.scan_instant(start),
                 '#' => return self.scan_duration(start),
                 _ => {
@@ -195,6 +211,19 @@ impl<'src> Lexer<'src> {
             span: self.span_from(start),
         });
         self.advance()
+    }
+
+    fn scan_postdot_int(&mut self, start: usize) -> Token {
+        self.scan_ascii_digits();
+        match self.source[start..self.pos].parse::<i64>() {
+            Ok(n) => self.make_token(start, TokenKind::IntLit(n)),
+            Err(_) => {
+                self.emit_error(QueryLexError::IntLiteralOverflow {
+                    span: self.span_from(start),
+                });
+                self.advance()
+            }
+        }
     }
 
     fn scan_number(&mut self, start: usize) -> Token {
@@ -1574,6 +1603,30 @@ mod tests {
         assert_ident!(lex, "a");
         assert_ident!(lex, "b");
         assert_eq!(lex.take_diagnostics().len(), 1);
+    }
+
+    #[test]
+    fn postdot_digits_lex_as_ints() {
+        let mut lex = Lexer::new("trio.2.1");
+        assert_ident!(lex, "trio");
+        assert_token!(lex, TokenKind::Dot);
+        assert_token!(lex, TokenKind::IntLit(2));
+        assert_token!(lex, TokenKind::Dot);
+        assert_token!(lex, TokenKind::IntLit(1));
+        assert_eof!(lex);
+        assert!(lex.take_diagnostics().is_empty());
+    }
+
+    #[test]
+    fn postdot_float_shape_stays_split() {
+        let mut lex = Lexer::new("a.1.5");
+        assert_ident!(lex, "a");
+        assert_token!(lex, TokenKind::Dot);
+        assert_token!(lex, TokenKind::IntLit(1));
+        assert_token!(lex, TokenKind::Dot);
+        assert_token!(lex, TokenKind::IntLit(5));
+        assert_eof!(lex);
+        assert!(lex.take_diagnostics().is_empty());
     }
 
     #[test]

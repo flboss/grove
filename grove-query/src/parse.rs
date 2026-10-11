@@ -203,33 +203,51 @@ impl<'src> Parser<'src> {
                 TokenKind::Dot | TokenKind::QuestionDot => {
                     let optional = matches!(self.current.value, TokenKind::QuestionDot);
                     self.bump();
-                    let Ok(name) = self.expect_ident() else {
-                        self.emit_error(QueryParseError::ExpectedIdentAfterDot {
-                            span: self.current.span,
-                        });
-                        return Err(());
-                    };
-                    if matches!(self.current.value, TokenKind::LParen) {
-                        let args = self.parse_method_args()?;
-                        let span = self.span_from(expr.span().start);
-                        expr = Expr::Method {
+                    if let TokenKind::IntLit(n) = &self.current.value {
+                        let (n, index_span) = (*n, self.current.span);
+                        self.bump();
+                        let span = Span {
+                            start: expr.span().start,
+                            end: index_span.end,
+                        };
+                        expr = Expr::TupleAccess {
                             base: Box::new(expr),
-                            name,
-                            args,
+                            index: Spanned {
+                                span: index_span,
+                                value: n,
+                            },
                             optional,
                             span,
                         };
                     } else {
-                        let span = Span {
-                            start: expr.span().start,
-                            end: name.span.end,
+                        let Ok(name) = self.expect_ident() else {
+                            self.emit_error(QueryParseError::ExpectedIdentAfterDot {
+                                span: self.current.span,
+                            });
+                            return Err(());
                         };
-                        expr = Expr::Field {
-                            base: Box::new(expr),
-                            name,
-                            optional,
-                            span,
-                        };
+                        if matches!(self.current.value, TokenKind::LParen) {
+                            let args = self.parse_method_args()?;
+                            let span = self.span_from(expr.span().start);
+                            expr = Expr::Method {
+                                base: Box::new(expr),
+                                name,
+                                args,
+                                optional,
+                                span,
+                            };
+                        } else {
+                            let span = Span {
+                                start: expr.span().start,
+                                end: name.span.end,
+                            };
+                            expr = Expr::Field {
+                                base: Box::new(expr),
+                                name,
+                                optional,
+                                span,
+                            };
+                        }
                     }
                 }
                 TokenKind::LBracket => {
@@ -412,6 +430,24 @@ impl<'src> Parser<'src> {
         while matches!(self.current.value, TokenKind::Dot | TokenKind::QuestionDot) {
             let optional = matches!(self.current.value, TokenKind::QuestionDot);
             self.bump();
+            if let TokenKind::IntLit(n) = &self.current.value {
+                let (n, index_span) = (*n, self.current.span);
+                self.bump();
+                let span = Span {
+                    start: expr.span().start,
+                    end: index_span.end,
+                };
+                expr = Expr::TupleAccess {
+                    base: Box::new(expr),
+                    index: Spanned {
+                        span: index_span,
+                        value: n,
+                    },
+                    optional,
+                    span,
+                };
+                continue;
+            }
             let span = self.span_from(expr.span().start);
             let Ok(name) = self.expect_ident() else {
                 self.emit_error(QueryParseError::ExpectedIdentAfterDot {
@@ -1221,6 +1257,45 @@ mod tests {
             args,
             ..
         } if n == "len" && args.is_empty()));
+    }
+
+    #[test]
+    fn tuple_access_single() {
+        let expr = parse_ok("pos.1");
+        assert!(matches!(
+            expr,
+            Expr::TupleAccess {
+                index: Spanned { value: 1, .. },
+                optional: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn tuple_access_chained() {
+        let expr = parse_ok("trio.2.1");
+        assert!(matches!(expr, Expr::TupleAccess {
+            base,
+            index: Spanned { value: 1, .. },
+            ..
+        } if matches!(base.as_ref(), Expr::TupleAccess {
+            index: Spanned { value: 2, .. },
+            ..
+        })));
+    }
+
+    #[test]
+    fn tuple_access_optional() {
+        let expr = parse_ok("t?.2");
+        assert!(matches!(
+            expr,
+            Expr::TupleAccess {
+                index: Spanned { value: 2, .. },
+                optional: true,
+                ..
+            }
+        ));
     }
 
     #[test]

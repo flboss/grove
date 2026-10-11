@@ -213,6 +213,15 @@ fn infer(expr: &Expr, env: &mut TypeEnv) -> Result<TypedExpr, TypeError> {
             let typed_base = infer(base, env)?;
             infer_field(typed_base, name, *optional, env.schema())
         }
+        Expr::TupleAccess {
+            base,
+            index,
+            optional,
+            ..
+        } => {
+            let typed_base = infer(base, env)?;
+            infer_tuple_access(typed_base, index, *optional)
+        }
         Expr::Method {
             base,
             name,
@@ -578,6 +587,57 @@ fn infer_field(
             optional,
         },
         ty: field_ty,
+        span,
+    })
+}
+
+fn infer_tuple_access(
+    base: TypedExpr,
+    index: &Spanned<i64>,
+    optional: bool,
+) -> Result<TypedExpr, TypeError> {
+    let lookup_ty = if optional {
+        match &base.ty {
+            QueryType::Optional(inner) => inner.as_ref().clone(),
+            other => {
+                return Err(TypeError::ArgTypeMismatch {
+                    method: format!(".{}", index.value),
+                    expected: "optional type".into(),
+                    got: other.to_string(),
+                    span: index.span,
+                });
+            }
+        }
+    } else {
+        base.ty.clone()
+    };
+    let QueryType::Tuple(elems) = &lookup_ty else {
+        return Err(TypeError::TupleAccessOnNonTuple {
+            base_ty: base.ty.to_string(),
+            span: index.span,
+        });
+    };
+    let n = index.value;
+    if n < 1 || (n as usize) > elems.len() {
+        return Err(TypeError::TupleIndexOutOfRange {
+            index: n,
+            len: elems.len(),
+            span: index.span,
+        });
+    }
+    let pos = n as usize - 1;
+    let mut elem_ty = elems[pos].clone();
+    if optional {
+        elem_ty = elem_ty.wrap_optional();
+    }
+    let span = Span::new(base.span.start, index.span.end);
+    Ok(TypedExpr {
+        kind: TypedExprKind::TupleAccess {
+            base: Box::new(base),
+            index: pos,
+            optional,
+        },
+        ty: elem_ty,
         span,
     })
 }
@@ -1239,6 +1299,11 @@ fn check(
         TypedExprKind::Literal(_) | TypedExprKind::Ident { .. } => {}
         // no propagation
         TypedExprKind::Field { base, .. } => {
+            let mut base_ty = base.ty.clone();
+            check(base, &mut base_ty, env)?;
+        }
+        // no propagation
+        TypedExprKind::TupleAccess { base, .. } => {
             let mut base_ty = base.ty.clone();
             check(base, &mut base_ty, env)?;
         }
@@ -2242,6 +2307,64 @@ mod tests {
         assert!(matches!(result.ty, QueryType::List(_)));
         let (file, _diags) = crate::parse_query("users.sort_desc_over(age, name)");
         assert!(infer(&file.unwrap().result, &mut env).is_ok());
+    }
+
+    #[test]
+    fn tuple_access() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _diags) = crate::parse_query("(\"a\", 1).1");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::String));
+        let (file, _diags) = crate::parse_query("(\"a\", 1).2");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Int));
+    }
+
+    #[test]
+    fn tuple_access_chained() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _diags) = crate::parse_query("((\"a\", 1), 2).1.2");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Int));
+    }
+
+    #[test]
+    fn tuple_access_optional() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _diags) = crate::parse_query("(\"a\", 1)?.1");
+        assert!(infer(&file.unwrap().result, &mut env).is_err());
+    }
+
+    #[test]
+    fn tuple_access_out_of_range() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        for query in ["(\"a\", 1).3", "(\"a\", 1).0"] {
+            let (file, _diags) = crate::parse_query(query);
+            assert!(infer(&file.unwrap().result, &mut env).is_err(), "{query}");
+        }
+    }
+
+    #[test]
+    fn tuple_access_on_non_tuple() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        for query in ["\"a\".1", "users.1", "[1, 2].1"] {
+            let (file, _diags) = crate::parse_query(query);
+            assert!(infer(&file.unwrap().result, &mut env).is_err(), "{query}");
+        }
+    }
+
+    #[test]
+    fn tuple_access_over_scope() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _diags) = crate::parse_query("users { x = (\"a\", age).2 }");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert!(matches!(result.ty, QueryType::List(_)));
     }
 
     #[test]
