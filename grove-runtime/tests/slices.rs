@@ -1139,6 +1139,22 @@ fn lit_record_field_access_values() {
         value("[{x = 1, y = 2}].y"),
         Value::List(vec![Value::Int(2)])
     );
+    assert_eq!(
+        value("[{xs = [1], y = 2}].y"),
+        Value::List(vec![Value::Int(2)])
+    );
+    assert_eq!(
+        value("[{xs = [1], y = 2}, {xs = [3], y = 4}].y"),
+        Value::List(vec![Value::Int(2), Value::Int(4)])
+    );
+    assert_eq!(
+        value("[{xs = [1], y = 1 + 1}].y"),
+        Value::List(vec![Value::Int(2)])
+    );
+    assert_eq!(
+        value("[{a = [{b = 1}], c = 5}].c"),
+        Value::List(vec![Value::Int(5)])
+    );
 }
 
 #[test]

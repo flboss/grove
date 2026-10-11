@@ -562,6 +562,10 @@ fn middle_col(level: &Level, name: &str) -> Option<String> {
     if level.pending.is_some() {
         return None;
     }
+    middle_parts_col(&level.builder.from, name)
+}
+
+fn middle_parts_col(from: &Option<FromClause>, name: &str) -> Option<String> {
     fn leaf(parts: &[MiddlePart], name: &str) -> Option<String> {
         for part in parts {
             match part {
@@ -581,7 +585,7 @@ fn middle_col(level: &Level, name: &str) -> Option<String> {
         }
         None
     }
-    let parts = match level.builder.from.as_ref() {
+    let parts = match from.as_ref() {
         Some(FromClause::Literal { middle_parts, .. }) => middle_parts.as_ref()?,
         Some(FromClause::Computed { middle_parts, .. }) => middle_parts.as_ref()?,
         _ => return None,
@@ -746,7 +750,13 @@ fn rows_field(
                 column: match middle_col(&level, &name.value) {
                     Some(col) => col,
                     None if lit_has_nested_split(&level) => {
-                        todo!("M6 query-valued array element");
+                        match middle_parts_col(&level.builder.from, &name.value) {
+                            Some(col) => {
+                                level.pending = None;
+                                col
+                            }
+                            None => todo!("M6 query-valued array element"),
+                        }
                     }
                     None => name.value.clone(),
                 },
