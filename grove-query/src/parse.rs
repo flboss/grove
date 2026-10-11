@@ -560,6 +560,13 @@ impl<'src> Parser<'src> {
                     value: "prev".to_string(),
                 }))
             }
+            TokenKind::Dollar => {
+                self.bump();
+                Ok(Expr::Ident(Spanned {
+                    span,
+                    value: "$".to_string(),
+                }))
+            }
             TokenKind::LParen => self.parse_tuple_or_group(),
             TokenKind::LBracket => self.parse_array(),
             TokenKind::Some => self.parse_some(),
@@ -1296,6 +1303,17 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn dollar_as_ident() {
+        let expr = parse_ok("[1, 2].filter($ > 0)");
+        let Expr::Method { args, .. } = expr else {
+            panic!("expected method");
+        };
+        assert_eq!(args.len(), 1);
+        assert!(matches!(&args[0].expr, Expr::Binary { lhs, .. }
+            if matches!(lhs.as_ref(), Expr::Ident(name) if name.value == "$")));
     }
 
     #[test]
