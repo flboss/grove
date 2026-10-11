@@ -342,6 +342,29 @@ fn collapse_is_some_is_none_values() {
             ]),
         ])
     );
+    let tb = |q: &str| value(&format!("users {{ name, h = orders.{q}.is_some() }}"));
+    let tbm = |name: &str, h: bool| {
+        Value::Record(vec![
+            ("name".to_string(), Value::String(name.to_string())),
+            ("h".to_string(), Value::Bool(h)),
+        ])
+    };
+    assert_eq!(
+        tb("take(1).first()"),
+        Value::List(vec![tbm("Ada", true), tbm("Bob", true)])
+    );
+    assert_eq!(
+        tb("nth(1)"),
+        Value::List(vec![tbm("Ada", true), tbm("Bob", false)])
+    );
+    assert_eq!(
+        tb("take(2).nth(1)"),
+        Value::List(vec![tbm("Ada", true), tbm("Bob", false)])
+    );
+    assert_eq!(
+        tb("take(0).first()"),
+        Value::List(vec![tbm("Ada", false), tbm("Bob", false)])
+    );
 }
 
 #[test]

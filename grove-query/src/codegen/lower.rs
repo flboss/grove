@@ -16648,6 +16648,29 @@ fn collapse_parks_split(mut node: &TypedExpr) -> bool {
     }
 }
 
+fn collapse_chain_lowerable(mut node: &TypedExpr, mut seen_collapse: bool) -> bool {
+    loop {
+        match &node.kind {
+            TypedExprKind::Method { base, name, .. }
+                if ["first", "nth", "take", "skip"].contains(&name.value.as_str()) =>
+            {
+                node = base;
+                seen_collapse = true;
+            }
+            TypedExprKind::Field { base, .. } | TypedExprKind::Projection { base, .. } => {
+                if !seen_collapse {
+                    return false;
+                }
+                node = base;
+            }
+            TypedExprKind::Ident { .. }
+            | TypedExprKind::Array { .. }
+            | TypedExprKind::Literal(_) => return true,
+            _ => return false,
+        }
+    }
+}
+
 fn presence_base(mut node: &TypedExpr) -> Option<&TypedExpr> {
     loop {
         match &node.kind {
@@ -18462,6 +18485,13 @@ fn scalar_method(
                                 vec![SelectItem::AllFrom { depth: 0 }],
                             )));
                         }
+                        if collapse_chain_lowerable(base, false) {
+                            return SqlExpr::Exists(Box::new(single_row_query(
+                                ctx,
+                                base,
+                                vec![SelectItem::AllFrom { depth: 0 }],
+                            )));
+                        }
                         todo!("M4 list-optional mechanics");
                     }
                     SqlExpr::Exists(Box::new(single_row_query(
@@ -18479,6 +18509,11 @@ fn scalar_method(
                                     bottom,
                                     vec![SelectItem::AllFrom { depth: 0 }],
                                 ),
+                            ))));
+                        }
+                        if collapse_chain_lowerable(base, false) {
+                            return SqlExpr::Not(Box::new(SqlExpr::Exists(Box::new(
+                                single_row_query(ctx, base, vec![SelectItem::AllFrom { depth: 0 }]),
                             ))));
                         }
                         todo!("M4 list-optional mechanics");
