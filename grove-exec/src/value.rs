@@ -51,7 +51,11 @@ impl fmt::Display for Scalar {
             Scalar::Dec(d) => write!(f, "{d}"),
             Scalar::String(s) => write!(f, "{s:?}"),
             Scalar::Bool(b) => write!(f, "{b}"),
-            Scalar::Instant(t) => write!(f, "{}", t.to_rfc3339()),
+            Scalar::Instant(t) => write!(
+                f,
+                "{}",
+                t.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+            ),
             Scalar::Duration(d) => write!(f, "{}", fmt_duration(d)),
         }
     }
@@ -148,7 +152,21 @@ mod tests {
     #[test]
     fn instant_display() {
         let t = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-        assert_eq!(Scalar::Instant(t).to_string(), "2023-11-14T22:13:20+00:00");
+        assert_eq!(Scalar::Instant(t).to_string(), "2023-11-14T22:13:20Z");
+    }
+
+    #[test]
+    fn instant_display_subseconds() {
+        // AutoSi picks millis/micros/nanos from the value; UTC
+        // always renders as `Z`.
+        let at = |nanos: u32| {
+            Scalar::Instant(DateTime::from_timestamp(1_700_000_000, nanos).unwrap()).to_string()
+        };
+        assert_eq!(at(0), "2023-11-14T22:13:20Z");
+        assert_eq!(at(123_000_000), "2023-11-14T22:13:20.123Z");
+        assert_eq!(at(123_456_000), "2023-11-14T22:13:20.123456Z");
+        assert_eq!(at(123_456_789), "2023-11-14T22:13:20.123456789Z");
+        assert_eq!(at(1), "2023-11-14T22:13:20.000000001Z");
     }
 
     #[test]
