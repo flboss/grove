@@ -2,6 +2,6 @@
 
 **G**raph-based **R**elational **O**bject **V**iew **E**ngine
 
-Compiles grove's graph-oriented query language to SQLite SQL, backed by a declarative schema configuration file that maps an object-graph view onto relational tables.
+Tree-like object view over SQLite storage, backed by a declarative schema configuration file that maps an object-graph view onto relational tables, with a graph-oriented query language evaluated in Rust.
 
 in very early development
