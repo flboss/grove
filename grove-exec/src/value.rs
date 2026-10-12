@@ -1,4 +1,4 @@
-use std::collections::{HashMap, hash_map::Entry};
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 
@@ -31,15 +31,25 @@ pub enum Val {
 /// Field-name interner owned by the executor
 #[derive(Debug, Default)]
 pub struct Interner {
-    names: HashMap<String, Arc<str>>,
+    names: HashSet<Arc<str>>,
 }
 
 impl Interner {
     pub fn intern(&mut self, name: &str) -> Arc<str> {
-        match self.names.entry(name.to_owned()) {
-            Entry::Occupied(entry) => Arc::clone(entry.get()),
-            Entry::Vacant(entry) => Arc::clone(entry.insert(Arc::from(name))),
+        if let Some(existing) = self.names.get(name) {
+            return existing.clone();
         }
+        let arc: Arc<str> = Arc::from(name);
+        self.names.insert(arc.clone());
+        arc
+    }
+
+    pub fn len(&self) -> usize {
+        self.names.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
     }
 }
 
@@ -193,6 +203,7 @@ mod tests {
         let y = interner.intern("y");
         assert!(Arc::ptr_eq(&x, &interner.intern("x")));
         assert!(!Arc::ptr_eq(&x, &y));
+        assert_eq!(interner.len(), 2);
         let list = Val::List(vec![Val::Scalar(Scalar::Int(1)), Val::None]);
         assert_eq!(list.to_string(), "[1, none]");
         let tuple = Val::Tuple(vec![
