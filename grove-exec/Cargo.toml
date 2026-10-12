@@ -1,0 +1,13 @@
+[package]
+name = "grove-exec"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+grove-types.workspace = true
+grove-schema.workspace = true
+grove-query.workspace = true
+
+chrono.workspace = true
+rust_decimal.workspace = true
+rusqlite.workspace = true

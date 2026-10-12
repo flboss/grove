@@ -1,0 +1,170 @@
+use std::fmt;
+
+use chrono::{DateTime, TimeDelta, Utc};
+use rust_decimal::Decimal;
+
+/// A scalar Grove value
+#[derive(Debug, Clone, PartialEq)]
+pub enum Scalar {
+    Int(i64),
+    Float(f64),
+    Dec(Decimal),
+    String(String),
+    Bool(bool),
+    Instant(DateTime<Utc>),
+    Duration(TimeDelta),
+}
+
+/// A Grove value
+#[derive(Debug, Clone, PartialEq)]
+pub enum Val {
+    None,
+    Some(Box<Val>),
+    Scalar(Scalar),
+    List(Vec<Val>),
+    Tuple(Vec<Val>),
+    Record(Vec<(String, Val)>),
+}
+
+/// TODO: show as larger units (m/h/d)
+fn fmt_duration(d: &TimeDelta) -> String {
+    let total_nanos = d
+        .num_nanoseconds()
+        .unwrap_or_else(|| d.num_seconds() * 1_000_000_000);
+    let sign = if total_nanos < 0 { "-" } else { "" };
+    let abs = total_nanos.unsigned_abs();
+    let secs = abs / 1_000_000_000;
+    let nanos = abs % 1_000_000_000;
+    if nanos == 0 {
+        format!("{sign}{secs}s")
+    } else {
+        let frac = format!("{nanos:09}");
+        format!("{sign}{secs}.{}s", frac.trim_end_matches('0'))
+    }
+}
+
+impl fmt::Display for Scalar {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Scalar::Int(n) => write!(f, "{n}"),
+            Scalar::Float(x) => write!(f, "{x:?}"),
+            Scalar::Dec(d) => write!(f, "{d}"),
+            Scalar::String(s) => write!(f, "{s:?}"),
+            Scalar::Bool(b) => write!(f, "{b}"),
+            Scalar::Instant(t) => write!(f, "{}", t.to_rfc3339()),
+            Scalar::Duration(d) => write!(f, "{}", fmt_duration(d)),
+        }
+    }
+}
+
+impl fmt::Display for Val {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Val::None => write!(f, "none"),
+            Val::Some(inner) => write!(f, "some({inner})"),
+            Val::Scalar(s) => write!(f, "{s}"),
+            Val::List(items) => {
+                write!(f, "[")?;
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{item}")?;
+                }
+                write!(f, "]")
+            }
+            Val::Tuple(items) => {
+                write!(f, "(")?;
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{item}")?;
+                }
+                write!(f, ")")
+            }
+            Val::Record(fields) => {
+                write!(f, "{{")?;
+                for (i, (name, value)) in fields.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{name}: {value}")?;
+                }
+                write!(f, "}}")
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dec(s: &str) -> Scalar {
+        Scalar::Dec(s.parse().unwrap())
+    }
+
+    fn some(v: Val) -> Val {
+        Val::Some(Box::new(v))
+    }
+
+    #[test]
+    fn scalar_display() {
+        assert_eq!(Scalar::Int(-7).to_string(), "-7");
+        assert_eq!(Scalar::Float(1.0).to_string(), "1.0");
+        assert_eq!(Scalar::Float(1.5).to_string(), "1.5");
+        assert_eq!(Scalar::Bool(true).to_string(), "true");
+        assert_eq!(Scalar::String("a\"b".to_string()).to_string(), "\"a\\\"b\"");
+        assert_eq!(dec("30.00").to_string(), "30.00");
+    }
+
+    #[test]
+    fn option_display() {
+        assert_eq!(Val::None.to_string(), "none");
+        assert_eq!(some(Val::Scalar(Scalar::Int(3))).to_string(), "some(3)");
+        assert_eq!(
+            some(some(Val::Scalar(Scalar::Int(3)))).to_string(),
+            "some(some(3))"
+        );
+    }
+
+    #[test]
+    fn duration_display() {
+        let s = |secs: i64| Scalar::Duration(TimeDelta::seconds(secs)).to_string();
+        assert_eq!(s(3600), "3600s");
+        assert_eq!(s(0), "0s");
+        assert_eq!(s(-90), "-90s");
+        assert_eq!(
+            Scalar::Duration(TimeDelta::milliseconds(1500)).to_string(),
+            "1.5s"
+        );
+        assert_eq!(
+            Scalar::Duration(TimeDelta::nanoseconds(1_234_567_890)).to_string(),
+            "1.23456789s"
+        );
+    }
+
+    #[test]
+    fn instant_display() {
+        let t = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        assert_eq!(Scalar::Instant(t).to_string(), "2023-11-14T22:13:20+00:00");
+    }
+
+    #[test]
+    fn composite_display() {
+        let list = Val::List(vec![Val::Scalar(Scalar::Int(1)), Val::None]);
+        assert_eq!(list.to_string(), "[1, none]");
+        let tuple = Val::Tuple(vec![
+            Val::Scalar(Scalar::String("a".to_string())),
+            Val::Scalar(Scalar::Int(1)),
+        ]);
+        assert_eq!(tuple.to_string(), "(\"a\", 1)");
+        let record = Val::Record(vec![
+            ("x".to_string(), Val::Scalar(Scalar::Int(1))),
+            ("y".to_string(), list),
+        ]);
+        assert_eq!(record.to_string(), "{x: 1, y: [1, none]}");
+        assert_eq!(Val::List(vec![]).to_string(), "[]");
+    }
+}

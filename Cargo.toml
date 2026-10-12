@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["grove-types", "grove-schema", "grove-query", "grove-debug"]
+members = ["grove-types", "grove-schema", "grove-query", "grove-exec", "grove-debug"]
 
 [workspace.package]
 version = "0.1.0"
