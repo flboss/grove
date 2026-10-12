@@ -560,11 +560,11 @@ impl<'src> Parser<'src> {
                     value: "prev".to_string(),
                 }))
             }
-            TokenKind::Dollar => {
+            &TokenKind::Dollar(count) => {
                 self.bump();
                 Ok(Expr::Ident(Spanned {
                     span,
-                    value: "$".to_string(),
+                    value: "$".repeat(count),
                 }))
             }
             TokenKind::LParen => self.parse_tuple_or_group(),

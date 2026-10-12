@@ -86,7 +86,14 @@ impl<'src> Lexer<'src> {
                 ',' => self.make_token(start, TokenKind::Comma),
                 ';' => self.make_token(start, TokenKind::Semicolon),
                 '.' => self.make_token(start, TokenKind::Dot),
-                '$' => self.make_token(start, TokenKind::Dollar),
+                '$' => {
+                    let mut count = 1;
+                    while self.peek_char() == Some('$') {
+                        self.bump();
+                        count += 1;
+                    }
+                    self.make_token(start, TokenKind::Dollar(count))
+                }
                 '+' => self.make_token(start, TokenKind::Plus),
                 '-' => self.make_token(start, TokenKind::Minus),
                 '*' => self.make_token(start, TokenKind::Star),
@@ -1631,13 +1638,23 @@ mod tests {
     }
 
     #[test]
-    fn dollar_token() {
+    fn dollar_is_own_token() {
         let mut lex = Lexer::new("[$ > 0]");
         assert_token!(lex, TokenKind::LBracket);
-        assert_token!(lex, TokenKind::Dollar);
+        assert_token!(lex, TokenKind::Dollar(1));
         assert_token!(lex, TokenKind::Greater);
         assert_token!(lex, TokenKind::IntLit(0));
         assert_token!(lex, TokenKind::RBracket);
+        assert_eof!(lex);
+        assert!(lex.take_diagnostics().is_empty());
+    }
+
+    #[test]
+    fn dollar_token_count() {
+        let mut lex = Lexer::new("$$ $$$ $");
+        assert_token!(lex, TokenKind::Dollar(2));
+        assert_token!(lex, TokenKind::Dollar(3));
+        assert_token!(lex, TokenKind::Dollar(1));
         assert_eof!(lex);
         assert!(lex.take_diagnostics().is_empty());
     }

@@ -21,6 +21,7 @@ struct ScopeEntry {
 struct TypeEnv<'s> {
     scopes: Vec<HashMap<String, ScopeEntry>>,
     schema: &'s ValidatedSchema,
+    element_depth: usize,
 }
 
 impl<'s> TypeEnv<'s> {
@@ -28,6 +29,7 @@ impl<'s> TypeEnv<'s> {
         let mut env = TypeEnv {
             scopes: vec![HashMap::new()],
             schema,
+            element_depth: 0,
         };
 
         for (root_idx, root) in schema.roots.iter().enumerate() {
@@ -45,6 +47,12 @@ impl<'s> TypeEnv<'s> {
 
     fn pop_scope(&mut self) {
         self.scopes.pop();
+    }
+
+    fn push_element(&mut self, ty: QueryType) {
+        self.element_depth += 1;
+        let name = "$".repeat(self.element_depth);
+        self.define(name, ty, IdentBinding::ListElement);
     }
 
     fn define(&mut self, name: String, ty: QueryType, binding: IdentBinding) {
@@ -642,6 +650,17 @@ fn infer_tuple_access(
     })
 }
 
+fn list_element_ty(ty: &QueryType) -> QueryType {
+    match ty {
+        QueryType::List(inner) => inner.as_ref().clone(),
+        _ => QueryType::Unknown,
+    }
+}
+
+fn element_is_record(ty: &QueryType) -> bool {
+    matches!(ty, QueryType::List(inner) if matches!(inner.as_ref(), QueryType::Record(_)))
+}
+
 fn infer_method(
     base: TypedExpr,
     name: &Spanned<String>,
@@ -707,38 +726,25 @@ fn infer_method(
         },
     }
 
-    let pushed_scope = match (&signature.args, name.value.as_str()) {
+    let (pushed_scope, pushed_element) = match (&signature.args, name.value.as_str()) {
         (ArgCheck::Scoped { .. }, "map") => {
             env.push_scope();
-            if let QueryType::List(inner) = &resolve_ty {
-                env.define(
-                    "$".to_string(),
-                    inner.as_ref().clone(),
-                    IdentBinding::ListElement,
-                );
-            }
-            true
+            env.push_element(list_element_ty(&resolve_ty));
+            (true, true)
         }
         (ArgCheck::Scoped { .. }, _) => {
             let pushed = env.push_record_fields(&resolve_ty);
-            let element_is_record = matches!(&resolve_ty, QueryType::List(inner) if matches!(inner.as_ref(), QueryType::Record(_)));
-            if !element_is_record {
+            if element_is_record(&resolve_ty) {
+                (pushed, false)
+            } else {
                 if !pushed {
                     env.push_scope();
                 }
-                if let QueryType::List(inner) = &resolve_ty {
-                    env.define(
-                        "$".to_string(),
-                        inner.as_ref().clone(),
-                        IdentBinding::ListElement,
-                    );
-                }
-                true
-            } else {
-                pushed
+                env.push_element(list_element_ty(&resolve_ty));
+                (true, true)
             }
         }
-        _ => false,
+        _ => (false, false),
     };
 
     let mut typed_args = Vec::new();
@@ -785,6 +791,9 @@ fn infer_method(
 
     if pushed_scope {
         env.pop_scope();
+    }
+    if pushed_element {
+        env.element_depth -= 1;
     }
     if let Some(err) = arg_error {
         return Err(err);
@@ -2518,7 +2527,7 @@ mod tests {
         };
         assert_eq!(name.value, "$");
         assert_eq!(*binding, IdentBinding::ListElement);
-        let (file, _diags) = crate::parse_query("[[1, 2], [3]].map($.map($ + 1))");
+        let (file, _diags) = crate::parse_query("[[1, 2], [3]].map($.map($$ + 1))");
         let result = infer(&file.unwrap().result, &mut env).unwrap();
         assert_eq!(
             result.ty,
@@ -2526,6 +2535,35 @@ mod tests {
                 ScalarType::Int
             )))))
         );
+    }
+
+    #[test]
+    fn dollar_outer_access() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _diags) = crate::parse_query("[[1, 2], [3]].map($.map($$ + $.len()))");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(
+            result.ty,
+            QueryType::List(Box::new(QueryType::List(Box::new(QueryType::Scalar(
+                ScalarType::Int
+            )))))
+        );
+        let (file, _diags) =
+            crate::parse_query("[[[1]], [[2, 3]]].map($.map($$.map($$$ + $$.len() + $.len())))");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert!(matches!(result.ty, QueryType::List(_)));
+        let (file, _diags) = crate::parse_query("[[1, 2], [3]].map($ + $$.len())");
+        assert!(infer(&file.unwrap().result, &mut env).is_err());
+    }
+
+    #[test]
+    fn dollar_through_record_scope() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _diags) = crate::parse_query("[1, 2].map(users.filter(age > $))");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert!(matches!(result.ty, QueryType::List(_)));
     }
 
     #[test]
