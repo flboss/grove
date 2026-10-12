@@ -1,4 +1,6 @@
+use std::collections::{HashMap, hash_map::Entry};
 use std::fmt;
+use std::sync::Arc;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use rust_decimal::Decimal;
@@ -23,7 +25,22 @@ pub enum Val {
     Scalar(Scalar),
     List(Vec<Val>),
     Tuple(Vec<Val>),
-    Record(Vec<(String, Val)>),
+    Record(Vec<(Arc<str>, Val)>),
+}
+
+/// Field-name interner owned by the executor
+#[derive(Debug, Default)]
+pub struct Interner {
+    names: HashMap<String, Arc<str>>,
+}
+
+impl Interner {
+    pub fn intern(&mut self, name: &str) -> Arc<str> {
+        match self.names.entry(name.to_owned()) {
+            Entry::Occupied(entry) => Arc::clone(entry.get()),
+            Entry::Vacant(entry) => Arc::clone(entry.insert(Arc::from(name))),
+        }
+    }
 }
 
 /// TODO: show as larger units (m/h/d)
@@ -171,6 +188,11 @@ mod tests {
 
     #[test]
     fn composite_display() {
+        let mut interner = Interner::default();
+        let x = interner.intern("x");
+        let y = interner.intern("y");
+        assert!(Arc::ptr_eq(&x, &interner.intern("x")));
+        assert!(!Arc::ptr_eq(&x, &y));
         let list = Val::List(vec![Val::Scalar(Scalar::Int(1)), Val::None]);
         assert_eq!(list.to_string(), "[1, none]");
         let tuple = Val::Tuple(vec![
@@ -178,10 +200,7 @@ mod tests {
             Val::Scalar(Scalar::Int(1)),
         ]);
         assert_eq!(tuple.to_string(), "(\"a\", 1)");
-        let record = Val::Record(vec![
-            ("x".to_string(), Val::Scalar(Scalar::Int(1))),
-            ("y".to_string(), list),
-        ]);
+        let record = Val::Record(vec![(x, Val::Scalar(Scalar::Int(1))), (y, list)]);
         assert_eq!(record.to_string(), "{x: 1, y: [1, none]}");
         assert_eq!(Val::List(vec![]).to_string(), "[]");
     }
