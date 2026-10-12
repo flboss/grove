@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use ariadne::{Color, Config, IndexType, Label, Report, ReportKind, Source};
 use clap::{Parser, Subcommand};
@@ -17,7 +17,7 @@ struct Cli {
 enum Command {
     /// Tokenize a schema file and display the token stream.
     SchemaLex {
-        /// Path to the schema file
+        /// Path to the schema file, or the schema source itself
         path: PathBuf,
 
         /// Display diagnostics as raw Debug output instead of using ariadne
@@ -27,7 +27,7 @@ enum Command {
 
     /// Parse a schema file and display the AST.
     SchemaParse {
-        /// Path to the schema file
+        /// Path to the schema file, or the schema source itself
         path: PathBuf,
 
         /// Display diagnostics as raw Debug output instead of using ariadne
@@ -37,7 +37,7 @@ enum Command {
 
     /// Validate a schema file and display the validated model.
     SchemaValidate {
-        /// Path to the schema file
+        /// Path to the schema file, or the schema source itself
         path: PathBuf,
 
         /// Display diagnostics as raw Debug output instead of using ariadne
@@ -47,7 +47,7 @@ enum Command {
 
     /// Tokenize a query file and display the token stream.
     QueryLex {
-        /// Path to the query file
+        /// Path to the query file, or the query source itself
         path: PathBuf,
 
         /// Display diagnostics as raw Debug output instead of using ariadne
@@ -57,7 +57,7 @@ enum Command {
 
     /// Parse a query file and display the AST.
     QueryParse {
-        /// Path to the query file
+        /// Path to the query file, or the query source itself
         path: PathBuf,
 
         /// Display diagnostics as raw Debug output instead of using ariadne
@@ -67,10 +67,10 @@ enum Command {
 
     /// Type-check a query file against a schema and display the typed AST.
     QueryTypecheck {
-        /// Path to the query file
+        /// Path to the query file, or the query source itself
         query: PathBuf,
 
-        /// Path to the schema file
+        /// Path to the schema file, or the schema source itself
         schema: PathBuf,
 
         /// Display diagnostics as raw Debug output instead of using ariadne
@@ -91,14 +91,22 @@ fn main() {
     }
 }
 
-fn schema_lex(path: &PathBuf, raw: bool) {
-    let source = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error reading {}: {e}", path.display());
-            std::process::exit(1);
+fn read_input(path: &PathBuf, kind: &str) -> (String, String) {
+    if path.is_file() {
+        match std::fs::read_to_string(path) {
+            Ok(source) => (path.display().to_string(), source),
+            Err(e) => {
+                eprintln!("error reading {kind} file {}: {e}", path.display());
+                std::process::exit(1);
+            }
         }
-    };
+    } else {
+        ("<inline>".to_string(), path.to_string_lossy().into_owned())
+    }
+}
+
+fn schema_lex(path: &PathBuf, raw: bool) {
+    let (name, source) = read_input(path, "schema");
 
     let mut lexer = grove_schema::lex::Lexer::new(&source);
     let mut tokens = Vec::new();
@@ -123,17 +131,11 @@ fn schema_lex(path: &PathBuf, raw: bool) {
         );
     }
 
-    print_diagnostics(&source, path, &diagnostics, raw, "");
+    print_diagnostics(&source, &name, &diagnostics, raw, "");
 }
 
 fn query_lex(path: &PathBuf, raw: bool) {
-    let source = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error reading {}: {e}", path.display());
-            std::process::exit(1);
-        }
-    };
+    let (name, source) = read_input(path, "query");
 
     let mut lexer = grove_query::lex::Lexer::new(&source);
     let mut tokens = Vec::new();
@@ -158,17 +160,11 @@ fn query_lex(path: &PathBuf, raw: bool) {
         );
     }
 
-    print_diagnostics(&source, path, &diagnostics, raw, "");
+    print_diagnostics(&source, &name, &diagnostics, raw, "");
 }
 
 fn query_parse(path: &PathBuf, raw: bool) {
-    let source = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error reading {}: {e}", path.display());
-            std::process::exit(1);
-        }
-    };
+    let (name, source) = read_input(path, "query");
 
     let (file, diagnostics) = grove_query::parse_query(&source);
 
@@ -178,32 +174,19 @@ fn query_parse(path: &PathBuf, raw: bool) {
         None => println!("No AST. (parse failed)"),
     }
 
-    print_diagnostics(&source, path, &diagnostics, raw, "");
+    print_diagnostics(&source, &name, &diagnostics, raw, "");
 }
 
 fn query_typecheck(query_path: &PathBuf, schema_path: &PathBuf, raw: bool) {
-    let query_source = match std::fs::read_to_string(query_path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error reading query file {}: {e}", query_path.display());
-            std::process::exit(1);
-        }
-    };
-
-    let schema_source = match std::fs::read_to_string(schema_path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error reading schema file {}: {e}", schema_path.display());
-            std::process::exit(1);
-        }
-    };
+    let (query_name, query_source) = read_input(query_path, "query");
+    let (schema_name, schema_source) = read_input(schema_path, "schema");
 
     let (schema, schema_parse_diagnostics) = grove_schema::parse_schema(&schema_source);
     let Some(schema) = schema else {
         println!("No validated schema. (parse failed)");
         print_diagnostics(
-            &query_source,
-            query_path,
+            &schema_source,
+            &schema_name,
             &schema_parse_diagnostics,
             raw,
             "Schema Parse ",
@@ -216,7 +199,7 @@ fn query_typecheck(query_path: &PathBuf, schema_path: &PathBuf, raw: bool) {
         println!("No validated schema. (validation failed)");
         print_diagnostics(
             &schema_source,
-            schema_path,
+            &schema_name,
             &schema_validation_diagnostics,
             raw,
             "Schema Validation ",
@@ -229,7 +212,7 @@ fn query_typecheck(query_path: &PathBuf, schema_path: &PathBuf, raw: bool) {
         println!("No query AST. (parse failed)");
         print_diagnostics(
             &query_source,
-            query_path,
+            &query_name,
             &parse_diagnostics,
             raw,
             "Query Parse ",
@@ -245,17 +228,11 @@ fn query_typecheck(query_path: &PathBuf, schema_path: &PathBuf, raw: bool) {
         None => println!("No typed AST. (typecheck failed)"),
     }
 
-    print_diagnostics(&query_source, query_path, &typecheck_diagnostics, raw, "");
+    print_diagnostics(&query_source, &query_name, &typecheck_diagnostics, raw, "");
 }
 
 fn schema_parse(path: &PathBuf, raw: bool) {
-    let source = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error reading {}: {e}", path.display());
-            std::process::exit(1);
-        }
-    };
+    let (name, source) = read_input(path, "schema");
 
     let (schema, diagnostics) = grove_schema::parse_schema(&source);
 
@@ -265,22 +242,16 @@ fn schema_parse(path: &PathBuf, raw: bool) {
         None => println!("No AST. (parse failed)"),
     }
 
-    print_diagnostics(&source, path, &diagnostics, raw, "");
+    print_diagnostics(&source, &name, &diagnostics, raw, "");
 }
 
 fn schema_validate(path: &PathBuf, raw: bool) {
-    let source = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error reading {}: {e}", path.display());
-            std::process::exit(1);
-        }
-    };
+    let (name, source) = read_input(path, "schema");
 
     let (schema, parse_diagnostics) = grove_schema::parse_schema(&source);
     let Some(schema) = schema else {
         println!("No validated schema. (parse failed)");
-        print_diagnostics(&source, path, &parse_diagnostics, raw, "");
+        print_diagnostics(&source, &name, &parse_diagnostics, raw, "");
         return;
     };
 
@@ -292,12 +263,12 @@ fn schema_validate(path: &PathBuf, raw: bool) {
         None => println!("No validated schema. (validation failed)"),
     }
 
-    print_diagnostics(&source, path, &validation_diagnostics, raw, "");
+    print_diagnostics(&source, &name, &validation_diagnostics, raw, "");
 }
 
 fn print_diagnostics(
     source: &str,
-    path: &Path,
+    name: &str,
     diagnostics: &[Diagnostic],
     raw: bool,
     specifier: &str,
@@ -319,9 +290,9 @@ fn print_diagnostics(
         return;
     }
 
-    let path_str = path.to_string_lossy();
+    let path_str = name;
     let ariadne_source = Source::from(source);
-    let mut cache = (path_str.as_ref(), ariadne_source);
+    let mut cache = (path_str, ariadne_source);
 
     for diag in diagnostics {
         let location = diag.labels.first().map(|l| l.span.range()).unwrap_or(0..0);
@@ -330,7 +301,7 @@ fn print_diagnostics(
                 grove_types::Severity::Error => ReportKind::Error,
                 grove_types::Severity::Warning => ReportKind::Warning,
             },
-            (path_str.as_ref(), location),
+            (path_str, location),
         )
         .with_config(Config::default().with_index_type(IndexType::Byte))
         .with_code(diag.code.as_ref())
@@ -342,7 +313,7 @@ fn print_diagnostics(
                 grove_types::LabelStyle::Secondary => Color::Blue,
             };
             report = report.with_label(
-                Label::new((path_str.as_ref(), label.span.range()))
+                Label::new((path_str, label.span.range()))
                     .with_message(label.message.as_ref())
                     .with_color(color),
             );
