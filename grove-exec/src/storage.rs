@@ -22,7 +22,7 @@ pub trait Storage {
     fn fetch_related(
         &self,
         rel: RelationId,
-        from_first: bool,
+        fetch_from_first: bool,
         parents: &[Key],
     ) -> Result<Vec<Vec<Row>>, ExecError>;
 }
@@ -44,7 +44,7 @@ mod tests {
         fn fetch_related(
             &self,
             _rel: RelationId,
-            _from_first: bool,
+            _fetch_from_first: bool,
             parents: &[Key],
         ) -> Result<Vec<Vec<Row>>, ExecError> {
             Ok(parents
