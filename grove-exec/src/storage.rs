@@ -16,14 +16,15 @@ pub struct Key(pub i64);
 
 pub trait Storage {
     /// Read `fields` of every row of the struct's table
-    fn scan(&self, struct_id: StructId, fields: &[FieldId]) -> Result<Vec<Row>, ExecError>;
+    fn fetch(&self, struct_id: StructId, fields: &[FieldId]) -> Result<Vec<Row>, ExecError>;
 
-    /// Rows on the other side of `rel`, grouped per requested rowid
+    /// `fields` of rows on the other side of `rel`, grouped per requested rowid
     fn fetch_related(
         &self,
         rel: RelationId,
         fetch_from_first: bool,
         parents: &[Key],
+        fields: &[FieldId],
     ) -> Result<Vec<Vec<Row>>, ExecError>;
 }
 
@@ -37,7 +38,7 @@ mod tests {
     }
 
     impl Storage for Stub {
-        fn scan(&self, _struct_id: StructId, _fields: &[FieldId]) -> Result<Vec<Row>, ExecError> {
+        fn fetch(&self, _struct_id: StructId, _fields: &[FieldId]) -> Result<Vec<Row>, ExecError> {
             Ok(self.rows.clone())
         }
 
@@ -46,6 +47,7 @@ mod tests {
             _rel: RelationId,
             _fetch_from_first: bool,
             parents: &[Key],
+            _fields: &[FieldId],
         ) -> Result<Vec<Vec<Row>>, ExecError> {
             Ok(parents
                 .iter()
@@ -82,7 +84,9 @@ mod tests {
         ];
         let backend = Stub { rows };
         let rel = RelationId::new(0);
-        let groups = backend.fetch_related(rel, true, &[Key(2), Key(9)]).unwrap();
+        let groups = backend
+            .fetch_related(rel, true, &[Key(2), Key(9)], &[])
+            .unwrap();
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].len(), 1);
         assert_eq!(groups[0][0].rowid, Key(2));
