@@ -17,13 +17,10 @@ pub(crate) fn encode_dec(value: Decimal) -> [u8; 13] {
     if normalized.is_zero() {
         return [0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     }
-    let raw = normalized.serialize();
-    let flags = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
-    let mut mant_bytes = [0u8; 16];
-    mant_bytes[0..12].copy_from_slice(&raw[4..16]);
-    let mantissa = u128::from_le_bytes(mant_bytes);
-    let scale = (flags >> 16) & 0x1F;
-    let negative = flags & 0x8000_0000 != 0;
+    let raw = normalized.mantissa();
+    let negative = raw < 0;
+    let mantissa = raw.unsigned_abs();
+    let scale = normalized.scale();
     let digits = mantissa.ilog10() + 1;
     let biased = (digits as i32 - 1 - scale as i32 + 28) as u8;
     let aligned = mantissa * 10u128.pow(29 - digits);
@@ -99,7 +96,7 @@ pub(crate) fn decode_dec(blob: &[u8]) -> Result<Decimal, ExecError> {
 }
 
 const SEC_BIAS: u64 = 0x8000_0000_0000_0000;
-const NANOS_PER_SEC: u32 = 1_000_000_000;
+const NANOS_PER_SEC: i32 = 1_000_000_000;
 
 fn encode_secs_nanos(secs: i64, nanos: u32) -> [u8; 12] {
     let mut out = [0u8; 12];
@@ -118,7 +115,7 @@ fn decode_secs_nanos(blob: &[u8], what: &str) -> Result<(i64, u32), ExecError> {
     nano_bytes.copy_from_slice(&blob[8..12]);
     let secs = (u64::from_be_bytes(sec_bytes) ^ SEC_BIAS) as i64;
     let nanos = u32::from_be_bytes(nano_bytes);
-    if nanos >= NANOS_PER_SEC {
+    if nanos >= NANOS_PER_SEC as u32 {
         return Err(malformed(
             what,
             format!("nanoseconds {nanos}, want 0-999999999"),
@@ -141,11 +138,14 @@ pub(crate) fn decode_instant(blob: &[u8]) -> Result<DateTime<Utc>, ExecError> {
 
 /// Encode a `Duration` as its 12-byte memcmp-ordered blob
 pub(crate) fn encode_duration(d: TimeDelta) -> [u8; 12] {
-    let total = d.num_seconds() as i128 * NANOS_PER_SEC as i128 + d.subsec_nanos() as i128;
-    let secs = total.div_euclid(NANOS_PER_SEC as i128);
-    let nanos = total.rem_euclid(NANOS_PER_SEC as i128);
-    let secs = i64::try_from(secs).expect("chrono TimeDelta range fits i64 seconds");
-    encode_secs_nanos(secs, nanos as u32)
+    let secs = d.num_seconds();
+    let nanos = d.subsec_nanos();
+    let (secs, nanos) = if nanos < 0 {
+        (secs - 1, (nanos + NANOS_PER_SEC) as u32)
+    } else {
+        (secs, nanos as u32)
+    };
+    encode_secs_nanos(secs, nanos)
 }
 
 /// Decode a 12-byte `Duration` blob
