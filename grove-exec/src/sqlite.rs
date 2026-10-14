@@ -15,13 +15,13 @@ use crate::error::ExecError;
 use crate::storage::{Key, Row, Storage};
 use crate::value::{Scalar, Val};
 
-pub struct SqliteBackend {
+pub struct SqliteBackend<'a> {
     conn: Connection,
-    schema: ValidatedSchema,
+    schema: &'a ValidatedSchema,
 }
 
-impl SqliteBackend {
-    pub fn new(conn: Connection, schema: ValidatedSchema) -> Result<Self, ExecError> {
+impl<'a> SqliteBackend<'a> {
+    pub fn new(conn: Connection, schema: &'a ValidatedSchema) -> Result<Self, ExecError> {
         for option in [
             // Disable quoted identifiers degrading to string literals in some cases
             DbConfig::SQLITE_DBCONFIG_DQS_DML,
@@ -35,7 +35,7 @@ impl SqliteBackend {
         Ok(backend)
     }
 
-    pub fn open_in_memory(schema: ValidatedSchema) -> Result<Self, ExecError> {
+    pub fn open_in_memory(schema: &'a ValidatedSchema) -> Result<Self, ExecError> {
         let conn = Connection::open_in_memory()
             .map_err(|err| Self::storage_error("open in-memory database", err))?;
         Self::new(conn, schema)
@@ -491,7 +491,7 @@ fn decode_scalar(ty: ScalarType, value: ValueRef<'_>, nullable: bool) -> Result<
     }
 }
 
-impl SqliteBackend {
+impl SqliteBackend<'_> {
     /// Build decode plans and prepare one statement per array node in `drafts`
     fn prepare_array_nodes(
         &self,
@@ -502,7 +502,7 @@ impl SqliteBackend {
         let mut nodes = Vec::with_capacity(drafts.len());
         let mut stmts = Vec::with_capacity(drafts.len());
         for (idx, draft) in drafts.iter().enumerate() {
-            let sql = node_sql(idx, drafts, &self.schema).map_err(|err| err.context(label))?;
+            let sql = node_sql(idx, drafts, self.schema).map_err(|err| err.context(label))?;
             stmts.push(
                 self.conn
                     .prepare(&sql)
@@ -748,18 +748,17 @@ impl SqliteBackend {
     }
 }
 
-impl Storage for SqliteBackend {
+impl Storage for SqliteBackend<'_> {
     fn fetch(&self, struct_id: StructId, fields: &[FieldId]) -> Result<Vec<Row>, ExecError> {
-        let schema = &self.schema;
         let struct_def =
-            schema
+            self.schema
                 .structs
                 .get(struct_id.index())
                 .ok_or_else(|| ExecError::Storage {
                     message: format!("unknown struct id {}", struct_id.index()),
                 })?;
         let struct_name = &struct_def.name;
-        let table = quote(&schema.tables[struct_def.table.index()].name);
+        let table = quote(&self.schema.tables[struct_def.table.index()].name);
         let ctx = format!("fetch {struct_name}");
         let mut select = vec!["rowid".to_string()];
         let mut slots = self.plan_fields(struct_id, fields, &table, &mut select, &ctx)?;
@@ -924,7 +923,7 @@ mod tests {
 
     #[test]
     fn open_in_memory_constructor() {
-        assert!(SqliteBackend::open_in_memory(ValidatedSchema::default()).is_ok());
+        assert!(SqliteBackend::open_in_memory(&ValidatedSchema::default()).is_ok());
     }
 
     #[test]
@@ -1010,12 +1009,10 @@ mod tests {
         }
     }
 
-    fn test_backend() -> (SqliteBackend, ValidatedSchema) {
-        let schema = testdata::schema();
+    fn test_backend(schema: &ValidatedSchema) -> SqliteBackend<'_> {
         let mut conn = Connection::open_in_memory().unwrap();
         testdata::seed(&mut conn).unwrap();
-        let backend = SqliteBackend::new(conn, schema.clone()).unwrap();
-        (backend, schema)
+        SqliteBackend::new(conn, schema).unwrap()
     }
 
     fn user_struct(schema: &ValidatedSchema) -> StructId {
@@ -1036,7 +1033,8 @@ mod tests {
 
     #[test]
     fn fetch_scalars_positional() {
-        let (backend, schema) = test_backend();
+        let schema = testdata::schema();
+        let backend = test_backend(&schema);
         let sid = user_struct(&schema);
         let rows = backend
             .fetch(
@@ -1083,7 +1081,8 @@ mod tests {
 
     #[test]
     fn fetch_optional_and_tuples() {
-        let (backend, schema) = test_backend();
+        let schema = testdata::schema();
+        let backend = test_backend(&schema);
         let sid = user_struct(&schema);
         let rows = backend
             .fetch(
@@ -1128,7 +1127,8 @@ mod tests {
 
     #[test]
     fn fetch_partial_null_tuple_error() {
-        let (backend, schema) = test_backend();
+        let schema = testdata::schema();
+        let backend = test_backend(&schema);
         backend
             .conn
             .execute("UPDATE users SET hx = 3.0 WHERE id = 3", [])
@@ -1143,7 +1143,8 @@ mod tests {
 
     #[test]
     fn fetch_empty_table_empty_fields() {
-        let (backend, schema) = test_backend();
+        let schema = testdata::schema();
+        let backend = test_backend(&schema);
         let sid = user_struct(&schema);
         let rows = backend.fetch(sid, &[]).unwrap();
         assert_eq!(rows.len(), 5);
@@ -1158,7 +1159,8 @@ mod tests {
 
     #[test]
     fn fetch_reads_rowid_order() {
-        let (backend, schema) = test_backend();
+        let schema = testdata::schema();
+        let backend = test_backend(&schema);
         backend
             .conn
             .execute("DELETE FROM users WHERE rowid = 2", [])
@@ -1189,7 +1191,8 @@ mod tests {
 
     #[test]
     fn fetch_arrays_grouped_by_link_in_side_rowid_order() {
-        let (backend, schema) = test_backend();
+        let schema = testdata::schema();
+        let backend = test_backend(&schema);
         let sid = user_struct(&schema);
         let rows = backend
             .fetch(
@@ -1286,7 +1289,7 @@ mod tests {
         };
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE t(x INTEGER)").unwrap();
-        let backend = SqliteBackend::new(conn, schema).unwrap();
+        let backend = SqliteBackend::new(conn, &schema).unwrap();
         let err = backend
             .fetch(StructId::new(0), &[FieldId::new(StructId::new(0), 0)])
             .unwrap_err();
@@ -1296,7 +1299,8 @@ mod tests {
 
     #[test]
     fn fetch_mismatched_types() {
-        let (backend, schema) = test_backend();
+        let schema = testdata::schema();
+        let backend = test_backend(&schema);
         let sid = user_struct(&schema);
         let id = user_field(&schema, sid, "id");
         let name = user_field(&schema, sid, "name");
@@ -1334,7 +1338,8 @@ mod tests {
 
     #[test]
     fn fetch_bad_ids_error() {
-        let (backend, schema) = test_backend();
+        let schema = testdata::schema();
+        let backend = test_backend(&schema);
         let sid = user_struct(&schema);
         assert!(matches!(
             backend.fetch(StructId::new(99), &[]).unwrap_err(),
@@ -1350,7 +1355,8 @@ mod tests {
 
     #[test]
     fn quoted_identifiers_dont_degrade() {
-        let backend = SqliteBackend::open_in_memory(ValidatedSchema::default()).unwrap();
+        let schema = ValidatedSchema::default();
+        let backend = SqliteBackend::open_in_memory(&schema).unwrap();
         let err = backend
             .conn
             .prepare("SELECT \"no_such_column_xyz\"")
@@ -1378,7 +1384,7 @@ mod tests {
         };
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(ddl).unwrap();
-        SqliteBackend::new(conn, schema).map(|_| ())
+        SqliteBackend::new(conn, &schema).map(|_| ())
     }
 
     #[test]
@@ -1464,7 +1470,8 @@ mod tests {
 
     #[test]
     fn fetch_nested_via_array() {
-        let (backend, schema) = test_backend();
+        let schema = testdata::schema();
+        let backend = test_backend(&schema);
         let sid = user_struct(&schema);
         let rows = backend
             .fetch(sid, &[user_field(&schema, sid, "matrix")])
@@ -1492,7 +1499,8 @@ mod tests {
 
     #[test]
     fn fetch_deep_branched_via_array() {
-        let (backend, schema) = test_backend();
+        let schema = testdata::schema();
+        let backend = test_backend(&schema);
         let sid = user_struct(&schema);
         let rows = backend
             .fetch(
@@ -1526,7 +1534,8 @@ mod tests {
 
     #[test]
     fn fetch_tuple_embedded_array() {
-        let (backend, schema) = test_backend();
+        let schema = testdata::schema();
+        let backend = test_backend(&schema);
         let sid = user_struct(&schema);
         let rows = backend
             .fetch(
@@ -1565,7 +1574,8 @@ mod tests {
 
     #[test]
     fn fetch_optional_tuple_embedded_array() {
-        let (backend, schema) = test_backend();
+        let schema = testdata::schema();
+        let backend = test_backend(&schema);
         let sid = user_struct(&schema);
         let rows = backend
             .fetch(
@@ -1618,7 +1628,8 @@ mod tests {
 
     #[test]
     fn fetch_related_one_to_one() {
-        let (backend, schema) = test_backend();
+        let schema = testdata::schema();
+        let backend = test_backend(&schema);
         let users = testdata::struct_id(&schema, "User");
         let profiles = testdata::struct_id(&schema, "Profile");
         let rel = rel_named(&schema, "Profile", "user", "User", "profile");
@@ -1639,7 +1650,8 @@ mod tests {
 
     #[test]
     fn fetch_related_many_to_one() {
-        let (backend, schema) = test_backend();
+        let schema = testdata::schema();
+        let backend = test_backend(&schema);
         let users = testdata::struct_id(&schema, "User");
         let orders = testdata::struct_id(&schema, "Order");
         let rel = rel_named(&schema, "Order", "user", "User", "orders");
@@ -1663,7 +1675,8 @@ mod tests {
 
     #[test]
     fn fetch_related_one_to_many() {
-        let (backend, schema) = test_backend();
+        let schema = testdata::schema();
+        let backend = test_backend(&schema);
         let images = testdata::struct_id(&schema, "Image");
         let messages = testdata::struct_id(&schema, "Message");
         let rel = rel_named(&schema, "Image", "messages", "Message", "image");
@@ -1684,7 +1697,8 @@ mod tests {
 
     #[test]
     fn fetch_related_many_to_many() {
-        let (backend, schema) = test_backend();
+        let schema = testdata::schema();
+        let backend = test_backend(&schema);
         let users = testdata::struct_id(&schema, "User");
         let roles = testdata::struct_id(&schema, "Role");
         let rel = rel_named(&schema, "Role", "users", "User", "roles");
@@ -1720,7 +1734,8 @@ mod tests {
 
     #[test]
     fn fetch_related_self_reference() {
-        let (backend, schema) = test_backend();
+        let schema = testdata::schema();
+        let backend = test_backend(&schema);
         let users = testdata::struct_id(&schema, "User");
         let rel = rel_named(&schema, "User", "manager", "User", "subordinates");
         let name = testdata::field_id(&schema, users, "name");
@@ -1742,7 +1757,8 @@ mod tests {
 
     #[test]
     fn fetch_related_with_array_fields() {
-        let (backend, schema) = test_backend();
+        let schema = testdata::schema();
+        let backend = test_backend(&schema);
         let profiles = testdata::struct_id(&schema, "Profile");
         let rel = rel_named(&schema, "Profile", "user", "User", "profile");
         let groups = backend
@@ -1766,7 +1782,8 @@ mod tests {
 
     #[test]
     fn fetch_related_edge_cases() {
-        let (backend, schema) = test_backend();
+        let schema = testdata::schema();
+        let backend = test_backend(&schema);
         let rel = rel_named(&schema, "Profile", "user", "User", "profile");
         // empty parents: no rows, fields arg irrelevant (never resolved)
         let groups = backend.fetch_related(rel, true, &[], &[]).unwrap();
