@@ -108,6 +108,17 @@ impl<'a> SqliteBackend<'a> {
                     });
                 }
             }
+            if live_cols
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case("_rowid_"))
+            {
+                return Err(ExecError::Storage {
+                    message: format!(
+                        "table `{}` has a column named `_rowid_`, shadowing the rowid alias",
+                        table.name
+                    ),
+                });
+            }
         }
         Ok(())
     }
@@ -1437,6 +1448,17 @@ mod tests {
     #[test]
     fn verify_case_insensitive_names() {
         assert!(verify_backend(&[("Users", &["A"])], "CREATE TABLE users(a INTEGER);").is_ok());
+    }
+
+    #[test]
+    fn verify_rowid_shadow_column() {
+        let err = verify_backend(&[("t", &["a"])], "CREATE TABLE t(a INTEGER, _rowid_ TEXT);")
+            .unwrap_err();
+        assert!(matches!(err, ExecError::Storage { .. }), "{err:?}");
+        assert!(
+            err.to_string().contains("shadowing the rowid alias"),
+            "{err}"
+        );
     }
 
     #[test]
