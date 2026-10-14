@@ -623,8 +623,17 @@ impl<'src> Lexer<'src> {
         }
 
         let Some(date) = NaiveDate::from_ymd_opt(year, month, day) else {
-            self.emit_error(QueryLexError::InstantDayInvalid {
-                span: self.span_from(day_start),
+            // Day 1 is valid for every month and month is already proven 1..=12,
+            // so a second failure can only mean the year is out of chrono's range
+            let year_bad = NaiveDate::from_ymd_opt(year, month, 1).is_none();
+            self.emit_error(if year_bad {
+                QueryLexError::InstantYearInvalid {
+                    span: Span::new(year_start, year_start + year_digits.len()),
+                }
+            } else {
+                QueryLexError::InstantDayInvalid {
+                    span: self.span_from(day_start),
+                }
             });
             return Err(());
         };
@@ -2072,6 +2081,47 @@ mod tests {
         let mut lex = Lexer::new("@2024-02-30");
         drain(&mut lex);
         assert_eq!(lex.take_diagnostics().len(), 1);
+    }
+
+    fn assert_instant_error(src: &str, code: &str, start: usize, end: usize) {
+        let mut lex = Lexer::new(src);
+        drain(&mut lex);
+        let diags = lex.take_diagnostics();
+        assert_eq!(diags.len(), 1, "for `{src}`");
+        assert_eq!(&diags[0].code[..], code, "for `{src}`");
+        assert_eq!(
+            diags[0].labels[0].span,
+            Span::new(start, end),
+            "for `{src}`"
+        );
+    }
+
+    #[test]
+    fn instant_year_out_of_range() {
+        assert_instant_error("@300000-01-01", "QL0024", 1, 7);
+        assert_instant_error("@262143-06-15", "QL0024", 1, 7);
+        assert_instant_error("@-300000-06-15", "QL0024", 2, 8);
+        assert_instant_error("@-262144-01-01", "QL0024", 2, 8);
+    }
+
+    #[test]
+    fn instant_year_range_boundaries() {
+        use chrono::Datelike;
+        let (lo, hi) = (NaiveDate::MIN.year(), NaiveDate::MAX.year());
+        assert_instant(&format!("@{hi}-12-31"), utc(hi, 12, 31, 0, 0, 0, 0));
+        assert_instant(&format!("@{lo}-01-01"), utc(lo, 1, 1, 0, 0, 0, 0));
+        let over = format!("@{}-01-01", hi + 1);
+        assert_instant_error(&over, "QL0024", 1, 1 + (hi + 1).to_string().len());
+        let under = format!("@{}-01-01", lo - 1);
+        let digits = (lo - 1).unsigned_abs().to_string().len();
+        assert_instant_error(&under, "QL0024", 2, 2 + digits);
+    }
+
+    #[test]
+    fn instant_bad_day() {
+        assert_instant_error("@2024-02-30", "QL0026", 9, 11);
+        assert_instant_error("@2023-02-29", "QL0026", 9, 11);
+        assert_instant_error("@2024-01-00", "QL0026", 9, 11);
     }
 
     #[test]

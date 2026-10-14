@@ -1,3 +1,4 @@
+use chrono::{Datelike, NaiveDate};
 use grove_types::{DiagStr, Diagnostic, Label, LabelStyle, Severity, Span};
 
 #[rustfmt::skip] // preserve one-line-per-variant formatting
@@ -195,8 +196,13 @@ impl From<QueryLexError> for Diagnostic {
                 "QL0024",
                 "invalid year in instant literal",
                 span,
-                "expected at least 4 digits",
-            ),
+                "expected at least 4 digits and valid range",
+            )
+            .with_note(format!(
+                "any year from {} to {} is valid",
+                NaiveDate::MIN.year(),
+                NaiveDate::MAX.year()
+            )),
             InstantMonthInvalid { span } => error_simple(
                 "QL0025",
                 "invalid month in instant literal",
