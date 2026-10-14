@@ -216,6 +216,17 @@ pub enum ValueType {
     },
 }
 
+impl ValueType {
+    pub fn has_array(&self) -> bool {
+        match self {
+            ValueType::Scalar(_) => false,
+            ValueType::Tuple(elements) => elements.iter().any(Self::has_array),
+            ValueType::Optional(inner) => inner.has_array(),
+            ValueType::Array { .. } => true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ScalarType {
     Int,

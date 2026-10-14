@@ -124,9 +124,7 @@ fn decode_node(ty: &ValueType, vals: &[ValueRef<'_>]) -> Result<(Val, usize), Ex
             }
             Ok((Val::Tuple(items), used))
         }
-        ValueType::Array { .. } => Err(ExecError::Storage {
-            message: "via array inside a value field is currently unsupported".to_string(),
-        }),
+        ValueType::Array { .. } => unreachable!("array reached scalar decode"),
     }
 }
 
@@ -142,17 +140,30 @@ struct ArraySlot<'conn> {
     link_idx: usize,
     nodes: Vec<ArrayNode>,
     stmts: Vec<Statement<'conn>>,
+    subtree: Vec<usize>,
+}
+
+struct ValueArraySlot<'conn> {
+    label: String,
+    start: usize,
+    len: usize,
+    plan: ElemPlan,
+    nodes: Vec<ArrayNode>,
+    stmts: Vec<Statement<'conn>>,
+    subtrees: Vec<(usize, Vec<usize>)>,
 }
 
 enum Slot<'a, 'conn> {
     Value(ValueSlot<'a>),
     Array(ArraySlot<'conn>),
+    ValueArray(ValueArraySlot<'conn>),
 }
 
 /// One array level in an element type tree
 struct ArrayNode {
     plan: ElemPlan,
     width: usize,
+    parent: Option<usize>,
 }
 
 /// Decode plan mirroring an array element type
@@ -170,11 +181,12 @@ struct NodeDraft<'a> {
     plan: Option<ElemPlan>,
 }
 
-/// Walk an element type, registering nested arrays as nodes; returns the
-/// decode plan. `counter` tracks value columns of the current level.
+/// Walk a (element) type, registering nested arrays as nodes; returns the
+/// decode plan. `counter` tracks value columns of the current level
+/// Top-level arrays (no parent node) scope `key = ?` on their own link
 fn walk_element<'a>(
     ty: &'a ValueType,
-    self_node: usize,
+    self_node: Option<usize>,
     drafts: &mut Vec<NodeDraft<'a>>,
     counter: &mut usize,
 ) -> ElemPlan {
@@ -198,11 +210,11 @@ fn walk_element<'a>(
             let idx = drafts.len();
             drafts.push(NodeDraft {
                 storage,
-                parent: Some((self_node, pos)),
+                parent: self_node.map(|n| (n, pos)),
                 plan: None,
             });
             let mut sub = 0;
-            let plan = walk_element(element, idx, drafts, &mut sub);
+            let plan = walk_element(element, Some(idx), drafts, &mut sub);
             drafts[idx].plan = Some(plan);
             ElemPlan::Link(idx)
         }
@@ -323,17 +335,64 @@ fn semi(plan: &ElemPlan, cells: &[ValueRef<'_>]) -> Result<(SemiVal, usize), Exe
     }
 }
 
-/// Resolve links against already-finalized deeper groups
-fn finalize(semi: SemiVal, groups: &[HashMap<LinkKey, Vec<Val>>]) -> Val {
+/// Resolve links against already-finalized deeper groups, keyed by node
+fn finalize(semi: SemiVal, groups: &HashMap<usize, HashMap<LinkKey, Vec<Val>>>) -> Val {
     match semi {
         SemiVal::Done(v) => v,
         SemiVal::Tuple(items) => {
             Val::Tuple(items.into_iter().map(|s| finalize(s, groups)).collect())
         }
         SemiVal::Some(inner) => Val::Some(Box::new(finalize(*inner, groups))),
-        SemiVal::Deep { node, key } => {
-            Val::List(groups[node].get(&key).cloned().unwrap_or_default())
+        SemiVal::Deep { node, key } => Val::List(
+            groups
+                .get(&node)
+                .and_then(|g| g.get(&key))
+                .cloned()
+                .unwrap_or_default(),
+        ),
+    }
+}
+
+/// Partition nodes into per-root subtrees (root, ascending members)
+fn split_roots(nodes: &[ArrayNode]) -> Vec<(usize, Vec<usize>)> {
+    fn root_of(nodes: &[ArrayNode], mut n: usize) -> usize {
+        while let Some(parent) = nodes[n].parent {
+            n = parent;
         }
+        n
+    }
+    let mut pos: HashMap<usize, usize> = HashMap::new();
+    let mut subtrees: Vec<(usize, Vec<usize>)> = Vec::new();
+    for i in 0..nodes.len() {
+        let root = root_of(nodes, i);
+        let parent = *pos.entry(root).or_insert_with(|| {
+            subtrees.push((root, Vec::new()));
+            subtrees.len() - 1
+        });
+        subtrees[parent].1.push(i);
+    }
+    subtrees
+}
+
+/// Find a root's link in a decoded field template
+fn find_link(tree: &SemiVal, root: usize) -> Option<LinkKey> {
+    match tree {
+        SemiVal::Done(_) => None,
+        SemiVal::Tuple(items) => items.iter().find_map(|s| find_link(s, root)),
+        SemiVal::Some(inner) => find_link(inner, root),
+        SemiVal::Deep { node, key } => (*node == root).then(|| key.clone()),
+    }
+}
+
+/// Splice resolved root lists back into a decoded field template
+fn splice(tree: SemiVal, resolved: &mut HashMap<usize, Val>) -> Val {
+    match tree {
+        SemiVal::Done(v) => v,
+        SemiVal::Tuple(items) => {
+            Val::Tuple(items.into_iter().map(|s| splice(s, resolved)).collect())
+        }
+        SemiVal::Some(inner) => Val::Some(Box::new(splice(*inner, resolved))),
+        SemiVal::Deep { node, .. } => resolved.remove(&node).unwrap_or(Val::List(Vec::new())),
     }
 }
 
@@ -361,6 +420,84 @@ fn decode_scalar(ty: ScalarType, value: ValueRef<'_>, nullable: bool) -> Result<
             codec::decode_duration(blob).map(|d| Val::Scalar(Scalar::Duration(d)))
         }
         (_, other) => Err(mismatch(stored_class(&other))),
+    }
+}
+
+impl SqliteBackend {
+    /// Build decode plans and prepare one statement per array node in `drafts`
+    fn prepare_array_nodes(
+        &self,
+        drafts: &[NodeDraft<'_>],
+        label: &str,
+        ctx: &str,
+    ) -> Result<(Vec<ArrayNode>, Vec<Statement<'_>>), ExecError> {
+        let mut nodes = Vec::with_capacity(drafts.len());
+        let mut stmts = Vec::with_capacity(drafts.len());
+        for (idx, draft) in drafts.iter().enumerate() {
+            let sql = node_sql(idx, drafts, &self.schema).map_err(|err| err.context(label))?;
+            stmts.push(
+                self.conn
+                    .prepare(&sql)
+                    .map_err(|err| Self::storage_error(ctx, err))?,
+            );
+            let plan = draft.plan.clone().expect("walk fills every draft");
+            nodes.push(ArrayNode {
+                width: plan_width(&plan),
+                plan,
+                parent: draft.parent.map(|(p, _)| p),
+            });
+        }
+        Ok((nodes, stmts))
+    }
+
+    /// Run one root's subtree bound to a single link; root rows in order
+    fn run_subtree(
+        &self,
+        nodes: &[ArrayNode],
+        stmts: &mut [Statement<'_>],
+        sub: &[usize],
+        key: Value,
+        label: &str,
+        ctx: &str,
+    ) -> Result<Vec<Val>, ExecError> {
+        let Some(&root) = sub.first() else {
+            return Ok(Vec::new());
+        };
+        let mut groups: HashMap<usize, HashMap<LinkKey, Vec<Val>>> = HashMap::new();
+        let mut items = Vec::new();
+        for &n in sub.iter().rev() {
+            let mut srows = stmts[n]
+                .query(params_from_iter(std::iter::once(key.clone())))
+                .map_err(|err| Self::storage_error(ctx, err))?;
+            while let Some(srow) = srows.next().map_err(|err| Self::storage_error(ctx, err))? {
+                let link = LinkKey::from_value(
+                    srow.get_ref(0)
+                        .map_err(|err| Self::storage_error(ctx, err))?,
+                );
+                let width = nodes[n].width;
+                let mut cells = Vec::with_capacity(width);
+                for i in 0..width {
+                    cells.push(
+                        srow.get_ref(1 + i)
+                            .map_err(|err| Self::storage_error(ctx, err))?,
+                    );
+                }
+                let (semival, _) =
+                    semi(&nodes[n].plan, &cells).map_err(|err| err.context(label))?;
+                let val = finalize(semival, &groups);
+                if n == root {
+                    items.push(val);
+                } else {
+                    groups
+                        .entry(n)
+                        .or_default()
+                        .entry(link)
+                        .or_default()
+                        .push(val);
+                }
+            }
+        }
+        Ok(items)
     }
 }
 
@@ -396,12 +533,30 @@ impl Storage for SqliteBackend {
                     for col in columns {
                         select.push(quote(schema.column_name(*col)));
                     }
-                    slots.push(Slot::Value(ValueSlot {
-                        label: format!("{struct_name}.{name}"),
-                        ty,
-                        start,
-                        len: columns.len(),
-                    }));
+                    let label = format!("{struct_name}.{name}");
+                    if ty.has_array() {
+                        let mut drafts = Vec::new();
+                        let mut counter = 0;
+                        let plan = walk_element(ty, None, &mut drafts, &mut counter);
+                        let (nodes, stmts) = self.prepare_array_nodes(&drafts, &label, &ctx)?;
+                        let subtrees = split_roots(&nodes);
+                        slots.push(Slot::ValueArray(ValueArraySlot {
+                            label,
+                            start,
+                            len: columns.len(),
+                            plan,
+                            nodes,
+                            stmts,
+                            subtrees,
+                        }));
+                    } else {
+                        slots.push(Slot::Value(ValueSlot {
+                            label,
+                            ty,
+                            start,
+                            len: columns.len(),
+                        }));
+                    }
                 }
                 Field::Array {
                     name,
@@ -418,29 +573,16 @@ impl Storage for SqliteBackend {
                         plan: None,
                     }];
                     let mut counter = 0;
-                    let plan = walk_element(element, 0, &mut drafts, &mut counter);
+                    let plan = walk_element(element, Some(0), &mut drafts, &mut counter);
                     drafts[0].plan = Some(plan);
-                    let mut nodes = Vec::with_capacity(drafts.len());
-                    let mut stmts = Vec::with_capacity(drafts.len());
-                    for (idx, draft) in drafts.iter().enumerate() {
-                        let sql =
-                            node_sql(idx, &drafts, schema).map_err(|err| err.context(&label))?;
-                        stmts.push(
-                            self.conn
-                                .prepare(&sql)
-                                .map_err(|err| Self::storage_error(&ctx, err))?,
-                        );
-                        let plan = draft.plan.clone().expect("walk fills every draft");
-                        nodes.push(ArrayNode {
-                            width: plan_width(&plan),
-                            plan,
-                        });
-                    }
+                    let (nodes, stmts) = self.prepare_array_nodes(&drafts, &label, &ctx)?;
+                    let subtree: Vec<usize> = (0..nodes.len()).collect();
                     slots.push(Slot::Array(ArraySlot {
                         label,
                         link_idx,
                         nodes,
                         stmts,
+                        subtree,
                     }));
                 }
                 Field::Ref { name, .. } => {
@@ -485,47 +627,42 @@ impl Storage for SqliteBackend {
                         let mut items = Vec::new();
                         if !matches!(link, ValueRef::Null) {
                             let top = LinkKey::from_value(link).to_value();
-                            let mut raws = Vec::with_capacity(slot.nodes.len());
-                            for (n, stmt) in slot.stmts.iter_mut().enumerate() {
-                                let mut srows = stmt
-                                    .query(params_from_iter(std::iter::once(top.clone())))
-                                    .map_err(|err| Self::storage_error(&ctx, err))?;
-                                let mut rows = Vec::new();
-                                while let Some(srow) =
-                                    srows.next().map_err(|err| Self::storage_error(&ctx, err))?
-                                {
-                                    let key = LinkKey::from_value(
-                                        srow.get_ref(0)
-                                            .map_err(|err| Self::storage_error(&ctx, err))?,
-                                    );
-                                    let width = slot.nodes[n].width;
-                                    let mut cells = Vec::with_capacity(width);
-                                    for i in 0..width {
-                                        cells.push(
-                                            srow.get_ref(1 + i)
-                                                .map_err(|err| Self::storage_error(&ctx, err))?,
-                                        );
-                                    }
-                                    let (sv, _) = semi(&slot.nodes[n].plan, &cells)
-                                        .map_err(|err| err.context(&slot.label))?;
-                                    rows.push((key, sv));
-                                }
-                                raws.push(rows);
-                            }
-                            let mut groups: Vec<HashMap<LinkKey, Vec<Val>>> =
-                                (0..slot.nodes.len()).map(|_| HashMap::new()).collect();
-                            for n in (1..slot.nodes.len()).rev() {
-                                for (key, sv) in raws[n].drain(..) {
-                                    let v = finalize(sv, &groups);
-                                    groups[n].entry(key).or_default().push(v);
-                                }
-                            }
-                            items = raws[0]
-                                .drain(..)
-                                .map(|(_, sv)| finalize(sv, &groups))
-                                .collect();
+                            items = self.run_subtree(
+                                &slot.nodes,
+                                &mut slot.stmts,
+                                &slot.subtree,
+                                top,
+                                &slot.label,
+                                &ctx,
+                            )?;
                         }
                         values.push(Val::List(items));
+                    }
+                    Slot::ValueArray(slot) => {
+                        let mut cells = Vec::with_capacity(slot.len);
+                        for i in 0..slot.len {
+                            cells.push(
+                                row.get_ref(slot.start + i)
+                                    .map_err(|err| Self::storage_error(&ctx, err))?,
+                            );
+                        }
+                        let (tree, _) =
+                            semi(&slot.plan, &cells).map_err(|err| err.context(&slot.label))?;
+                        let mut resolved: HashMap<usize, Val> = HashMap::new();
+                        for (root, sub) in &slot.subtrees {
+                            if let Some(key) = find_link(&tree, *root) {
+                                let items = self.run_subtree(
+                                    &slot.nodes,
+                                    &mut slot.stmts,
+                                    sub,
+                                    key.to_value(),
+                                    &slot.label,
+                                    &ctx,
+                                )?;
+                                resolved.insert(*root, Val::List(items));
+                            }
+                        }
+                        values.push(splice(tree, &mut resolved));
                     }
                 }
             }
@@ -1099,5 +1236,78 @@ mod tests {
         for row in &rows[1..] {
             assert_eq!(row.values[1], Val::List(vec![]));
         }
+    }
+
+    fn str(s: &str) -> Val {
+        Val::Scalar(Scalar::String(s.to_string()))
+    }
+
+    #[test]
+    fn fetch_tuple_embedded_array() {
+        let (backend, schema) = test_backend();
+        let sid = user_struct(&schema);
+        let rows = backend
+            .fetch(
+                sid,
+                &[
+                    user_field(&schema, sid, "id"),
+                    user_field(&schema, sid, "extra"),
+                ],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 5);
+        assert_eq!(
+            rows[0].values,
+            vec![
+                int(1),
+                Val::Tuple(vec![int(1), Val::List(vec![str("x"), str("y")])]),
+            ]
+        );
+        assert_eq!(
+            rows[1].values,
+            vec![int(2), Val::Tuple(vec![int(3), Val::List(vec![])])]
+        );
+        assert_eq!(
+            rows[2].values,
+            vec![int(3), Val::Tuple(vec![int(4), Val::List(vec![])])]
+        );
+        assert_eq!(
+            rows[3].values,
+            vec![int(4), Val::Tuple(vec![int(2), Val::List(vec![str("z")])])]
+        );
+        assert_eq!(
+            rows[4].values,
+            vec![int(5), Val::Tuple(vec![int(5), Val::List(vec![])])]
+        );
+    }
+
+    #[test]
+    fn fetch_optional_tuple_embedded_array() {
+        let (backend, schema) = test_backend();
+        let sid = user_struct(&schema);
+        let rows = backend
+            .fetch(
+                sid,
+                &[
+                    user_field(&schema, sid, "id"),
+                    user_field(&schema, sid, "opt_extra"),
+                ],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 5);
+        assert_eq!(
+            rows[0].values,
+            vec![
+                int(1),
+                some(Val::Tuple(vec![int(5), Val::List(vec![str("p")])])),
+            ]
+        );
+        assert_eq!(rows[1].values, vec![int(2), Val::None]);
+        assert_eq!(rows[2].values, vec![int(3), Val::None]);
+        assert_eq!(
+            rows[3].values,
+            vec![int(4), some(Val::Tuple(vec![int(7), Val::List(vec![])]))]
+        );
+        assert_eq!(rows[4].values, vec![int(5), Val::None]);
     }
 }
