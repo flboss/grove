@@ -347,7 +347,7 @@ fn node_sql(
         .collect();
     let scope = node_scope(idx, drafts, schema)?;
     Ok(format!(
-        "SELECT {key}, {} FROM {table} AS {alias} WHERE {scope} ORDER BY rowid",
+        "SELECT {key}, {} FROM {table} AS {alias} WHERE {scope} ORDER BY _rowid_",
         vals.join(", ")
     ))
 }
@@ -760,9 +760,9 @@ impl Storage for SqliteBackend<'_> {
         let struct_name = &struct_def.name;
         let table = quote(&self.schema.tables[struct_def.table.index()].name);
         let ctx = format!("fetch {struct_name}");
-        let mut select = vec!["rowid".to_string()];
+        let mut select = vec!["_rowid_".to_string()];
         let mut slots = self.plan_fields(struct_id, fields, &table, &mut select, &ctx)?;
-        let sql = format!("SELECT {} FROM {table} ORDER BY rowid", select.join(", "));
+        let sql = format!("SELECT {} FROM {table} ORDER BY _rowid_", select.join(", "));
         let mut stmt = self
             .conn
             .prepare(&sql)
@@ -871,13 +871,13 @@ impl Storage for SqliteBackend<'_> {
                 )
             }
         };
-        let mut select = vec!["g$f.rowid".to_string()];
+        let mut select = vec!["g$f._rowid_".to_string()];
         let mut slots = self.plan_fields(target, fields, "g$f", &mut select, &ctx)?;
         let parent_col = select.len();
-        select.push("g$k.rowid".to_string());
+        select.push("g$k._rowid_".to_string());
         let placeholders = vec!["?"; parents.len()].join(", ");
         let sql = format!(
-            "SELECT {} FROM {from} WHERE g$k.rowid IN ({placeholders}) ORDER BY g$f.rowid",
+            "SELECT {} FROM {from} WHERE g$k._rowid_ IN ({placeholders}) ORDER BY g$f._rowid_",
             select.join(", ")
         );
         let parent_ids: Vec<i64> = parents.iter().map(|key| key.0).collect();
