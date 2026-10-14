@@ -1,5 +1,7 @@
+use std::collections::HashMap;
+
 use grove_schema::validated::{
-    Field, FieldId, RelationId, ScalarType, StructId, ValidatedSchema, ValueType,
+    Field, FieldId, RelationId, ScalarType, StorageTable, StructId, ValidatedSchema, ValueType,
 };
 use rusqlite::Connection;
 use rusqlite::Statement;
@@ -123,7 +125,7 @@ fn decode_node(ty: &ValueType, vals: &[ValueRef<'_>]) -> Result<(Val, usize), Ex
             Ok((Val::Tuple(items), used))
         }
         ValueType::Array { .. } => Err(ExecError::Storage {
-            message: "nested via arrays are not yet implemented".to_string(),
+            message: "via array inside a value field is currently unsupported".to_string(),
         }),
     }
 }
@@ -135,20 +137,207 @@ struct ValueSlot<'a> {
     len: usize,
 }
 
-struct ArraySlot<'a, 'conn> {
+struct ArraySlot<'conn> {
     label: String,
-    element: &'a ValueType,
     link_idx: usize,
-    n_value_cols: usize,
-    stmt: Statement<'conn>,
+    nodes: Vec<ArrayNode>,
+    stmts: Vec<Statement<'conn>>,
 }
 
 enum Slot<'a, 'conn> {
     Value(ValueSlot<'a>),
-    Array(ArraySlot<'a, 'conn>),
+    Array(ArraySlot<'conn>),
 }
 
-/// Decode one scalar cell; `NULL` is `None` only when nullable
+/// One array level in an element type tree
+struct ArrayNode {
+    plan: ElemPlan,
+    width: usize,
+}
+
+/// Decode plan mirroring an array element type
+#[derive(Debug, Clone)]
+enum ElemPlan {
+    Scalar(ScalarType),
+    Tuple(Vec<ElemPlan>),
+    Optional(Box<ElemPlan>),
+    Link(usize),
+}
+
+struct NodeDraft<'a> {
+    storage: &'a StorageTable,
+    parent: Option<(usize, usize)>,
+    plan: Option<ElemPlan>,
+}
+
+/// Walk an element type, registering nested arrays as nodes; returns the
+/// decode plan. `counter` tracks value columns of the current level.
+fn walk_element<'a>(
+    ty: &'a ValueType,
+    self_node: usize,
+    drafts: &mut Vec<NodeDraft<'a>>,
+    counter: &mut usize,
+) -> ElemPlan {
+    match ty {
+        ValueType::Scalar(scalar) => {
+            *counter += 1;
+            ElemPlan::Scalar(*scalar)
+        }
+        ValueType::Tuple(elements) => ElemPlan::Tuple(
+            elements
+                .iter()
+                .map(|e| walk_element(e, self_node, drafts, counter))
+                .collect(),
+        ),
+        ValueType::Optional(inner) => {
+            ElemPlan::Optional(Box::new(walk_element(inner, self_node, drafts, counter)))
+        }
+        ValueType::Array { element, storage } => {
+            let pos = *counter;
+            *counter += 1;
+            let idx = drafts.len();
+            drafts.push(NodeDraft {
+                storage,
+                parent: Some((self_node, pos)),
+                plan: None,
+            });
+            let mut sub = 0;
+            let plan = walk_element(element, idx, drafts, &mut sub);
+            drafts[idx].plan = Some(plan);
+            ElemPlan::Link(idx)
+        }
+    }
+}
+
+fn plan_width(plan: &ElemPlan) -> usize {
+    match plan {
+        ElemPlan::Scalar(_) | ElemPlan::Link(_) => 1,
+        ElemPlan::Tuple(elements) => elements.iter().map(plan_width).sum(),
+        ElemPlan::Optional(inner) => plan_width(inner),
+    }
+}
+
+/// Scope predicate tying a node's rows to the parent row's top link
+fn node_scope(
+    idx: usize,
+    drafts: &[NodeDraft<'_>],
+    schema: &ValidatedSchema,
+) -> Result<String, ExecError> {
+    let alias = format!("__a{idx}");
+    let key = format!(
+        "{alias}.{}",
+        quote(schema.column_name(drafts[idx].storage.key))
+    );
+    match drafts[idx].parent {
+        None => Ok(format!("{key} = ?")),
+        Some((parent, pos)) => {
+            let palias = format!("__a{parent}");
+            let ptable = quote(&schema.tables[drafts[parent].storage.table.index()].name);
+            let pcol =
+                drafts[parent]
+                    .storage
+                    .value
+                    .get(pos)
+                    .ok_or_else(|| ExecError::Integrity {
+                        message: format!("array storage for `{ptable}` names no column {pos}"),
+                    })?;
+            let plink = format!("{palias}.{}", quote(schema.column_name(*pcol)));
+            let pscope = node_scope(parent, drafts, schema)?;
+            Ok(format!(
+                "{key} IN (SELECT {plink} FROM {ptable} AS {palias} WHERE {pscope})"
+            ))
+        }
+    }
+}
+
+fn node_sql(
+    idx: usize,
+    drafts: &[NodeDraft<'_>],
+    schema: &ValidatedSchema,
+) -> Result<String, ExecError> {
+    let draft = &drafts[idx];
+    let alias = format!("__a{idx}");
+    let table = quote(&schema.tables[draft.storage.table.index()].name);
+    let key = format!("{alias}.{}", quote(schema.column_name(draft.storage.key)));
+    let vals: Vec<String> = draft
+        .storage
+        .value
+        .iter()
+        .map(|col| format!("{alias}.{}", quote(schema.column_name(*col))))
+        .collect();
+    let scope = node_scope(idx, drafts, schema)?;
+    Ok(format!(
+        "SELECT {key}, {} FROM {table} AS {alias} WHERE {scope} ORDER BY rowid",
+        vals.join(", ")
+    ))
+}
+
+/// A decoded level row holding finished values or links into deeper nodes
+enum SemiVal {
+    Done(Val),
+    Tuple(Vec<SemiVal>),
+    Some(Box<SemiVal>),
+    Deep { node: usize, key: LinkKey },
+}
+
+/// Decode one level row
+fn semi(plan: &ElemPlan, cells: &[ValueRef<'_>]) -> Result<(SemiVal, usize), ExecError> {
+    match plan {
+        ElemPlan::Scalar(scalar) => {
+            decode_scalar(*scalar, cells[0], false).map(|v| (SemiVal::Done(v), 1))
+        }
+        ElemPlan::Tuple(plans) => {
+            let mut items = Vec::with_capacity(plans.len());
+            let mut used = 0;
+            for plan in plans {
+                let (v, n) = semi(plan, &cells[used..])?;
+                items.push(v);
+                used += n;
+            }
+            Ok((SemiVal::Tuple(items), used))
+        }
+        ElemPlan::Optional(inner) => {
+            let width = plan_width(inner);
+            if cells[..width].iter().all(|v| matches!(v, ValueRef::Null)) {
+                Ok((SemiVal::Done(Val::None), width))
+            } else {
+                semi(inner, cells).map(|(s, n)| match s {
+                    SemiVal::Done(v) => (SemiVal::Done(Val::Some(Box::new(v))), n),
+                    other => (SemiVal::Some(Box::new(other)), n),
+                })
+            }
+        }
+        ElemPlan::Link(node) => {
+            if matches!(cells[0], ValueRef::Null) {
+                Ok((SemiVal::Done(Val::List(Vec::new())), 1))
+            } else {
+                Ok((
+                    SemiVal::Deep {
+                        node: *node,
+                        key: LinkKey::from_value(cells[0]),
+                    },
+                    1,
+                ))
+            }
+        }
+    }
+}
+
+/// Resolve links against already-finalized deeper groups
+fn finalize(semi: SemiVal, groups: &[HashMap<LinkKey, Vec<Val>>]) -> Val {
+    match semi {
+        SemiVal::Done(v) => v,
+        SemiVal::Tuple(items) => {
+            Val::Tuple(items.into_iter().map(|s| finalize(s, groups)).collect())
+        }
+        SemiVal::Some(inner) => Val::Some(Box::new(finalize(*inner, groups))),
+        SemiVal::Deep { node, key } => {
+            Val::List(groups[node].get(&key).cloned().unwrap_or_default())
+        }
+    }
+}
+
+/// Decode one scalar cell
 fn decode_scalar(ty: ScalarType, value: ValueRef<'_>, nullable: bool) -> Result<Val, ExecError> {
     let mismatch = |found: &str| ExecError::Integrity {
         message: format!("expected {ty:?}, found {found}"),
@@ -222,29 +411,36 @@ impl Storage for SqliteBackend {
                 } => {
                     let link_idx = select.len();
                     select.push(quote(schema.column_name(*link)));
-                    let side_table = quote(&schema.tables[storage.table.index()].name);
-                    let key_col =
-                        format!("{side_table}.{}", quote(schema.column_name(storage.key)));
-                    let value_cols: Vec<String> = storage
-                        .value
-                        .iter()
-                        .map(|col| quote(schema.column_name(*col)))
-                        .collect();
-                    let n_value_cols = value_cols.len();
-                    let sql = format!(
-                        "SELECT {} FROM {side_table} WHERE {key_col} = ? ORDER BY rowid",
-                        value_cols.join(", "),
-                    );
-                    let stmt = self
-                        .conn
-                        .prepare(&sql)
-                        .map_err(|err| Self::storage_error(&ctx, err))?;
+                    let label = format!("{struct_name}.{name}");
+                    let mut drafts = vec![NodeDraft {
+                        storage,
+                        parent: None,
+                        plan: None,
+                    }];
+                    let mut counter = 0;
+                    let plan = walk_element(element, 0, &mut drafts, &mut counter);
+                    drafts[0].plan = Some(plan);
+                    let mut nodes = Vec::with_capacity(drafts.len());
+                    let mut stmts = Vec::with_capacity(drafts.len());
+                    for (idx, draft) in drafts.iter().enumerate() {
+                        let sql =
+                            node_sql(idx, &drafts, schema).map_err(|err| err.context(&label))?;
+                        stmts.push(
+                            self.conn
+                                .prepare(&sql)
+                                .map_err(|err| Self::storage_error(&ctx, err))?,
+                        );
+                        let plan = draft.plan.clone().expect("walk fills every draft");
+                        nodes.push(ArrayNode {
+                            width: plan_width(&plan),
+                            plan,
+                        });
+                    }
                     slots.push(Slot::Array(ArraySlot {
-                        label: format!("{struct_name}.{name}"),
-                        element,
+                        label,
                         link_idx,
-                        n_value_cols,
-                        stmt,
+                        nodes,
+                        stmts,
                     }));
                 }
                 Field::Ref { name, .. } => {
@@ -288,25 +484,46 @@ impl Storage for SqliteBackend {
                             .map_err(|err| Self::storage_error(&ctx, err))?;
                         let mut items = Vec::new();
                         if !matches!(link, ValueRef::Null) {
-                            let key = LinkKey::from_value(link).to_value();
-                            let mut srows = slot
-                                .stmt
-                                .query(params_from_iter(std::iter::once(key)))
-                                .map_err(|err| Self::storage_error(&ctx, err))?;
-                            while let Some(srow) =
-                                srows.next().map_err(|err| Self::storage_error(&ctx, err))?
-                            {
-                                let mut cells = Vec::with_capacity(slot.n_value_cols);
-                                for i in 0..slot.n_value_cols {
-                                    cells.push(
-                                        srow.get_ref(i)
+                            let top = LinkKey::from_value(link).to_value();
+                            let mut raws = Vec::with_capacity(slot.nodes.len());
+                            for (n, stmt) in slot.stmts.iter_mut().enumerate() {
+                                let mut srows = stmt
+                                    .query(params_from_iter(std::iter::once(top.clone())))
+                                    .map_err(|err| Self::storage_error(&ctx, err))?;
+                                let mut rows = Vec::new();
+                                while let Some(srow) =
+                                    srows.next().map_err(|err| Self::storage_error(&ctx, err))?
+                                {
+                                    let key = LinkKey::from_value(
+                                        srow.get_ref(0)
                                             .map_err(|err| Self::storage_error(&ctx, err))?,
                                     );
+                                    let width = slot.nodes[n].width;
+                                    let mut cells = Vec::with_capacity(width);
+                                    for i in 0..width {
+                                        cells.push(
+                                            srow.get_ref(1 + i)
+                                                .map_err(|err| Self::storage_error(&ctx, err))?,
+                                        );
+                                    }
+                                    let (sv, _) = semi(&slot.nodes[n].plan, &cells)
+                                        .map_err(|err| err.context(&slot.label))?;
+                                    rows.push((key, sv));
                                 }
-                                let (v, _) = decode_node(slot.element, &cells)
-                                    .map_err(|err| err.context(&slot.label))?;
-                                items.push(v);
+                                raws.push(rows);
                             }
+                            let mut groups: Vec<HashMap<LinkKey, Vec<Val>>> =
+                                (0..slot.nodes.len()).map(|_| HashMap::new()).collect();
+                            for n in (1..slot.nodes.len()).rev() {
+                                for (key, sv) in raws[n].drain(..) {
+                                    let v = finalize(sv, &groups);
+                                    groups[n].entry(key).or_default().push(v);
+                                }
+                            }
+                            items = raws[0]
+                                .drain(..)
+                                .map(|(_, sv)| finalize(sv, &groups))
+                                .collect();
                         }
                         values.push(Val::List(items));
                     }
@@ -827,13 +1044,22 @@ mod tests {
     }
 
     #[test]
-    fn fetch_nested_via_array_unsupported() {
+    fn fetch_nested_via_array() {
         let (backend, schema) = test_backend();
         let sid = user_struct(&schema);
-        let err = backend
+        let rows = backend
             .fetch(sid, &[user_field(&schema, sid, "matrix")])
-            .unwrap_err();
-        assert!(matches!(err, ExecError::Storage { .. }), "{err:?}");
-        assert!(err.to_string().contains("nested via arrays"), "{err}");
+            .unwrap();
+        assert_eq!(rows.len(), 5);
+        assert_eq!(
+            rows[0].values,
+            vec![Val::List(vec![
+                Val::List(vec![int(1), int(2)]),
+                Val::List(vec![]),
+            ])]
+        );
+        for row in &rows[1..] {
+            assert_eq!(row.values, vec![Val::List(vec![])]);
+        }
     }
 }
