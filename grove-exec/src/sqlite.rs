@@ -1,9 +1,8 @@
-use std::collections::HashMap;
-
 use grove_schema::validated::{
     Field, FieldId, RelationId, ScalarType, StructId, ValidatedSchema, ValueType,
 };
 use rusqlite::Connection;
+use rusqlite::Statement;
 use rusqlite::config::DbConfig;
 use rusqlite::params_from_iter;
 use rusqlite::types::{Value, ValueRef};
@@ -136,20 +135,17 @@ struct ValueSlot<'a> {
     len: usize,
 }
 
-struct ArraySlot<'a> {
-    slot: usize,
+struct ArraySlot<'a, 'conn> {
     label: String,
     element: &'a ValueType,
     link_idx: usize,
-    side_table: String,
-    key_col: String,
-    value_cols: Vec<String>,
-    keys: Vec<Option<LinkKey>>,
+    n_value_cols: usize,
+    stmt: Statement<'conn>,
 }
 
-enum Slot<'a> {
+enum Slot<'a, 'conn> {
     Value(ValueSlot<'a>),
-    Array(ArraySlot<'a>),
+    Array(ArraySlot<'a, 'conn>),
 }
 
 /// Decode one scalar cell; `NULL` is `None` only when nullable
@@ -190,6 +186,7 @@ impl Storage for SqliteBackend {
             })?;
         let struct_name = &def.name;
         let table = quote(&schema.tables[def.table.index()].name);
+        let ctx = format!("fetch {struct_name}");
         let mut select = vec!["rowid".to_string()];
         let mut slots = Vec::with_capacity(fields.len());
         for field_id in fields {
@@ -228,19 +225,26 @@ impl Storage for SqliteBackend {
                     let side_table = quote(&schema.tables[storage.table.index()].name);
                     let key_col =
                         format!("{side_table}.{}", quote(schema.column_name(storage.key)));
+                    let value_cols: Vec<String> = storage
+                        .value
+                        .iter()
+                        .map(|col| quote(schema.column_name(*col)))
+                        .collect();
+                    let n_value_cols = value_cols.len();
+                    let sql = format!(
+                        "SELECT {} FROM {side_table} WHERE {key_col} = ? ORDER BY rowid",
+                        value_cols.join(", "),
+                    );
+                    let stmt = self
+                        .conn
+                        .prepare(&sql)
+                        .map_err(|err| Self::storage_error(&ctx, err))?;
                     slots.push(Slot::Array(ArraySlot {
-                        slot: slots.len(),
                         label: format!("{struct_name}.{name}"),
                         element,
                         link_idx,
-                        side_table,
-                        key_col,
-                        value_cols: storage
-                            .value
-                            .iter()
-                            .map(|col| quote(schema.column_name(*col)))
-                            .collect(),
-                        keys: Vec::new(),
+                        n_value_cols,
+                        stmt,
                     }));
                 }
                 Field::Ref { name, .. } => {
@@ -252,7 +256,6 @@ impl Storage for SqliteBackend {
                 }
             }
         }
-        let ctx = format!("fetch {struct_name}");
         let sql = format!("SELECT {} FROM {table} ORDER BY rowid", select.join(", "));
         let mut stmt = self
             .conn
@@ -283,12 +286,29 @@ impl Storage for SqliteBackend {
                         let link = row
                             .get_ref(slot.link_idx)
                             .map_err(|err| Self::storage_error(&ctx, err))?;
-                        slot.keys.push(if matches!(link, ValueRef::Null) {
-                            None
-                        } else {
-                            Some(LinkKey::from_value(link))
-                        });
-                        values.push(Val::List(Vec::new()));
+                        let mut items = Vec::new();
+                        if !matches!(link, ValueRef::Null) {
+                            let key = LinkKey::from_value(link).to_value();
+                            let mut srows = slot
+                                .stmt
+                                .query(params_from_iter(std::iter::once(key)))
+                                .map_err(|err| Self::storage_error(&ctx, err))?;
+                            while let Some(srow) =
+                                srows.next().map_err(|err| Self::storage_error(&ctx, err))?
+                            {
+                                let mut cells = Vec::with_capacity(slot.n_value_cols);
+                                for i in 0..slot.n_value_cols {
+                                    cells.push(
+                                        srow.get_ref(i)
+                                            .map_err(|err| Self::storage_error(&ctx, err))?,
+                                    );
+                                }
+                                let (v, _) = decode_node(slot.element, &cells)
+                                    .map_err(|err| err.context(&slot.label))?;
+                                items.push(v);
+                            }
+                        }
+                        values.push(Val::List(items));
                     }
                 }
             }
@@ -296,58 +316,6 @@ impl Storage for SqliteBackend {
                 rowid: Key(rowid),
                 values,
             });
-        }
-        for slot in &slots {
-            let Slot::Array(job) = slot else { continue };
-            let mut wanted = Vec::new();
-            let mut seen = HashMap::new();
-            for key in job.keys.iter().flatten() {
-                if seen.insert(key, ()).is_none() {
-                    wanted.push(key.to_value());
-                }
-            }
-            if wanted.is_empty() {
-                continue;
-            }
-            let placeholders = vec!["?"; wanted.len()].join(", ");
-            let sql = format!(
-                "SELECT {}, {} FROM {} WHERE {} IN ({placeholders}) ORDER BY rowid",
-                job.key_col,
-                job.value_cols.join(", "),
-                job.side_table,
-                job.key_col,
-            );
-            let mut side = self
-                .conn
-                .prepare(&sql)
-                .map_err(|err| Self::storage_error(&ctx, err))?;
-            let mut srows = side
-                .query(params_from_iter(wanted))
-                .map_err(|err| Self::storage_error(&ctx, err))?;
-            let mut groups: HashMap<LinkKey, Vec<Val>> = HashMap::new();
-            while let Some(srow) = srows.next().map_err(|err| Self::storage_error(&ctx, err))? {
-                let key = LinkKey::from_value(
-                    srow.get_ref(0)
-                        .map_err(|err| Self::storage_error(&ctx, err))?,
-                );
-                let mut cells = Vec::with_capacity(job.value_cols.len());
-                for i in 0..job.value_cols.len() {
-                    cells.push(
-                        srow.get_ref(1 + i)
-                            .map_err(|err| Self::storage_error(&ctx, err))?,
-                    );
-                }
-                let (v, _) =
-                    decode_node(job.element, &cells).map_err(|err| err.context(&job.label))?;
-                groups.entry(key).or_default().push(v);
-            }
-            for (i, link) in job.keys.iter().enumerate() {
-                if let Some(key) = link
-                    && let Some(items) = groups.get(key)
-                {
-                    out[i].values[job.slot] = Val::List(items.clone());
-                }
-            }
         }
         Ok(out)
     }
