@@ -1062,4 +1062,42 @@ mod tests {
             assert_eq!(row.values, vec![Val::List(vec![])]);
         }
     }
+
+    fn float(n: f64) -> Val {
+        Val::Scalar(Scalar::Float(n))
+    }
+
+    fn bool(n: bool) -> Val {
+        Val::Scalar(Scalar::Bool(n))
+    }
+
+    #[test]
+    fn fetch_deep_branched_via_array() {
+        let (backend, schema) = test_backend();
+        let sid = user_struct(&schema);
+        let rows = backend
+            .fetch(
+                sid,
+                &[
+                    user_field(&schema, sid, "id"),
+                    user_field(&schema, sid, "deep_branches"),
+                ],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 5);
+        assert_eq!(
+            rows[0].values,
+            vec![
+                int(1),
+                Val::List(vec![Val::Tuple(vec![
+                    Val::List(vec![Val::List(vec![int(1), int(2)]), Val::List(vec![])]),
+                    Val::List(vec![float(2.5)]),
+                    bool(true),
+                ])]),
+            ]
+        );
+        for row in &rows[1..] {
+            assert_eq!(row.values[1], Val::List(vec![]));
+        }
+    }
 }

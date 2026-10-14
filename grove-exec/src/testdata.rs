@@ -21,6 +21,7 @@ struct User {
   scores: List<(Int, String)>@scores_ref via user_scores[user_key, (s_int, s_str)],
   lucky: List<?Int>@lucky_ref via user_lucky[user_key, lucky_num],
   matrix: List<List<Int> via inner_table[ref, data]>@matrix_ref via outer_table[ref, inner_ref],
+  deep_branches: List<(List<List<Int> via deep_inner[dkey, dval]> via deep_mid[dkey, dlink], List<Float> via deep_float[dkey, dval], Bool)>@deep_ref via deep_outer[dkey, (el1, el2, eflag)],
 }
 "#;
 
@@ -45,7 +46,8 @@ pub fn seed(conn: &mut Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE users(id INTEGER, name TEXT, nickname TEXT, x REAL, y REAL,
            hx REAL, hy REAL, balance BLOB, created BLOB, elapsed BLOB, active INTEGER,
-           tags_ref INTEGER, scores_ref INTEGER, lucky_ref INTEGER, matrix_ref INTEGER);
+           tags_ref INTEGER, scores_ref INTEGER, lucky_ref INTEGER, matrix_ref INTEGER,
+           deep_ref INTEGER);
          CREATE TABLE user_tags(user_key INTEGER, tag_value TEXT);
          CREATE TABLE user_scores(user_key INTEGER, s_int INTEGER, s_str TEXT);
          CREATE TABLE user_lucky(user_key INTEGER, lucky_num INTEGER);
@@ -58,11 +60,19 @@ pub fn seed(conn: &mut Connection) -> rusqlite::Result<()> {
          INSERT INTO user_lucky(user_key, lucky_num) VALUES
            (1000, 5), (1000, NULL);
          INSERT INTO outer_table(ref, inner_ref) VALUES (500, 50), (500, 60);
-         INSERT INTO inner_table(ref, data) VALUES (50, 1), (50, 2);",
+         INSERT INTO inner_table(ref, data) VALUES (50, 1), (50, 2);
+         CREATE TABLE deep_outer(dkey INTEGER, el1 INTEGER, el2 INTEGER, eflag INTEGER);
+         CREATE TABLE deep_mid(dkey INTEGER, dlink INTEGER);
+         CREATE TABLE deep_inner(dkey INTEGER, dval INTEGER);
+         CREATE TABLE deep_float(dkey INTEGER, dval REAL);
+         INSERT INTO deep_outer(dkey, el1, el2, eflag) VALUES (600, 61, 62, 1);
+         INSERT INTO deep_mid(dkey, dlink) VALUES (61, 611), (61, 612);
+         INSERT INTO deep_inner(dkey, dval) VALUES (611, 1), (611, 2);
+         INSERT INTO deep_float(dkey, dval) VALUES (62, 2.5);",
     )?;
     let insert = "INSERT INTO users(id, name, nickname, x, y, hx, hy, balance, created, \
-                  elapsed, active, tags_ref, scores_ref, lucky_ref, matrix_ref) \
-                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                  elapsed, active, tags_ref, scores_ref, lucky_ref, matrix_ref, deep_ref) \
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
     struct SeedUser {
         id: i64,
         name: &'static str,
@@ -80,6 +90,7 @@ pub fn seed(conn: &mut Connection) -> rusqlite::Result<()> {
         scores: Option<i64>,
         lucky: Option<i64>,
         matrix: Option<i64>,
+        deep_branches: Option<i64>,
     }
     let users = [
         SeedUser {
@@ -99,6 +110,7 @@ pub fn seed(conn: &mut Connection) -> rusqlite::Result<()> {
             scores: Some(100),
             lucky: Some(1000),
             matrix: Some(500),
+            deep_branches: Some(600),
         },
         SeedUser {
             id: 2,
@@ -117,6 +129,7 @@ pub fn seed(conn: &mut Connection) -> rusqlite::Result<()> {
             scores: None,
             lucky: None,
             matrix: None,
+            deep_branches: None,
         },
         SeedUser {
             id: 3,
@@ -135,6 +148,7 @@ pub fn seed(conn: &mut Connection) -> rusqlite::Result<()> {
             scores: None,
             lucky: None,
             matrix: None,
+            deep_branches: None,
         },
         SeedUser {
             id: 4,
@@ -153,6 +167,7 @@ pub fn seed(conn: &mut Connection) -> rusqlite::Result<()> {
             scores: Some(200),
             lucky: None,
             matrix: Some(700),
+            deep_branches: Some(650),
         },
         SeedUser {
             id: 5,
@@ -171,6 +186,7 @@ pub fn seed(conn: &mut Connection) -> rusqlite::Result<()> {
             scores: None,
             lucky: Some(2000),
             matrix: None,
+            deep_branches: None,
         },
     ];
     for u in users {
@@ -194,6 +210,7 @@ pub fn seed(conn: &mut Connection) -> rusqlite::Result<()> {
                 u.scores,
                 u.lucky,
                 u.matrix,
+                u.deep_branches,
             ],
         )?;
     }
