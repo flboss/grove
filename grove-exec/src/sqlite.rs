@@ -455,4 +455,417 @@ mod tests {
             other => panic!("unexpected decode result: {other:?}"),
         }
     }
+
+    fn test_backend() -> (SqliteBackend, ValidatedSchema) {
+        let schema = crate::testdata::schema();
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::testdata::seed(&mut conn).unwrap();
+        let backend = SqliteBackend::new(conn, schema.clone()).unwrap();
+        (backend, schema)
+    }
+
+    fn user_struct(schema: &ValidatedSchema) -> StructId {
+        crate::testdata::struct_id(schema, "User")
+    }
+
+    fn user_field(schema: &ValidatedSchema, sid: StructId, name: &str) -> FieldId {
+        crate::testdata::field_id(schema, sid, name)
+    }
+
+    fn some(v: Val) -> Val {
+        Val::Some(Box::new(v))
+    }
+
+    fn int(n: i64) -> Val {
+        Val::Scalar(Scalar::Int(n))
+    }
+
+    #[test]
+    fn fetch_scalars_positional() {
+        let (backend, schema) = test_backend();
+        let sid = user_struct(&schema);
+        let rows = backend
+            .fetch(
+                sid,
+                &[
+                    user_field(&schema, sid, "name"),
+                    user_field(&schema, sid, "id"),
+                    user_field(&schema, sid, "balance"),
+                    user_field(&schema, sid, "created"),
+                    user_field(&schema, sid, "elapsed"),
+                    user_field(&schema, sid, "active"),
+                ],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[0].rowid, Key(1));
+        assert_eq!(
+            rows[0].values,
+            vec![
+                Val::Scalar(Scalar::String("Ada".to_string())),
+                int(1),
+                Val::Scalar(Scalar::Dec("30".parse().unwrap())),
+                Val::Scalar(Scalar::Instant(
+                    DateTime::from_timestamp(1_700_000_000, 0).unwrap()
+                )),
+                Val::Scalar(Scalar::Duration(TimeDelta::seconds(90))),
+                Val::Scalar(Scalar::Bool(true)),
+            ]
+        );
+        assert_eq!(
+            rows[2].values,
+            vec![
+                Val::Scalar(Scalar::String("Cyd".to_string())),
+                int(3),
+                Val::Scalar(Scalar::Dec("-5.25".parse().unwrap())),
+                Val::Scalar(Scalar::Instant(
+                    DateTime::from_timestamp(-1, 500_000_000).unwrap()
+                )),
+                Val::Scalar(Scalar::Duration(TimeDelta::milliseconds(-1500))),
+                Val::Scalar(Scalar::Bool(false)),
+            ]
+        );
+    }
+
+    #[test]
+    fn fetch_optional_and_tuples() {
+        let (backend, schema) = test_backend();
+        let sid = user_struct(&schema);
+        let rows = backend
+            .fetch(
+                sid,
+                &[
+                    user_field(&schema, sid, "id"),
+                    user_field(&schema, sid, "nickname"),
+                    user_field(&schema, sid, "pos"),
+                    user_field(&schema, sid, "home"),
+                ],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 5);
+        assert_eq!(
+            rows[0].values,
+            vec![
+                int(1),
+                some(Val::Scalar(Scalar::String("A".to_string()))),
+                Val::Tuple(vec![
+                    Val::Scalar(Scalar::Float(1.5)),
+                    Val::Scalar(Scalar::Float(-2.5)),
+                ]),
+                some(Val::Tuple(vec![
+                    Val::Scalar(Scalar::Float(3.0)),
+                    Val::Scalar(Scalar::Float(4.0)),
+                ])),
+            ]
+        );
+        assert_eq!(
+            rows[1].values,
+            vec![
+                int(2),
+                Val::None,
+                Val::Tuple(vec![
+                    Val::Scalar(Scalar::Float(0.0)),
+                    Val::Scalar(Scalar::Float(0.0)),
+                ]),
+                Val::None,
+            ]
+        );
+    }
+
+    #[test]
+    fn fetch_partial_null_tuple_error() {
+        let (backend, schema) = test_backend();
+        backend
+            .conn
+            .execute("UPDATE users SET hx = 3.0 WHERE id = 3", [])
+            .unwrap();
+        let sid = user_struct(&schema);
+        let err = backend
+            .fetch(sid, &[user_field(&schema, sid, "home")])
+            .unwrap_err();
+        assert!(matches!(err, ExecError::Integrity { .. }), "{err:?}");
+        assert!(err.to_string().contains("User.home"), "{err}");
+    }
+
+    #[test]
+    fn fetch_empty_table_empty_fields() {
+        let (backend, schema) = test_backend();
+        let sid = user_struct(&schema);
+        let rows = backend.fetch(sid, &[]).unwrap();
+        assert_eq!(rows.len(), 5);
+        assert!(rows[0].values.is_empty());
+        assert_eq!(rows[4].rowid, Key(5));
+        backend.conn.execute("DELETE FROM users", []).unwrap();
+        let rows = backend
+            .fetch(sid, &[user_field(&schema, sid, "id")])
+            .unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn fetch_reads_rowid_order() {
+        let (backend, schema) = test_backend();
+        backend
+            .conn
+            .execute("DELETE FROM users WHERE rowid = 2", [])
+            .unwrap();
+        backend
+            .conn
+            .execute("INSERT INTO users(id) VALUES (9)", [])
+            .unwrap();
+        let sid = user_struct(&schema);
+        let rows = backend
+            .fetch(sid, &[user_field(&schema, sid, "id")])
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.rowid).collect::<Vec<_>>(),
+            vec![Key(1), Key(3), Key(4), Key(5), Key(6)]
+        );
+        assert_eq!(
+            rows.iter().map(|r| r.values.clone()).collect::<Vec<_>>(),
+            vec![
+                vec![int(1)],
+                vec![int(3)],
+                vec![int(4)],
+                vec![int(5)],
+                vec![int(9)],
+            ]
+        );
+    }
+
+    #[test]
+    fn fetch_arrays_grouped_by_link_in_side_rowid_order() {
+        let (backend, schema) = test_backend();
+        let sid = user_struct(&schema);
+        let rows = backend
+            .fetch(
+                sid,
+                &[
+                    user_field(&schema, sid, "id"),
+                    user_field(&schema, sid, "tags"),
+                    user_field(&schema, sid, "scores"),
+                    user_field(&schema, sid, "lucky"),
+                ],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 5);
+        let str_list = |ss: &[&str]| {
+            Val::List(
+                ss.iter()
+                    .map(|s| Val::Scalar(Scalar::String(s.to_string())))
+                    .collect(),
+            )
+        };
+        assert_eq!(
+            rows[0].values,
+            vec![
+                int(1),
+                str_list(&["a1", "a2"]),
+                Val::List(vec![
+                    Val::Tuple(vec![int(1), Val::Scalar(Scalar::String("one".to_string()))]),
+                    Val::Tuple(vec![int(2), Val::Scalar(Scalar::String("two".to_string()))]),
+                ]),
+                Val::List(vec![some(int(5)), Val::None]),
+            ]
+        );
+        assert_eq!(
+            rows[1].values,
+            vec![
+                int(2),
+                str_list(&["b2", "b1"]),
+                Val::List(vec![]),
+                Val::List(vec![]),
+            ]
+        );
+        assert_eq!(
+            rows[2].values,
+            vec![
+                int(3),
+                Val::List(vec![]),
+                Val::List(vec![]),
+                Val::List(vec![])
+            ]
+        );
+        assert_eq!(
+            rows[3].values,
+            vec![
+                int(4),
+                Val::List(vec![]),
+                Val::List(vec![Val::Tuple(vec![
+                    int(3),
+                    Val::Scalar(Scalar::String("three".to_string()))
+                ])]),
+                Val::List(vec![]),
+            ]
+        );
+        assert_eq!(
+            rows[4].values,
+            vec![
+                int(5),
+                str_list(&["a1", "a2"]),
+                Val::List(vec![]),
+                Val::List(vec![]),
+            ]
+        );
+    }
+
+    #[test]
+    fn fetch_ref_field_error() {
+        use grove_schema::validated::{Field, Struct, Table, TableId};
+        let schema = ValidatedSchema {
+            tables: vec![Table {
+                name: "t".to_string(),
+                columns: vec![],
+            }],
+            structs: vec![Struct {
+                name: "S".to_string(),
+                table: TableId::new(0),
+                fields: vec![Field::Ref {
+                    name: "r".to_string(),
+                    target: StructId::new(0),
+                    optional: false,
+                    is_list: false,
+                    owning: false,
+                }],
+            }],
+            ..Default::default()
+        };
+        let backend = SqliteBackend::open_in_memory(schema).unwrap();
+        let err = backend
+            .fetch(StructId::new(0), &[FieldId::new(StructId::new(0), 0)])
+            .unwrap_err();
+        assert!(matches!(err, ExecError::Integrity { .. }), "{err:?}");
+        assert!(err.to_string().contains("Ref field `S.r`"), "{err}");
+    }
+
+    #[test]
+    fn fetch_mismatched_types() {
+        let (backend, schema) = test_backend();
+        let sid = user_struct(&schema);
+        let id = user_field(&schema, sid, "id");
+        let name = user_field(&schema, sid, "name");
+        let active = user_field(&schema, sid, "active");
+        let balance = user_field(&schema, sid, "balance");
+        for (setup, field, label) in [
+            (
+                "INSERT INTO users(id, name) VALUES (1, x'313233')",
+                name,
+                "User.name",
+            ),
+            (
+                "INSERT INTO users(id, name) VALUES (1.5, 'x')",
+                id,
+                "User.id",
+            ),
+            (
+                "INSERT INTO users(id, name, active) VALUES (1, 'x', 2)",
+                active,
+                "User.active",
+            ),
+            (
+                "INSERT INTO users(id, name, balance) VALUES (1, 'x', x'6a756e6b')",
+                balance,
+                "User.balance",
+            ),
+        ] {
+            backend.conn.execute_batch("DELETE FROM users").unwrap();
+            backend.conn.execute_batch(setup).unwrap();
+            let err = backend.fetch(sid, &[field]).unwrap_err();
+            assert!(matches!(err, ExecError::Integrity { .. }), "{err:?}");
+            assert!(err.to_string().contains(label), "{err}");
+        }
+    }
+
+    #[test]
+    fn fetch_bad_ids_error() {
+        let (backend, schema) = test_backend();
+        let sid = user_struct(&schema);
+        assert!(matches!(
+            backend.fetch(StructId::new(99), &[]).unwrap_err(),
+            ExecError::Storage { .. }
+        ));
+        assert!(matches!(
+            backend
+                .fetch(sid, &[FieldId::new(StructId::new(7), 0)])
+                .unwrap_err(),
+            ExecError::Integrity { .. }
+        ));
+    }
+
+    #[test]
+    fn fetch_missing_column_error() {
+        use grove_schema::validated::{
+            Column, ColumnId, Field, ScalarType, Struct, Table, TableId, ValueType,
+        };
+        let ghost = ColumnId::new(TableId::new(0), 0);
+        let schema = ValidatedSchema {
+            tables: vec![Table {
+                name: "t".to_string(),
+                columns: vec![Column {
+                    name: "ghost".to_string(),
+                    ty: Some(ScalarType::Int),
+                }],
+            }],
+            structs: vec![Struct {
+                name: "S".to_string(),
+                table: TableId::new(0),
+                fields: vec![Field::Value {
+                    name: "x".to_string(),
+                    ty: ValueType::Scalar(ScalarType::Int),
+                    columns: vec![ghost],
+                }],
+            }],
+            ..Default::default()
+        };
+        let backend = SqliteBackend::open_in_memory(schema).unwrap();
+        backend
+            .conn
+            .execute_batch("CREATE TABLE t(c INTEGER);")
+            .unwrap();
+        let err = backend
+            .fetch(StructId::new(0), &[FieldId::new(StructId::new(0), 0)])
+            .unwrap_err();
+        assert!(matches!(err, ExecError::Storage { .. }), "{err:?}");
+        assert!(err.to_string().contains("no such column"), "{err}");
+    }
+
+    #[test]
+    fn decode_node_nested_tuples() {
+        use grove_schema::validated::ValueType;
+        let ty = ValueType::Tuple(vec![
+            ValueType::Scalar(ScalarType::Int),
+            ValueType::Tuple(vec![
+                ValueType::Scalar(ScalarType::String),
+                ValueType::Scalar(ScalarType::Bool),
+            ]),
+        ]);
+        let vals = [
+            ValueRef::Integer(1),
+            ValueRef::Text(b"a"),
+            ValueRef::Integer(1),
+        ];
+        let (v, used) = decode_node(&ty, &vals).unwrap();
+        assert_eq!(used, 3);
+        assert_eq!(
+            v,
+            Val::Tuple(vec![
+                int(1),
+                Val::Tuple(vec![
+                    Val::Scalar(Scalar::String("a".to_string())),
+                    Val::Scalar(Scalar::Bool(true)),
+                ]),
+            ])
+        );
+    }
+
+    #[test]
+    fn fetch_nested_via_array_unsupported() {
+        let (backend, schema) = test_backend();
+        let sid = user_struct(&schema);
+        let err = backend
+            .fetch(sid, &[user_field(&schema, sid, "matrix")])
+            .unwrap_err();
+        assert!(matches!(err, ExecError::Storage { .. }), "{err:?}");
+        assert!(err.to_string().contains("nested via arrays"), "{err}");
+    }
 }
