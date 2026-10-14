@@ -139,12 +139,13 @@ fn array_link_column(field: &FieldDecl) -> (&str, Span) {
     }
 }
 
-fn value_scalar_leaves(ty: &TypeExpr) -> Vec<ScalarType> {
+fn value_column_types(ty: &TypeExpr) -> Vec<Option<ScalarType>> {
     match ty {
-        TypeExpr::Primitive(spanned) => vec![builtin_scalar(spanned)],
-        TypeExpr::Optional { inner, .. } => value_scalar_leaves(inner),
-        TypeExpr::Tuple { elements, .. } => elements.iter().flat_map(value_scalar_leaves).collect(),
-        TypeExpr::List { element, .. } => value_scalar_leaves(element),
+        TypeExpr::Primitive(spanned) => vec![Some(builtin_scalar(spanned))],
+        TypeExpr::Optional { inner, .. } => value_column_types(inner),
+        TypeExpr::Tuple { elements, .. } => elements.iter().flat_map(value_column_types).collect(),
+        TypeExpr::List { via: Some(_), .. } => vec![None],
+        TypeExpr::List { element, .. } => value_column_types(element),
         TypeExpr::Struct(_) => Vec::new(),
     }
 }

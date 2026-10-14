@@ -224,10 +224,23 @@ impl<'s> Builder<'s> {
     ) {
         match super::field_kind(&field.exposed_type) {
             FieldKind::Value | FieldKind::ListNoVia => {
-                let scalars = super::value_scalar_leaves(&field.exposed_type);
+                let leaves = super::value_column_types(&field.exposed_type);
                 for (i, (name, span)) in super::value_column_refs(field).into_iter().enumerate() {
-                    self.claim_declared(tid, name, span, scalars.get(i).copied(), declared_columns);
+                    match leaves.get(i) {
+                        Some(Some(scalar)) => {
+                            self.claim_declared(tid, name, span, Some(*scalar), declared_columns);
+                        }
+                        // A `via` list inside the type holds its rows aside;
+                        // the column holds the link key (untyped)
+                        Some(None) => {
+                            self.claim_reference(tid, name, span);
+                        }
+                        None => {
+                            self.claim_declared(tid, name, span, None, declared_columns);
+                        }
+                    }
                 }
+                self.collect_storage_tables(&field.exposed_type, first_claims, declared_columns);
             }
             FieldKind::Array { element, via } => {
                 let (link, span) = super::array_link_column(field);
@@ -530,6 +543,31 @@ mod tests {
                     stacked,
                     vec![("user_key", None), ("tag_value", Some(ScalarType::String)),]
                 );
+            },
+        );
+    }
+
+    #[test]
+    fn tuple_via_list_link_inventory() {
+        stage_physical(
+            "root ss: S; \
+             struct S { t: Tuple<Int, List<String> via tt[k, v]>@(a, b) }",
+            |b| {
+                assert!(b.diags.is_empty());
+                let names: Vec<&str> = b.tables.iter().map(|t| t.name.as_str()).collect();
+                assert_eq!(names, vec!["ss", "tt"]);
+                let parent: Vec<(&str, Option<ScalarType>)> = b.tables[0]
+                    .columns
+                    .iter()
+                    .map(|c| (c.name.as_str(), c.ty))
+                    .collect();
+                assert_eq!(parent, vec![("a", Some(ScalarType::Int)), ("b", None)]);
+                let side: Vec<(&str, Option<ScalarType>)> = b.tables[1]
+                    .columns
+                    .iter()
+                    .map(|c| (c.name.as_str(), c.ty))
+                    .collect();
+                assert_eq!(side, vec![("k", None), ("v", Some(ScalarType::String))]);
             },
         );
     }

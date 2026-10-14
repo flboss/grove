@@ -65,7 +65,7 @@ impl<'s> Builder<'s> {
             }
             FieldKind::Value => {
                 let declared = super::value_column_refs(field).len();
-                let expected = super::value_scalar_leaves(&field.exposed_type).len();
+                let expected = super::value_column_types(&field.exposed_type).len();
                 if declared != expected {
                     let columns = field
                         .column
@@ -490,6 +490,91 @@ mod tests {
                     panic!("pos should wrap a Tuple");
                 };
                 assert_eq!(ts.len(), 2);
+                assert_eq!(columns.len(), 2);
+            },
+        );
+    }
+
+    #[test]
+    fn value_tuple_holding_via_list() {
+        stage_structs(
+            "root ss: S; struct S { t: Tuple<Int, List<String> via tt[k, v]>@(a, b) }",
+            |b| {
+                assert!(b.diags.is_empty(), "{:?}", codes(&b.diags));
+                let t = b.field_index[&("S", "t")];
+                let Field::Value { ty, columns, .. } = &b.structs[0].fields[t.local()] else {
+                    panic!("t should be a Value field");
+                };
+                let ValueType::Tuple(ts) = ty else {
+                    panic!("t should be a Tuple");
+                };
+                assert!(matches!(ts[0], ValueType::Scalar(ScalarType::Int)));
+                let ValueType::Array { element, storage } = &ts[1] else {
+                    panic!("second element should be a via array");
+                };
+                assert!(matches!(
+                    element.as_ref(),
+                    ValueType::Scalar(ScalarType::String)
+                ));
+                assert_eq!(storage.table, TableId::new(1));
+                assert_eq!(storage.value.len(), 1);
+                assert_eq!(columns.len(), 2);
+                assert_eq!(b.tables[0].columns[1].ty, None);
+                assert_eq!(b.tables[1].name, "tt");
+            },
+        );
+    }
+
+    #[test]
+    fn value_optional_tuple_holding_via_list() {
+        stage_structs(
+            "root ss: S; struct S { u: ?Tuple<Int, List<String> via tt[k, v]>@(a, b) }",
+            |b| {
+                assert!(b.diags.is_empty(), "{:?}", codes(&b.diags));
+                let u = b.field_index[&("S", "u")];
+                let Field::Value { ty, columns, .. } = &b.structs[0].fields[u.local()] else {
+                    panic!("u should be a Value field");
+                };
+                let ValueType::Optional(inner) = ty else {
+                    panic!("u should be Optional");
+                };
+                let ValueType::Tuple(ts) = inner.as_ref() else {
+                    panic!("u should wrap a Tuple");
+                };
+                assert!(matches!(ts[0], ValueType::Scalar(ScalarType::Int)));
+                assert!(matches!(ts[1], ValueType::Array { .. }));
+                assert_eq!(columns.len(), 2);
+            },
+        );
+    }
+
+    #[test]
+    fn value_tuple_via_list_arity() {
+        stage_structs(
+            "root ss: S; struct S { t: Tuple<Int, List<String> via tt[k, v]>@(a, b, c) }",
+            |b| {
+                assert_eq!(codes(&b.diags), vec!["SV0009"]);
+            },
+        );
+    }
+
+    #[test]
+    fn value_tuple_holding_via_tuple_list() {
+        stage_structs(
+            "root ss: S; struct S { t: Tuple<Int, List<Tuple<Int, String>> via tt[k, (x, y)]>@(a, b) }",
+            |b| {
+                assert!(b.diags.is_empty(), "{:?}", codes(&b.diags));
+                let t = b.field_index[&("S", "t")];
+                let Field::Value { ty, columns, .. } = &b.structs[0].fields[t.local()] else {
+                    panic!("t should be a Value field");
+                };
+                let ValueType::Tuple(ts) = ty else {
+                    panic!("t should be a Tuple");
+                };
+                let ValueType::Array { element, .. } = &ts[1] else {
+                    panic!("second element should be a via array");
+                };
+                assert!(matches!(element.as_ref(), ValueType::Tuple(_)));
                 assert_eq!(columns.len(), 2);
             },
         );
