@@ -19,6 +19,7 @@ pub enum TokenKind {
     Mod,
     Asc,
     Desc,
+    Let,
     Int,
     Float,
     Dec,

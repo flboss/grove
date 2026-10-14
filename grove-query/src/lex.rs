@@ -153,6 +153,7 @@ impl<'src> Lexer<'src> {
             "mod" => TokenKind::Mod,
             "asc" => TokenKind::Asc,
             "desc" => TokenKind::Desc,
+            "let" => TokenKind::Let,
             "Int" => TokenKind::Int,
             "Float" => TokenKind::Float,
             "Dec" => TokenKind::Dec,
@@ -1368,7 +1369,7 @@ mod tests {
 
     #[test]
     fn keywords() {
-        let mut lex = Lexer::new("none some true false prev in as if else mod asc desc");
+        let mut lex = Lexer::new("none some true false prev in as if else mod asc desc let");
         assert_token!(lex, TokenKind::None);
         assert_token!(lex, TokenKind::Some);
         assert_token!(lex, TokenKind::True);
@@ -1381,6 +1382,7 @@ mod tests {
         assert_token!(lex, TokenKind::Mod);
         assert_token!(lex, TokenKind::Asc);
         assert_token!(lex, TokenKind::Desc);
+        assert_token!(lex, TokenKind::Let);
         assert_eof!(lex);
     }
 
@@ -1404,19 +1406,22 @@ mod tests {
 
     #[test]
     fn ident_does_not_match_keyword() {
-        let mut lex = Lexer::new("incoming truex Intx");
+        let mut lex = Lexer::new("incoming truex Intx letter outlet");
         assert_ident!(lex, "incoming");
         assert_ident!(lex, "truex");
         assert_ident!(lex, "Intx");
+        assert_ident!(lex, "letter");
+        assert_ident!(lex, "outlet");
         assert_eof!(lex);
     }
 
     #[test]
     fn backtick_ident_escapes_keywords() {
-        let mut lex = Lexer::new("`prev` `true` `foo`");
+        let mut lex = Lexer::new("`prev` `true` `foo` `let`");
         assert_ident!(lex, "prev");
         assert_ident!(lex, "true");
         assert_ident!(lex, "foo");
+        assert_ident!(lex, "let");
         assert_eof!(lex);
     }
 
