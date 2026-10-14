@@ -303,7 +303,7 @@ fn node_scope(
     drafts: &[NodeDraft<'_>],
     schema: &ValidatedSchema,
 ) -> Result<String, ExecError> {
-    let alias = format!("__a{idx}");
+    let alias = format!("g$a{idx}");
     let key = format!(
         "{alias}.{}",
         quote(schema.column_name(drafts[idx].storage.key))
@@ -311,7 +311,7 @@ fn node_scope(
     match drafts[idx].parent {
         None => Ok(format!("{key} = ?")),
         Some((parent, pos)) => {
-            let palias = format!("__a{parent}");
+            let palias = format!("g$a{parent}");
             let ptable = quote(&schema.tables[drafts[parent].storage.table.index()].name);
             let pcol =
                 drafts[parent]
@@ -336,7 +336,7 @@ fn node_sql(
     schema: &ValidatedSchema,
 ) -> Result<String, ExecError> {
     let draft = &drafts[idx];
-    let alias = format!("__a{idx}");
+    let alias = format!("g$a{idx}");
     let table = quote(&schema.tables[draft.storage.table.index()].name);
     let key = format!("{alias}.{}", quote(schema.column_name(draft.storage.key)));
     let vals: Vec<String> = draft
@@ -827,21 +827,21 @@ impl Storage for SqliteBackend<'_> {
                 let fk_col = quote(schema.column_name(*fk));
                 let pk_col = quote(schema.column_name(*pk));
                 let on = if fetch_ep != *child_ref {
-                    format!("__f.{fk_col} = __k.{pk_col}")
+                    format!("g$f.{fk_col} = g$k.{pk_col}")
                 } else {
-                    format!("__f.{pk_col} = __k.{fk_col}")
+                    format!("g$f.{pk_col} = g$k.{fk_col}")
                 };
-                format!("{fetched_table} AS __f JOIN {known_table} AS __k ON {on}")
+                format!("{fetched_table} AS g$f JOIN {known_table} AS g$k ON {on}")
             }
             Relation::OneToMany { b_ref, fk, pk, .. } => {
                 let fk_col = quote(schema.column_name(*fk));
                 let pk_col = quote(schema.column_name(*pk));
                 let on = if fetch_ep != *b_ref {
-                    format!("__f.{fk_col} = __k.{pk_col}")
+                    format!("g$f.{fk_col} = g$k.{pk_col}")
                 } else {
-                    format!("__f.{pk_col} = __k.{fk_col}")
+                    format!("g$f.{pk_col} = g$k.{fk_col}")
                 };
-                format!("{fetched_table} AS __f JOIN {known_table} AS __k ON {on}")
+                format!("{fetched_table} AS g$f JOIN {known_table} AS g$k ON {on}")
             }
             Relation::ManyToMany {
                 a_ref,
@@ -865,19 +865,19 @@ impl Storage for SqliteBackend<'_> {
                 let y_col = quote(schema.column_name(*y_col));
                 let y_pk = quote(schema.column_name(*y_pk));
                 format!(
-                    "{fetched_table} AS __f \
-                     JOIN {join_table} AS __j ON __j.{x_col} = __f.{x_pk} \
-                     JOIN {known_table} AS __k ON __j.{y_col} = __k.{y_pk}"
+                    "{fetched_table} AS g$f \
+                     JOIN {join_table} AS g$j ON g$j.{x_col} = g$f.{x_pk} \
+                     JOIN {known_table} AS g$k ON g$j.{y_col} = g$k.{y_pk}"
                 )
             }
         };
-        let mut select = vec!["__f.rowid".to_string()];
-        let mut slots = self.plan_fields(target, fields, "__f", &mut select, &ctx)?;
+        let mut select = vec!["g$f.rowid".to_string()];
+        let mut slots = self.plan_fields(target, fields, "g$f", &mut select, &ctx)?;
         let parent_col = select.len();
-        select.push("__k.rowid".to_string());
+        select.push("g$k.rowid".to_string());
         let placeholders = vec!["?"; parents.len()].join(", ");
         let sql = format!(
-            "SELECT {} FROM {from} WHERE __k.rowid IN ({placeholders}) ORDER BY __f.rowid",
+            "SELECT {} FROM {from} WHERE g$k.rowid IN ({placeholders}) ORDER BY g$f.rowid",
             select.join(", ")
         );
         let parent_ids: Vec<i64> = parents.iter().map(|key| key.0).collect();
