@@ -20,3 +20,21 @@ impl fmt::Display for ExecError {
 }
 
 impl std::error::Error for ExecError {}
+
+impl ExecError {
+    pub fn context(self, context: &str) -> Self {
+        let prefixed = |message: String| format!("{context}: {message}");
+        match self {
+            ExecError::Abort { message, span } => ExecError::Abort {
+                message: prefixed(message),
+                span,
+            },
+            ExecError::Integrity { message } => ExecError::Integrity {
+                message: prefixed(message),
+            },
+            ExecError::Storage { message } => ExecError::Storage {
+                message: prefixed(message),
+            },
+        }
+    }
+}
