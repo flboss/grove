@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use grove_schema::validated::{
-    Field, FieldId, RelationId, ScalarType, StorageTable, StructId, ValidatedSchema, ValueType,
+    Field, FieldId, Relation, RelationId, ScalarType, StorageTable, StructId, ValidatedSchema,
+    ValueType,
 };
 use rusqlite::Connection;
 use rusqlite::Statement;
@@ -499,21 +500,24 @@ impl SqliteBackend {
         }
         Ok(items)
     }
-}
 
-impl Storage for SqliteBackend {
-    fn fetch(&self, struct_id: StructId, fields: &[FieldId]) -> Result<Vec<Row>, ExecError> {
-        let schema = &self.schema;
-        let def = schema
-            .structs
-            .get(struct_id.index())
-            .ok_or_else(|| ExecError::Storage {
-                message: format!("unknown struct id {}", struct_id.index()),
-            })?;
-        let struct_name = &def.name;
-        let table = quote(&schema.tables[def.table.index()].name);
-        let ctx = format!("fetch {struct_name}");
-        let mut select = vec!["rowid".to_string()];
+    /// Plan field slots, appending qualified columns to `select`
+    fn plan_fields(
+        &self,
+        struct_id: StructId,
+        fields: &[FieldId],
+        qualifier: &str,
+        select: &mut Vec<String>,
+        ctx: &str,
+    ) -> Result<Vec<Slot<'_, '_>>, ExecError> {
+        let struct_def =
+            self.schema
+                .structs
+                .get(struct_id.index())
+                .ok_or_else(|| ExecError::Storage {
+                    message: format!("unknown struct id {}", struct_id.index()),
+                })?;
+        let struct_name = &struct_def.name;
         let mut slots = Vec::with_capacity(fields.len());
         for field_id in fields {
             if field_id.struct_id() != struct_id {
@@ -521,24 +525,28 @@ impl Storage for SqliteBackend {
                     message: format!("fetch field {field_id:?} belongs to another struct"),
                 });
             }
-            let field = def
-                .fields
-                .get(field_id.local())
-                .ok_or_else(|| ExecError::Integrity {
-                    message: format!("unknown field {field_id:?} on struct `{struct_name}`"),
-                })?;
+            let field =
+                struct_def
+                    .fields
+                    .get(field_id.local())
+                    .ok_or_else(|| ExecError::Integrity {
+                        message: format!("unknown field {field_id:?} on struct `{struct_name}`"),
+                    })?;
             match field {
                 Field::Value { name, ty, columns } => {
                     let start = select.len();
                     for col in columns {
-                        select.push(quote(schema.column_name(*col)));
+                        select.push(format!(
+                            "{qualifier}.{}",
+                            quote(self.schema.column_name(*col))
+                        ));
                     }
                     let label = format!("{struct_name}.{name}");
                     if ty.has_array() {
                         let mut drafts = Vec::new();
                         let mut counter = 0;
                         let plan = walk_element(ty, None, &mut drafts, &mut counter);
-                        let (nodes, stmts) = self.prepare_array_nodes(&drafts, &label, &ctx)?;
+                        let (nodes, stmts) = self.prepare_array_nodes(&drafts, &label, ctx)?;
                         let subtrees = split_roots(&nodes);
                         slots.push(Slot::ValueArray(ValueArraySlot {
                             label,
@@ -565,7 +573,10 @@ impl Storage for SqliteBackend {
                     storage,
                 } => {
                     let link_idx = select.len();
-                    select.push(quote(schema.column_name(*link)));
+                    select.push(format!(
+                        "{qualifier}.{}",
+                        quote(self.schema.column_name(*link))
+                    ));
                     let label = format!("{struct_name}.{name}");
                     let mut drafts = vec![NodeDraft {
                         storage,
@@ -575,7 +586,7 @@ impl Storage for SqliteBackend {
                     let mut counter = 0;
                     let plan = walk_element(element, Some(0), &mut drafts, &mut counter);
                     drafts[0].plan = Some(plan);
-                    let (nodes, stmts) = self.prepare_array_nodes(&drafts, &label, &ctx)?;
+                    let (nodes, stmts) = self.prepare_array_nodes(&drafts, &label, ctx)?;
                     let subtree: Vec<usize> = (0..nodes.len()).collect();
                     slots.push(Slot::Array(ArraySlot {
                         label,
@@ -594,6 +605,97 @@ impl Storage for SqliteBackend {
                 }
             }
         }
+        Ok(slots)
+    }
+
+    /// Decode one storage row at the planned columns
+    fn decode_row(
+        &self,
+        slots: &mut [Slot<'_, '_>],
+        row: &rusqlite::Row<'_>,
+        ctx: &str,
+    ) -> Result<(Key, Vec<Val>), ExecError> {
+        let rowid: i64 = row.get(0).map_err(|err| Self::storage_error(ctx, err))?;
+        let mut values = Vec::with_capacity(slots.len());
+        for slot in slots.iter_mut() {
+            match slot {
+                Slot::Value(slot) => {
+                    let mut cells = Vec::with_capacity(slot.len);
+                    for i in 0..slot.len {
+                        cells.push(
+                            row.get_ref(slot.start + i)
+                                .map_err(|err| Self::storage_error(ctx, err))?,
+                        );
+                    }
+                    let (val, _) =
+                        decode_node(slot.ty, &cells).map_err(|err| err.context(&slot.label))?;
+                    values.push(val);
+                }
+                Slot::Array(slot) => {
+                    let link = row
+                        .get_ref(slot.link_idx)
+                        .map_err(|err| Self::storage_error(ctx, err))?;
+                    let mut items = Vec::new();
+                    if !matches!(link, ValueRef::Null) {
+                        let top = LinkKey::from_value(link).to_value();
+                        items = self.run_subtree(
+                            &slot.nodes,
+                            &mut slot.stmts,
+                            &slot.subtree,
+                            top,
+                            &slot.label,
+                            ctx,
+                        )?;
+                    }
+                    values.push(Val::List(items));
+                }
+                Slot::ValueArray(slot) => {
+                    let mut cells = Vec::with_capacity(slot.len);
+                    for i in 0..slot.len {
+                        cells.push(
+                            row.get_ref(slot.start + i)
+                                .map_err(|err| Self::storage_error(ctx, err))?,
+                        );
+                    }
+                    let (tree, _) =
+                        semi(&slot.plan, &cells).map_err(|err| err.context(&slot.label))?;
+                    let mut resolved: HashMap<usize, Val> = HashMap::new();
+                    for (root, sub) in &slot.subtrees {
+                        if let Some(key) = find_link(&tree, *root) {
+                            let items = self.run_subtree(
+                                &slot.nodes,
+                                &mut slot.stmts,
+                                sub,
+                                key.to_value(),
+                                &slot.label,
+                                ctx,
+                            )?;
+                            resolved.insert(*root, Val::List(items));
+                        }
+                    }
+                    values.push(splice(tree, &mut resolved));
+                }
+            }
+        }
+        Ok((Key(rowid), values))
+    }
+}
+
+impl Storage for SqliteBackend {
+    fn fetch(&self, struct_id: StructId, fields: &[FieldId]) -> Result<Vec<Row>, ExecError> {
+        let schema = &self.schema;
+        let struct_def =
+            schema
+                .structs
+                .get(struct_id.index())
+                .ok_or_else(|| ExecError::Storage {
+                    message: format!("unknown struct id {}", struct_id.index()),
+                })?;
+        let struct_name = &struct_def.name;
+        let table = quote(&schema.tables[struct_def.table.index()].name);
+        let ctx = format!("fetch {struct_name}");
+        let mut select = vec!["rowid".to_string()];
+        let mut slots = self.plan_fields(struct_id, fields, &table, &mut select, &ctx)?;
         let sql = format!("SELECT {} FROM {table} ORDER BY rowid", select.join(", "));
         let mut stmt = self
             .conn
@@ -604,89 +706,152 @@ impl Storage for SqliteBackend {
             .map_err(|err| Self::storage_error(&ctx, err))?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().map_err(|err| Self::storage_error(&ctx, err))? {
-            let rowid: i64 = row.get(0).map_err(|err| Self::storage_error(&ctx, err))?;
-            let mut values = Vec::with_capacity(slots.len());
-            for slot in &mut slots {
-                match slot {
-                    Slot::Value(slot) => {
-                        let mut cells = Vec::with_capacity(slot.len);
-                        for i in 0..slot.len {
-                            cells.push(
-                                row.get_ref(slot.start + i)
-                                    .map_err(|err| Self::storage_error(&ctx, err))?,
-                            );
-                        }
-                        let (val, _) =
-                            decode_node(slot.ty, &cells).map_err(|err| err.context(&slot.label))?;
-                        values.push(val);
-                    }
-                    Slot::Array(slot) => {
-                        let link = row
-                            .get_ref(slot.link_idx)
-                            .map_err(|err| Self::storage_error(&ctx, err))?;
-                        let mut items = Vec::new();
-                        if !matches!(link, ValueRef::Null) {
-                            let top = LinkKey::from_value(link).to_value();
-                            items = self.run_subtree(
-                                &slot.nodes,
-                                &mut slot.stmts,
-                                &slot.subtree,
-                                top,
-                                &slot.label,
-                                &ctx,
-                            )?;
-                        }
-                        values.push(Val::List(items));
-                    }
-                    Slot::ValueArray(slot) => {
-                        let mut cells = Vec::with_capacity(slot.len);
-                        for i in 0..slot.len {
-                            cells.push(
-                                row.get_ref(slot.start + i)
-                                    .map_err(|err| Self::storage_error(&ctx, err))?,
-                            );
-                        }
-                        let (tree, _) =
-                            semi(&slot.plan, &cells).map_err(|err| err.context(&slot.label))?;
-                        let mut resolved: HashMap<usize, Val> = HashMap::new();
-                        for (root, sub) in &slot.subtrees {
-                            if let Some(key) = find_link(&tree, *root) {
-                                let items = self.run_subtree(
-                                    &slot.nodes,
-                                    &mut slot.stmts,
-                                    sub,
-                                    key.to_value(),
-                                    &slot.label,
-                                    &ctx,
-                                )?;
-                                resolved.insert(*root, Val::List(items));
-                            }
-                        }
-                        values.push(splice(tree, &mut resolved));
-                    }
-                }
-            }
-            out.push(Row {
-                rowid: Key(rowid),
-                values,
-            });
+            let (rowid, values) = self.decode_row(&mut slots, row, &ctx)?;
+            out.push(Row { rowid, values });
         }
         Ok(out)
     }
 
     fn fetch_related(
         &self,
-        _rel: RelationId,
-        _fetch_from_first: bool,
-        _parents: &[Key],
-        _fields: &[FieldId],
+        rel: RelationId,
+        fetch_from_first: bool,
+        parents: &[Key],
+        fields: &[FieldId],
     ) -> Result<Vec<Vec<Row>>, ExecError> {
-        todo!()
+        let mut groups: Vec<Vec<Row>> = parents.iter().map(|_| Vec::new()).collect();
+        if parents.is_empty() {
+            return Ok(groups);
+        }
+        let schema = &self.schema;
+        let relation = schema
+            .relations
+            .get(rel.index())
+            .ok_or_else(|| ExecError::Storage {
+                message: format!("unknown relation id {}", rel.index()),
+            })?;
+        let fetch_ep = if fetch_from_first {
+            relation.endpoints()[0]
+        } else {
+            relation.endpoints()[1]
+        };
+        // Parents are rows of the navigated endpoint's struct;
+        // fetched rows are the endpoint target
+        let parent_struct = fetch_ep.struct_id();
+        let parent_def = &schema.structs[parent_struct.index()];
+        let (target, field_name) = match parent_def.fields.get(fetch_ep.local()) {
+            Some(Field::Ref { target, name, .. }) => (*target, name.clone()),
+            _ => {
+                return Err(ExecError::Integrity {
+                    message: format!("relation endpoint {fetch_ep:?} is not a reference"),
+                });
+            }
+        };
+        let ctx = format!("fetch_related {}.{field_name}", parent_def.name);
+        let target_def = &schema.structs[target.index()];
+        let fetched_table = quote(&schema.tables[target_def.table.index()].name);
+        let known_table = quote(&schema.tables[parent_def.table.index()].name);
+        let from = match relation {
+            Relation::OneToOne {
+                child_ref, fk, pk, ..
+            }
+            | Relation::ManyToOne {
+                child_ref, fk, pk, ..
+            } => {
+                let fk_col = quote(schema.column_name(*fk));
+                let pk_col = quote(schema.column_name(*pk));
+                let on = if fetch_ep != *child_ref {
+                    format!("__f.{fk_col} = __k.{pk_col}")
+                } else {
+                    format!("__f.{pk_col} = __k.{fk_col}")
+                };
+                format!("{fetched_table} AS __f JOIN {known_table} AS __k ON {on}")
+            }
+            Relation::OneToMany { b_ref, fk, pk, .. } => {
+                let fk_col = quote(schema.column_name(*fk));
+                let pk_col = quote(schema.column_name(*pk));
+                let on = if fetch_ep != *b_ref {
+                    format!("__f.{fk_col} = __k.{pk_col}")
+                } else {
+                    format!("__f.{pk_col} = __k.{fk_col}")
+                };
+                format!("{fetched_table} AS __f JOIN {known_table} AS __k ON {on}")
+            }
+            Relation::ManyToMany {
+                a_ref,
+                b_ref: _,
+                join_table,
+                a_col,
+                a_pk,
+                b_col,
+                b_pk,
+            } => {
+                // Endpoints point across (b endpoint's target is the a-side struct),
+                // so fetching through b reads a-side rows
+                let (x_col, x_pk, y_col, y_pk) = if fetch_ep != *a_ref {
+                    (a_col, a_pk, b_col, b_pk)
+                } else {
+                    (b_col, b_pk, a_col, a_pk)
+                };
+                let join_table = quote(&schema.tables[join_table.index()].name);
+                let x_col = quote(schema.column_name(*x_col));
+                let x_pk = quote(schema.column_name(*x_pk));
+                let y_col = quote(schema.column_name(*y_col));
+                let y_pk = quote(schema.column_name(*y_pk));
+                format!(
+                    "{fetched_table} AS __f \
+                     JOIN {join_table} AS __j ON __j.{x_col} = __f.{x_pk} \
+                     JOIN {known_table} AS __k ON __j.{y_col} = __k.{y_pk}"
+                )
+            }
+        };
+        let mut select = vec!["__f.rowid".to_string()];
+        let mut slots = self.plan_fields(target, fields, "__f", &mut select, &ctx)?;
+        let parent_col = select.len();
+        select.push("__k.rowid".to_string());
+        let placeholders = vec!["?"; parents.len()].join(", ");
+        let sql = format!(
+            "SELECT {} FROM {from} WHERE __k.rowid IN ({placeholders}) ORDER BY __f.rowid",
+            select.join(", ")
+        );
+        let parent_ids: Vec<i64> = parents.iter().map(|key| key.0).collect();
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|err| Self::storage_error(&ctx, err))?;
+        let mut rows = stmt
+            .query(params_from_iter(parent_ids))
+            .map_err(|err| Self::storage_error(&ctx, err))?;
+        let mut index: HashMap<Key, Vec<usize>> = HashMap::new();
+        for (i, key) in parents.iter().enumerate() {
+            index.entry(*key).or_default().push(i);
+        }
+        while let Some(row) = rows.next().map_err(|err| Self::storage_error(&ctx, err))? {
+            let (rowid, values) = self.decode_row(&mut slots, row, &ctx)?;
+            let parent: i64 = row
+                .get(parent_col)
+                .map_err(|err| Self::storage_error(&ctx, err))?;
+            if let Some(positions) = index.get(&Key(parent)) {
+                if positions.len() == 1 {
+                    groups[positions[0]].push(Row { rowid, values });
+                } else {
+                    for &i in positions {
+                        groups[i].push(Row {
+                            rowid,
+                            values: values.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(groups)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::testdata;
+
     use super::*;
     use chrono::{DateTime, TimeDelta};
 
@@ -779,19 +944,19 @@ mod tests {
     }
 
     fn test_backend() -> (SqliteBackend, ValidatedSchema) {
-        let schema = crate::testdata::schema();
+        let schema = testdata::schema();
         let mut conn = Connection::open_in_memory().unwrap();
-        crate::testdata::seed(&mut conn).unwrap();
+        testdata::seed(&mut conn).unwrap();
         let backend = SqliteBackend::new(conn, schema.clone()).unwrap();
         (backend, schema)
     }
 
     fn user_struct(schema: &ValidatedSchema) -> StructId {
-        crate::testdata::struct_id(schema, "User")
+        testdata::struct_id(schema, "User")
     }
 
     fn user_field(schema: &ValidatedSchema, sid: StructId, name: &str) -> FieldId {
-        crate::testdata::field_id(schema, sid, name)
+        testdata::field_id(schema, sid, name)
     }
 
     fn some(v: Val) -> Val {
@@ -1309,5 +1474,189 @@ mod tests {
             vec![int(4), some(Val::Tuple(vec![int(7), Val::List(vec![])]))]
         );
         assert_eq!(rows[4].values, vec![int(5), Val::None]);
+    }
+
+    fn rel_named(
+        schema: &ValidatedSchema,
+        a_struct: &str,
+        a_field: &str,
+        b_struct: &str,
+        b_field: &str,
+    ) -> RelationId {
+        let asid = testdata::struct_id(schema, a_struct);
+        let bsid = testdata::struct_id(schema, b_struct);
+        testdata::relation_id(
+            schema,
+            testdata::field_id(schema, asid, a_field),
+            testdata::field_id(schema, bsid, b_field),
+        )
+    }
+
+    fn firsts(groups: &[Vec<Row>]) -> Vec<Vec<Val>> {
+        groups
+            .iter()
+            .map(|g| g.iter().map(|row| row.values[0].clone()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn fetch_related_one_to_one() {
+        let (backend, schema) = test_backend();
+        let users = testdata::struct_id(&schema, "User");
+        let profiles = testdata::struct_id(&schema, "Profile");
+        let rel = rel_named(&schema, "Profile", "user", "User", "profile");
+        let bio = testdata::field_id(&schema, profiles, "bio");
+        let groups = backend
+            .fetch_related(rel, false, &[Key(1), Key(2), Key(3)], &[bio])
+            .unwrap();
+        assert_eq!(
+            firsts(&groups),
+            vec![vec![str("AdaBio")], vec![], vec![str("CydBio")]]
+        );
+        let name = testdata::field_id(&schema, users, "name");
+        let groups = backend
+            .fetch_related(rel, true, &[Key(1), Key(2)], &[name])
+            .unwrap();
+        assert_eq!(firsts(&groups), vec![vec![str("Ada")], vec![str("Cyd")]]);
+    }
+
+    #[test]
+    fn fetch_related_many_to_one() {
+        let (backend, schema) = test_backend();
+        let users = testdata::struct_id(&schema, "User");
+        let orders = testdata::struct_id(&schema, "Order");
+        let rel = rel_named(&schema, "Order", "user", "User", "orders");
+        let name = testdata::field_id(&schema, users, "name");
+        let groups = backend
+            .fetch_related(rel, true, &[Key(1), Key(2), Key(3), Key(4)], &[name])
+            .unwrap();
+        assert_eq!(
+            firsts(&groups),
+            vec![vec![str("Ada")], vec![str("Ada")], vec![], vec![str("Bob")]]
+        );
+        let amount = testdata::field_id(&schema, orders, "amount");
+        let groups = backend
+            .fetch_related(rel, false, &[Key(1), Key(2), Key(3)], &[amount])
+            .unwrap();
+        assert_eq!(
+            firsts(&groups),
+            vec![vec![int(100), int(200)], vec![int(400)], vec![]]
+        );
+    }
+
+    #[test]
+    fn fetch_related_one_to_many() {
+        let (backend, schema) = test_backend();
+        let images = testdata::struct_id(&schema, "Image");
+        let messages = testdata::struct_id(&schema, "Message");
+        let rel = rel_named(&schema, "Image", "messages", "Message", "image");
+        let body = testdata::field_id(&schema, messages, "body");
+        let groups = backend
+            .fetch_related(rel, true, &[Key(1), Key(2)], &[body])
+            .unwrap();
+        assert_eq!(
+            firsts(&groups),
+            vec![vec![str("nice"), str("wow")], vec![str("meh")]]
+        );
+        let title = testdata::field_id(&schema, images, "title");
+        let groups = backend
+            .fetch_related(rel, false, &[Key(1), Key(4)], &[title])
+            .unwrap();
+        assert_eq!(firsts(&groups), vec![vec![str("Sunset")], vec![]]);
+    }
+
+    #[test]
+    fn fetch_related_many_to_many() {
+        let (backend, schema) = test_backend();
+        let users = testdata::struct_id(&schema, "User");
+        let roles = testdata::struct_id(&schema, "Role");
+        let rel = rel_named(&schema, "Role", "users", "User", "roles");
+        let rname = testdata::field_id(&schema, roles, "name");
+        let groups = backend
+            .fetch_related(rel, false, &[Key(1), Key(3), Key(2)], &[rname])
+            .unwrap();
+        assert_eq!(
+            firsts(&groups),
+            vec![
+                vec![str("admin"), str("editor"), str("editor")],
+                vec![str("editor")],
+                vec![],
+            ]
+        );
+        assert_eq!(
+            groups[0].iter().map(|row| row.rowid).collect::<Vec<_>>(),
+            vec![Key(1), Key(2), Key(2)]
+        );
+        let uname = testdata::field_id(&schema, users, "name");
+        let groups = backend
+            .fetch_related(rel, true, &[Key(2), Key(1)], &[uname])
+            .unwrap();
+        assert_eq!(
+            firsts(&groups),
+            vec![vec![str("Ada"), str("Ada"), str("Cyd")], vec![str("Ada")]]
+        );
+        assert_eq!(
+            groups[0].iter().map(|row| row.rowid).collect::<Vec<_>>(),
+            vec![Key(1), Key(1), Key(3)]
+        );
+    }
+
+    #[test]
+    fn fetch_related_self_reference() {
+        let (backend, schema) = test_backend();
+        let users = testdata::struct_id(&schema, "User");
+        let rel = rel_named(&schema, "User", "manager", "User", "subordinates");
+        let name = testdata::field_id(&schema, users, "name");
+        let groups = backend
+            .fetch_related(rel, false, &[Key(2), Key(1)], &[name])
+            .unwrap();
+        assert_eq!(
+            firsts(&groups),
+            vec![vec![str("Ada"), str("Cyd")], vec![str("Dan")]]
+        );
+        let groups = backend
+            .fetch_related(rel, true, &[Key(1), Key(4), Key(2)], &[name])
+            .unwrap();
+        assert_eq!(
+            firsts(&groups),
+            vec![vec![str("Bob")], vec![str("Ada")], vec![]]
+        );
+    }
+
+    #[test]
+    fn fetch_related_with_array_fields() {
+        let (backend, schema) = test_backend();
+        let profiles = testdata::struct_id(&schema, "Profile");
+        let rel = rel_named(&schema, "Profile", "user", "User", "profile");
+        let groups = backend
+            .fetch_related(
+                rel,
+                false,
+                &[Key(1), Key(3)],
+                &[
+                    testdata::field_id(&schema, profiles, "bio"),
+                    testdata::field_id(&schema, profiles, "notes"),
+                ],
+            )
+            .unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            groups[0][0].values,
+            vec![str("AdaBio"), Val::List(vec![str("a-note")])]
+        );
+        assert_eq!(groups[1][0].values, vec![str("CydBio"), Val::List(vec![])]);
+    }
+
+    #[test]
+    fn fetch_related_edge_cases() {
+        let (backend, schema) = test_backend();
+        let rel = rel_named(&schema, "Profile", "user", "User", "profile");
+        // empty parents: no rows, fields arg irrelevant (never resolved)
+        let groups = backend.fetch_related(rel, true, &[], &[]).unwrap();
+        assert!(groups.is_empty());
+        let err = backend
+            .fetch_related(RelationId::new(99), true, &[Key(1)], &[])
+            .unwrap_err();
+        assert!(matches!(err, ExecError::Storage { .. }), "{err:?}");
     }
 }

@@ -1,12 +1,14 @@
-//! Central test dataset for backend tests (test-only).
+//! Central test dataset for backend tests (test-only)
 
 use chrono::{DateTime, TimeDelta};
-use grove_schema::validated::{FieldId, StructId, ValidatedSchema};
+use grove_schema::validated::{FieldId, RelationId, StructId, ValidatedSchema};
 use rusqlite::{Connection, params};
 use rust_decimal::Decimal;
 
 pub const SCHEMA: &str = r#"
 root users: User;
+root roles: Role;
+root images: Image;
 struct User {
   id: Int,
   name: String,
@@ -24,7 +26,38 @@ struct User {
   deep_branches: List<(List<List<Int> via deep_inner[dkey, dval]> via deep_mid[dkey, dlink], List<Float> via deep_float[dkey, dval], Bool)>@deep_ref via deep_outer[dkey, (el1, el2, eflag)],
   extra: Tuple<Int, List<String> via extra_tags[ekey, eval]>@(eid, elink),
   opt_extra: ?Tuple<Int, List<String> via opt_tags[okey, oval]>@(oid, olink),
+  profile: ?Profile,
+  orders: List<Order>,
+  roles: &List<Role>,
+  manager: &?User,
+  subordinates: &List<User>,
 }
+struct Profile {
+  bio: String,
+  user: &User,
+  notes: List<String>@notes_ref via profile_notes[profile_key, note],
+}
+struct Order {
+  amount: Int,
+  user: &?User,
+}
+struct Image {
+  title: String,
+  messages: &List<Message>,
+}
+struct Message {
+  body: String,
+  image: &?Image,
+}
+struct Role {
+  name: String,
+  users: &List<User>,
+}
+rel Profile.user <-> User.profile (profiles.user_id -> users.id);
+rel Order.user <<-> User.orders (orders.user_id -> users.id);
+rel Image.messages <->> Message.image (messages.image_id -> images.id);
+rel Role.users <<->> User.roles via user_roles[role_id -> roles.id, user_id -> users.id];
+rel User.manager <<-> User.subordinates (users.manager_id -> users.id);
 "#;
 
 pub fn schema() -> ValidatedSchema {
@@ -43,13 +76,25 @@ pub fn field_id(schema: &ValidatedSchema, sid: StructId, name: &str) -> FieldId 
     schema.struct_field(sid, name).unwrap().0
 }
 
+/// Relation by its endpoints in written order (matters for direction)
+pub fn relation_id(schema: &ValidatedSchema, first: FieldId, second: FieldId) -> RelationId {
+    RelationId::new(
+        schema
+            .relations
+            .iter()
+            .position(|r| r.endpoints() == [first, second])
+            .unwrap(),
+    )
+}
+
 /// Create the dataset tables and rows in an empty connection
 pub fn seed(conn: &mut Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE users(id INTEGER, name TEXT, nickname TEXT, x REAL, y REAL,
            hx REAL, hy REAL, balance BLOB, created BLOB, elapsed BLOB, active INTEGER,
            tags_ref INTEGER, scores_ref INTEGER, lucky_ref INTEGER, matrix_ref INTEGER,
-           deep_ref INTEGER, eid INTEGER, elink INTEGER, oid INTEGER, olink INTEGER);
+           deep_ref INTEGER, eid INTEGER, elink INTEGER, oid INTEGER, olink INTEGER,
+           manager_id INTEGER);
          CREATE TABLE user_tags(user_key INTEGER, tag_value TEXT);
          CREATE TABLE user_scores(user_key INTEGER, s_int INTEGER, s_str TEXT);
          CREATE TABLE user_lucky(user_key INTEGER, lucky_num INTEGER);
@@ -74,12 +119,28 @@ pub fn seed(conn: &mut Connection) -> rusqlite::Result<()> {
          CREATE TABLE extra_tags(ekey INTEGER, eval TEXT);
          CREATE TABLE opt_tags(okey INTEGER, oval TEXT);
          INSERT INTO extra_tags(ekey, eval) VALUES (910, 'x'), (910, 'y'), (950, 'z');
-         INSERT INTO opt_tags(okey, oval) VALUES (960, 'p');",
+         INSERT INTO opt_tags(okey, oval) VALUES (960, 'p');
+         CREATE TABLE profiles(bio TEXT, user_id INTEGER, notes_ref INTEGER);
+         CREATE TABLE profile_notes(profile_key INTEGER, note TEXT);
+         CREATE TABLE orders(amount INTEGER, user_id INTEGER);
+         CREATE TABLE images(id INTEGER, title TEXT);
+         CREATE TABLE messages(body TEXT, image_id INTEGER);
+         CREATE TABLE roles(id INTEGER, name TEXT);
+         CREATE TABLE user_roles(role_id INTEGER, user_id INTEGER);
+         INSERT INTO profiles(bio, user_id, notes_ref) VALUES
+           ('AdaBio', 1, 501), ('CydBio', 3, NULL);
+         INSERT INTO profile_notes(profile_key, note) VALUES (501, 'a-note');
+         INSERT INTO orders(amount, user_id) VALUES (100, 1), (200, 1), (300, NULL), (400, 2);
+         INSERT INTO images(id, title) VALUES (1, 'Sunset'), (2, 'Portrait');
+         INSERT INTO messages(body, image_id) VALUES
+           ('nice', 1), ('wow', 1), ('meh', 2), ('lost', NULL);
+         INSERT INTO roles(id, name) VALUES (1, 'admin'), (2, 'editor');
+         INSERT INTO user_roles(role_id, user_id) VALUES (1, 1), (2, 1), (2, 3), (2, 1);",
     )?;
     let insert = "INSERT INTO users(id, name, nickname, x, y, hx, hy, balance, created, \
                   elapsed, active, tags_ref, scores_ref, lucky_ref, matrix_ref, deep_ref, \
-                  eid, elink, oid, olink) \
-                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                  eid, elink, oid, olink, manager_id) \
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
     struct SeedUser {
         id: i64,
         name: &'static str,
@@ -102,6 +163,7 @@ pub fn seed(conn: &mut Connection) -> rusqlite::Result<()> {
         elink: Option<i64>,
         oid: Option<i64>,
         olink: Option<i64>,
+        manager: Option<i64>,
     }
     let users = [
         SeedUser {
@@ -126,6 +188,7 @@ pub fn seed(conn: &mut Connection) -> rusqlite::Result<()> {
             elink: Some(910),
             oid: Some(5),
             olink: Some(960),
+            manager: Some(2),
         },
         SeedUser {
             id: 2,
@@ -149,6 +212,7 @@ pub fn seed(conn: &mut Connection) -> rusqlite::Result<()> {
             elink: None,
             oid: None,
             olink: None,
+            manager: None,
         },
         SeedUser {
             id: 3,
@@ -172,6 +236,7 @@ pub fn seed(conn: &mut Connection) -> rusqlite::Result<()> {
             elink: None,
             oid: None,
             olink: None,
+            manager: Some(2),
         },
         SeedUser {
             id: 4,
@@ -195,6 +260,7 @@ pub fn seed(conn: &mut Connection) -> rusqlite::Result<()> {
             elink: Some(950),
             oid: Some(7),
             olink: None,
+            manager: Some(1),
         },
         SeedUser {
             id: 5,
@@ -218,6 +284,7 @@ pub fn seed(conn: &mut Connection) -> rusqlite::Result<()> {
             elink: None,
             oid: None,
             olink: None,
+            manager: None,
         },
     ];
     for u in users {
@@ -246,6 +313,7 @@ pub fn seed(conn: &mut Connection) -> rusqlite::Result<()> {
                 u.elink,
                 u.oid,
                 u.olink,
+                u.manager,
             ],
         )?;
     }
