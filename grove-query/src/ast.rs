@@ -204,6 +204,20 @@ pub enum BinaryOp {
     Or,
 }
 
+impl BinaryOp {
+    pub fn is_arithmetic(&self) -> bool {
+        matches!(
+            self,
+            BinaryOp::Add
+                | BinaryOp::Sub
+                | BinaryOp::Mul
+                | BinaryOp::Div
+                | BinaryOp::Rem
+                | BinaryOp::Mod
+        )
+    }
+}
+
 impl fmt::Display for BinaryOp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
