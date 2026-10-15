@@ -57,7 +57,8 @@ impl Interner {
 fn fmt_duration(d: &TimeDelta) -> String {
     let total_nanos = d
         .num_nanoseconds()
-        .unwrap_or_else(|| d.num_seconds() * 1_000_000_000);
+        .map(|ns| ns as i128)
+        .unwrap_or_else(|| d.num_seconds() as i128 * 1_000_000_000);
     let sign = if total_nanos < 0 { "-" } else { "" };
     let abs = total_nanos.unsigned_abs();
     let secs = abs / 1_000_000_000;
