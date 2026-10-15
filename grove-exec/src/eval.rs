@@ -365,10 +365,13 @@ fn eval_binary(
 ) -> Result<Val, ExecError> {
     let l = eval(lhs, env, now, config)?;
     let r = eval(rhs, env, now, config)?;
+    if matches!(
+        op.value,
+        BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Ge
+    ) {
+        return eval_ordered(op, &l, &r, span);
+    }
     let scalar = match (op.value, l, r) {
-        (BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Ge, _, _) => {
-            todo!("comparisons")
-        }
         (BinaryOp::Eq | BinaryOp::Ne, _, _) => todo!("equality"),
         (BinaryOp::And | BinaryOp::Or, _, _) => todo!("logic"),
         (BinaryOp::In, _, _) => todo!("membership"),
@@ -576,6 +579,22 @@ fn eval_unary(
             message: format!("mismatched unary operand: {op}{operand} (internal error)"),
         }),
     }
+}
+
+fn eval_ordered(op: &Spanned<BinaryOp>, l: &Val, r: &Val, span: Span) -> Result<Val, ExecError> {
+    let ord = l.cmp(r, span)?;
+    let result = match op.value {
+        BinaryOp::Lt => ord == std::cmp::Ordering::Less,
+        BinaryOp::Le => ord != std::cmp::Ordering::Greater,
+        BinaryOp::Gt => ord == std::cmp::Ordering::Greater,
+        BinaryOp::Ge => ord != std::cmp::Ordering::Less,
+        _ => {
+            return Err(ExecError::Integrity {
+                message: "non-ordering operator in ordered dispatch (internal error)".to_string(),
+            });
+        }
+    };
+    Ok(Val::Scalar(Scalar::Bool(result)))
 }
 
 fn decode_literal(lit: &Spanned<Literal>, now: DateTime<Utc>) -> Val {
@@ -1037,5 +1056,64 @@ mod tests {
             let err = run_src(src).unwrap_err();
             assert!(err.to_string().contains("zero"), "{src}: {err}");
         }
+    }
+
+    fn bool(b: bool) -> Val {
+        Val::Scalar(Scalar::Bool(b))
+    }
+
+    #[test]
+    fn eval_ordered_comparisons() {
+        for (src, expected) in [
+            ("1 < 2", true),
+            ("2 <= 2", true),
+            ("3 > 4", false),
+            ("2 >= 3", false),
+            ("1 < 1", false),
+            ("1.5f < 2.0f", true),
+            ("2.0f <= 2.0f", true),
+            ("1.5 < 2.5", true),
+            ("30.00 < 30.01", true),
+            ("\"a\" < \"b\"", true),
+            ("\"b\" <= \"b\"", true),
+            ("\"abc\" > \"abd\"", false),
+            ("false < true", true),
+            ("true <= true", true),
+            ("@now < @3000-01-02", true),
+            ("#30s > #1s", true),
+            ("#30s >= #30s", true),
+        ] {
+            assert_eq!(run_src(src), Ok(bool(expected)), "{src}");
+        }
+    }
+
+    #[test]
+    fn eval_ordered_tuples() {
+        use std::cmp::Ordering;
+        let span = Span::new(0, 0);
+        assert_eq!(
+            Val::Tuple(vec![int(1), str("a")]).cmp(&Val::Tuple(vec![int(1), str("b")]), span),
+            Ok(Ordering::Less)
+        );
+        assert_eq!(
+            Val::Tuple(vec![int(1), str("a")]).cmp(&Val::Tuple(vec![int(1), str("a")]), span),
+            Ok(Ordering::Equal)
+        );
+        assert_eq!(
+            Val::Tuple(vec![int(2), str("a")]).cmp(&Val::Tuple(vec![int(1), str("z")]), span),
+            Ok(Ordering::Greater)
+        );
+        assert!(
+            Val::Tuple(vec![int(1)])
+                .cmp(&Val::Tuple(vec![int(1), str("a")]), span)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn eval_ordered_nan_aborts() {
+        let off = r#"config { float_checks = false }"#;
+        let err = run_src_config("(0.0f / 0.0f) < 1.0f", off).unwrap_err();
+        assert!(err.to_string().contains("NaN"), "{err}");
     }
 }

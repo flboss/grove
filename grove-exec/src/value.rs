@@ -3,7 +3,10 @@ use std::fmt;
 use std::sync::Arc;
 
 use chrono::{DateTime, TimeDelta, Utc};
+use grove_types::Span;
 use rust_decimal::Decimal;
+
+use crate::error::ExecError;
 
 /// A scalar Grove value
 #[derive(Debug, Clone, PartialEq)]
@@ -26,6 +29,53 @@ pub enum Val {
     List(Vec<Val>),
     Tuple(Vec<Val>),
     Record(Vec<(Arc<str>, Val)>),
+}
+
+impl Val {
+    pub fn cmp(&self, other: &Val, span: Span) -> Result<std::cmp::Ordering, ExecError> {
+        match (self, other) {
+            (Val::Scalar(x), Val::Scalar(y)) => x.cmp(y, span),
+            (Val::Tuple(xs), Val::Tuple(ys)) => {
+                if xs.len() != ys.len() {
+                    return Err(ExecError::Integrity {
+                        message: "mismatched tuple comparison (internal error)".to_string(),
+                    });
+                }
+                for (x, y) in xs.iter().zip(ys) {
+                    match x.cmp(y, span)? {
+                        std::cmp::Ordering::Equal => {}
+                        other => return Ok(other),
+                    }
+                }
+                Ok(std::cmp::Ordering::Equal)
+            }
+            _ => Err(ExecError::Integrity {
+                message: "mismatched comparison operands (internal error)".to_string(),
+            }),
+        }
+    }
+}
+
+impl Scalar {
+    pub fn cmp(&self, other: &Scalar, span: Span) -> Result<std::cmp::Ordering, ExecError> {
+        match (self, other) {
+            (Scalar::Int(x), Scalar::Int(y)) => Ok(x.cmp(y)),
+            (Scalar::Float(x), Scalar::Float(y)) => {
+                x.partial_cmp(y).ok_or_else(|| ExecError::Abort {
+                    message: "cannot order NaN values".to_string(),
+                    span,
+                })
+            }
+            (Scalar::Dec(x), Scalar::Dec(y)) => Ok(x.cmp(y)),
+            (Scalar::String(x), Scalar::String(y)) => Ok(x.cmp(y)),
+            (Scalar::Bool(x), Scalar::Bool(y)) => Ok(x.cmp(y)),
+            (Scalar::Instant(x), Scalar::Instant(y)) => Ok(x.cmp(y)),
+            (Scalar::Duration(x), Scalar::Duration(y)) => Ok(x.cmp(y)),
+            _ => Err(ExecError::Integrity {
+                message: "mismatched comparison operands (internal error)".to_string(),
+            }),
+        }
+    }
 }
 
 /// Field-name interner owned by the executor
