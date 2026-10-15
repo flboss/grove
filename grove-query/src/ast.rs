@@ -164,6 +164,16 @@ pub enum TypeName {
     Dec,
 }
 
+impl fmt::Display for TypeName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TypeName::Int => write!(f, "Int"),
+            TypeName::Float => write!(f, "Float"),
+            TypeName::Dec => write!(f, "Dec"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConstantName {
     Min,

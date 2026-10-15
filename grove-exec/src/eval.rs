@@ -91,7 +91,10 @@ pub fn eval(
         }
         TypedExprKind::Field { .. } | TypedExprKind::TupleAccess { .. } => todo!("navigation"),
         TypedExprKind::Method { .. } => todo!("methods"),
-        TypedExprKind::Cast { .. } => todo!("casts"),
+        TypedExprKind::Cast { expr: inner, ty } => {
+            let value = eval(inner, env, now, config)?;
+            eval_cast(value, ty.value, expr.span)
+        }
         TypedExprKind::Tuple { .. }
         | TypedExprKind::Array { .. }
         | TypedExprKind::Struct { .. }
@@ -638,6 +641,51 @@ fn eval_logic(
         });
     };
     Ok(Val::Scalar(Scalar::Bool(r)))
+}
+
+fn eval_cast(value: Val, target: TypeName, span: Span) -> Result<Val, ExecError> {
+    let scalar = match (value, target) {
+        (Val::Scalar(Scalar::Int(n)), TypeName::Int) => Scalar::Int(n),
+        (Val::Scalar(Scalar::Int(n)), TypeName::Float) => Scalar::Float(n as f64),
+        (Val::Scalar(Scalar::Int(n)), TypeName::Dec) => {
+            Scalar::Dec(Decimal::from_i64(n).expect("Decimal fits every i64"))
+        }
+        // Rust `as` semantics: truncate toward zero, saturate, NaN to zero
+        (Val::Scalar(Scalar::Float(x)), TypeName::Int) => Scalar::Int(x as i64),
+        (Val::Scalar(Scalar::Float(x)), TypeName::Float) => Scalar::Float(x),
+        (Val::Scalar(Scalar::Float(x)), TypeName::Dec) => match Decimal::from_f64(x) {
+            Some(d) => Scalar::Dec(d.normalize()),
+            None if x.is_nan() => {
+                return Err(ExecError::Abort {
+                    message: "cannot cast NaN to Dec".to_string(),
+                    span,
+                });
+            }
+            None => Scalar::Dec(if x.is_sign_positive() {
+                Decimal::MAX
+            } else {
+                Decimal::MIN
+            }),
+        },
+        (Val::Scalar(Scalar::Dec(d)), TypeName::Int) => {
+            Scalar::Int(d.trunc().to_i64().unwrap_or(if d.is_sign_positive() {
+                i64::MAX
+            } else {
+                i64::MIN
+            }))
+        }
+        (Val::Scalar(Scalar::Dec(d)), TypeName::Float) => {
+            Scalar::Float(d.to_f64().expect("f64 has a wider range than Decimal"))
+        }
+        (Val::Scalar(Scalar::Dec(d)), TypeName::Dec) => Scalar::Dec(d),
+        (Val::Scalar(Scalar::Bool(b)), TypeName::Int) => Scalar::Int(i64::from(b)),
+        (value, target) => {
+            return Err(ExecError::Integrity {
+                message: format!("mismatched cast operands: {value} as {target} (internal error)"),
+            });
+        }
+    };
+    Ok(Val::Scalar(scalar))
 }
 
 fn decode_literal(lit: &Spanned<Literal>, now: DateTime<Utc>) -> Val {
@@ -1245,5 +1293,39 @@ mod tests {
                 .to_string()
                 .contains("zero")
         );
+    }
+
+    #[test]
+    fn eval_casts() {
+        for (src, expected) in [
+            ("5 as Float", float(5.0)),
+            ("5 as Dec", Val::Scalar(Scalar::Dec(dec!(5)))),
+            ("5 as Int", int(5)),
+            ("1.9f as Int", int(1)),
+            ("-1.9f as Int", int(-1)),
+            ("1e300f as Int", int(i64::MAX)),
+            ("(-1e300f) as Int", int(i64::MIN)),
+            ("1.5f as Dec", Val::Scalar(Scalar::Dec(dec!(1.5)))),
+            ("1e300f as Dec", Val::Scalar(Scalar::Dec(Decimal::MAX))),
+            ("5.9 as Int", int(5)),
+            ("-5.9 as Int", int(-5)),
+            ("30.00 as Int", int(30)),
+            ("Dec::MAX as Int", int(i64::MAX)),
+            ("(-Dec::MAX) as Int", int(i64::MIN)),
+            ("-Dec::MAX as Int", int(i64::MIN + 1)),
+            ("Dec::MIN as Float", float(Decimal::MIN.to_f64().unwrap())),
+            ("5.5 as Float", float(5.5)),
+            ("true as Int", int(1)),
+            ("false as Int", int(0)),
+        ] {
+            assert_eq!(run_src(src), Ok(expected), "{src}");
+        }
+    }
+
+    #[test]
+    fn eval_cast_nan_to_dec_aborts() {
+        let off = r#"config { float_checks = false }"#;
+        let err = run_src_config("(0.0f / 0.0f) as Dec", off).unwrap_err();
+        assert!(err.to_string().contains("NaN"), "{err}");
     }
 }
