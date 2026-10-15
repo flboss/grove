@@ -1453,7 +1453,19 @@ fn typecheck_stmt(stmt: &Statement, env: &mut TypeEnv) -> Result<TypedStatement,
             Ok(TypedStatement::Expr(typed))
         }
         Statement::Mutation(mutation) => typecheck_mutation(mutation, env),
-        Statement::Let(_) => todo!("let statements"),
+        Statement::Let(let_stmt) => {
+            let value = infer(&let_stmt.value, env)?;
+            env.define(
+                let_stmt.name.value.clone(),
+                value.ty.clone(),
+                IdentBinding::Let,
+            );
+            Ok(TypedStatement::Let(TypedLetStmt {
+                name: let_stmt.name.clone(),
+                span: let_stmt.value.span(),
+                value,
+            }))
+        }
     }
 }
 
@@ -2066,6 +2078,95 @@ mod tests {
             }
         );
         assert_eq!(*depth, 0);
+    }
+
+    #[test]
+    fn let_statement_binds_value_type() {
+        let schema = test_schema();
+        let (file, _) = crate::parse_query("let x = 42; x");
+        let (typed, diags) = typecheck(file.unwrap(), &schema);
+        assert!(diags.is_empty(), "expected no errors, got {diags:?}");
+        let typed = typed.unwrap();
+        let TypedStatement::Let(let_stmt) = &typed.statements[0] else {
+            panic!("expected let statement");
+        };
+        assert_eq!(let_stmt.name.value, "x");
+        assert_eq!(let_stmt.value.ty, QueryType::Scalar(ScalarType::Int));
+        let TypedExprKind::Ident { binding, depth, .. } = &typed.result.kind else {
+            panic!("expected ident result");
+        };
+        assert_eq!(*binding, IdentBinding::Let);
+        assert_eq!(*depth, 0);
+        assert_eq!(typed.result.ty, QueryType::Scalar(ScalarType::Int));
+    }
+
+    #[test]
+    fn let_chain_scope_visible() {
+        let schema = test_schema();
+        let (file, _) = crate::parse_query("let a = 1; let b = a; b");
+        let (typed, diags) = typecheck(file.unwrap(), &schema);
+        assert!(diags.is_empty(), "expected no errors, got {diags:?}");
+        assert_eq!(typed.unwrap().statements.len(), 2);
+    }
+
+    #[test]
+    fn let_collection_type() {
+        let schema = test_schema();
+        let (file, _) = crate::parse_query("let names = users { name }; names");
+        let (typed, diags) = typecheck(file.unwrap(), &schema);
+        assert!(diags.is_empty(), "expected no errors, got {diags:?}");
+        let typed = typed.unwrap();
+        let TypedStatement::Let(let_stmt) = &typed.statements[0] else {
+            panic!("expected let statement");
+        };
+        assert!(matches!(let_stmt.value.ty, QueryType::List(_)));
+        assert_eq!(typed.result.ty, let_stmt.value.ty);
+    }
+
+    #[test]
+    fn let_use_before_def() {
+        let schema = test_schema();
+        let (file, _) = crate::parse_query("let x = y; 0");
+        let (_, diags) = typecheck(file.unwrap(), &schema);
+        assert!(diags.iter().any(|d| d.code.as_ref() == "QT0001"));
+    }
+
+    #[test]
+    fn let_self_reference_error() {
+        let schema = test_schema();
+        let (file, _) = crate::parse_query("let x = x; 0");
+        let (_, diags) = typecheck(file.unwrap(), &schema);
+        assert!(diags.iter().any(|d| d.code.as_ref() == "QT0001"));
+    }
+
+    #[test]
+    fn let_shadows_root() {
+        let schema = test_schema();
+        let (file, _) = crate::parse_query("let users = 1; users");
+        let (typed, diags) = typecheck(file.unwrap(), &schema);
+        assert!(diags.is_empty(), "expected no errors, got {diags:?}");
+        let TypedExprKind::Ident { binding, .. } = &typed.unwrap().result.kind else {
+            panic!("expected ident result");
+        };
+        assert_eq!(*binding, IdentBinding::Let);
+    }
+
+    #[test]
+    fn let_rebind_same_scope() {
+        let schema = test_schema();
+        let (file, _) = crate::parse_query("let x = 1; let x = 2; x");
+        let (typed, diags) = typecheck(file.unwrap(), &schema);
+        assert!(diags.is_empty(), "expected no errors, got {diags:?}");
+        assert_eq!(typed.unwrap().result.ty, QueryType::Scalar(ScalarType::Int));
+    }
+
+    #[test]
+    fn let_in_query() {
+        let schema = test_schema();
+        let (file, _) = crate::parse_query("let limit = 30; users[age > limit]");
+        let (typed, diags) = typecheck(file.unwrap(), &schema);
+        assert!(diags.is_empty(), "expected no errors, got {diags:?}");
+        assert!(matches!(typed.unwrap().result.ty, QueryType::List(_)));
     }
 
     #[test]

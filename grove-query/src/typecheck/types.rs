@@ -13,7 +13,15 @@ pub struct TypedQueryFile {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypedStatement {
     Mutation(TypedMutationStmt),
+    Let(TypedLetStmt),
     Expr(TypedExpr),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedLetStmt {
+    pub name: Spanned<String>,
+    pub value: TypedExpr,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -123,6 +131,7 @@ pub enum IdentBinding {
     ProjectedField { name: String },
     Prev { struct_id: StructId },
     ListElement,
+    Let,
 }
 
 #[derive(Debug, Clone, PartialEq)]
