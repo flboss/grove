@@ -595,12 +595,7 @@ mod tests {
     const FIXED_NOW: DateTime<Utc> = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
 
     fn run_src(src: &str) -> Result<Val, ExecError> {
-        // Explicit spec defaults: ValidatedSchema::default() leaves
-        // float_checks off, which no validated schema ever has.
-        run_src_config(
-            src,
-            r#"config { int_arithmetic = "checked", float_checks = true, dec_arithmetic = "checked" }"#,
-        )
+        run_with(src, ValidatedSchema::default())
     }
 
     fn run_src_config(src: &str, config_block: &str) -> Result<Val, ExecError> {

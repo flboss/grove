@@ -143,11 +143,21 @@ impl ValidatedSchema {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub int_arithmetic: IntArithmetic,
     pub float_checks: bool,
     pub dec_arithmetic: DecArithmetic,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            int_arithmetic: IntArithmetic::default(),
+            float_checks: true,
+            dec_arithmetic: DecArithmetic::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
