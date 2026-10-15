@@ -592,7 +592,7 @@ impl SqliteBackend<'_> {
             self.schema
                 .structs
                 .get(struct_id.index())
-                .ok_or_else(|| ExecError::Storage {
+                .ok_or_else(|| ExecError::Integrity {
                     message: format!("unknown struct id {}", struct_id.index()),
                 })?;
         let struct_name = &struct_def.name;
@@ -765,7 +765,7 @@ impl Storage for SqliteBackend<'_> {
             self.schema
                 .structs
                 .get(struct_id.index())
-                .ok_or_else(|| ExecError::Storage {
+                .ok_or_else(|| ExecError::Integrity {
                     message: format!("unknown struct id {}", struct_id.index()),
                 })?;
         let struct_name = &struct_def.name;
@@ -804,7 +804,7 @@ impl Storage for SqliteBackend<'_> {
         let relation = schema
             .relations
             .get(rel.index())
-            .ok_or_else(|| ExecError::Storage {
+            .ok_or_else(|| ExecError::Integrity {
                 message: format!("unknown relation id {}", rel.index()),
             })?;
         let fetch_ep = if fetch_from_first {
@@ -1354,7 +1354,7 @@ mod tests {
         let sid = user_struct(&schema);
         assert!(matches!(
             backend.fetch(StructId::new(99), &[]).unwrap_err(),
-            ExecError::Storage { .. }
+            ExecError::Integrity { .. }
         ));
         assert!(matches!(
             backend
@@ -1813,6 +1813,6 @@ mod tests {
         let err = backend
             .fetch_related(RelationId::new(99), true, &[Key(1)], &[])
             .unwrap_err();
-        assert!(matches!(err, ExecError::Storage { .. }), "{err:?}");
+        assert!(matches!(err, ExecError::Integrity { .. }), "{err:?}");
     }
 }

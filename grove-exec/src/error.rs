@@ -4,8 +4,12 @@ use grove_types::Span;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExecError {
+    /// A valid query failing at runtime on data
     Abort { message: String, span: Span },
+    /// Upstream correctness issue: data violating its schema, or a broken
+    /// pipeline invariant
     Integrity { message: String },
+    /// Backend or environment failure (SQLite errors, DB/shape mismatch).
     Storage { message: String },
 }
 
