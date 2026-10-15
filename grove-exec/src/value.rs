@@ -54,6 +54,38 @@ impl Val {
             }),
         }
     }
+
+    pub fn eq(&self, other: &Val) -> Option<bool> {
+        match (self, other) {
+            (Val::None, Val::None) => Some(true),
+            (Val::Some(x), Val::Some(y)) => Some(x.as_ref().eq(y)?),
+            (Val::None, Val::Some(_)) | (Val::Some(_), Val::None) => Some(false),
+            (Val::Scalar(x), Val::Scalar(y)) => x.eq(y),
+            (Val::List(xs), Val::List(ys)) => {
+                if xs.len() != ys.len() {
+                    return Some(false);
+                }
+                let eqs: Option<Vec<bool>> = xs.iter().zip(ys).map(|(x, y)| x.eq(y)).collect();
+                Some(eqs?.into_iter().all(|b| b))
+            }
+            (Val::Tuple(xs), Val::Tuple(ys)) => {
+                if xs.len() != ys.len() {
+                    return None;
+                }
+                let eqs: Option<Vec<bool>> = xs.iter().zip(ys).map(|(x, y)| x.eq(y)).collect();
+                Some(eqs?.into_iter().all(|b| b))
+            }
+            (Val::Record(xs), Val::Record(ys)) => {
+                if xs.len() != ys.len() || xs.iter().zip(ys).any(|((nx, _), (ny, _))| nx != ny) {
+                    return None;
+                }
+                let eqs: Option<Vec<bool>> =
+                    xs.iter().zip(ys).map(|((_, x), (_, y))| x.eq(y)).collect();
+                Some(eqs?.into_iter().all(|b| b))
+            }
+            _ => None,
+        }
+    }
 }
 
 impl Scalar {
@@ -74,6 +106,19 @@ impl Scalar {
             _ => Err(ExecError::Integrity {
                 message: "mismatched comparison operands (internal error)".to_string(),
             }),
+        }
+    }
+
+    pub fn eq(&self, other: &Scalar) -> Option<bool> {
+        match (self, other) {
+            (Scalar::Int(x), Scalar::Int(y)) => Some(x == y),
+            (Scalar::Float(x), Scalar::Float(y)) => Some(x == y),
+            (Scalar::Dec(x), Scalar::Dec(y)) => Some(x == y),
+            (Scalar::String(x), Scalar::String(y)) => Some(x == y),
+            (Scalar::Bool(x), Scalar::Bool(y)) => Some(x == y),
+            (Scalar::Instant(x), Scalar::Instant(y)) => Some(x == y),
+            (Scalar::Duration(x), Scalar::Duration(y)) => Some(x == y),
+            _ => None,
         }
     }
 }

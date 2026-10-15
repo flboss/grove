@@ -371,8 +371,10 @@ fn eval_binary(
     ) {
         return eval_ordered(op, &l, &r, span);
     }
+    if matches!(op.value, BinaryOp::Eq | BinaryOp::Ne) {
+        return eval_equality(op, &l, &r);
+    }
     let scalar = match (op.value, l, r) {
-        (BinaryOp::Eq | BinaryOp::Ne, _, _) => todo!("equality"),
         (BinaryOp::And | BinaryOp::Or, _, _) => todo!("logic"),
         (BinaryOp::In, _, _) => todo!("membership"),
         (op, Val::Scalar(Scalar::Int(a)), Val::Scalar(Scalar::Int(b))) if op.is_arithmetic() => {
@@ -579,6 +581,17 @@ fn eval_unary(
             message: format!("mismatched unary operand: {op}{operand} (internal error)"),
         }),
     }
+}
+
+fn eval_equality(op: &Spanned<BinaryOp>, l: &Val, r: &Val) -> Result<Val, ExecError> {
+    let eq = l.eq(r).ok_or_else(|| ExecError::Integrity {
+        message: format!(
+            "mismatched equality operands: {l} {} {r} (internal error)",
+            op.value
+        ),
+    })?;
+    let result = matches!((op.value, eq), (BinaryOp::Eq, true) | (BinaryOp::Ne, false));
+    Ok(Val::Scalar(Scalar::Bool(result)))
 }
 
 fn eval_ordered(op: &Spanned<BinaryOp>, l: &Val, r: &Val, span: Span) -> Result<Val, ExecError> {
@@ -828,6 +841,18 @@ mod tests {
         Val::Scalar(Scalar::Int(n))
     }
 
+    fn float(x: f64) -> Val {
+        Val::Scalar(Scalar::Float(x))
+    }
+
+    fn str(s: &str) -> Val {
+        Val::Scalar(Scalar::String(s.to_string()))
+    }
+
+    fn bool(b: bool) -> Val {
+        Val::Scalar(Scalar::Bool(b))
+    }
+
     #[test]
     fn eval_int_overflow_checked() {
         for src in [
@@ -882,10 +907,6 @@ mod tests {
         assert_eq!(run_src("5.5f mod 2.0f"), Ok(float(1.5)));
         assert_eq!(run_src("-7.5f mod 2.0f"), Ok(float(0.5)));
         assert_eq!(run_src("-0.0f"), Ok(float(0.0)));
-    }
-
-    fn float(x: f64) -> Val {
-        Val::Scalar(Scalar::Float(x))
     }
 
     #[test]
@@ -1058,10 +1079,6 @@ mod tests {
         }
     }
 
-    fn bool(b: bool) -> Val {
-        Val::Scalar(Scalar::Bool(b))
-    }
-
     #[test]
     fn eval_ordered_comparisons() {
         for (src, expected) in [
@@ -1115,5 +1132,58 @@ mod tests {
         let off = r#"config { float_checks = false }"#;
         let err = run_src_config("(0.0f / 0.0f) < 1.0f", off).unwrap_err();
         assert!(err.to_string().contains("NaN"), "{err}");
+    }
+
+    #[test]
+    fn eval_equality() {
+        for (src, expected) in [
+            ("1 == 1", true),
+            ("1 != 2", true),
+            ("1 == 2", false),
+            ("1.5f == 1.5f", true),
+            ("\"a\" == \"a\"", true),
+            ("\"a\" != \"b\"", true),
+            ("true == true", true),
+            ("true != false", true),
+            ("30.00 == 30.0", true),
+            ("@now == @now", true),
+            ("#30s == #30s", true),
+            ("some(1) == some(1)", true),
+            ("some(1) != some(2)", true),
+            ("none == some(2)", false),
+            ("some(\"a\") != none", true),
+        ] {
+            assert_eq!(run_src(src), Ok(bool(expected)), "{src}");
+        }
+    }
+
+    #[test]
+    fn eval_equality_nan() {
+        let off = r#"config { float_checks = false }"#;
+        assert_eq!(
+            run_src_config("(0.0f / 0.0f) == (0.0f / 0.0f)", off),
+            Ok(bool(false))
+        );
+        assert_eq!(
+            run_src_config("(0.0f / 0.0f) != (0.0f / 0.0f)", off),
+            Ok(bool(true))
+        );
+    }
+
+    #[test]
+    fn eval_equality_structural() {
+        assert_eq!(Val::None.eq(&Val::None), Some(true));
+        assert_eq!(
+            Val::List(vec![int(1), Val::None]).eq(&Val::List(vec![int(1), Val::None])),
+            Some(true)
+        );
+        assert_eq!(
+            Val::List(vec![int(1)]).eq(&Val::List(vec![int(1), int(2)])),
+            Some(false)
+        );
+        assert_eq!(
+            Val::Scalar(Scalar::Int(1)).eq(&Val::Scalar(Scalar::Bool(true))),
+            None
+        );
     }
 }
