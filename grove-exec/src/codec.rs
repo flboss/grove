@@ -159,83 +159,88 @@ pub(crate) fn decode_duration(blob: &[u8]) -> Result<TimeDelta, ExecError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_decimal::dec;
 
-    fn dec(s: &str) -> Decimal {
-        s.parse().unwrap()
-    }
-
-    fn round_trip(s: &str) {
-        let d = dec(s);
+    fn round_trip(d: Decimal) {
         assert_eq!(decode_dec(&encode_dec(d)), Ok(d.normalize()));
     }
 
     #[test]
     fn dec_zero_is_canonical() {
         let zero = [0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        assert_eq!(encode_dec(dec("0")), zero);
-        assert_eq!(encode_dec(dec("-0")), zero);
+        assert_eq!(encode_dec(dec!(0)), zero);
+        assert_eq!(encode_dec(dec!(-0)), zero);
         assert_eq!(decode_dec(&zero), Ok(Decimal::ZERO));
     }
 
     #[test]
     fn dec_one_bytes() {
-        let bytes = encode_dec(dec("1"));
+        let bytes = encode_dec(dec!(1));
         assert_eq!(bytes[0], 0xB8);
         let mut field = [0u8; 16];
         field[4..16].copy_from_slice(&bytes[1..13]);
         assert_eq!(u128::from_be_bytes(field), 10u128.pow(28));
-        assert_eq!(decode_dec(&bytes), Ok(dec("1")));
+        assert_eq!(decode_dec(&bytes), Ok(dec!(1)));
     }
 
     #[test]
     fn dec_negative_inverts_positive() {
-        let pos = encode_dec(dec("1"));
-        let neg = encode_dec(dec("-1"));
+        let pos = encode_dec(dec!(1));
+        let neg = encode_dec(dec!(-1));
         let inverted: Vec<u8> = pos.iter().map(|b| !b).collect();
         assert_eq!(neg, inverted.as_slice());
-        assert_eq!(decode_dec(&neg), Ok(dec("-1")));
+        assert_eq!(decode_dec(&neg), Ok(dec!(-1)));
     }
 
     #[test]
     fn dec_trailing_zeros_not_preserved() {
-        assert_eq!(encode_dec(dec("5.00")), encode_dec(dec("5")));
-        assert_eq!(decode_dec(&encode_dec(dec("5.00"))), Ok(dec("5")));
+        assert_eq!(encode_dec(dec!(5.00)), encode_dec(dec!(5)));
+        assert_eq!(decode_dec(&encode_dec(dec!(5.00))), Ok(dec!(5)));
     }
 
     #[test]
     fn dec_round_trips() {
-        for s in [
-            "0",
-            "1",
-            "-1",
-            "5",
-            "0.5",
-            "-0.5",
-            "123.456",
-            "-123.456",
-            "250",
-            "0.1",
-            "1000000",
-            "79228162514264337593543950335",
-            "-79228162514264337593543950335",
-            "1.234567890123456789012345678",
-            "0.0000000000000000000000000001",
-            "9",
+        for d in [
+            dec!(0),
+            dec!(1),
+            dec!(-1),
+            dec!(5),
+            dec!(0.5),
+            dec!(-0.5),
+            dec!(123.456),
+            dec!(-123.456),
+            dec!(250),
+            dec!(0.1),
+            dec!(1000000),
+            dec!(79228162514264337593543950335),
+            dec!(-79228162514264337593543950335),
+            dec!(1.234567890123456789012345678),
+            dec!(0.0000000000000000000000000001),
+            dec!(9),
         ] {
-            round_trip(s);
+            round_trip(d);
         }
     }
 
     #[test]
     fn dec_bytes_order_matches_value_order() {
         let values = [
-            "-100.5", "-1", "-0.01", "0", "0.01", "0.5", "1", "2", "10", "100.25",
+            dec!(-100.5),
+            dec!(-1),
+            dec!(-0.01),
+            dec!(0),
+            dec!(0.01),
+            dec!(0.5),
+            dec!(1),
+            dec!(2),
+            dec!(10),
+            dec!(100.25),
         ];
         let mut prev: Option<[u8; 13]> = None;
-        for s in values {
-            let bytes = encode_dec(dec(s));
+        for d in values {
+            let bytes = encode_dec(d);
             if let Some(p) = prev {
-                assert!(p < bytes, "{s} sorts after previous");
+                assert!(p < bytes, "{d} sorts after previous");
             }
             prev = Some(bytes);
         }

@@ -1257,6 +1257,7 @@ fn increment_digits(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_decimal::dec;
 
     macro_rules! assert_token {
         ($lexer:expr, $kind:pat) => {
@@ -1728,9 +1729,9 @@ mod tests {
     fn decimal_literals() {
         let mut lex = Lexer::new("3.14 42.0");
         let tok = lex.next_token();
-        assert_eq!(tok.value, TokenKind::DecLit("3.14".parse().unwrap()));
+        assert_eq!(tok.value, TokenKind::DecLit(dec!(3.14)));
         let tok = lex.next_token();
-        assert_eq!(tok.value, TokenKind::DecLit("42.0".parse().unwrap()));
+        assert_eq!(tok.value, TokenKind::DecLit(dec!(42.0)));
         assert_eof!(lex);
         assert!(lex.take_diagnostics().is_empty());
     }
@@ -1739,15 +1740,15 @@ mod tests {
     fn decimal_exponents() {
         let mut lex = Lexer::new("1e10 1e-3 123.456e2 123.456e-2 1E5");
         let tok = lex.next_token();
-        assert_eq!(tok.value, TokenKind::DecLit("10000000000".parse().unwrap()));
+        assert_eq!(tok.value, TokenKind::DecLit(dec!(10000000000)));
         let tok = lex.next_token();
-        assert_eq!(tok.value, TokenKind::DecLit("0.001".parse().unwrap()));
+        assert_eq!(tok.value, TokenKind::DecLit(dec!(0.001)));
         let tok = lex.next_token();
-        assert_eq!(tok.value, TokenKind::DecLit("12345.6".parse().unwrap()));
+        assert_eq!(tok.value, TokenKind::DecLit(dec!(12345.6)));
         let tok = lex.next_token();
-        assert_eq!(tok.value, TokenKind::DecLit("1.23456".parse().unwrap()));
+        assert_eq!(tok.value, TokenKind::DecLit(dec!(1.23456)));
         let tok = lex.next_token();
-        assert_eq!(tok.value, TokenKind::DecLit("100000".parse().unwrap()));
+        assert_eq!(tok.value, TokenKind::DecLit(dec!(100000)));
         assert_eof!(lex);
         assert!(lex.take_diagnostics().is_empty());
     }
@@ -1788,7 +1789,7 @@ mod tests {
     fn incomplete_exponent_with_sign_is_error() {
         let mut lex = Lexer::new("1.5e+");
         let tok = lex.next_token();
-        assert_eq!(tok.value, TokenKind::DecLit("1.5".parse().unwrap()));
+        assert_eq!(tok.value, TokenKind::DecLit(dec!(1.5)));
         assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
@@ -1796,7 +1797,7 @@ mod tests {
     fn double_dot_in_number_is_error() {
         let mut lex = Lexer::new("1.2.3");
         let tok = lex.next_token();
-        assert_eq!(tok.value, TokenKind::DecLit("1.2".parse().unwrap()));
+        assert_eq!(tok.value, TokenKind::DecLit(dec!(1.2)));
         assert_token!(lex, TokenKind::Dot);
         let tok = lex.next_token();
         assert_eq!(tok.value, TokenKind::IntLit(3));
@@ -1813,7 +1814,7 @@ mod tests {
         assert_token!(lex, TokenKind::LParen);
         assert_token!(lex, TokenKind::RParen);
         let tok = lex.next_token();
-        assert_eq!(tok.value, TokenKind::DecLit("3.14".parse().unwrap()));
+        assert_eq!(tok.value, TokenKind::DecLit(dec!(3.14)));
         assert_token!(lex, TokenKind::Dot);
         assert_ident!(lex, "to_string");
         assert_token!(lex, TokenKind::LParen);
@@ -1828,7 +1829,7 @@ mod tests {
         let tok = lex.next_token();
         assert_eq!(
             tok.value,
-            TokenKind::DecLit("1.0000000000000000000000000000".parse().unwrap())
+            TokenKind::DecLit(dec!(1.0000000000000000000000000000))
         );
         let diags = lex.take_diagnostics();
         assert_eq!(diags.len(), 1);
@@ -1841,7 +1842,7 @@ mod tests {
         let tok = lex.next_token();
         assert_eq!(
             tok.value,
-            TokenKind::DecLit("1.0000000000000000000000000002".parse().unwrap())
+            TokenKind::DecLit(dec!(1.0000000000000000000000000002))
         );
         assert_eq!(lex.take_diagnostics().len(), 1);
     }
@@ -1852,7 +1853,7 @@ mod tests {
         let tok = lex.next_token();
         assert_eq!(
             tok.value,
-            TokenKind::DecLit("10.000000000000000000000000000".parse().unwrap())
+            TokenKind::DecLit(dec!(10.000000000000000000000000000))
         );
         assert_eq!(lex.take_diagnostics().len(), 1);
     }
@@ -1863,7 +1864,7 @@ mod tests {
         let tok = lex.next_token();
         assert_eq!(
             tok.value,
-            TokenKind::DecLit("0.0000000000000000000000000000".parse().unwrap())
+            TokenKind::DecLit(dec!(0.0000000000000000000000000000))
         );
         assert_eq!(lex.take_diagnostics().len(), 1);
     }
@@ -1888,7 +1889,7 @@ mod tests {
         let tok = lex.next_token();
         assert_eq!(
             tok.value,
-            TokenKind::DecLit("79228162514264337593543950335".parse().unwrap())
+            TokenKind::DecLit(dec!(79228162514264337593543950335))
         );
         assert_eof!(lex);
         assert!(lex.take_diagnostics().is_empty());
@@ -1907,7 +1908,7 @@ mod tests {
         let tok = lex.next_token();
         assert_eq!(
             tok.value,
-            TokenKind::DecLit("0.0000000000000000000000000001".parse().unwrap())
+            TokenKind::DecLit(dec!(0.0000000000000000000000000001))
         );
         assert_eof!(lex);
         assert!(lex.take_diagnostics().is_empty());
@@ -1941,7 +1942,7 @@ mod tests {
         let tok = lex.next_token();
         assert_eq!(
             tok.value,
-            TokenKind::DecLit("70000000000000000000000000000".parse().unwrap())
+            TokenKind::DecLit(dec!(70000000000000000000000000000))
         );
         assert_eq!(lex.take_diagnostics().len(), 1);
     }

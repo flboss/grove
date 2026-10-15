@@ -131,10 +131,7 @@ impl fmt::Display for Val {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn dec(s: &str) -> Scalar {
-        Scalar::Dec(s.parse().unwrap())
-    }
+    use rust_decimal::dec;
 
     fn some(v: Val) -> Val {
         Val::Some(Box::new(v))
@@ -147,7 +144,7 @@ mod tests {
         assert_eq!(Scalar::Float(1.5).to_string(), "1.5");
         assert_eq!(Scalar::Bool(true).to_string(), "true");
         assert_eq!(Scalar::String("a\"b".to_string()).to_string(), "\"a\\\"b\"");
-        assert_eq!(dec("30.00").to_string(), "30.00");
+        assert_eq!(Scalar::Dec(dec!(30.00)).to_string(), "30.00");
     }
 
     #[test]

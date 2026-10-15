@@ -931,6 +931,7 @@ mod tests {
 
     use super::*;
     use chrono::{DateTime, TimeDelta};
+    use rust_decimal::dec;
 
     #[test]
     fn open_in_memory_constructor() {
@@ -988,7 +989,7 @@ mod tests {
 
     #[test]
     fn decode_blobs_round_trip() {
-        let d: rust_decimal::Decimal = "30.00".parse().unwrap();
+        let d = dec!(30.00);
         assert_eq!(
             decode_scalar(
                 ScalarType::Dec,
@@ -1067,7 +1068,7 @@ mod tests {
             vec![
                 Val::Scalar(Scalar::String("Ada".to_string())),
                 int(1),
-                Val::Scalar(Scalar::Dec("30".parse().unwrap())),
+                Val::Scalar(Scalar::Dec(dec!(30))),
                 Val::Scalar(Scalar::Instant(
                     DateTime::from_timestamp(1_700_000_000, 0).unwrap()
                 )),
@@ -1080,7 +1081,7 @@ mod tests {
             vec![
                 Val::Scalar(Scalar::String("Cyd".to_string())),
                 int(3),
-                Val::Scalar(Scalar::Dec("-5.25".parse().unwrap())),
+                Val::Scalar(Scalar::Dec(dec!(-5.25))),
                 Val::Scalar(Scalar::Instant(
                     DateTime::from_timestamp(-1, 500_000_000).unwrap()
                 )),

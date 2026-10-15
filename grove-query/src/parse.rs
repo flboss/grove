@@ -997,7 +997,7 @@ mod tests {
     use super::*;
     use crate::parse_query;
     use grove_types::Diagnostic;
-    use rust_decimal::Decimal;
+    use rust_decimal::dec;
 
     fn codes(diags: &[Diagnostic]) -> Vec<&str> {
         diags.iter().map(|d| d.code.as_ref()).collect()
@@ -1037,7 +1037,7 @@ mod tests {
                 let Literal::Dec(d) = lit.value else {
                     panic!("expected Dec literal");
                 };
-                assert_eq!(d, "1e10".parse::<Decimal>().unwrap());
+                assert_eq!(d, dec!(1e10));
             }
             other => panic!("expected literal, got {other:?}"),
         }

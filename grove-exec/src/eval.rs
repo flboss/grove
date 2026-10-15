@@ -131,6 +131,7 @@ mod tests {
     use grove_query::typecheck::types::{QueryType, TypedStatement};
     use grove_schema::validated::ValidatedSchema;
     use grove_types::Span;
+    use rust_decimal::dec;
 
     const FIXED_NOW: DateTime<Utc> = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
 
@@ -158,10 +159,7 @@ mod tests {
     fn eval_literals() {
         assert_eq!(run_src("42"), Ok(Val::Scalar(Scalar::Int(42))));
         assert_eq!(run_src("1.5f"), Ok(Val::Scalar(Scalar::Float(1.5))));
-        assert_eq!(
-            run_src("30.00"),
-            Ok(Val::Scalar(Scalar::Dec("30.00".parse().unwrap())))
-        );
+        assert_eq!(run_src("30.00"), Ok(Val::Scalar(Scalar::Dec(dec!(30.00)))));
         assert_eq!(
             run_src("\"hi\""),
             Ok(Val::Scalar(Scalar::String("hi".to_string())))
