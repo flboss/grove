@@ -65,23 +65,27 @@ impl Val {
                 if xs.len() != ys.len() {
                     return Some(false);
                 }
-                let eqs: Option<Vec<bool>> = xs.iter().zip(ys).map(|(x, y)| x.eq(y)).collect();
-                Some(eqs?.into_iter().all(|b| b))
+                xs.iter().zip(ys).try_fold(true, |all_equal, (x, y)| {
+                    x.eq(y).map(|equal| all_equal & equal)
+                })
             }
             (Val::Tuple(xs), Val::Tuple(ys)) => {
                 if xs.len() != ys.len() {
                     return None;
                 }
-                let eqs: Option<Vec<bool>> = xs.iter().zip(ys).map(|(x, y)| x.eq(y)).collect();
-                Some(eqs?.into_iter().all(|b| b))
+                xs.iter().zip(ys).try_fold(true, |all_equal, (x, y)| {
+                    x.eq(y).map(|equal| all_equal & equal)
+                })
             }
             (Val::Record(xs), Val::Record(ys)) => {
                 if xs.len() != ys.len() || xs.iter().zip(ys).any(|((nx, _), (ny, _))| nx != ny) {
                     return None;
                 }
-                let eqs: Option<Vec<bool>> =
-                    xs.iter().zip(ys).map(|((_, x), (_, y))| x.eq(y)).collect();
-                Some(eqs?.into_iter().all(|b| b))
+                xs.iter()
+                    .zip(ys)
+                    .try_fold(true, |all_equal, ((_, x), (_, y))| {
+                        x.eq(y).map(|equal| all_equal & equal)
+                    })
             }
             _ => None,
         }
