@@ -182,22 +182,28 @@ fn leaf_count(ty: &ValueType) -> usize {
 }
 
 /// Decode one node from the head of `vals`; returns value, columns consumed
-fn decode_node(ty: &ValueType, vals: &[ValueRef<'_>]) -> Result<(Val, usize), ExecError> {
+fn decode_node(
+    ty: &ValueType,
+    vals: &[ValueRef<'_>],
+    float_checks: bool,
+) -> Result<(Val, usize), ExecError> {
     match ty {
-        ValueType::Scalar(scalar) => decode_scalar(*scalar, vals[0], false).map(|v| (v, 1)),
+        ValueType::Scalar(scalar) => {
+            decode_scalar(*scalar, vals[0], false, float_checks).map(|v| (v, 1))
+        }
         ValueType::Optional(inner) => {
             let len = leaf_count(inner);
             if vals[..len].iter().all(|v| matches!(v, ValueRef::Null)) {
                 Ok((Val::None, len))
             } else {
-                decode_node(inner, vals).map(|(v, n)| (Val::Some(Box::new(v)), n))
+                decode_node(inner, vals, float_checks).map(|(v, n)| (Val::Some(Box::new(v)), n))
             }
         }
         ValueType::Tuple(elements) => {
             let mut items = Vec::with_capacity(elements.len());
             let mut used = 0;
             for element in elements {
-                let (v, n) = decode_node(element, &vals[used..])?;
+                let (v, n) = decode_node(element, &vals[used..], float_checks)?;
                 items.push(v);
                 used += n;
             }
@@ -372,16 +378,20 @@ enum SemiVal {
 }
 
 /// Decode one level row
-fn semi(plan: &ElemPlan, cells: &[ValueRef<'_>]) -> Result<(SemiVal, usize), ExecError> {
+fn semi(
+    plan: &ElemPlan,
+    cells: &[ValueRef<'_>],
+    float_checks: bool,
+) -> Result<(SemiVal, usize), ExecError> {
     match plan {
         ElemPlan::Scalar(scalar) => {
-            decode_scalar(*scalar, cells[0], false).map(|v| (SemiVal::Done(v), 1))
+            decode_scalar(*scalar, cells[0], false, float_checks).map(|v| (SemiVal::Done(v), 1))
         }
         ElemPlan::Tuple(plans) => {
             let mut items = Vec::with_capacity(plans.len());
             let mut used = 0;
             for plan in plans {
-                let (v, n) = semi(plan, &cells[used..])?;
+                let (v, n) = semi(plan, &cells[used..], float_checks)?;
                 items.push(v);
                 used += n;
             }
@@ -392,7 +402,7 @@ fn semi(plan: &ElemPlan, cells: &[ValueRef<'_>]) -> Result<(SemiVal, usize), Exe
             if cells[..width].iter().all(|v| matches!(v, ValueRef::Null)) {
                 Ok((SemiVal::Done(Val::None), width))
             } else {
-                semi(inner, cells).map(|(s, n)| match s {
+                semi(inner, cells, float_checks).map(|(s, n)| match s {
                     SemiVal::Done(v) => (SemiVal::Done(Val::Some(Box::new(v))), n),
                     other => (SemiVal::Some(Box::new(other)), n),
                 })
@@ -476,12 +486,27 @@ fn splice(tree: SemiVal, resolved: &mut HashMap<usize, Val>) -> Val {
 }
 
 /// Decode one scalar cell
-fn decode_scalar(ty: ScalarType, value: ValueRef<'_>, nullable: bool) -> Result<Val, ExecError> {
+fn decode_scalar(
+    ty: ScalarType,
+    value: ValueRef<'_>,
+    nullable: bool,
+    float_checks: bool,
+) -> Result<Val, ExecError> {
     let mismatch = |found: &str| ExecError::Integrity {
         message: format!("expected {ty:?}, found {found}"),
     };
     match (ty, value) {
         (_, ValueRef::Null) if nullable => Ok(Val::None),
+        // SQLite stores NaN as NULL; decoding prefers absence over NaN if nullable
+        (ScalarType::Float, ValueRef::Null) => {
+            if float_checks {
+                Err(ExecError::Integrity {
+                    message: "found non-finite float: NaN".to_string(),
+                })
+            } else {
+                Ok(Val::Scalar(Scalar::Float(f64::NAN)))
+            }
+        }
         (ScalarType::Int, ValueRef::Integer(n)) => Ok(Val::Scalar(Scalar::Int(n))),
         (ScalarType::Float, ValueRef::Real(x)) => Ok(Val::Scalar(Scalar::Float(x))),
         (ScalarType::String, ValueRef::Text(bytes)) => String::from_utf8(bytes.to_vec())
@@ -561,8 +586,8 @@ impl SqliteBackend<'_> {
                             .map_err(|err| Self::storage_error(ctx, err))?,
                     );
                 }
-                let (semival, _) =
-                    semi(&nodes[n].plan, &cells).map_err(|err| err.context(label))?;
+                let (semival, _) = semi(&nodes[n].plan, &cells, self.schema.config.float_checks)
+                    .map_err(|err| err.context(label))?;
                 let val = finalize(semival, &groups);
                 if n == root {
                     items.push(val);
@@ -694,6 +719,7 @@ impl SqliteBackend<'_> {
         ctx: &str,
     ) -> Result<(Key, Vec<Val>), ExecError> {
         let rowid: i64 = row.get(0).map_err(|err| Self::storage_error(ctx, err))?;
+        let float_checks = self.schema.config.float_checks;
         let mut values = Vec::with_capacity(slots.len());
         for slot in slots.iter_mut() {
             match slot {
@@ -705,8 +731,8 @@ impl SqliteBackend<'_> {
                                 .map_err(|err| Self::storage_error(ctx, err))?,
                         );
                     }
-                    let (val, _) =
-                        decode_node(slot.ty, &cells).map_err(|err| err.context(&slot.label))?;
+                    let (val, _) = decode_node(slot.ty, &cells, float_checks)
+                        .map_err(|err| err.context(&slot.label))?;
                     values.push(val);
                 }
                 Slot::Array(slot) => {
@@ -735,8 +761,8 @@ impl SqliteBackend<'_> {
                                 .map_err(|err| Self::storage_error(ctx, err))?,
                         );
                     }
-                    let (tree, _) =
-                        semi(&slot.plan, &cells).map_err(|err| err.context(&slot.label))?;
+                    let (tree, _) = semi(&slot.plan, &cells, float_checks)
+                        .map_err(|err| err.context(&slot.label))?;
                     let mut resolved: HashMap<usize, Val> = HashMap::new();
                     for (root, sub) in &slot.subtrees {
                         if let Some(key) = find_link(&tree, *root) {
@@ -941,50 +967,114 @@ mod tests {
     #[test]
     fn decode_int_float_string() {
         assert_eq!(
-            decode_scalar(ScalarType::Int, ValueRef::Integer(-7), false),
+            decode_scalar(ScalarType::Int, ValueRef::Integer(-7), false, true),
             Ok(Val::Scalar(Scalar::Int(-7)))
         );
         assert_eq!(
-            decode_scalar(ScalarType::Float, ValueRef::Real(1.5), false),
+            decode_scalar(ScalarType::Float, ValueRef::Real(1.5), false, true),
             Ok(Val::Scalar(Scalar::Float(1.5)))
         );
         assert_eq!(
-            decode_scalar(ScalarType::String, ValueRef::Text(b"hi"), false),
+            decode_scalar(ScalarType::String, ValueRef::Text(b"hi"), false, true),
             Ok(Val::Scalar(Scalar::String("hi".to_string())))
         );
-        assert!(decode_scalar(ScalarType::String, ValueRef::Text(b"\xFF"), false).is_err());
+        assert!(decode_scalar(ScalarType::String, ValueRef::Text(b"\xFF"), false, true).is_err());
     }
 
     #[test]
     fn decode_bool_strict() {
         assert_eq!(
-            decode_scalar(ScalarType::Bool, ValueRef::Integer(0), false),
+            decode_scalar(ScalarType::Bool, ValueRef::Integer(0), false, true),
             Ok(Val::Scalar(Scalar::Bool(false)))
         );
         assert_eq!(
-            decode_scalar(ScalarType::Bool, ValueRef::Integer(1), false),
+            decode_scalar(ScalarType::Bool, ValueRef::Integer(1), false, true),
             Ok(Val::Scalar(Scalar::Bool(true)))
         );
-        assert!(decode_scalar(ScalarType::Bool, ValueRef::Integer(2), false).is_err());
-        assert!(decode_scalar(ScalarType::Bool, ValueRef::Real(1.0), false).is_err());
+        assert!(decode_scalar(ScalarType::Bool, ValueRef::Integer(2), false, true).is_err());
+        assert!(decode_scalar(ScalarType::Bool, ValueRef::Real(1.0), false, true).is_err());
     }
 
     #[test]
     fn decode_null() {
         assert_eq!(
-            decode_scalar(ScalarType::Int, ValueRef::Null, true),
+            decode_scalar(ScalarType::Int, ValueRef::Null, true, true),
             Ok(Val::None)
         );
-        assert!(decode_scalar(ScalarType::Int, ValueRef::Null, false).is_err());
+        assert!(decode_scalar(ScalarType::Int, ValueRef::Null, false, true).is_err());
+    }
+
+    #[test]
+    fn decode_null_float_nan() {
+        assert_eq!(
+            decode_scalar(ScalarType::Float, ValueRef::Null, true, true),
+            Ok(Val::None)
+        );
+        assert_eq!(
+            decode_scalar(ScalarType::Float, ValueRef::Null, true, false),
+            Ok(Val::None)
+        );
+        match decode_scalar(ScalarType::Float, ValueRef::Null, false, false) {
+            Ok(Val::Scalar(Scalar::Float(x))) => assert!(x.is_nan()),
+            other => panic!("expected NaN, got {other:?}"),
+        }
+        assert!(decode_scalar(ScalarType::Float, ValueRef::Null, false, true).is_err());
+    }
+
+    #[test]
+    fn fetch_null_float_checks() {
+        use grove_schema::validated::{
+            Column, ColumnId, Config, Field, FieldId, Struct, StructId, Table, TableId, ValueType,
+        };
+        fn schema_with_checks(float_checks: bool) -> ValidatedSchema {
+            ValidatedSchema {
+                config: Config {
+                    float_checks,
+                    ..Default::default()
+                },
+                tables: vec![Table {
+                    name: "t".to_string(),
+                    columns: vec![Column {
+                        name: "x".to_string(),
+                        ty: Some(ScalarType::Float),
+                    }],
+                }],
+                structs: vec![Struct {
+                    name: "S".to_string(),
+                    table: TableId::new(0),
+                    fields: vec![Field::Value {
+                        name: "x".to_string(),
+                        ty: ValueType::Scalar(ScalarType::Float),
+                        columns: vec![ColumnId::new(TableId::new(0), 0)],
+                    }],
+                }],
+                ..Default::default()
+            }
+        }
+        fn fetch_null_float(float_checks: bool) -> Result<Vec<Row>, ExecError> {
+            let schema = schema_with_checks(float_checks);
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch("CREATE TABLE t(x REAL); INSERT INTO t(x) VALUES (NULL);")
+                .unwrap();
+            let backend = SqliteBackend::new(conn, &schema).unwrap();
+            let sid = StructId::new(0);
+            backend.fetch(sid, &[FieldId::new(sid, 0)])
+        }
+        match fetch_null_float(false).unwrap()[0].values[0] {
+            Val::Scalar(Scalar::Float(x)) => assert!(x.is_nan()),
+            ref other => panic!("expected NaN, got {other:?}"),
+        }
+        let err = fetch_null_float(true).unwrap_err();
+        assert!(matches!(err, ExecError::Integrity { .. }), "{err:?}");
     }
 
     #[test]
     fn decode_storage_class_mismatch() {
-        assert!(decode_scalar(ScalarType::String, ValueRef::Integer(1), false).is_err());
-        assert!(decode_scalar(ScalarType::Int, ValueRef::Real(1.0), false).is_err());
-        assert!(decode_scalar(ScalarType::Float, ValueRef::Integer(1), false).is_err());
-        assert!(decode_scalar(ScalarType::Dec, ValueRef::Text(b"1.5"), false).is_err());
-        assert!(decode_scalar(ScalarType::Instant, ValueRef::Integer(0), false).is_err());
+        assert!(decode_scalar(ScalarType::String, ValueRef::Integer(1), false, true).is_err());
+        assert!(decode_scalar(ScalarType::Int, ValueRef::Real(1.0), false, true).is_err());
+        assert!(decode_scalar(ScalarType::Float, ValueRef::Integer(1), false, true).is_err());
+        assert!(decode_scalar(ScalarType::Dec, ValueRef::Text(b"1.5"), false, true).is_err());
+        assert!(decode_scalar(ScalarType::Instant, ValueRef::Integer(0), false, true).is_err());
     }
 
     #[test]
@@ -994,7 +1084,8 @@ mod tests {
             decode_scalar(
                 ScalarType::Dec,
                 ValueRef::Blob(&codec::encode_dec(d)),
-                false
+                false,
+                true
             ),
             Ok(Val::Scalar(Scalar::Dec(d.normalize())))
         );
@@ -1003,7 +1094,8 @@ mod tests {
             decode_scalar(
                 ScalarType::Instant,
                 ValueRef::Blob(&codec::encode_instant(t)),
-                false
+                false,
+                true
             ),
             Ok(Val::Scalar(Scalar::Instant(t)))
         );
@@ -1012,6 +1104,7 @@ mod tests {
             ScalarType::Duration,
             ValueRef::Blob(&codec::encode_duration(span)),
             false,
+            true,
         ) {
             Ok(Val::Scalar(Scalar::Duration(back))) => {
                 assert_eq!(back.num_seconds(), span.num_seconds());
@@ -1477,7 +1570,7 @@ mod tests {
             ValueRef::Text(b"a"),
             ValueRef::Integer(1),
         ];
-        let (v, used) = decode_node(&ty, &vals).unwrap();
+        let (v, used) = decode_node(&ty, &vals, true).unwrap();
         assert_eq!(used, 3);
         assert_eq!(
             v,
