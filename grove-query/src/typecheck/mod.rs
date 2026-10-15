@@ -3360,6 +3360,32 @@ mod tests {
     }
 
     #[test]
+    fn some_nested_optional() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query(r#"some(some("a"))"#);
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(
+            result.ty,
+            QueryType::Optional(Box::new(QueryType::Optional(Box::new(QueryType::Scalar(
+                ScalarType::String
+            )))))
+        );
+    }
+
+    #[test]
+    fn infer_nested_optional() {
+        let schema = test_schema();
+        let (file, _) = crate::parse_query(r#"some(some("a")) != some(none)"#);
+        let (typed, diags) = typecheck(file.unwrap(), &schema);
+        assert!(diags.is_empty(), "expected no errors, got {diags:?}");
+        assert_eq!(
+            typed.unwrap().result.ty,
+            QueryType::Scalar(ScalarType::Bool)
+        );
+    }
+
+    #[test]
     fn array_int() {
         let schema = test_schema();
         let mut env = TypeEnv::new(&schema);

@@ -1151,7 +1151,7 @@ mod tests {
             ("some(1) == some(1)", true),
             ("some(1) != some(2)", true),
             ("none == some(2)", false),
-            ("some(\"a\") != none", true),
+            ("some(some(\"a\")) != some(none)", true),
         ] {
             assert_eq!(run_src(src), Ok(bool(expected)), "{src}");
         }

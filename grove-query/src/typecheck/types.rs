@@ -193,10 +193,7 @@ impl QueryType {
     }
 
     pub fn wrap_optional(self) -> QueryType {
-        match self {
-            QueryType::Optional(_) => self,
-            other => QueryType::Optional(Box::new(other)),
-        }
+        QueryType::Optional(Box::new(self))
     }
 
     pub fn is_unknown(&self) -> bool {
