@@ -1453,6 +1453,7 @@ fn typecheck_stmt(stmt: &Statement, env: &mut TypeEnv) -> Result<TypedStatement,
             Ok(TypedStatement::Expr(typed))
         }
         Statement::Mutation(mutation) => typecheck_mutation(mutation, env),
+        Statement::Let(_) => todo!("let statements"),
     }
 }
 

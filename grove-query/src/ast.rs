@@ -13,6 +13,7 @@ pub struct QueryFile {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     Mutation(MutationStmt),
+    Let(LetStmt),
     Expr(Expr),
 }
 
@@ -28,6 +29,12 @@ pub enum MutationKind {
     Insert,
     Update,
     Delete,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LetStmt {
+    pub name: Spanned<String>,
+    pub value: Expr,
 }
 
 impl fmt::Display for MutationKind {

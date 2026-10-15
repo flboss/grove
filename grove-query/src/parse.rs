@@ -1,6 +1,6 @@
 use crate::ast::{
-    Arg, BinaryOp, ConstantName, Expr, Literal, MutationKind, MutationStmt, ProjectionItem,
-    QueryFile, SortDir, Statement, TypeName, UnaryOp,
+    Arg, BinaryOp, ConstantName, Expr, LetStmt, Literal, MutationKind, MutationStmt,
+    ProjectionItem, QueryFile, SortDir, Statement, TypeName, UnaryOp,
 };
 use crate::error::QueryParseError;
 use crate::lex::Lexer;
@@ -97,6 +97,34 @@ impl<'src> Parser<'src> {
                 continue;
             }
 
+            if matches!(self.current.value, TokenKind::Let) {
+                let Ok((name, value)) = self.parse_let_binding() else {
+                    while !matches!(self.current.value, TokenKind::Semicolon | TokenKind::Eof) {
+                        self.bump();
+                    }
+                    if matches!(self.current.value, TokenKind::Semicolon) {
+                        self.bump();
+                    }
+                    continue;
+                };
+
+                if matches!(self.current.value, TokenKind::Semicolon) {
+                    self.bump();
+                    statements.push(Statement::Let(LetStmt { name, value }));
+                    continue;
+                }
+
+                if !matches!(self.current.value, TokenKind::Eof) {
+                    self.emit_error(QueryParseError::TrailingInput {
+                        span: self.current.span,
+                    });
+                    return Err(());
+                }
+
+                self.emit_error(QueryParseError::LetAsResult { span: value.span() });
+                return Err(());
+            }
+
             let Ok(expr) = self.parse_expr(true) else {
                 while !matches!(self.current.value, TokenKind::Semicolon | TokenKind::Eof) {
                     self.bump();
@@ -136,6 +164,28 @@ impl<'src> Parser<'src> {
                 result: expr,
             });
         }
+    }
+
+    fn parse_let_binding(&mut self) -> Result<(Spanned<String>, Expr), ()> {
+        self.bump();
+        let name = match &self.current.value {
+            TokenKind::Ident(_) => self.expect_ident()?,
+            _ => {
+                let span = self.current.span;
+                self.emit_error(QueryParseError::LetNameExpected { span });
+                return Err(());
+            }
+        };
+        self.expect(
+            |k| matches!(k, TokenKind::Equals),
+            |span| QueryParseError::LetEqualsExpected { span },
+        )?;
+        let value = self.parse_expr(true)?;
+        if is_mutation(&value) {
+            self.emit_error(QueryParseError::MutationAsValue { span: value.span() });
+            return Err(());
+        }
+        Ok((name, value))
     }
 
     fn parse_expr(&mut self, allow_projection_braces: bool) -> Result<Expr, ()> {
@@ -1870,6 +1920,82 @@ mod tests {
         let (file, diags) = parse_query(";");
         assert!(file.is_none());
         assert!(diags.iter().any(|d| d.code.as_ref() == "QP0023"));
+    }
+
+    #[test]
+    fn let_statement() {
+        let (file, diags) = parse_query("let x = 1; x");
+        let file = file.expect("should parse");
+        assert_eq!(file.statements.len(), 1);
+        assert!(matches!(&file.statements[0], Statement::Let(let_stmt)
+                if let_stmt.name.value == "x"
+                    && matches!(&let_stmt.value, Expr::Literal(lit) if lit.value == Literal::Int(1))));
+        assert!(matches!(&file.result, Expr::Ident(name) if name.value == "x"));
+        assert!(
+            diags
+                .iter()
+                .all(|d| d.severity != grove_types::Severity::Warning)
+        );
+    }
+
+    #[test]
+    fn let_chain() {
+        let file = parse_query("let a = 1; let b = a; b")
+            .0
+            .expect("should parse");
+        assert_eq!(file.statements.len(), 2);
+        assert!(matches!(&file.statements[0], Statement::Let(_)));
+        assert!(matches!(&file.statements[1], Statement::Let(_)));
+    }
+
+    #[test]
+    fn let_backtick_name() {
+        let file = parse_query("let `let` = 1; `let`").0.expect("should parse");
+        assert!(
+            matches!(&file.statements[0], Statement::Let(let_stmt) if let_stmt.name.value == "let")
+        );
+    }
+
+    #[test]
+    fn let_missing_equals() {
+        let (file, diags) = parse_query("let x 1; 0");
+        assert!(file.is_none());
+        assert!(diags.iter().any(|d| d.code.as_ref() == "QP0026"));
+    }
+
+    #[test]
+    fn let_missing_name() {
+        let (file, diags) = parse_query("let = 1; 0");
+        assert!(file.is_none());
+        assert!(diags.iter().any(|d| d.code.as_ref() == "QP0029"));
+    }
+
+    #[test]
+    fn let_as_result() {
+        let (file, diags) = parse_query("let x = 1");
+        assert!(file.is_none());
+        assert!(diags.iter().any(|d| d.code.as_ref() == "QP0027"));
+    }
+
+    #[test]
+    fn let_mutation_value() {
+        let (file, diags) = parse_query("let x = users.insert({name = \"Alice\"}); 0");
+        assert!(file.is_none());
+        assert!(diags.iter().any(|d| d.code.as_ref() == "QP0028"));
+    }
+
+    #[test]
+    fn let_missing_result() {
+        let (file, diags) = parse_query("let x = 1;");
+        assert!(file.is_none());
+        assert!(diags.iter().any(|d| d.code.as_ref() == "QP0001"));
+    }
+
+    #[test]
+    fn let_trailing_input() {
+        let (file, diags) = parse_query("let x = 1 foo; 0");
+        assert!(file.is_none());
+        assert!(diags.iter().any(|d| d.code.as_ref() == "QP0002"));
     }
 
     #[test]
