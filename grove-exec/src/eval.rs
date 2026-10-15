@@ -101,13 +101,6 @@ pub fn eval(
 
 const MIDNIGHT: NaiveTime = NaiveTime::from_hms_opt(0, 0, 0).expect("midnight is a valid time");
 
-fn temporal_overflow(span: Span) -> ExecError {
-    ExecError::Abort {
-        message: "temporal overflow".to_string(),
-        span,
-    }
-}
-
 #[derive(Clone, Copy)]
 enum ArithOp {
     Add,
@@ -314,8 +307,13 @@ fn total_nanos(d: TimeDelta) -> i128 {
 fn duration_from_nanos(nanos: i128, span: Span) -> Result<TimeDelta, ExecError> {
     let secs = nanos.div_euclid(1_000_000_000);
     let sub = nanos.rem_euclid(1_000_000_000) as u32;
-    let secs = i64::try_from(secs).map_err(|_| temporal_overflow(span))?;
-    TimeDelta::new(secs, sub).ok_or_else(|| temporal_overflow(span))
+    i64::try_from(secs)
+        .ok()
+        .and_then(|secs| TimeDelta::new(secs, sub))
+        .ok_or_else(|| ExecError::Abort {
+            message: format!("duration overflow: {secs}.{sub:09}s"),
+            span,
+        })
 }
 
 /// Scale a duration by a decimal factor (banker's rounding to ns)
@@ -327,7 +325,10 @@ fn scale_duration(
 ) -> Result<Scalar, ExecError> {
     if is_div && factor.is_zero() {
         return Err(ExecError::Abort {
-            message: format!("division by zero"),
+            message: format!(
+                "division by zero: {} / {factor}",
+                Scalar::Duration(duration)
+            ),
             span,
         });
     }
@@ -337,9 +338,19 @@ fn scale_duration(
     } else {
         base.checked_mul(factor)
     };
-    let scaled = scaled.ok_or_else(|| temporal_overflow(span))?;
-    let rounded = scaled.round_dp_with_strategy(0, RoundingStrategy::MidpointNearestEven);
-    let nanos = rounded.to_i128().ok_or_else(|| temporal_overflow(span))?;
+    let nanos = scaled
+        .and_then(|scaled| {
+            let rounded = scaled.round_dp_with_strategy(0, RoundingStrategy::MidpointNearestEven);
+            rounded.to_i128()
+        })
+        .ok_or_else(|| ExecError::Abort {
+            message: format!(
+                "duration overflow: {factor} {} {}",
+                if is_div { "/" } else { "*" },
+                Scalar::Duration(duration)
+            ),
+            span,
+        })?;
     duration_from_nanos(nanos, span).map(Scalar::Duration)
 }
 
@@ -372,42 +383,64 @@ fn eval_binary(
         (op, Val::Scalar(Scalar::Dec(a)), Val::Scalar(Scalar::Dec(b))) if op.is_arithmetic() => {
             dec_arith(a, op.try_into().unwrap(), b, config.dec_arithmetic, span)?
         }
-        (BinaryOp::Add, Val::Scalar(Scalar::Instant(t)), Val::Scalar(Scalar::Duration(d))) => {
-            Scalar::Instant(
-                t.checked_add_signed(d)
-                    .ok_or_else(|| temporal_overflow(span))?,
-            )
-        }
-        (BinaryOp::Sub, Val::Scalar(Scalar::Instant(t)), Val::Scalar(Scalar::Duration(d))) => {
-            Scalar::Instant(
-                t.checked_sub_signed(d)
-                    .ok_or_else(|| temporal_overflow(span))?,
-            )
-        }
+        (
+            BinaryOp::Add,
+            Val::Scalar(lhs @ Scalar::Instant(t)),
+            Val::Scalar(rhs @ Scalar::Duration(d)),
+        ) => Scalar::Instant(t.checked_add_signed(d).ok_or_else(|| ExecError::Abort {
+            message: format!("instant overflow: {lhs} + {rhs}"),
+            span,
+        })?),
+        (
+            BinaryOp::Sub,
+            Val::Scalar(lhs @ Scalar::Instant(t)),
+            Val::Scalar(rhs @ Scalar::Duration(d)),
+        ) => Scalar::Instant(t.checked_sub_signed(d).ok_or_else(|| ExecError::Abort {
+            message: format!("instant overflow: {lhs} - {rhs}"),
+            span,
+        })?),
         (BinaryOp::Sub, Val::Scalar(Scalar::Instant(a)), Val::Scalar(Scalar::Instant(b))) => {
             Scalar::Duration(a.signed_duration_since(b))
         }
-        (BinaryOp::Add, Val::Scalar(Scalar::Duration(a)), Val::Scalar(Scalar::Duration(b))) => {
-            Scalar::Duration(a.checked_add(&b).ok_or_else(|| temporal_overflow(span))?)
-        }
-        (BinaryOp::Sub, Val::Scalar(Scalar::Duration(a)), Val::Scalar(Scalar::Duration(b))) => {
-            Scalar::Duration(a.checked_sub(&b).ok_or_else(|| temporal_overflow(span))?)
-        }
-        (BinaryOp::Rem, Val::Scalar(Scalar::Duration(a)), Val::Scalar(Scalar::Duration(b))) => {
+        (
+            BinaryOp::Add,
+            Val::Scalar(lhs @ Scalar::Duration(a)),
+            Val::Scalar(rhs @ Scalar::Duration(b)),
+        ) => Scalar::Duration(a.checked_add(&b).ok_or_else(|| ExecError::Abort {
+            message: format!("duration overflow: {lhs} + {rhs}"),
+            span,
+        })?),
+        (
+            BinaryOp::Sub,
+            Val::Scalar(lhs @ Scalar::Duration(a)),
+            Val::Scalar(rhs @ Scalar::Duration(b)),
+        ) => Scalar::Duration(a.checked_sub(&b).ok_or_else(|| ExecError::Abort {
+            message: format!("duration overflow: {lhs} - {rhs}"),
+            span,
+        })?),
+        (
+            BinaryOp::Rem,
+            Val::Scalar(lhs @ Scalar::Duration(a)),
+            Val::Scalar(rhs @ Scalar::Duration(b)),
+        ) => {
             let (an, bn) = (total_nanos(a), total_nanos(b));
             if bn == 0 {
                 return Err(ExecError::Abort {
-                    message: format!("remainder by zero"),
+                    message: format!("remainder by zero: {lhs} % {rhs}"),
                     span,
                 });
             }
             Scalar::Duration(duration_from_nanos(an % bn, span)?)
         }
-        (BinaryOp::Mod, Val::Scalar(Scalar::Duration(a)), Val::Scalar(Scalar::Duration(b))) => {
+        (
+            BinaryOp::Mod,
+            Val::Scalar(lhs @ Scalar::Duration(a)),
+            Val::Scalar(rhs @ Scalar::Duration(b)),
+        ) => {
             let (an, bn) = (total_nanos(a), total_nanos(b));
             if bn == 0 {
                 return Err(ExecError::Abort {
-                    message: format!("remainder by zero"),
+                    message: format!("remainder by zero: {lhs} mod {rhs}"),
                     span,
                 });
             }
@@ -415,16 +448,23 @@ fn eval_binary(
             let r = if r < 0 { r + bn.abs() } else { r };
             Scalar::Duration(duration_from_nanos(r, span)?)
         }
-        (BinaryOp::Div, Val::Scalar(Scalar::Duration(a)), Val::Scalar(Scalar::Duration(b))) => {
+        (
+            BinaryOp::Div,
+            Val::Scalar(lhs @ Scalar::Duration(a)),
+            Val::Scalar(rhs @ Scalar::Duration(b)),
+        ) => {
             if b.is_zero() {
                 return Err(ExecError::Abort {
-                    message: format!("division by zero"),
+                    message: format!("division by zero: {lhs} / {rhs}"),
                     span,
                 });
             }
             let ratio = Decimal::from_i128_with_scale(total_nanos(a), 0)
                 .checked_div(Decimal::from_i128_with_scale(total_nanos(b), 0))
-                .ok_or_else(|| temporal_overflow(span))?;
+                .ok_or_else(|| ExecError::Abort {
+                    message: format!("decimal overflow: {lhs} / {rhs}"),
+                    span,
+                })?;
             Scalar::Dec(ratio.normalize())
         }
         (BinaryOp::Mul, Val::Scalar(Scalar::Duration(d)), factor)
@@ -436,9 +476,16 @@ fn eval_binary(
         {
             match factor {
                 Val::Scalar(Scalar::Int(n)) => {
-                    let scaled = total_nanos(d)
-                        .checked_mul(n as i128)
-                        .ok_or_else(|| temporal_overflow(span))?;
+                    let scaled =
+                        total_nanos(d)
+                            .checked_mul(n as i128)
+                            .ok_or_else(|| ExecError::Abort {
+                                message: format!(
+                                    "duration overflow: {} * {factor}",
+                                    Scalar::Duration(d)
+                                ),
+                                span,
+                            })?;
                     Scalar::Duration(duration_from_nanos(scaled, span)?)
                 }
                 Val::Scalar(Scalar::Float(x)) => {
@@ -458,23 +505,17 @@ fn eval_binary(
                 Val::Scalar(Scalar::Int(_) | Scalar::Float(_) | Scalar::Dec(_))
             ) =>
         {
+            if matches!(factor, Val::Scalar(Scalar::Int(n)) if n == 0)
+                || matches!(factor, Val::Scalar(Scalar::Float(f)) if f == 0.0)
+            {
+                return Err(ExecError::Abort {
+                    message: format!("division by zero: {} / {factor}", Scalar::Duration(d)),
+                    span,
+                });
+            }
             match factor {
-                Val::Scalar(Scalar::Int(n)) => {
-                    if n == 0 {
-                        return Err(ExecError::Abort {
-                            message: format!("division by zero"),
-                            span,
-                        });
-                    }
-                    scale_duration(d, Decimal::from(n), true, span)?
-                }
+                Val::Scalar(Scalar::Int(n)) => scale_duration(d, Decimal::from(n), true, span)?,
                 Val::Scalar(Scalar::Float(x)) => {
-                    if x == 0.0 {
-                        return Err(ExecError::Abort {
-                            message: format!("division by zero"),
-                            span,
-                        });
-                    }
                     let factor = Decimal::from_f64(x).ok_or_else(|| ExecError::Abort {
                         message: format!("cannot scale a duration by {x}"),
                         span,
@@ -485,9 +526,9 @@ fn eval_binary(
                 _ => unreachable!("factor guard above"),
             }
         }
-        _ => {
+        (op, lhs, rhs) => {
             return Err(ExecError::Integrity {
-                message: "mismatched binary operands (internal error)".to_string(),
+                message: format!("mismatched binary operands: {lhs} {op} {rhs} (internal error)"),
             });
         }
     };
@@ -531,8 +572,8 @@ fn eval_unary(
         }
         (UnaryOp::Neg, Val::Scalar(Scalar::Duration(d))) => Ok(Val::Scalar(Scalar::Duration(-d))),
         (UnaryOp::Not, _) => todo!("logic"),
-        _ => Err(ExecError::Integrity {
-            message: "mismatched unary operand (internal error)".to_string(),
+        (op, operand) => Err(ExecError::Integrity {
+            message: format!("mismatched unary operand: {op}{operand} (internal error)"),
         }),
     }
 }
@@ -985,13 +1026,13 @@ mod tests {
     #[test]
     fn eval_temporal_overflow() {
         let err = run_src("@262142-12-31 + #1d").unwrap_err();
-        assert!(err.to_string().contains("temporal overflow"), "{err}");
+        assert!(err.to_string().contains("instant overflow"), "{err}");
         let err = run_src("@262142-12-31_23:59:59.999999999 + #0.000000001s").unwrap_err();
-        assert!(err.to_string().contains("temporal overflow"), "{err}");
+        assert!(err.to_string().contains("instant overflow"), "{err}");
         let err = run_src("#100000000000d + #100000000000d").unwrap_err();
-        assert!(err.to_string().contains("temporal overflow"), "{err}");
+        assert!(err.to_string().contains("duration overflow"), "{err}");
         let err = run_src("#100000000000d * 100000000000").unwrap_err();
-        assert!(err.to_string().contains("temporal overflow"), "{err}");
+        assert!(err.to_string().contains("duration overflow"), "{err}");
         for src in ["#90s / #0s", "#5s % #0s", "#5s mod #0s", "#5s / 0"] {
             let err = run_src(src).unwrap_err();
             assert!(err.to_string().contains("zero"), "{src}: {err}");
