@@ -363,6 +363,9 @@ fn eval_binary(
     config: &Config,
     span: Span,
 ) -> Result<Val, ExecError> {
+    if matches!(op.value, BinaryOp::And | BinaryOp::Or) {
+        return eval_logic(op, lhs, rhs, env, now, config);
+    }
     let l = eval(lhs, env, now, config)?;
     let r = eval(rhs, env, now, config)?;
     if matches!(
@@ -375,7 +378,6 @@ fn eval_binary(
         return eval_equality(op, &l, &r);
     }
     let scalar = match (op.value, l, r) {
-        (BinaryOp::And | BinaryOp::Or, _, _) => todo!("logic"),
         (BinaryOp::In, _, _) => todo!("membership"),
         (op, Val::Scalar(Scalar::Int(a)), Val::Scalar(Scalar::Int(b))) if op.is_arithmetic() => {
             int_arith(a, op.try_into().unwrap(), b, config.int_arithmetic, span)?
@@ -576,7 +578,7 @@ fn eval_unary(
             Ok(Val::Scalar(Scalar::Dec((-d).normalize())))
         }
         (UnaryOp::Neg, Val::Scalar(Scalar::Duration(d))) => Ok(Val::Scalar(Scalar::Duration(-d))),
-        (UnaryOp::Not, _) => todo!("logic"),
+        (UnaryOp::Not, Val::Scalar(Scalar::Bool(b))) => Ok(Val::Scalar(Scalar::Bool(!b))),
         (op, operand) => Err(ExecError::Integrity {
             message: format!("mismatched unary operand: {op}{operand} (internal error)"),
         }),
@@ -608,6 +610,34 @@ fn eval_ordered(op: &Spanned<BinaryOp>, l: &Val, r: &Val, span: Span) -> Result<
         }
     };
     Ok(Val::Scalar(Scalar::Bool(result)))
+}
+
+// Short-circuiting, evaluates lazily
+fn eval_logic(
+    op: &Spanned<BinaryOp>,
+    lhs: &TypedExpr,
+    rhs: &TypedExpr,
+    env: &mut Env,
+    now: DateTime<Utc>,
+    config: &Config,
+) -> Result<Val, ExecError> {
+    let l = eval(lhs, env, now, config)?;
+    let Val::Scalar(Scalar::Bool(l)) = l else {
+        return Err(ExecError::Integrity {
+            message: format!("non-Bool logic operand: {l} (internal error)"),
+        });
+    };
+    let decided = matches!((op.value, l), (BinaryOp::And, false) | (BinaryOp::Or, true));
+    if decided {
+        return Ok(Val::Scalar(Scalar::Bool(l)));
+    }
+    let r = eval(rhs, env, now, config)?;
+    let Val::Scalar(Scalar::Bool(r)) = r else {
+        return Err(ExecError::Integrity {
+            message: format!("non-Bool logic operand: {r} (internal error)"),
+        });
+    };
+    Ok(Val::Scalar(Scalar::Bool(r)))
 }
 
 fn decode_literal(lit: &Spanned<Literal>, now: DateTime<Utc>) -> Val {
@@ -1184,6 +1214,36 @@ mod tests {
         assert_eq!(
             Val::Scalar(Scalar::Int(1)).eq(&Val::Scalar(Scalar::Bool(true))),
             None
+        );
+    }
+
+    #[test]
+    fn eval_logic() {
+        for (src, expected) in [
+            ("true && true", true),
+            ("true && false", false),
+            ("false && true", false),
+            ("true || false", true),
+            ("false || false", false),
+            ("true || false && false", true),
+            ("(true || false) && false", false),
+            ("!false", true),
+            ("!!true", true),
+            ("!(1 != 2)", false),
+        ] {
+            assert_eq!(run_src(src), Ok(bool(expected)), "{src}");
+        }
+    }
+
+    #[test]
+    fn eval_logic_short_circuit() {
+        assert_eq!(run_src("false && (1 / 0 == 0)"), Ok(bool(false)));
+        assert_eq!(run_src("true || (1 / 0 == 0)"), Ok(bool(true)));
+        assert!(
+            run_src("true && (1 / 0 == 0)")
+                .unwrap_err()
+                .to_string()
+                .contains("zero")
         );
     }
 }
