@@ -38,7 +38,7 @@ impl Env {
     }
 }
 
-/// Evaluate a scalar expression. `now` fixes the clock for `Now`/`Today`.
+/// Evaluate a scalar expression; fixed clock for `Now`/`Today`
 pub fn eval(
     expr: &TypedExpr,
     env: &mut Env,
@@ -260,16 +260,13 @@ fn dec_arith(
         ArithOp::Mul => a.checked_mul(b),
         ArithOp::Div => a.checked_div(b),
         ArithOp::Rem => a.checked_rem(b),
-        ArithOp::Mod => a
-            .checked_rem(b)
-            .map(|r| {
-                if r.is_sign_negative() {
-                    r.checked_add(b.abs())
-                } else {
-                    Some(r)
-                }
-            })
-            .flatten(),
+        ArithOp::Mod => a.checked_rem(b).and_then(|r| {
+            if r.is_sign_negative() {
+                r.checked_add(b.abs())
+            } else {
+                Some(r)
+            }
+        }),
     };
     let d = match checked {
         Some(d) => d,
