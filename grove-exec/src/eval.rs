@@ -1577,7 +1577,7 @@ mod tests {
         for (src, expected) in [
             ("#90s.as_seconds()", Val::Scalar(Scalar::Dec(dec!(90)))),
             ("#1.5s.as_seconds()", Val::Scalar(Scalar::Dec(dec!(1.5)))),
-            ("-#90s.as_seconds()", Val::Scalar(Scalar::Dec(dec!(-90)))),
+            ("(-#90s).as_seconds()", Val::Scalar(Scalar::Dec(dec!(-90)))),
             ("#3600s.as_minutes()", Val::Scalar(Scalar::Dec(dec!(60)))),
             ("#3600s.as_hours()", Val::Scalar(Scalar::Dec(dec!(1)))),
             ("#86400s.as_days()", Val::Scalar(Scalar::Dec(dec!(1)))),
@@ -1628,12 +1628,12 @@ mod tests {
     fn eval_float_rounding() {
         for (src, expected) in [
             ("2.5f.round()", float(3.0)),
-            ("-2.5f.round()", float(-3.0)),
+            ("(-2.5f).round()", float(-3.0)),
             ("2.1f.round()", float(2.0)),
             ("2.9f.floor()", float(2.0)),
-            ("-2.1f.floor()", float(-3.0)),
+            ("(-2.1f).floor()", float(-3.0)),
             ("2.1f.ceil()", float(3.0)),
-            ("-2.9f.ceil()", float(-2.0)),
+            ("(-2.9f).ceil()", float(-2.0)),
         ] {
             assert_eq!(run_src(src), Ok(expected), "{src}");
         }
