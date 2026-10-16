@@ -12,7 +12,9 @@ use num_traits::{FromPrimitive, ToPrimitive};
 use rust_decimal::{Decimal, RoundingStrategy};
 
 use crate::error::ExecError;
-use crate::value::{Interner, Scalar, Val};
+use crate::value::{
+    Interner, NANOS_PER_DAY, NANOS_PER_HOUR, NANOS_PER_MIN, NANOS_PER_SEC, Scalar, Val, total_nanos,
+};
 
 /// Lexical value scope chain
 #[derive(Debug, Default)]
@@ -335,15 +337,10 @@ fn dec_arith(
     Ok(Scalar::Dec(d.normalize()))
 }
 
-/// Total nanoseconds of a Duration
-fn total_nanos(d: TimeDelta) -> i128 {
-    d.num_seconds() as i128 * 1_000_000_000 + d.subsec_nanos() as i128
-}
-
 /// Build a Duration from whole nanoseconds; out-of-range aborts
 fn duration_from_nanos(nanos: i128, span: Span) -> Result<TimeDelta, ExecError> {
-    let secs = nanos.div_euclid(1_000_000_000);
-    let sub = nanos.rem_euclid(1_000_000_000) as u32;
+    let secs = nanos.div_euclid(NANOS_PER_SEC as i128);
+    let sub = nanos.rem_euclid(NANOS_PER_SEC as i128) as u32;
     i64::try_from(secs)
         .ok()
         .and_then(|secs| TimeDelta::new(secs, sub))
@@ -369,7 +366,7 @@ fn scale_duration(
             span,
         });
     }
-    let base = Decimal::from_i128_with_scale(total_nanos(duration), 0);
+    let base = Decimal::from_i128_with_scale(total_nanos(&duration), 0);
     let scaled = if is_div {
         base.checked_div(factor)
     } else {
@@ -477,7 +474,7 @@ fn eval_binary(
             Val::Scalar(lhs @ Scalar::Duration(a)),
             Val::Scalar(rhs @ Scalar::Duration(b)),
         ) => {
-            let (an, bn) = (total_nanos(a), total_nanos(b));
+            let (an, bn) = (total_nanos(&a), total_nanos(&b));
             if bn == 0 {
                 return Err(ExecError::Abort {
                     message: format!("remainder by zero: {lhs} % {rhs}"),
@@ -491,7 +488,7 @@ fn eval_binary(
             Val::Scalar(lhs @ Scalar::Duration(a)),
             Val::Scalar(rhs @ Scalar::Duration(b)),
         ) => {
-            let (an, bn) = (total_nanos(a), total_nanos(b));
+            let (an, bn) = (total_nanos(&a), total_nanos(&b));
             if bn == 0 {
                 return Err(ExecError::Abort {
                     message: format!("remainder by zero: {lhs} mod {rhs}"),
@@ -513,8 +510,8 @@ fn eval_binary(
                     span,
                 });
             }
-            let ratio = Decimal::from_i128_with_scale(total_nanos(a), 0)
-                .checked_div(Decimal::from_i128_with_scale(total_nanos(b), 0))
+            let ratio = Decimal::from_i128_with_scale(total_nanos(&a), 0)
+                .checked_div(Decimal::from_i128_with_scale(total_nanos(&b), 0))
                 .ok_or_else(|| ExecError::Abort {
                     message: format!("decimal overflow: {lhs} / {rhs}"),
                     span,
@@ -531,7 +528,7 @@ fn eval_binary(
             match factor {
                 Val::Scalar(Scalar::Int(n)) => {
                     let scaled =
-                        total_nanos(d)
+                        total_nanos(&d)
                             .checked_mul(n as i128)
                             .ok_or_else(|| ExecError::Abort {
                                 message: format!(
@@ -846,20 +843,20 @@ fn eval_scalar_method(
             t.to_rfc3339_opts(SecondsFormat::AutoSi, true),
         )),
         (Scalar::Duration(d), "as_seconds") => Ok(duration_as(
-            Decimal::from_i128_with_scale(total_nanos(*d), 0),
-            1_000_000_000,
+            Decimal::from_i128_with_scale(total_nanos(d), 0),
+            NANOS_PER_SEC as i64,
         )),
         (Scalar::Duration(d), "as_minutes") => Ok(duration_as(
-            Decimal::from_i128_with_scale(total_nanos(*d), 0),
-            60 * 1_000_000_000,
+            Decimal::from_i128_with_scale(total_nanos(d), 0),
+            NANOS_PER_MIN as i64,
         )),
         (Scalar::Duration(d), "as_hours") => Ok(duration_as(
-            Decimal::from_i128_with_scale(total_nanos(*d), 0),
-            60 * 60 * 1_000_000_000,
+            Decimal::from_i128_with_scale(total_nanos(d), 0),
+            NANOS_PER_HOUR as i64,
         )),
         (Scalar::Duration(d), "as_days") => Ok(duration_as(
-            Decimal::from_i128_with_scale(total_nanos(*d), 0),
-            24 * 60 * 60 * 1_000_000_000,
+            Decimal::from_i128_with_scale(total_nanos(d), 0),
+            NANOS_PER_DAY as i64,
         )),
         (Scalar::Dec(d), "round_dp") => {
             let n = method_int_arg(args, name)?;
