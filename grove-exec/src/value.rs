@@ -20,6 +20,20 @@ pub enum Scalar {
     Duration(TimeDelta),
 }
 
+impl Scalar {
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            Scalar::Int(_) => "Int",
+            Scalar::Float(_) => "Float",
+            Scalar::Dec(_) => "Dec",
+            Scalar::String(_) => "String",
+            Scalar::Bool(_) => "Bool",
+            Scalar::Instant(_) => "Instant",
+            Scalar::Duration(_) => "Duration",
+        }
+    }
+}
+
 /// A Grove value
 #[derive(Debug, Clone, PartialEq)]
 pub enum Val {
