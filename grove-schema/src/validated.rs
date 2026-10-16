@@ -143,7 +143,7 @@ impl ValidatedSchema {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Config {
     pub int_arithmetic: IntArithmetic,
     pub float_checks: bool,

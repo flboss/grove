@@ -40,22 +40,30 @@ impl Env {
     }
 }
 
-/// Evaluate a scalar expression; fixed clock for `Now`/`Today`
-pub fn eval(
-    expr: &TypedExpr,
-    env: &mut Env,
+pub struct EvalCtx {
+    env: Env,
     now: DateTime<Utc>,
-    config: &Config,
-) -> Result<Val, ExecError> {
+    config: Config,
+}
+
+impl EvalCtx {
+    pub fn new(env: Env, now: DateTime<Utc>, config: Config) -> Self {
+        EvalCtx { env, now, config }
+    }
+}
+
+/// Evaluate an expression
+pub fn eval(expr: &TypedExpr, ctx: &mut EvalCtx) -> Result<Val, ExecError> {
     match &expr.kind {
-        TypedExprKind::Literal(lit) => Ok(decode_literal(lit, now)),
+        TypedExprKind::Literal(lit) => Ok(decode_literal(lit, ctx.now)),
         TypedExprKind::Ident {
             name,
             binding,
             depth,
         } => match binding {
             IdentBinding::Let => {
-                env.lookup(&name.value, *depth)
+                ctx.env
+                    .lookup(&name.value, *depth)
                     .cloned()
                     .ok_or_else(|| ExecError::Integrity {
                         message: format!("unbound variable `{}` (internal error)", name.value),
@@ -67,14 +75,12 @@ pub fn eval(
             IdentBinding::Prev { .. } => todo!("prev with mutations"),
             IdentBinding::ListElement => todo!("element references inside collection operators"),
         },
-        TypedExprKind::Some { value } => {
-            eval(value, env, now, config).map(|v| Val::Some(Box::new(v)))
-        }
+        TypedExprKind::Some { value } => eval(value, ctx).map(|v| Val::Some(Box::new(v))),
         TypedExprKind::TypeConstant { ty, name } => Ok(eval_type_constant(ty.value, name.value)),
         TypedExprKind::If { arms, default } => {
             for (cond, value) in arms {
-                match eval(cond, env, now, config)? {
-                    Val::Scalar(Scalar::Bool(true)) => return eval(value, env, now, config),
+                match eval(cond, ctx)? {
+                    Val::Scalar(Scalar::Bool(true)) => return eval(value, ctx),
                     Val::Scalar(Scalar::Bool(false)) => {}
                     _ => {
                         return Err(ExecError::Integrity {
@@ -83,23 +89,19 @@ pub fn eval(
                     }
                 }
             }
-            eval(default, env, now, config)
+            eval(default, ctx)
         }
-        TypedExprKind::Binary { op, lhs, rhs } => {
-            eval_binary(op, lhs, rhs, env, now, config, expr.span)
-        }
-        TypedExprKind::Unary { op, expr: inner } => {
-            eval_unary(op, inner, env, now, config, expr.span)
-        }
+        TypedExprKind::Binary { op, lhs, rhs } => eval_binary(op, lhs, rhs, ctx, expr.span),
+        TypedExprKind::Unary { op, expr: inner } => eval_unary(op, inner, ctx, expr.span),
         TypedExprKind::Field { .. } | TypedExprKind::TupleAccess { .. } => todo!("navigation"),
         TypedExprKind::Method {
             base,
             name,
             args,
             optional,
-        } => eval_method(base, name, args, *optional, env, now, config, expr.span),
+        } => eval_method(base, &name.value, args, *optional, ctx, expr.span),
         TypedExprKind::Cast { expr: inner, ty } => {
-            let value = eval(inner, env, now, config)?;
+            let value = eval(inner, ctx)?;
             eval_cast(value, ty.value, expr.span)
         }
         TypedExprKind::Tuple { .. }
@@ -368,16 +370,14 @@ fn eval_binary(
     op: &Spanned<BinaryOp>,
     lhs: &TypedExpr,
     rhs: &TypedExpr,
-    env: &mut Env,
-    now: DateTime<Utc>,
-    config: &Config,
+    ctx: &mut EvalCtx,
     span: Span,
 ) -> Result<Val, ExecError> {
     if matches!(op.value, BinaryOp::And | BinaryOp::Or) {
-        return eval_logic(op, lhs, rhs, env, now, config);
+        return eval_logic(op, lhs, rhs, ctx);
     }
-    let l = eval(lhs, env, now, config)?;
-    let r = eval(rhs, env, now, config)?;
+    let l = eval(lhs, ctx)?;
+    let r = eval(rhs, ctx)?;
     if matches!(
         op.value,
         BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Ge
@@ -390,15 +390,27 @@ fn eval_binary(
     let scalar = match (op.value, l, r) {
         (BinaryOp::In, _, _) => todo!("membership"),
         (op, Val::Scalar(Scalar::Int(a)), Val::Scalar(Scalar::Int(b))) if op.is_arithmetic() => {
-            int_arith(a, op.try_into().unwrap(), b, config.int_arithmetic, span)?
+            int_arith(
+                a,
+                op.try_into().unwrap(),
+                b,
+                ctx.config.int_arithmetic,
+                span,
+            )?
         }
         (op, Val::Scalar(Scalar::Float(a)), Val::Scalar(Scalar::Float(b)))
             if op.is_arithmetic() =>
         {
-            float_arith(a, op.try_into().unwrap(), b, config.float_checks, span)?
+            float_arith(a, op.try_into().unwrap(), b, ctx.config.float_checks, span)?
         }
         (op, Val::Scalar(Scalar::Dec(a)), Val::Scalar(Scalar::Dec(b))) if op.is_arithmetic() => {
-            dec_arith(a, op.try_into().unwrap(), b, config.dec_arithmetic, span)?
+            dec_arith(
+                a,
+                op.try_into().unwrap(),
+                b,
+                ctx.config.dec_arithmetic,
+                span,
+            )?
         }
         (
             BinaryOp::Add,
@@ -555,16 +567,14 @@ fn eval_binary(
 fn eval_unary(
     op: &Spanned<UnaryOp>,
     inner: &TypedExpr,
-    env: &mut Env,
-    now: DateTime<Utc>,
-    config: &Config,
+    ctx: &mut EvalCtx,
     span: Span,
 ) -> Result<Val, ExecError> {
-    let value = eval(inner, env, now, config)?;
+    let value = eval(inner, ctx)?;
     match (op.value, value) {
         (UnaryOp::Neg, Val::Scalar(Scalar::Int(n))) => Ok(match n.checked_neg() {
             Some(m) => Val::Scalar(Scalar::Int(m)),
-            None => match config.int_arithmetic {
+            None => match ctx.config.int_arithmetic {
                 IntArithmetic::Checked => {
                     return Err(ExecError::Abort {
                         message: format!("integer overflow: -{n}"),
@@ -576,7 +586,7 @@ fn eval_unary(
             },
         }),
         (UnaryOp::Neg, Val::Scalar(Scalar::Float(x))) => {
-            if config.float_checks && !(-x).is_finite() {
+            if ctx.config.float_checks && !(-x).is_finite() {
                 return Err(ExecError::Abort {
                     message: format!("non-finite float result: -{x}"),
                     span,
@@ -627,11 +637,9 @@ fn eval_logic(
     op: &Spanned<BinaryOp>,
     lhs: &TypedExpr,
     rhs: &TypedExpr,
-    env: &mut Env,
-    now: DateTime<Utc>,
-    config: &Config,
+    ctx: &mut EvalCtx,
 ) -> Result<Val, ExecError> {
-    let l = eval(lhs, env, now, config)?;
+    let l = eval(lhs, ctx)?;
     let Val::Scalar(Scalar::Bool(l)) = l else {
         return Err(ExecError::Integrity {
             message: format!("non-Bool logic operand: {l} (internal error)"),
@@ -641,7 +649,7 @@ fn eval_logic(
     if decided {
         return Ok(Val::Scalar(Scalar::Bool(l)));
     }
-    let r = eval(rhs, env, now, config)?;
+    let r = eval(rhs, ctx)?;
     let Val::Scalar(Scalar::Bool(r)) = r else {
         return Err(ExecError::Integrity {
             message: format!("non-Bool logic operand: {r} (internal error)"),
@@ -695,18 +703,15 @@ fn eval_cast(value: Val, target: TypeName, span: Span) -> Result<Val, ExecError>
     Ok(Val::Scalar(scalar))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn eval_method(
     base: &TypedExpr,
     name: &str,
     args: &[TypedMethodArg],
     optional: bool,
-    env: &mut Env,
-    now: DateTime<Utc>,
-    config: &Config,
+    ctx: &mut EvalCtx,
     span: Span,
 ) -> Result<Val, ExecError> {
-    let base = eval(base, env, now, config)?;
+    let base = eval(base, ctx)?;
     // `?.` on none returns none without evaluating args
     let base = match (optional, base) {
         (true, Val::None) => return Ok(Val::None),
@@ -715,7 +720,7 @@ fn eval_method(
     };
     let mut arg_vals = Vec::with_capacity(args.len());
     for arg in args {
-        arg_vals.push(eval(&arg.expr, env, now, config)?);
+        arg_vals.push(eval(&arg.expr, ctx)?);
     }
     let scalar = eval_scalar_method(&base, name, &arg_vals, span)?;
     let value = Val::Scalar(scalar);
@@ -900,14 +905,9 @@ fn eval_type_constant(ty: TypeName, name: ConstantName) -> Val {
 }
 
 /// Evaluate a `let` and bind its value
-pub fn eval_let(
-    stmt: &TypedLetStmt,
-    env: &mut Env,
-    now: DateTime<Utc>,
-    config: &Config,
-) -> Result<(), ExecError> {
-    let value = eval(&stmt.value, env, now, config)?;
-    env.define(stmt.name.value.clone(), value);
+pub fn eval_let(stmt: &TypedLetStmt, ctx: &mut EvalCtx) -> Result<(), ExecError> {
+    let value = eval(&stmt.value, ctx)?;
+    ctx.env.define(stmt.name.value.clone(), value);
     Ok(())
 }
 
@@ -942,19 +942,17 @@ mod tests {
         let (typed, diags) = grove_query::typecheck::typecheck(file.unwrap(), &schema);
         assert!(diags.is_empty(), "{diags:?}");
         let file = typed.unwrap();
-        let mut env = Env::new();
+        let mut ctx = EvalCtx::new(Env::new(), FIXED_NOW, schema.config);
         for stmt in &file.statements {
             match stmt {
-                TypedStatement::Let(let_stmt) => {
-                    eval_let(let_stmt, &mut env, FIXED_NOW, &schema.config)?
-                }
+                TypedStatement::Let(let_stmt) => eval_let(let_stmt, &mut ctx)?,
                 TypedStatement::Expr(expr) => {
-                    eval(expr, &mut env, FIXED_NOW, &schema.config)?;
+                    eval(expr, &mut ctx)?;
                 }
                 TypedStatement::Mutation(_) => todo!("mutations"),
             }
         }
-        eval(&file.result, &mut env, FIXED_NOW, &schema.config)
+        eval(&file.result, &mut ctx)
     }
 
     #[test]
@@ -1059,6 +1057,7 @@ mod tests {
             "xs".to_string(),
             Val::List(vec![Val::Scalar(Scalar::Int(1)), Val::None]),
         );
+        let mut ctx = EvalCtx::new(env, FIXED_NOW, Config::default());
         let span = Span::new(0, 0);
         let expr = TypedExpr {
             kind: TypedExprKind::Ident {
@@ -1075,7 +1074,7 @@ mod tests {
             span,
         };
         assert_eq!(
-            eval(&expr, &mut env, FIXED_NOW, &Config::default()),
+            eval(&expr, &mut ctx),
             Ok(Val::List(vec![Val::Scalar(Scalar::Int(1)), Val::None]))
         );
     }
