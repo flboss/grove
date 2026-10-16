@@ -150,10 +150,10 @@ pub struct Interner {
 impl Interner {
     pub fn intern(&mut self, name: &str) -> Arc<str> {
         if let Some(existing) = self.names.get(name) {
-            return existing.clone();
+            return Arc::clone(existing);
         }
         let arc: Arc<str> = Arc::from(name);
-        self.names.insert(arc.clone());
+        self.names.insert(Arc::clone(&arc));
         arc
     }
 
