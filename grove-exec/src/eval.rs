@@ -1603,8 +1603,9 @@ mod tests {
             ("2.665.round_dp(2)", Val::Scalar(Scalar::Dec(dec!(2.66)))),
             ("2.567.round_dp(2)", Val::Scalar(Scalar::Dec(dec!(2.57)))),
             ("1.5.round_dp(100)", Val::Scalar(Scalar::Dec(dec!(1.5)))),
-            ("30.00.to_string()", str("30")),
+            ("30.00.to_string()", str("30.0")),
             ("2.5.to_string()", str("2.5")),
+            ("(123456789 as Dec).to_string()", str("123456789.0")),
         ] {
             assert_eq!(run_src(src), Ok(expected), "{src}");
         }

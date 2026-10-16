@@ -189,7 +189,7 @@ impl fmt::Display for Scalar {
         match self {
             Scalar::Int(n) => write!(f, "{n}"),
             Scalar::Float(x) => write!(f, "{x:?}"),
-            Scalar::Dec(d) => write!(f, "{d}"),
+            Scalar::Dec(d) => write!(f, "{d}{}", if d.scale() == 0 { ".0" } else { "" }),
             Scalar::String(s) => write!(f, "{s:?}"),
             Scalar::Bool(b) => write!(f, "{b}"),
             Scalar::Instant(t) => write!(
