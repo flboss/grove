@@ -1,154 +1,21 @@
-use std::collections::HashMap;
 use std::fmt::Display;
 
 use chrono::{DateTime, Datelike, NaiveTime, SecondsFormat, TimeDelta, Timelike, Utc};
 use grove_query::ast::{BinaryOp, ConstantName, Literal, TypeName, UnaryOp};
-use grove_query::typecheck::types::{
-    IdentBinding, TypedExpr, TypedExprKind, TypedLetStmt, TypedMethodArg,
-};
-use grove_schema::validated::{DecArithmetic, IntArithmetic, ValidatedSchema};
+use grove_query::typecheck::types::{TypedExpr, TypedMethodArg};
+use grove_schema::validated::{DecArithmetic, IntArithmetic};
 use grove_types::{Span, Spanned};
 use num_traits::{FromPrimitive, ToPrimitive};
 use rust_decimal::{Decimal, RoundingStrategy};
 
+use super::{EvalCtx, eval};
 use crate::error::ExecError;
-use crate::exec::exec_root;
-use crate::storage::Storage;
 use crate::value::{
-    Interner, NANOS_PER_DAY, NANOS_PER_HOUR, NANOS_PER_MIN, NANOS_PER_SEC, Scalar, Val, total_nanos,
+    NANOS_PER_DAY, NANOS_PER_HOUR, NANOS_PER_MIN, NANOS_PER_SEC, Scalar, Val, total_nanos,
 };
 
-/// Lexical value scope chain
-#[derive(Debug, Default)]
-pub struct Env {
-    scopes: Vec<HashMap<String, Val>>,
-}
-
-impl Env {
-    pub fn new() -> Self {
-        Env {
-            scopes: vec![HashMap::new()],
-        }
-    }
-
-    pub fn define(&mut self, name: String, value: Val) {
-        self.scopes
-            .last_mut()
-            .expect("env always has a scope")
-            .insert(name, value);
-    }
-
-    /// `depth` counts scopes skipped to reach the identifier
-    fn lookup(&self, name: &str, depth: usize) -> Option<&Val> {
-        self.scopes.iter().rev().nth(depth)?.get(name)
-    }
-}
-
-pub struct EvalCtx<'a> {
-    env: Env,
-    now: DateTime<Utc>,
-    pub(crate) interner: Interner,
-    pub(crate) storage: &'a dyn Storage,
-    pub(crate) schema: &'a ValidatedSchema,
-}
-
-impl<'a> EvalCtx<'a> {
-    pub fn new(
-        env: Env,
-        now: DateTime<Utc>,
-        storage: &'a dyn Storage,
-        schema: &'a ValidatedSchema,
-    ) -> Self {
-        EvalCtx {
-            env,
-            now,
-            interner: Interner::default(),
-            storage,
-            schema,
-        }
-    }
-}
-
-/// Evaluate an expression
-pub fn eval(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
-    match &expr.kind {
-        TypedExprKind::Literal(lit) => Ok(decode_literal(lit, ctx.now)),
-        TypedExprKind::Ident {
-            name,
-            binding,
-            depth,
-        } => match binding {
-            IdentBinding::Let => {
-                ctx.env
-                    .lookup(&name.value, *depth)
-                    .cloned()
-                    .ok_or_else(|| ExecError::Integrity {
-                        message: format!("unbound variable `{}` (internal error)", name.value),
-                    })
-            }
-            IdentBinding::Root { root_idx } => exec_root(ctx, *root_idx),
-            IdentBinding::Field(_) | IdentBinding::ProjectedField { .. } => {
-                todo!("data references with row contexts")
-            }
-            IdentBinding::Prev { .. } => todo!("prev with mutations"),
-            IdentBinding::ListElement => todo!("element references inside collection operators"),
-        },
-        TypedExprKind::Some { value } => eval(value, ctx).map(|v| Val::Some(Box::new(v))),
-        TypedExprKind::TypeConstant { ty, name } => Ok(eval_type_constant(ty.value, name.value)),
-        TypedExprKind::If { arms, default } => {
-            for (cond, value) in arms {
-                match eval(cond, ctx)? {
-                    Val::Scalar(Scalar::Bool(true)) => return eval(value, ctx),
-                    Val::Scalar(Scalar::Bool(false)) => {}
-                    _ => {
-                        return Err(ExecError::Integrity {
-                            message: "if condition must be a Bool (internal error)".to_string(),
-                        });
-                    }
-                }
-            }
-            eval(default, ctx)
-        }
-        TypedExprKind::Binary { op, lhs, rhs } => eval_binary(op, lhs, rhs, ctx, expr.span),
-        TypedExprKind::Unary { op, expr: inner } => eval_unary(op, inner, ctx, expr.span),
-        TypedExprKind::Field { .. } | TypedExprKind::TupleAccess { .. } => todo!("navigation"),
-        TypedExprKind::Method {
-            base,
-            name,
-            args,
-            optional,
-        } => eval_method(base, &name.value, args, *optional, ctx, expr.span),
-        TypedExprKind::Cast { expr: inner, ty } => {
-            let value = eval(inner, ctx)?;
-            eval_cast(value, ty.value, expr.span)
-        }
-        TypedExprKind::Tuple { elements } => {
-            let mut items = Vec::with_capacity(elements.len());
-            for element in elements {
-                items.push(eval(element, ctx)?);
-            }
-            Ok(Val::Tuple(items))
-        }
-        TypedExprKind::Array { elements } => {
-            let mut items = Vec::with_capacity(elements.len());
-            for element in elements {
-                items.push(eval(element, ctx)?);
-            }
-            Ok(Val::List(items))
-        }
-        TypedExprKind::Struct { fields } => {
-            let mut record = Vec::with_capacity(fields.len());
-            for (name, value) in fields {
-                let value = eval(value, ctx)?;
-                record.push((ctx.interner.intern(&name.value), value));
-            }
-            Ok(Val::Record(record))
-        }
-        TypedExprKind::Projection { .. } => todo!("projections"),
-    }
-}
-
-const MIDNIGHT: NaiveTime = NaiveTime::from_hms_opt(0, 0, 0).expect("midnight is a valid time");
+pub(crate) const MIDNIGHT: NaiveTime =
+    NaiveTime::from_hms_opt(0, 0, 0).expect("midnight is a valid time");
 
 #[derive(Clone, Copy)]
 enum ArithOp {
@@ -241,7 +108,7 @@ fn int_arith(
                 ArithOp::Sub => a.saturating_sub(b),
                 ArithOp::Mul => a.saturating_mul(b),
                 ArithOp::Div => a.saturating_div(b),
-                // i64::MIN % -1 is the only failure case, mathematically this is 0
+                // i64::MIN % -1 is the only failure case
                 ArithOp::Rem | ArithOp::Mod => 0,
             },
             IntArithmetic::Wrapping => match op {
@@ -398,7 +265,7 @@ fn scale_duration(
     duration_from_nanos(nanos, span).map(Scalar::Duration)
 }
 
-fn eval_binary(
+pub(crate) fn eval_binary(
     op: &Spanned<BinaryOp>,
     lhs: &TypedExpr,
     rhs: &TypedExpr,
@@ -602,7 +469,7 @@ fn eval_binary(
     Ok(Val::Scalar(scalar))
 }
 
-fn eval_unary(
+pub(crate) fn eval_unary(
     op: &Spanned<UnaryOp>,
     inner: &TypedExpr,
     ctx: &mut EvalCtx<'_>,
@@ -696,7 +563,7 @@ fn eval_logic(
     Ok(Val::Scalar(Scalar::Bool(r)))
 }
 
-fn eval_cast(value: Val, target: TypeName, span: Span) -> Result<Val, ExecError> {
+pub(crate) fn eval_cast(value: Val, target: TypeName, span: Span) -> Result<Val, ExecError> {
     let scalar = match (value, target) {
         (Val::Scalar(Scalar::Int(n)), TypeName::Int) => Scalar::Int(n),
         (Val::Scalar(Scalar::Int(n)), TypeName::Float) => Scalar::Float(n as f64),
@@ -741,7 +608,7 @@ fn eval_cast(value: Val, target: TypeName, span: Span) -> Result<Val, ExecError>
     Ok(Val::Scalar(scalar))
 }
 
-fn eval_method(
+pub(crate) fn eval_method(
     base: &TypedExpr,
     name: &str,
     args: &[TypedMethodArg],
@@ -911,7 +778,7 @@ fn eval_scalar_method(
     }
 }
 
-fn decode_literal(lit: &Spanned<Literal>, now: DateTime<Utc>) -> Val {
+pub(crate) fn decode_literal(lit: &Spanned<Literal>, now: DateTime<Utc>) -> Val {
     match &lit.value {
         Literal::Int(n) => Val::Scalar(Scalar::Int(*n)),
         Literal::Float(x) => Val::Scalar(Scalar::Float(*x)),
@@ -930,7 +797,7 @@ fn decode_literal(lit: &Spanned<Literal>, now: DateTime<Utc>) -> Val {
     }
 }
 
-fn eval_type_constant(ty: TypeName, name: ConstantName) -> Val {
+pub(crate) fn eval_type_constant(ty: TypeName, name: ConstantName) -> Val {
     let scalar = match (ty, name) {
         (TypeName::Int, ConstantName::Min) => Scalar::Int(i64::MIN),
         (TypeName::Int, ConstantName::Max) => Scalar::Int(i64::MAX),
@@ -942,81 +809,13 @@ fn eval_type_constant(ty: TypeName, name: ConstantName) -> Val {
     Val::Scalar(scalar)
 }
 
-/// Evaluate a `let` and bind its value
-pub fn eval_let(stmt: &TypedLetStmt, ctx: &mut EvalCtx<'_>) -> Result<(), ExecError> {
-    let value = eval(&stmt.value, ctx)?;
-    ctx.env.define(stmt.name.value.clone(), value);
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeDelta;
-    use grove_query::typecheck::types::{QueryType, TypedStatement};
-    use grove_schema::validated::{FieldId, RelationId, StructId, ValidatedSchema};
-    use grove_types::Span;
-    use rust_decimal::dec;
-    use std::sync::Arc;
-
-    use crate::storage::{Key, Row};
-
-    const FIXED_NOW: DateTime<Utc> = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-
-    struct NoStorage;
-
-    impl Storage for NoStorage {
-        fn fetch(&self, _struct_id: StructId, _fields: &[FieldId]) -> Result<Vec<Row>, ExecError> {
-            Err(ExecError::Integrity {
-                message: "NoStorage backend cannot provide storage (internal error)".to_string(),
-            })
-        }
-
-        fn fetch_related(
-            &self,
-            _rel: RelationId,
-            _fetch_from_first: bool,
-            _parents: &[Key],
-            _fields: &[FieldId],
-        ) -> Result<Vec<Vec<Row>>, ExecError> {
-            Err(ExecError::Integrity {
-                message: "NoStorage backend cannot provide storage (internal error)".to_string(),
-            })
-        }
-    }
-
-    fn run_src(src: &str) -> Result<Val, ExecError> {
-        run_with(src, ValidatedSchema::default())
-    }
-
-    fn run_src_config(src: &str, config_block: &str) -> Result<Val, ExecError> {
-        let schema_src =
-            format!("{config_block}\nroot users: User; struct User {{ name: String }}");
-        let (schema, schema_diags) = grove_schema::parse_schema(&schema_src);
-        assert!(schema_diags.is_empty(), "{schema_diags:?}");
-        let (schema, schema_diags) = grove_schema::validate(schema.unwrap());
-        assert!(schema_diags.is_empty(), "{schema_diags:?}");
-        run_with(src, schema.unwrap())
-    }
-
-    fn run_with(src: &str, schema: ValidatedSchema) -> Result<Val, ExecError> {
-        let (file, parse_diags) = grove_query::parse_query(src);
-        assert!(parse_diags.is_empty(), "{parse_diags:?}");
-        let (typed, diags) = grove_query::typecheck::typecheck(file.unwrap(), &schema);
-        assert!(diags.is_empty(), "{diags:?}");
-        let file = typed.unwrap();
-        let mut ctx = EvalCtx::new(Env::new(), FIXED_NOW, &NoStorage, &schema);
-        for stmt in &file.statements {
-            match stmt {
-                TypedStatement::Let(let_stmt) => eval_let(let_stmt, &mut ctx)?,
-                TypedStatement::Expr(expr) => {
-                    eval(expr, &mut ctx)?;
-                }
-                TypedStatement::Mutation(_) => todo!("mutations"),
-            }
-        }
-        eval(&file.result, &mut ctx)
-    }
+    use crate::eval::harness::*;
+    use crate::value::{Scalar, Val};
+    use chrono::{DateTime, TimeDelta};
+    use rust_decimal::{Decimal, dec};
 
     #[test]
     fn eval_literals() {
@@ -1081,69 +880,6 @@ mod tests {
     }
 
     #[test]
-    fn eval_let_binding() {
-        assert_eq!(run_src("let x = 1; x"), Ok(Val::Scalar(Scalar::Int(1))));
-        assert_eq!(
-            run_src("let x = 1; let x = 2; x"),
-            Ok(Val::Scalar(Scalar::Int(2)))
-        );
-        assert_eq!(
-            run_src("let x = true; let x = \"hello\"; x"),
-            Ok(Val::Scalar(Scalar::String("hello".to_string())))
-        );
-        assert_eq!(
-            run_src("let a = 1; let b = a; b"),
-            Ok(Val::Scalar(Scalar::Int(1)))
-        );
-    }
-
-    #[test]
-    fn eval_if_scalar() {
-        assert_eq!(
-            run_src("if true { 1 } else { 2 }"),
-            Ok(Val::Scalar(Scalar::Int(1)))
-        );
-        assert_eq!(
-            run_src("if false { 1 } else { 2 }"),
-            Ok(Val::Scalar(Scalar::Int(2)))
-        );
-        assert_eq!(
-            run_src("if false { 1 } else if false { 2 } else { 3 }"),
-            Ok(Val::Scalar(Scalar::Int(3)))
-        );
-    }
-
-    #[test]
-    fn eval_env_depth_collections() {
-        let mut env = Env::new();
-        env.define(
-            "xs".to_string(),
-            Val::List(vec![Val::Scalar(Scalar::Int(1)), Val::None]),
-        );
-        let schema = ValidatedSchema::default();
-        let mut ctx = EvalCtx::new(env, FIXED_NOW, &NoStorage, &schema);
-        let span = Span::new(0, 0);
-        let expr = TypedExpr {
-            kind: TypedExprKind::Ident {
-                name: grove_types::Spanned {
-                    span,
-                    value: "xs".to_string(),
-                },
-                binding: IdentBinding::Let,
-                depth: 0,
-            },
-            ty: QueryType::List(Box::new(QueryType::Optional(Box::new(QueryType::Scalar(
-                grove_schema::validated::ScalarType::Int,
-            ))))),
-            span,
-        };
-        assert_eq!(
-            eval(&expr, &mut ctx),
-            Ok(Val::List(vec![Val::Scalar(Scalar::Int(1)), Val::None]))
-        );
-    }
-
-    #[test]
     fn eval_int_arithmetic() {
         assert_eq!(run_src("1 + 2"), Ok(int(3)));
         assert_eq!(run_src("7 - 10"), Ok(int(-3)));
@@ -1156,31 +892,6 @@ mod tests {
         assert_eq!(run_src("7 mod -3"), Ok(int(1)));
         assert_eq!(run_src("-5"), Ok(int(-5)));
         assert_eq!(run_src("--5"), Ok(int(5)));
-    }
-
-    fn int(n: i64) -> Val {
-        Val::Scalar(Scalar::Int(n))
-    }
-
-    fn float(x: f64) -> Val {
-        Val::Scalar(Scalar::Float(x))
-    }
-
-    fn str(s: &str) -> Val {
-        Val::Scalar(Scalar::String(s.to_string()))
-    }
-
-    fn bool(b: bool) -> Val {
-        Val::Scalar(Scalar::Bool(b))
-    }
-
-    fn rec(fields: Vec<(&str, Val)>) -> Val {
-        Val::Record(
-            fields
-                .into_iter()
-                .map(|(name, value)| (Arc::from(name), value))
-                .collect(),
-        )
     }
 
     #[test]
@@ -1721,63 +1432,6 @@ mod tests {
         assert_eq!(
             run_src(r#"some("hi")?.contains("i")"#),
             Ok(Val::Some(Box::new(bool(true))))
-        );
-    }
-
-    #[test]
-    fn eval_tuple_literal() {
-        assert_eq!(
-            run_src("(1, \"hi\")"),
-            Ok(Val::Tuple(vec![int(1), str("hi")]))
-        );
-        assert_eq!(
-            run_src("(1, (2, 3))"),
-            Ok(Val::Tuple(vec![int(1), Val::Tuple(vec![int(2), int(3)])]))
-        );
-        assert_eq!(
-            run_src("let x = 1; (x, x)"),
-            Ok(Val::Tuple(vec![int(1), int(1)]))
-        );
-        assert_eq!(
-            run_src("if true { (1, 2) } else { (3, 4) }"),
-            Ok(Val::Tuple(vec![int(1), int(2)]))
-        );
-    }
-
-    #[test]
-    fn eval_array_literal() {
-        assert_eq!(
-            run_src("[1, 2, 3]"),
-            Ok(Val::List(vec![int(1), int(2), int(3)]))
-        );
-        assert_eq!(
-            run_src("[[1], [2]]"),
-            Ok(Val::List(vec![
-                Val::List(vec![int(1)]),
-                Val::List(vec![int(2)])
-            ]))
-        );
-        assert_eq!(run_src("[1 + 1, 3]"), Ok(Val::List(vec![int(2), int(3)])));
-        assert_eq!(
-            run_src("let x = 1; [x, x]"),
-            Ok(Val::List(vec![int(1), int(1)]))
-        );
-    }
-
-    #[test]
-    fn eval_struct_literal() {
-        assert_eq!(
-            run_src("{name = \"Alice\", age = 30}"),
-            Ok(rec(vec![("name", str("Alice")), ("age", int(30))]))
-        );
-        assert_eq!(run_src("let x = 1; {a = x}"), Ok(rec(vec![("a", int(1))])));
-        assert_eq!(
-            run_src("{a = {b = 1}}"),
-            Ok(rec(vec![("a", rec(vec![("b", int(1))]))]))
-        );
-        assert_eq!(
-            run_src("{a = [1, 2]}"),
-            Ok(rec(vec![("a", Val::List(vec![int(1), int(2)]))]))
         );
     }
 }

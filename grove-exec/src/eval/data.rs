@@ -50,67 +50,18 @@ pub(crate) fn exec_root(ctx: &mut EvalCtx, root_idx: usize) -> Result<Val, ExecE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-
-    use chrono::{DateTime, Utc};
     use rusqlite::Connection;
 
-    use crate::eval::{Env, EvalCtx, eval, eval_let};
+    use crate::eval::harness::*;
     use crate::sqlite::SqliteBackend;
-    use crate::storage::Storage;
     use crate::testdata;
-    use crate::value::Scalar;
-    use grove_query::typecheck::types::TypedStatement;
-    use grove_schema::validated::ValidatedSchema;
-
-    const FIXED_NOW: DateTime<Utc> = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-
-    fn run_with_backend<S: Storage>(
-        src: &str,
-        schema: &ValidatedSchema,
-        storage: &S,
-    ) -> Result<Val, ExecError> {
-        let (file, parse_diags) = grove_query::parse_query(src);
-        assert!(parse_diags.is_empty(), "{parse_diags:?}");
-        let (typed, diags) = grove_query::typecheck::typecheck(file.unwrap(), schema);
-        assert!(diags.is_empty(), "{diags:?}");
-        let file = typed.unwrap();
-        let mut ctx = EvalCtx::new(Env::new(), FIXED_NOW, storage, schema);
-        for stmt in &file.statements {
-            match stmt {
-                TypedStatement::Let(let_stmt) => eval_let(let_stmt, &mut ctx)?,
-                TypedStatement::Expr(expr) => {
-                    eval(expr, &mut ctx)?;
-                }
-                TypedStatement::Mutation(_) => todo!("mutations"),
-            }
-        }
-        eval(&file.result, &mut ctx)
-    }
 
     fn run_seeded(src: &str) -> Result<Val, ExecError> {
         let schema = testdata::schema();
         let mut conn = Connection::open_in_memory().expect("in-memory database should open");
         testdata::seed(&mut conn).expect("testdata initialization should succeed");
         let backend = SqliteBackend::new(conn, &schema).expect("backend should verify");
-        run_with_backend(src, &schema, &backend)
-    }
-
-    fn str(s: &str) -> Val {
-        Val::Scalar(Scalar::String(s.to_string()))
-    }
-
-    fn some(v: Val) -> Val {
-        Val::Some(Box::new(v))
-    }
-
-    fn rec(fields: Vec<(&str, Val)>) -> Val {
-        Val::Record(
-            fields
-                .into_iter()
-                .map(|(name, value)| (Arc::from(name), value))
-                .collect(),
-        )
+        run_with_storage(src, schema.clone(), &backend)
     }
 
     #[test]
