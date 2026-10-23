@@ -6,12 +6,14 @@ use grove_query::ast::{BinaryOp, ConstantName, Literal, TypeName, UnaryOp};
 use grove_query::typecheck::types::{
     IdentBinding, TypedExpr, TypedExprKind, TypedLetStmt, TypedMethodArg,
 };
-use grove_schema::validated::{Config, DecArithmetic, IntArithmetic};
+use grove_schema::validated::{DecArithmetic, IntArithmetic, ValidatedSchema};
 use grove_types::{Span, Spanned};
 use num_traits::{FromPrimitive, ToPrimitive};
 use rust_decimal::{Decimal, RoundingStrategy};
 
 use crate::error::ExecError;
+use crate::exec::exec_root;
+use crate::storage::Storage;
 use crate::value::{
     Interner, NANOS_PER_DAY, NANOS_PER_HOUR, NANOS_PER_MIN, NANOS_PER_SEC, Scalar, Val, total_nanos,
 };
@@ -42,26 +44,33 @@ impl Env {
     }
 }
 
-pub struct EvalCtx {
+pub struct EvalCtx<'a> {
     env: Env,
     now: DateTime<Utc>,
-    config: Config,
-    interner: Interner,
+    pub(crate) interner: Interner,
+    pub(crate) storage: &'a dyn Storage,
+    pub(crate) schema: &'a ValidatedSchema,
 }
 
-impl EvalCtx {
-    pub fn new(env: Env, now: DateTime<Utc>, config: Config) -> Self {
+impl<'a> EvalCtx<'a> {
+    pub fn new(
+        env: Env,
+        now: DateTime<Utc>,
+        storage: &'a dyn Storage,
+        schema: &'a ValidatedSchema,
+    ) -> Self {
         EvalCtx {
             env,
             now,
-            config,
             interner: Interner::default(),
+            storage,
+            schema,
         }
     }
 }
 
 /// Evaluate an expression
-pub fn eval(expr: &TypedExpr, ctx: &mut EvalCtx) -> Result<Val, ExecError> {
+pub fn eval(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
     match &expr.kind {
         TypedExprKind::Literal(lit) => Ok(decode_literal(lit, ctx.now)),
         TypedExprKind::Ident {
@@ -77,9 +86,10 @@ pub fn eval(expr: &TypedExpr, ctx: &mut EvalCtx) -> Result<Val, ExecError> {
                         message: format!("unbound variable `{}` (internal error)", name.value),
                     })
             }
-            IdentBinding::Root { .. }
-            | IdentBinding::Field(_)
-            | IdentBinding::ProjectedField { .. } => todo!("data references with row contexts"),
+            IdentBinding::Root { root_idx } => exec_root(ctx, *root_idx),
+            IdentBinding::Field(_) | IdentBinding::ProjectedField { .. } => {
+                todo!("data references with row contexts")
+            }
             IdentBinding::Prev { .. } => todo!("prev with mutations"),
             IdentBinding::ListElement => todo!("element references inside collection operators"),
         },
@@ -392,7 +402,7 @@ fn eval_binary(
     op: &Spanned<BinaryOp>,
     lhs: &TypedExpr,
     rhs: &TypedExpr,
-    ctx: &mut EvalCtx,
+    ctx: &mut EvalCtx<'_>,
     span: Span,
 ) -> Result<Val, ExecError> {
     if matches!(op.value, BinaryOp::And | BinaryOp::Or) {
@@ -416,21 +426,27 @@ fn eval_binary(
                 a,
                 op.try_into().unwrap(),
                 b,
-                ctx.config.int_arithmetic,
+                ctx.schema.config.int_arithmetic,
                 span,
             )?
         }
         (op, Val::Scalar(Scalar::Float(a)), Val::Scalar(Scalar::Float(b)))
             if op.is_arithmetic() =>
         {
-            float_arith(a, op.try_into().unwrap(), b, ctx.config.float_checks, span)?
+            float_arith(
+                a,
+                op.try_into().unwrap(),
+                b,
+                ctx.schema.config.float_checks,
+                span,
+            )?
         }
         (op, Val::Scalar(Scalar::Dec(a)), Val::Scalar(Scalar::Dec(b))) if op.is_arithmetic() => {
             dec_arith(
                 a,
                 op.try_into().unwrap(),
                 b,
-                ctx.config.dec_arithmetic,
+                ctx.schema.config.dec_arithmetic,
                 span,
             )?
         }
@@ -589,14 +605,14 @@ fn eval_binary(
 fn eval_unary(
     op: &Spanned<UnaryOp>,
     inner: &TypedExpr,
-    ctx: &mut EvalCtx,
+    ctx: &mut EvalCtx<'_>,
     span: Span,
 ) -> Result<Val, ExecError> {
     let value = eval(inner, ctx)?;
     match (op.value, value) {
         (UnaryOp::Neg, Val::Scalar(Scalar::Int(n))) => Ok(match n.checked_neg() {
             Some(m) => Val::Scalar(Scalar::Int(m)),
-            None => match ctx.config.int_arithmetic {
+            None => match ctx.schema.config.int_arithmetic {
                 IntArithmetic::Checked => {
                     return Err(ExecError::Abort {
                         message: format!("integer overflow: -{n}"),
@@ -608,7 +624,7 @@ fn eval_unary(
             },
         }),
         (UnaryOp::Neg, Val::Scalar(Scalar::Float(x))) => {
-            if ctx.config.float_checks && !(-x).is_finite() {
+            if ctx.schema.config.float_checks && !(-x).is_finite() {
                 return Err(ExecError::Abort {
                     message: format!("non-finite float result: -{x}"),
                     span,
@@ -659,7 +675,7 @@ fn eval_logic(
     op: &Spanned<BinaryOp>,
     lhs: &TypedExpr,
     rhs: &TypedExpr,
-    ctx: &mut EvalCtx,
+    ctx: &mut EvalCtx<'_>,
 ) -> Result<Val, ExecError> {
     let l = eval(lhs, ctx)?;
     let Val::Scalar(Scalar::Bool(l)) = l else {
@@ -730,7 +746,7 @@ fn eval_method(
     name: &str,
     args: &[TypedMethodArg],
     optional: bool,
-    ctx: &mut EvalCtx,
+    ctx: &mut EvalCtx<'_>,
     span: Span,
 ) -> Result<Val, ExecError> {
     let base = eval(base, ctx)?;
@@ -927,7 +943,7 @@ fn eval_type_constant(ty: TypeName, name: ConstantName) -> Val {
 }
 
 /// Evaluate a `let` and bind its value
-pub fn eval_let(stmt: &TypedLetStmt, ctx: &mut EvalCtx) -> Result<(), ExecError> {
+pub fn eval_let(stmt: &TypedLetStmt, ctx: &mut EvalCtx<'_>) -> Result<(), ExecError> {
     let value = eval(&stmt.value, ctx)?;
     ctx.env.define(stmt.name.value.clone(), value);
     Ok(())
@@ -938,12 +954,36 @@ mod tests {
     use super::*;
     use chrono::TimeDelta;
     use grove_query::typecheck::types::{QueryType, TypedStatement};
-    use grove_schema::validated::ValidatedSchema;
+    use grove_schema::validated::{FieldId, RelationId, StructId, ValidatedSchema};
     use grove_types::Span;
     use rust_decimal::dec;
     use std::sync::Arc;
 
+    use crate::storage::{Key, Row};
+
     const FIXED_NOW: DateTime<Utc> = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+
+    struct NoStorage;
+
+    impl Storage for NoStorage {
+        fn fetch(&self, _struct_id: StructId, _fields: &[FieldId]) -> Result<Vec<Row>, ExecError> {
+            Err(ExecError::Integrity {
+                message: "NoStorage backend cannot provide storage (internal error)".to_string(),
+            })
+        }
+
+        fn fetch_related(
+            &self,
+            _rel: RelationId,
+            _fetch_from_first: bool,
+            _parents: &[Key],
+            _fields: &[FieldId],
+        ) -> Result<Vec<Vec<Row>>, ExecError> {
+            Err(ExecError::Integrity {
+                message: "NoStorage backend cannot provide storage (internal error)".to_string(),
+            })
+        }
+    }
 
     fn run_src(src: &str) -> Result<Val, ExecError> {
         run_with(src, ValidatedSchema::default())
@@ -965,7 +1005,7 @@ mod tests {
         let (typed, diags) = grove_query::typecheck::typecheck(file.unwrap(), &schema);
         assert!(diags.is_empty(), "{diags:?}");
         let file = typed.unwrap();
-        let mut ctx = EvalCtx::new(Env::new(), FIXED_NOW, schema.config);
+        let mut ctx = EvalCtx::new(Env::new(), FIXED_NOW, &NoStorage, &schema);
         for stmt in &file.statements {
             match stmt {
                 TypedStatement::Let(let_stmt) => eval_let(let_stmt, &mut ctx)?,
@@ -1080,7 +1120,8 @@ mod tests {
             "xs".to_string(),
             Val::List(vec![Val::Scalar(Scalar::Int(1)), Val::None]),
         );
-        let mut ctx = EvalCtx::new(env, FIXED_NOW, Config::default());
+        let schema = ValidatedSchema::default();
+        let mut ctx = EvalCtx::new(env, FIXED_NOW, &NoStorage, &schema);
         let span = Span::new(0, 0);
         let expr = TypedExpr {
             kind: TypedExprKind::Ident {
