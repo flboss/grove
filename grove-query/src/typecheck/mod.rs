@@ -10,7 +10,7 @@ use crate::ast::{
 use crate::typecheck::error::TypeError;
 use crate::typecheck::types::*;
 use grove_schema::validated::{Field, FieldId, ScalarType, StructId, ValidatedSchema, ValueType};
-use grove_types::{Diagnostic, Severity, Span, Spanned};
+use grove_types::{Diagnostic, NodeId, Severity, Span, Spanned};
 
 #[derive(Debug, Clone, PartialEq)]
 struct ScopeEntry {
@@ -22,6 +22,7 @@ struct TypeEnv<'s> {
     scopes: Vec<HashMap<String, ScopeEntry>>,
     schema: &'s ValidatedSchema,
     element_depth: usize,
+    next_id: u64,
 }
 
 impl<'s> TypeEnv<'s> {
@@ -30,6 +31,7 @@ impl<'s> TypeEnv<'s> {
             scopes: vec![HashMap::new()],
             schema,
             element_depth: 0,
+            next_id: 0,
         };
 
         for (root_idx, root) in schema.roots.iter().enumerate() {
@@ -73,6 +75,12 @@ impl<'s> TypeEnv<'s> {
 
     fn schema(&self) -> &ValidatedSchema {
         self.schema
+    }
+
+    fn typed(&mut self, kind: TypedExprKind, ty: QueryType, span: Span) -> TypedExpr {
+        let id = NodeId(self.next_id);
+        self.next_id += 1;
+        TypedExpr { kind, ty, span, id }
     }
 
     fn push_record_fields(&mut self, ty: &QueryType) -> bool {
@@ -189,11 +197,7 @@ fn infer(expr: &Expr, env: &mut TypeEnv) -> Result<TypedExpr, TypeError> {
     match expr {
         Expr::Literal(lit) => {
             let ty = infer_literal(&lit.value);
-            Ok(TypedExpr {
-                kind: TypedExprKind::Literal(lit.clone()),
-                ty,
-                span: lit.span,
-            })
+            Ok(env.typed(TypedExprKind::Literal(lit.clone()), ty, lit.span))
         }
         Expr::Ident(name) => {
             let (entry, depth) =
@@ -202,15 +206,15 @@ fn infer(expr: &Expr, env: &mut TypeEnv) -> Result<TypedExpr, TypeError> {
                         name: name.to_string(),
                         span: name.span,
                     })?;
-            Ok(TypedExpr {
-                kind: TypedExprKind::Ident {
+            Ok(env.typed(
+                TypedExprKind::Ident {
                     name: name.clone(),
                     binding: entry.binding.clone(),
                     depth,
                 },
-                ty: entry.ty.clone(),
-                span: name.span,
-            })
+                entry.ty.clone(),
+                name.span,
+            ))
         }
         Expr::Field {
             base,
@@ -219,7 +223,7 @@ fn infer(expr: &Expr, env: &mut TypeEnv) -> Result<TypedExpr, TypeError> {
             ..
         } => {
             let typed_base = infer(base, env)?;
-            infer_field(typed_base, name, *optional, env.schema())
+            infer_field(typed_base, name, *optional, env)
         }
         Expr::TupleAccess {
             base,
@@ -228,7 +232,7 @@ fn infer(expr: &Expr, env: &mut TypeEnv) -> Result<TypedExpr, TypeError> {
             ..
         } => {
             let typed_base = infer(base, env)?;
-            infer_tuple_access(typed_base, index, *optional)
+            infer_tuple_access(typed_base, index, *optional, env)
         }
         Expr::Method {
             base,
@@ -248,25 +252,25 @@ fn infer(expr: &Expr, env: &mut TypeEnv) -> Result<TypedExpr, TypeError> {
                 typed_elems.push(infer(elem, env)?);
             }
             let ty = QueryType::Tuple(typed_elems.iter().map(|e| e.ty.clone()).collect());
-            Ok(TypedExpr {
-                kind: TypedExprKind::Tuple {
+            Ok(env.typed(
+                TypedExprKind::Tuple {
                     elements: typed_elems,
                 },
                 ty,
-                span: expr.span(),
-            })
+                expr.span(),
+            ))
         }
         Expr::Array { elements, span } => infer_array(elements, *span, env),
         Expr::Some { value, .. } => {
             let typed_value = infer(value, env)?;
             let ty = typed_value.ty.clone().wrap_optional();
-            Ok(TypedExpr {
-                kind: TypedExprKind::Some {
+            Ok(env.typed(
+                TypedExprKind::Some {
                     value: Box::new(typed_value),
                 },
                 ty,
-                span: expr.span(),
-            })
+                expr.span(),
+            ))
         }
         Expr::If {
             arms,
@@ -275,7 +279,7 @@ fn infer(expr: &Expr, env: &mut TypeEnv) -> Result<TypedExpr, TypeError> {
         } => infer_if(arms, default, *span, env),
         Expr::Cast { expr, ty, .. } => infer_cast(expr, ty, env),
         Expr::Projection { base, items, span } => infer_projection(base, items, *span, env),
-        Expr::TypeConstant { ty, name } => infer_type_constant(ty, name),
+        Expr::TypeConstant { ty, name } => infer_type_constant(ty, name, env),
         Expr::Struct { fields, span } => infer_struct_literal(fields, *span, env),
     }
 }
@@ -305,13 +309,13 @@ fn infer_array(elements: &[Expr], span: Span, env: &mut TypeEnv) -> Result<Typed
 
     let ty = QueryType::List(Box::new(ty));
 
-    Ok(TypedExpr {
-        kind: TypedExprKind::Array {
+    Ok(env.typed(
+        TypedExprKind::Array {
             elements: typed_elems,
         },
         ty,
         span,
-    })
+    ))
 }
 
 fn infer_if(
@@ -350,14 +354,14 @@ fn infer_if(
 
     let ty = typed_default.ty.clone();
 
-    Ok(TypedExpr {
-        kind: TypedExprKind::If {
+    Ok(env.typed(
+        TypedExprKind::If {
             arms: typed_arms,
             default: Box::new(typed_default),
         },
         ty,
         span,
-    })
+    ))
 }
 
 fn infer_cast(
@@ -378,14 +382,14 @@ fn infer_cast(
         });
     }
 
-    Ok(TypedExpr {
-        kind: TypedExprKind::Cast {
+    Ok(env.typed(
+        TypedExprKind::Cast {
             expr: Box::new(typed_expr),
             ty: target.clone(),
         },
-        ty: target_ty,
+        target_ty,
         span,
-    })
+    ))
 }
 
 fn cast_allowed(from: &QueryType, to: &QueryType) -> bool {
@@ -400,6 +404,7 @@ fn cast_allowed(from: &QueryType, to: &QueryType) -> bool {
 fn infer_type_constant(
     type_name: &Spanned<TypeName>,
     name: &Spanned<crate::ast::ConstantName>,
+    env: &mut TypeEnv,
 ) -> Result<TypedExpr, TypeError> {
     let scalar_ty = match type_name.value {
         TypeName::Int => ScalarType::Int,
@@ -410,14 +415,14 @@ fn infer_type_constant(
     let result_ty = QueryType::Scalar(scalar_ty);
     let span = Span::new(type_name.span.start, name.span.end);
 
-    Ok(TypedExpr {
-        kind: TypedExprKind::TypeConstant {
+    Ok(env.typed(
+        TypedExprKind::TypeConstant {
             ty: type_name.clone(),
             name: name.clone(),
         },
-        ty: result_ty,
+        result_ty,
         span,
-    })
+    ))
 }
 
 fn infer_struct_literal(
@@ -445,13 +450,13 @@ fn infer_struct_literal(
     }
 
     let result_ty = QueryType::Record(RecordSource::Projection(proj_fields));
-    Ok(TypedExpr {
-        kind: TypedExprKind::Struct {
+    Ok(env.typed(
+        TypedExprKind::Struct {
             fields: typed_fields,
         },
-        ty: result_ty,
+        result_ty,
         span,
-    })
+    ))
 }
 
 fn infer_projection(
@@ -535,22 +540,23 @@ fn infer_projection(
         env.pop_scope();
     }
 
-    Ok(TypedExpr {
-        kind: TypedExprKind::Projection {
+    Ok(env.typed(
+        TypedExprKind::Projection {
             base: Box::new(typed_base),
             items: typed_items,
         },
-        ty: result_ty,
+        result_ty,
         span,
-    })
+    ))
 }
 
 fn infer_field(
     base: TypedExpr,
     name: &Spanned<String>,
     optional: bool,
-    schema: &ValidatedSchema,
+    env: &mut TypeEnv,
 ) -> Result<TypedExpr, TypeError> {
+    let schema = env.schema();
     let lookup_ty = if optional {
         match &base.ty {
             QueryType::Optional(inner) => inner.as_ref().clone(),
@@ -588,21 +594,22 @@ fn infer_field(
     }
 
     let span = Span::new(base.span.start, name.span.end);
-    Ok(TypedExpr {
-        kind: TypedExprKind::Field {
+    Ok(env.typed(
+        TypedExprKind::Field {
             base: Box::new(base),
             name: name.clone(),
             optional,
         },
-        ty: field_ty,
+        field_ty,
         span,
-    })
+    ))
 }
 
 fn infer_tuple_access(
     base: TypedExpr,
     index: &Spanned<i64>,
     optional: bool,
+    env: &mut TypeEnv,
 ) -> Result<TypedExpr, TypeError> {
     let lookup_ty = if optional {
         match &base.ty {
@@ -639,15 +646,15 @@ fn infer_tuple_access(
         elem_ty = elem_ty.wrap_optional();
     }
     let span = Span::new(base.span.start, index.span.end);
-    Ok(TypedExpr {
-        kind: TypedExprKind::TupleAccess {
+    Ok(env.typed(
+        TypedExprKind::TupleAccess {
             base: Box::new(base),
             index: pos,
             optional,
         },
-        ty: elem_ty,
+        elem_ty,
         span,
-    })
+    ))
 }
 
 fn list_element_ty(ty: &QueryType) -> QueryType {
@@ -825,16 +832,16 @@ fn infer_method(
     };
 
     let span = Span::new(base.span.start, name.span.end);
-    Ok(TypedExpr {
-        kind: TypedExprKind::Method {
+    Ok(env.typed(
+        TypedExprKind::Method {
             base: Box::new(base),
             name: name.clone(),
             args: typed_args,
             optional,
         },
-        ty: return_ty,
+        return_ty,
         span,
-    })
+    ))
 }
 
 fn infer_binary(
@@ -877,15 +884,15 @@ fn infer_binary(
         _ => infer_arithmetic_op(&mut typed_lhs.ty, &op.value, &mut typed_rhs.ty, span)?,
     };
 
-    Ok(TypedExpr {
-        kind: TypedExprKind::Binary {
+    Ok(env.typed(
+        TypedExprKind::Binary {
             op: op.clone(),
             lhs: Box::new(typed_lhs),
             rhs: Box::new(typed_rhs),
         },
-        ty: result_ty,
+        result_ty,
         span,
-    })
+    ))
 }
 
 fn infer_binary_in(
@@ -1066,14 +1073,14 @@ fn infer_unary(
         }
     };
 
-    Ok(TypedExpr {
-        kind: TypedExprKind::Unary {
+    Ok(env.typed(
+        TypedExprKind::Unary {
             op: op.clone(),
             expr: Box::new(typed_expr),
         },
-        ty: result_ty,
+        result_ty,
         span,
-    })
+    ))
 }
 
 fn types_compatible(a: &mut QueryType, b: &mut QueryType, schema: &ValidatedSchema) -> bool {
@@ -1505,7 +1512,7 @@ fn typecheck_mutation(
         MutationKind::Insert => {
             let (typed_base, struct_id) = check_insert_base(&mutation.base, env)?;
             let mut typed_arg = infer(mutation.arg.as_ref().expect("checked above"), env)?;
-            validate_insert(struct_id, &mut typed_arg, env.schema())?;
+            validate_insert(struct_id, &mut typed_arg, env)?;
             Ok(TypedStatement::Mutation(TypedMutationStmt::Insert {
                 span: mutation.kind.span,
                 base: typed_base,
@@ -1593,15 +1600,15 @@ fn check_insert_base(base: &Expr, env: &mut TypeEnv) -> Result<(TypedExpr, Struc
         }
     };
     let span = base.span();
-    let typed_base = TypedExpr {
-        kind: TypedExprKind::Ident {
+    let typed_base = env.typed(
+        TypedExprKind::Ident {
             name: base_ident.clone(),
             binding: IdentBinding::Root { root_idx },
             depth,
         },
-        ty: entry.ty.clone(),
+        entry.ty.clone(),
         span,
-    };
+    );
     Ok((typed_base, struct_id))
 }
 
@@ -1624,17 +1631,19 @@ fn expect_constructed_record(
 fn validate_insert(
     sid: StructId,
     typed_arg: &mut TypedExpr,
-    schema: &ValidatedSchema,
+    env: &mut TypeEnv,
 ) -> Result<(), TypeError> {
-    let struct_ = &schema.structs[sid.index()];
     let (record_ty, is_list) = match &mut typed_arg.ty {
         QueryType::List(inner) => (inner.as_mut(), true),
         ty => (ty, false),
     };
     let proj_fields = expect_constructed_record(record_ty, typed_arg.span, MutationKind::Insert)?;
 
-    for schema_field in &struct_.fields {
-        let (expected_name, is_optional) = match schema_field {
+    let schema = env.schema();
+    let struct_fields = schema.structs[sid.index()].fields.clone();
+    let struct_name = schema.structs[sid.index()].name.clone();
+    for schema_field in &struct_fields {
+        let (expected_name, is_optional) = match &schema_field {
             Field::Value {
                 name,
                 ty: ValueType::Optional(_),
@@ -1649,7 +1658,7 @@ fn validate_insert(
                 if proj_fields.iter().any(|f| &f.name == name) {
                     return Err(TypeError::RefFieldInMutation {
                         field: name.clone(),
-                        struct_name: struct_.name.clone(),
+                        struct_name,
                         span: typed_arg.span,
                     });
                 }
@@ -1664,14 +1673,14 @@ fn validate_insert(
 
         if is_optional {
             let schema_ty = field_query_type(schema_field);
-            let none_expr = TypedExpr {
-                kind: TypedExprKind::Literal(Spanned {
+            let none_expr = env.typed(
+                TypedExprKind::Literal(Spanned {
                     span: typed_arg.span,
                     value: Literal::None,
                 }),
-                ty: schema_ty.clone(),
-                span: typed_arg.span,
-            };
+                schema_ty.clone(),
+                typed_arg.span,
+            );
             let mut cloned_ty = QueryType::Record(RecordSource::Projection(proj_fields.clone()));
             if is_list {
                 cloned_ty = QueryType::List(Box::new(cloned_ty));
@@ -1680,11 +1689,7 @@ fn validate_insert(
             let _ = std::mem::replace(
                 &mut typed_arg.kind,
                 TypedExprKind::Projection {
-                    base: Box::new(TypedExpr {
-                        kind: prev_arg_kind,
-                        ty: cloned_ty,
-                        span: typed_arg.span,
-                    }),
+                    base: Box::new(env.typed(prev_arg_kind, cloned_ty, typed_arg.span)),
                     items: vec![TypedProjectionItem {
                         alias: Spanned {
                             value: expected_name.clone(),
@@ -1701,14 +1706,15 @@ fn validate_insert(
         } else {
             return Err(TypeError::InsertMissingRequiredField {
                 field: expected_name.clone(),
-                struct_name: struct_.name.clone(),
+                struct_name,
                 span: typed_arg.span,
             });
         }
     }
 
     for proj_field in proj_fields {
-        let schema_field = struct_.fields.iter().find(|f| match f {
+        let schema = env.schema();
+        let schema_field = schema.structs[sid.index()].fields.iter().find(|f| match f {
             Field::Value { name, .. } | Field::Array { name, .. } | Field::Ref { name, .. } => {
                 name == &proj_field.name
             }
@@ -1716,7 +1722,7 @@ fn validate_insert(
         let Some(mut schema_ty) = schema_field.map(field_query_type) else {
             return Err(TypeError::StructFieldNotInSchema {
                 field: proj_field.name.clone(),
-                struct_name: struct_.name.clone(),
+                struct_name: schema.structs[sid.index()].name.clone(),
                 span: typed_arg.span,
             });
         };
@@ -1724,7 +1730,7 @@ fn validate_insert(
         if !types_compatible(&mut schema_ty, &mut proj_field.ty, schema) {
             return Err(TypeError::StructFieldTypeMismatch {
                 field: proj_field.name.clone(),
-                struct_name: struct_.name.clone(),
+                struct_name: schema.structs[sid.index()].name.clone(),
                 expected: schema_ty.to_string(),
                 got: proj_field.ty.to_string(),
                 span: typed_arg.span,
@@ -2251,6 +2257,71 @@ mod tests {
         let (file, _diags) = crate::parse_query(r#""xyz".starts_with("abc")"#);
         let result = infer(&file.unwrap().result, &mut env).unwrap();
         assert_eq!(result.ty, QueryType::Scalar(ScalarType::Bool));
+    }
+
+    fn collect_node_ids(expr: &TypedExpr, ids: &mut Vec<NodeId>) {
+        ids.push(expr.id);
+        match &expr.kind {
+            TypedExprKind::Literal(_)
+            | TypedExprKind::Ident { .. }
+            | TypedExprKind::TypeConstant { .. } => {}
+            TypedExprKind::Some { value } => collect_node_ids(value, ids),
+            TypedExprKind::Tuple { elements } | TypedExprKind::Array { elements } => {
+                for element in elements {
+                    collect_node_ids(element, ids);
+                }
+            }
+            TypedExprKind::Struct { fields } => {
+                for (_, value) in fields {
+                    collect_node_ids(value, ids);
+                }
+            }
+            TypedExprKind::Projection { base, items } => {
+                collect_node_ids(base, ids);
+                for item in items {
+                    collect_node_ids(&item.value, ids);
+                }
+            }
+            TypedExprKind::Binary { lhs, rhs, .. } => {
+                collect_node_ids(lhs, ids);
+                collect_node_ids(rhs, ids);
+            }
+            TypedExprKind::Unary { expr, .. } | TypedExprKind::Cast { expr, .. } => {
+                collect_node_ids(expr, ids);
+            }
+            TypedExprKind::Method { base, args, .. } => {
+                collect_node_ids(base, ids);
+                for arg in args {
+                    collect_node_ids(&arg.expr, ids);
+                }
+            }
+            TypedExprKind::If { arms, default } => {
+                for (cond, value) in arms {
+                    collect_node_ids(cond, ids);
+                    collect_node_ids(value, ids);
+                }
+                collect_node_ids(default, ids);
+            }
+            TypedExprKind::Field { base, .. } | TypedExprKind::TupleAccess { base, .. } => {
+                collect_node_ids(base, ids);
+            }
+        }
+    }
+
+    #[test]
+    fn node_ids_are_unique() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _diags) =
+            crate::parse_query(r#"users { name, shout = name.to_upper() } { name }"#);
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        let mut ids = Vec::new();
+        collect_node_ids(&result, &mut ids);
+        let mut sorted = ids.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(ids.len(), sorted.len(), "duplicate node ids: {ids:?}");
+        assert!(!ids.is_empty());
     }
 
     #[test]

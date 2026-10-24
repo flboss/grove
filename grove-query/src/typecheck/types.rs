@@ -2,7 +2,7 @@ use std::fmt;
 
 use crate::ast::{BinaryOp, ConstantName, Literal, SortDir, TypeName, UnaryOp};
 use grove_schema::validated::{FieldId, ScalarType, StructId, ValueType};
-use grove_types::{Span, Spanned};
+use grove_types::{NodeId, Span, Spanned};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypedQueryFile {
@@ -47,6 +47,7 @@ pub struct TypedExpr {
     pub kind: TypedExprKind,
     pub ty: QueryType,
     pub span: Span,
+    pub id: NodeId,
 }
 
 #[derive(Debug, Clone, PartialEq)]

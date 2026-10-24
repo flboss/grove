@@ -22,6 +22,10 @@ impl From<Range<usize>> for Span {
     }
 }
 
+/// Unique identity of a typechecked node
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct NodeId(pub u64);
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Spanned<T> {
     pub span: Span,
