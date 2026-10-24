@@ -43,7 +43,7 @@ pub(crate) fn exec_root(ctx: &mut EvalCtx, root_idx: usize) -> Result<Val, ExecE
         }
         let mut record = Vec::with_capacity(names.len());
         for (name, value) in names.iter().zip(row.values) {
-            record.push((ctx.interner.intern(name), value));
+            record.push((ctx.interner.intern(*name), value));
         }
         items.push(Val::Record(record));
     }

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fmt::{self, Write};
 use std::sync::Arc;
@@ -148,11 +149,12 @@ pub struct Interner {
 }
 
 impl Interner {
-    pub fn intern(&mut self, name: &str) -> Arc<str> {
-        if let Some(existing) = self.names.get(name) {
+    pub fn intern<'a>(&mut self, name: impl Into<Cow<'a, str>>) -> Arc<str> {
+        let name = name.into();
+        if let Some(existing) = self.names.get(name.as_ref()) {
             return Arc::clone(existing);
         }
-        let arc: Arc<str> = Arc::from(name);
+        let arc: Arc<str> = Arc::from(name.into_owned());
         self.names.insert(Arc::clone(&arc));
         arc
     }
