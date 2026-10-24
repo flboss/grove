@@ -39,7 +39,7 @@ struct Profile {
 }
 struct Order {
   amount: Int,
-  user: &?User,
+  user: &User,
 }
 struct Image {
   title: String,
