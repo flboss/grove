@@ -73,7 +73,7 @@ impl<'s> TypeEnv<'s> {
         None
     }
 
-    fn schema(&self) -> &ValidatedSchema {
+    fn schema(&self) -> &'s ValidatedSchema {
         self.schema
     }
 
@@ -1639,10 +1639,9 @@ fn validate_insert(
     };
     let proj_fields = expect_constructed_record(record_ty, typed_arg.span, MutationKind::Insert)?;
 
-    let schema = env.schema();
-    let struct_fields = schema.structs[sid.index()].fields.clone();
-    let struct_name = schema.structs[sid.index()].name.clone();
-    for schema_field in &struct_fields {
+    let struct_fields = &env.schema().structs[sid.index()].fields;
+    let struct_name = &env.schema().structs[sid.index()].name;
+    for schema_field in struct_fields {
         let (expected_name, is_optional) = match &schema_field {
             Field::Value {
                 name,
@@ -1658,7 +1657,7 @@ fn validate_insert(
                 if proj_fields.iter().any(|f| &f.name == name) {
                     return Err(TypeError::RefFieldInMutation {
                         field: name.clone(),
-                        struct_name,
+                        struct_name: struct_name.clone(),
                         span: typed_arg.span,
                     });
                 }
@@ -1706,15 +1705,14 @@ fn validate_insert(
         } else {
             return Err(TypeError::InsertMissingRequiredField {
                 field: expected_name.clone(),
-                struct_name,
+                struct_name: struct_name.clone(),
                 span: typed_arg.span,
             });
         }
     }
 
     for proj_field in proj_fields {
-        let schema = env.schema();
-        let schema_field = schema.structs[sid.index()].fields.iter().find(|f| match f {
+        let schema_field = struct_fields.iter().find(|f| match f {
             Field::Value { name, .. } | Field::Array { name, .. } | Field::Ref { name, .. } => {
                 name == &proj_field.name
             }
@@ -1722,15 +1720,15 @@ fn validate_insert(
         let Some(mut schema_ty) = schema_field.map(field_query_type) else {
             return Err(TypeError::StructFieldNotInSchema {
                 field: proj_field.name.clone(),
-                struct_name: schema.structs[sid.index()].name.clone(),
+                struct_name: struct_name.clone(),
                 span: typed_arg.span,
             });
         };
 
-        if !types_compatible(&mut schema_ty, &mut proj_field.ty, schema) {
+        if !types_compatible(&mut schema_ty, &mut proj_field.ty, env.schema()) {
             return Err(TypeError::StructFieldTypeMismatch {
                 field: proj_field.name.clone(),
-                struct_name: schema.structs[sid.index()].name.clone(),
+                struct_name: struct_name.clone(),
                 expected: schema_ty.to_string(),
                 got: proj_field.ty.to_string(),
                 span: typed_arg.span,
