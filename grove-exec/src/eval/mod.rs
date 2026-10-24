@@ -12,8 +12,8 @@ pub mod composite;
 pub mod data;
 pub mod scalar;
 
-use composite::{eval_array, eval_struct, eval_tuple};
-use data::exec_root;
+use composite::{eval_array, eval_projection, eval_struct, eval_tuple};
+use data::{exec_field, exec_root};
 use scalar::{eval_binary, eval_cast, eval_method, eval_unary};
 
 /// Lexical value scope chain
@@ -39,6 +39,14 @@ impl Env {
     /// `depth` counts scopes skipped to reach the identifier
     fn lookup(&self, name: &str, depth: usize) -> Option<&Val> {
         self.scopes.iter().rev().nth(depth)?.get(name)
+    }
+
+    pub(crate) fn push_scope(&mut self, scope: HashMap<String, Val>) {
+        self.scopes.push(scope);
+    }
+
+    pub(crate) fn pop_scope(&mut self) {
+        self.scopes.pop();
     }
 }
 
@@ -85,9 +93,13 @@ pub fn eval(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
                     })
             }
             IdentBinding::Root { root_idx } => exec_root(ctx, *root_idx),
-            IdentBinding::Field(_) | IdentBinding::ProjectedField { .. } => {
-                todo!("data references with row contexts")
-            }
+            IdentBinding::Field(_) | IdentBinding::ProjectedField { .. } => ctx
+                .env
+                .lookup(&name.value, *depth)
+                .cloned()
+                .ok_or_else(|| ExecError::Integrity {
+                    message: format!("unbound field `{}` (internal error)", name.value),
+                }),
             IdentBinding::Prev { .. } => todo!("prev with mutations"),
             IdentBinding::ListElement => todo!("element references inside collection operators"),
         },
@@ -111,7 +123,12 @@ pub fn eval(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
         }
         TypedExprKind::Binary { op, lhs, rhs } => eval_binary(op, lhs, rhs, ctx, expr.span),
         TypedExprKind::Unary { op, expr: inner } => eval_unary(op, inner, ctx, expr.span),
-        TypedExprKind::Field { .. } | TypedExprKind::TupleAccess { .. } => todo!("navigation"),
+        TypedExprKind::Field {
+            base,
+            name,
+            optional,
+        } => exec_field(base, &name.value, *optional, ctx),
+        TypedExprKind::TupleAccess { .. } => todo!("tuple access"),
         TypedExprKind::Method {
             base,
             name,
@@ -125,7 +142,7 @@ pub fn eval(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
         TypedExprKind::Tuple { elements } => eval_tuple(elements, ctx),
         TypedExprKind::Array { elements } => eval_array(elements, ctx),
         TypedExprKind::Struct { fields } => eval_struct(fields, ctx),
-        TypedExprKind::Projection { .. } => todo!("projections"),
+        TypedExprKind::Projection { base, items } => eval_projection(base, items, ctx),
     }
 }
 
@@ -138,8 +155,11 @@ pub fn eval_let(stmt: &TypedLetStmt, ctx: &mut EvalCtx<'_>) -> Result<(), ExecEr
 
 #[cfg(test)]
 pub(crate) mod harness {
+    use crate::{sqlite::SqliteBackend, testdata};
+
     use super::*;
     use grove_query::typecheck::types::TypedStatement;
+    use rusqlite::Connection;
 
     pub(crate) fn run_src(src: &str) -> Result<Val, ExecError> {
         run_with(src, ValidatedSchema::default())
@@ -181,6 +201,14 @@ pub(crate) mod harness {
             }
         }
         eval(&file.result, &mut ctx)
+    }
+
+    pub(crate) fn run_seeded(src: &str) -> Result<Val, ExecError> {
+        let schema = testdata::schema();
+        let mut conn = Connection::open_in_memory().expect("in-memory database should open");
+        testdata::seed(&mut conn).expect("testdata initialization should succeed");
+        let backend = SqliteBackend::new(conn, &schema).expect("backend should verify");
+        run_with_storage(src, schema.clone(), &backend)
     }
 
     pub(crate) const FIXED_NOW: DateTime<Utc> = DateTime::from_timestamp(1_700_000_000, 0).unwrap();

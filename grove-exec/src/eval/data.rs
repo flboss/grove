@@ -1,7 +1,10 @@
+use std::sync::Arc;
+
+use grove_query::typecheck::types::TypedExpr;
 use grove_schema::validated::{Field, FieldId};
 
 use crate::error::ExecError;
-use crate::eval::EvalCtx;
+use crate::eval::{EvalCtx, eval};
 use crate::value::Val;
 
 /// Read root table into a List<Record> (excluding Refs)
@@ -47,22 +50,62 @@ pub(crate) fn exec_root(ctx: &mut EvalCtx, root_idx: usize) -> Result<Val, ExecE
     Ok(Val::List(items))
 }
 
+/// Perform a record field access
+pub(crate) fn exec_field(
+    base: &TypedExpr,
+    name: &str,
+    optional: bool,
+    ctx: &mut EvalCtx,
+) -> Result<Val, ExecError> {
+    let base = eval(base, ctx)?;
+    let base = match (optional, base) {
+        (true, Val::None) => return Ok(Val::None),
+        (true, Val::Some(v)) => *v,
+        (_, v) => v,
+    };
+    match base {
+        Val::Record(fields) => record_field(fields, name),
+        Val::List(items) => {
+            let mut mapped = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    Val::Record(fields) => mapped.push(record_field(fields, name)?),
+                    Val::None => mapped.push(Val::None),
+                    other => {
+                        return Err(ExecError::Integrity {
+                            message: format!(
+                                "field `{name}` on non-record list element: {other} (internal error)"
+                            ),
+                        });
+                    }
+                }
+            }
+            Ok(Val::List(mapped))
+        }
+        _ => Err(ExecError::Integrity {
+            message: format!("field `{name}` on non-record value (internal error)"),
+        }),
+    }
+}
+
+fn record_field(
+    fields: impl IntoIterator<Item = (Arc<str>, Val)>,
+    name: &str,
+) -> Result<Val, ExecError> {
+    fields
+        .into_iter()
+        .find(|(field_name, _)| field_name.as_ref() == name)
+        .map(|(_, value)| value)
+        .ok_or_else(|| ExecError::Integrity {
+            message: format!("unknown field `{name}` (internal error)"),
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::Connection;
 
     use crate::eval::harness::*;
-    use crate::sqlite::SqliteBackend;
-    use crate::testdata;
-
-    fn run_seeded(src: &str) -> Result<Val, ExecError> {
-        let schema = testdata::schema();
-        let mut conn = Connection::open_in_memory().expect("in-memory database should open");
-        testdata::seed(&mut conn).expect("testdata initialization should succeed");
-        let backend = SqliteBackend::new(conn, &schema).expect("backend should verify");
-        run_with_storage(src, schema.clone(), &backend)
-    }
 
     #[test]
     fn root_fetch_skips_ref_fields() {
