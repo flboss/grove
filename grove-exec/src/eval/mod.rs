@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use grove_query::typecheck::types::{IdentBinding, TypedExpr, TypedExprKind, TypedLetStmt};
+use grove_query::typecheck::types::{
+    IdentBinding, TypedExpr, TypedExprKind, TypedLetStmt, TypedQueryFile, TypedStatement,
+};
 use grove_schema::validated::ValidatedSchema;
 
 use crate::error::ExecError;
@@ -156,12 +158,30 @@ pub fn eval_let(stmt: &TypedLetStmt, ctx: &mut EvalCtx<'_>) -> Result<(), ExecEr
     Ok(())
 }
 
+/// Run a typed query file consisting of statements and a result against storage
+pub fn exec_file(
+    file: &TypedQueryFile,
+    storage: &dyn Storage,
+    schema: &ValidatedSchema,
+    now: DateTime<Utc>,
+) -> Result<Val, ExecError> {
+    let mut ctx = EvalCtx::new(Env::new(), now, storage, schema);
+    for stmt in &file.statements {
+        match stmt {
+            TypedStatement::Let(let_stmt) => eval_let(let_stmt, &mut ctx)?,
+            // discarded `;`-terminated expressions
+            TypedStatement::Expr(_) => {}
+            TypedStatement::Mutation(_) => todo!("mutations"),
+        }
+    }
+    eval(&file.result, &mut ctx)
+}
+
 #[cfg(test)]
 pub(crate) mod harness {
     use crate::{sqlite::SqliteBackend, testdata};
 
     use super::*;
-    use grove_query::typecheck::types::TypedStatement;
     use rusqlite::Connection;
 
     pub(crate) fn run_src(src: &str) -> Result<Val, ExecError> {
@@ -189,21 +209,15 @@ pub(crate) mod harness {
         storage: &S,
     ) -> Result<Val, ExecError> {
         let (file, parse_diags) = grove_query::parse_query(src);
-        assert!(parse_diags.is_empty(), "{parse_diags:?}");
+        assert!(
+            parse_diags
+                .iter()
+                .all(|d| d.severity == grove_types::Severity::Warning),
+            "{parse_diags:?}"
+        );
         let (typed, diags) = grove_query::typecheck::typecheck(file.unwrap(), &schema);
         assert!(diags.is_empty(), "{diags:?}");
-        let file = typed.unwrap();
-        let mut ctx = EvalCtx::new(Env::new(), FIXED_NOW, storage, &schema);
-        for stmt in &file.statements {
-            match stmt {
-                TypedStatement::Let(let_stmt) => eval_let(let_stmt, &mut ctx)?,
-                TypedStatement::Expr(expr) => {
-                    eval(expr, &mut ctx)?;
-                }
-                TypedStatement::Mutation(_) => todo!("mutations"),
-            }
-        }
-        eval(&file.result, &mut ctx)
+        exec_file(&typed.unwrap(), storage, &schema, FIXED_NOW)
     }
 
     pub(crate) fn run_seeded(src: &str) -> Result<Val, ExecError> {
@@ -331,6 +345,19 @@ mod tests {
         assert_eq!(
             eval(&expr, &mut ctx),
             Ok(Val::List(vec![Val::Scalar(Scalar::Int(1)), Val::None]))
+        );
+    }
+
+    #[test]
+    fn exec_file_discarded_exprs() {
+        assert_eq!(run_seeded("let x = 40 + 2; 1 / 0; x"), Ok(int(42)));
+        assert_eq!(run_seeded("let a = 1; let b = a + 2; b"), Ok(int(3)));
+        assert_eq!(
+            run_seeded("users { name, x = 1 / 0 }; roles { name }"),
+            Ok(Val::List(vec![
+                rec(vec![("name", str("admin"))]),
+                rec(vec![("name", str("editor"))]),
+            ]))
         );
     }
 }
