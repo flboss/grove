@@ -77,6 +77,22 @@ enum Command {
         #[arg(long)]
         raw: bool,
     },
+
+    /// Run a query file against a SQLite database and print the result.
+    ExecRun {
+        /// Path to the query file, or the query source itself
+        query: PathBuf,
+
+        /// Path to the schema file, or the schema source itself
+        schema: PathBuf,
+
+        /// Path to the SQLite database file
+        db: PathBuf,
+
+        /// Display diagnostics as raw Debug output instead of using ariadne
+        #[arg(long)]
+        raw: bool,
+    },
 }
 
 fn main() {
@@ -88,6 +104,12 @@ fn main() {
         Command::QueryLex { path, raw } => query_lex(&path, raw),
         Command::QueryParse { path, raw } => query_parse(&path, raw),
         Command::QueryTypecheck { query, schema, raw } => query_typecheck(&query, &schema, raw),
+        Command::ExecRun {
+            query,
+            schema,
+            db,
+            raw,
+        } => exec_run(&query, &schema, &db, raw),
     }
 }
 
@@ -329,4 +351,85 @@ fn print_diagnostics(
 
         report.finish().print(&mut cache).unwrap();
     }
+}
+
+fn exec_run(query_path: &PathBuf, schema_path: &PathBuf, db_path: &PathBuf, raw: bool) {
+    let (query_name, query_source) = read_input(query_path, "query");
+    let (schema_name, schema_source) = read_input(schema_path, "schema");
+
+    let (schema, schema_parse_diagnostics) = grove_schema::parse_schema(&schema_source);
+    let Some(schema) = schema else {
+        println!("No validated schema. (parse failed)");
+        print_diagnostics(
+            &schema_source,
+            &schema_name,
+            &schema_parse_diagnostics,
+            raw,
+            "Schema Parse ",
+        );
+        return;
+    };
+
+    let (validated_schema, schema_validation_diagnostics) = grove_schema::validate(schema);
+    let Some(validated_schema) = validated_schema else {
+        println!("No validated schema. (validation failed)");
+        print_diagnostics(
+            &schema_source,
+            &schema_name,
+            &schema_validation_diagnostics,
+            raw,
+            "Schema Validation ",
+        );
+        return;
+    };
+
+    let (file, parse_diagnostics) = grove_query::parse_query(&query_source);
+    let Some(file) = file else {
+        println!("No query AST. (parse failed)");
+        print_diagnostics(
+            &query_source,
+            &query_name,
+            &parse_diagnostics,
+            raw,
+            "Query Parse ",
+        );
+        return;
+    };
+
+    let (typed_file, mut typecheck_diagnostics) = typecheck(file, &validated_schema);
+    let has_errors = typecheck_diagnostics
+        .iter()
+        .any(|d| d.severity == grove_types::Severity::Error);
+    let Some(typed_file) = typed_file else {
+        println!("No typed AST. (typecheck failed)");
+        print_diagnostics(&query_source, &query_name, &typecheck_diagnostics, raw, "");
+        return;
+    };
+    if has_errors {
+        println!("No result. (typecheck failed)");
+        print_diagnostics(&query_source, &query_name, &typecheck_diagnostics, raw, "");
+        return;
+    }
+    typecheck_diagnostics.extend(parse_diagnostics);
+
+    let conn = match rusqlite::Connection::open(db_path) {
+        Ok(conn) => conn,
+        Err(e) => {
+            eprintln!("error opening database {}: {e}", db_path.display());
+            std::process::exit(1);
+        }
+    };
+    let backend = match grove_exec::sqlite::SqliteBackend::new(conn, &validated_schema) {
+        Ok(backend) => backend,
+        Err(e) => {
+            println!("No result. (storage failed: {e})");
+            return;
+        }
+    };
+    match grove_exec::eval::exec_file(&typed_file, &backend, &validated_schema, chrono::Utc::now())
+    {
+        Ok(value) => println!("{value}"),
+        Err(e) => println!("No result. (execution failed: {e})"),
+    }
+    print_diagnostics(&query_source, &query_name, &typecheck_diagnostics, raw, "");
 }

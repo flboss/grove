@@ -4,9 +4,12 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+grove-exec.workspace = true
 grove-schema.workspace = true
 grove-query.workspace = true
 grove-types.workspace = true
 
 ariadne.workspace = true
+chrono.workspace = true
 clap.workspace = true
+rusqlite.workspace = true

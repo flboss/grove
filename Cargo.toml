@@ -10,6 +10,7 @@ edition = "2024"
 grove-types = { path = "grove-types" }
 grove-schema = { path = "grove-schema" }
 grove-query = { path = "grove-query" }
+grove-exec = { path = "grove-exec" }
 
 chrono = "0.4"
 rust_decimal = { version = "1", features = ["macros"] }
