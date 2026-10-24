@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use grove_query::typecheck::types::{IdentBinding, TypedExpr, TypedExprKind, TypedLetStmt};
@@ -19,7 +20,7 @@ use scalar::{eval_binary, eval_cast, eval_method, eval_unary};
 /// Lexical value scope chain
 #[derive(Debug, Default)]
 pub struct Env {
-    scopes: Vec<HashMap<String, Val>>,
+    scopes: Vec<HashMap<Arc<str>, Val>>,
 }
 
 impl Env {
@@ -29,7 +30,7 @@ impl Env {
         }
     }
 
-    pub fn define(&mut self, name: String, value: Val) {
+    pub fn define(&mut self, name: Arc<str>, value: Val) {
         self.scopes
             .last_mut()
             .expect("env always has a scope")
@@ -41,12 +42,14 @@ impl Env {
         self.scopes.iter().rev().nth(depth)?.get(name)
     }
 
-    pub(crate) fn push_scope(&mut self, scope: HashMap<String, Val>) {
+    pub(crate) fn push_scope(&mut self, scope: HashMap<Arc<str>, Val>) {
         self.scopes.push(scope);
     }
 
     pub(crate) fn pop_scope(&mut self) {
-        self.scopes.pop();
+        if !self.scopes.is_empty() {
+            self.scopes.pop();
+        }
     }
 }
 
@@ -149,7 +152,7 @@ pub fn eval(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
 /// Evaluate a `let` and bind its value
 pub fn eval_let(stmt: &TypedLetStmt, ctx: &mut EvalCtx<'_>) -> Result<(), ExecError> {
     let value = eval(&stmt.value, ctx)?;
-    ctx.env.define(stmt.name.value.clone(), value);
+    ctx.env.define(ctx.interner.intern(&stmt.name.value), value);
     Ok(())
 }
 
@@ -277,6 +280,7 @@ mod tests {
     use grove_query::typecheck::types::{IdentBinding, QueryType, TypedExpr, TypedExprKind};
     use grove_schema::validated::{ScalarType, ValidatedSchema};
     use grove_types::{Span, Spanned};
+    use std::sync::Arc;
 
     #[test]
     fn eval_let_binding() {
@@ -303,7 +307,7 @@ mod tests {
     fn eval_env_depth_collections() {
         let mut env = Env::new();
         env.define(
-            "xs".to_string(),
+            Arc::from("xs"),
             Val::List(vec![Val::Scalar(Scalar::Int(1)), Val::None]),
         );
         let schema = ValidatedSchema::default();

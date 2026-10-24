@@ -73,8 +73,7 @@ fn project_record(
 ) -> Result<Val, ExecError> {
     let scope = record
         .into_iter()
-        // TODO: avoid allocation
-        .map(|(name, value)| (name.to_string(), value))
+        .map(|(name, value)| (ctx.interner.intern(name.as_ref()), value))
         .collect();
     ctx.env.push_scope(scope);
     let mut projected = Vec::with_capacity(items.len());
