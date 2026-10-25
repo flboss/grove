@@ -102,6 +102,15 @@ pub enum SchemaValidationError {
         span: Span,
         struct_name: String,
     },
+    MultipleOwners {
+        span: Span,
+        struct_name: String,
+        parents: Vec<String>,
+    },
+    UnownedNonRoot {
+        span: Span,
+        struct_name: String,
+    },
     NonOwningNonRef {
         span: Span,
         struct_name: String,
@@ -361,7 +370,10 @@ impl From<SchemaValidationError> for Diagnostic {
                 span,
                 "owned struct as root",
             )
-            .with_note("every struct must either be owned by another struct through a relation or be declared as a root"),
+            .with_note(
+                "every struct must either be owned by exactly one other struct \
+                 through a relation or be declared as a root",
+            ),
             NonOwningNonRef {
                 span,
                 struct_name,
@@ -378,13 +390,45 @@ impl From<SchemaValidationError> for Diagnostic {
             UnrootedOwnership { span, struct_name } => error_simple(
                 "SV0022",
                 format!(
-                    "struct `{struct_name}` is owned but its ownership chain contains circular ownership"
+                    "struct `{struct_name}` is owned \
+                     but its ownership chain contains circular ownership"
                 ),
                 span,
                 "ownership without a root",
             )
             .with_note(
-                "every struct must either be owned by another struct through a relation or be declared as a root",
+                "every struct must either be owned by exactly one other struct \
+                 through a relation or be declared as a root",
+            ),
+            MultipleOwners {
+                span,
+                struct_name,
+                parents,
+            } => error_simple(
+                "SV0023",
+                format!(
+                    "struct `{struct_name}` is owned by more than one struct ({})",
+                    parents.join(", ")
+                ),
+                span,
+                "multiple owners",
+            )
+            .with_note(
+                "every struct must either be owned by exactly one other struct \
+                 through a relation or be declared as a root",
+            ),
+            UnownedNonRoot { span, struct_name } => error_simple(
+                "SV0024",
+                format!("struct `{struct_name}` has no owner and is not declared as a root"),
+                span,
+                "floating struct",
+            )
+            .with_help(format!(
+                "declare `{struct_name}` as a root if it is has no owner"
+            ))
+            .with_note(
+                "every struct must either be owned by exactly one other struct \
+                 through a relation or be declared as a root",
             ),
         }
     }

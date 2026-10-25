@@ -9,6 +9,7 @@ pub const SCHEMA: &str = r#"
 root users: User;
 root roles: Role;
 root images: Image;
+root messages: Message;
 struct User {
   id: Int,
   name: String,

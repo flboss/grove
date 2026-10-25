@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use grove_types::Span;
+
 use crate::{
     validated::{Relation, StructId},
     validation_error::SchemaValidationError,
@@ -28,6 +30,43 @@ impl<'s> Builder<'s> {
                 owners.entry(child).or_default().push(parent);
             }
         }
+        for parents in owners.values_mut() {
+            parents.sort_by_key(|sid| sid.index());
+            parents.dedup();
+        }
+
+        let declared_roots: HashSet<StructId> =
+            self.roots.iter().map(|root| root.struct_id).collect();
+
+        let mut multi_owned: Vec<StructId> = owners
+            .iter()
+            .filter(|(_, parents)| parents.len() > 1)
+            .map(|(child, _)| *child)
+            .collect();
+        multi_owned.sort_by_key(|sid| sid.index());
+        for child in multi_owned {
+            let struct_name = self.structs[child.index()].name.clone();
+            let span = self.struct_span(&struct_name);
+            let parents = owners[&child]
+                .iter()
+                .map(|sid| self.structs[sid.index()].name.clone())
+                .collect();
+            self.emit_error(SchemaValidationError::MultipleOwners {
+                span,
+                struct_name,
+                parents,
+            });
+        }
+
+        let unowned: Vec<StructId> = (0..self.structs.len())
+            .map(StructId::new)
+            .filter(|sid| !owners.contains_key(sid) && !declared_roots.contains(sid))
+            .collect();
+        for sid in unowned {
+            let struct_name = self.structs[sid.index()].name.clone();
+            let span = self.struct_span(&struct_name);
+            self.emit_error(SchemaValidationError::UnownedNonRoot { span, struct_name });
+        }
 
         for root in &self.schema.roots {
             let Some(&sid) = self.struct_index.get(root.struct_name.as_str()) else {
@@ -42,8 +81,6 @@ impl<'s> Builder<'s> {
             }
         }
 
-        let declared_roots: HashSet<StructId> =
-            self.roots.iter().map(|root| root.struct_id).collect();
         let mut terminated: HashMap<StructId, bool> = HashMap::new();
         let mut starts: Vec<StructId> = owners.keys().copied().collect();
         starts.sort_by_key(|sid| sid.index());
@@ -56,19 +93,22 @@ impl<'s> Builder<'s> {
                 &mut Vec::new(),
             ) {
                 let struct_name = self.structs[start.index()].name.clone();
-                let span = self
-                    .schema
-                    .structs
-                    .iter()
-                    .find(|def| def.name.value == struct_name)
-                    .map(|def| def.name.span)
-                    .unwrap_or_default();
+                let span = self.struct_span(&struct_name);
                 self.emit_error(SchemaValidationError::UnrootedOwnership { span, struct_name });
             }
         }
 
         self.roots
             .retain(|root| !owners.contains_key(&root.struct_id));
+    }
+
+    fn struct_span(&self, struct_name: &str) -> Span {
+        self.schema
+            .structs
+            .iter()
+            .find(|def| def.name.value == struct_name)
+            .map(|def| def.name.span)
+            .unwrap_or_default()
     }
 }
 
@@ -219,7 +259,76 @@ mod tests {
              rel Leaf.middle <<-> Middle.items (leaf.middle_id -> middle.id); \
              rel Middle.top <<-> Top.middles (middle.top_id -> top.id);",
             |b| {
-                assert_eq!(codes(&b.diags), vec!["SV0022", "SV0022"]);
+                assert_eq!(codes(&b.diags), vec!["SV0024", "SV0022", "SV0022"]);
+            },
+        );
+    }
+
+    #[test]
+    fn double_ownership_many_to_one_error() {
+        stage_ownership(
+            "root p1: P1; root p2: P2; \
+             struct P1 { cs: List<C> } struct P2 { cs: List<C> } struct C { p1: &P1, p2: &P2 } \
+             rel C.p1 <<-> P1.cs (c.p1_id -> p1.id); \
+             rel C.p2 <<-> P2.cs (c.p2_id -> p2.id);",
+            |b| {
+                assert_eq!(codes(&b.diags), vec!["SV0023"]);
+                assert!(b.diags[0].message.contains("P1"));
+                assert!(b.diags[0].message.contains("P2"));
+                assert_eq!(b.roots.len(), 2);
+            },
+        );
+    }
+
+    #[test]
+    fn double_ownership_one_to_one_error() {
+        stage_ownership(
+            "root a: A; root b: B; \
+             struct A { c: ?C } struct B { c: ?C } struct C { a: &A, b: &B } \
+             rel C.a <-> A.c (c.a_id -> a.id); \
+             rel C.b <-> B.c (c.b_id -> b.id);",
+            |b| {
+                assert_eq!(codes(&b.diags), vec!["SV0023"]);
+            },
+        );
+    }
+
+    #[test]
+    fn same_parent_twice_is_single_ownership() {
+        stage_ownership(
+            "root p: P; \
+             struct P { as: List<C>, bs: List<C> } struct C { a: &P, b: &P } \
+             rel C.a <<-> P.as (c.a_id -> p.id); \
+             rel C.b <<-> P.bs (c.b_id -> p.id);",
+            |b| {
+                assert!(b.diags.is_empty());
+                assert_eq!(b.roots.len(), 1);
+            },
+        );
+    }
+
+    #[test]
+    fn unowned_non_root_many_to_many_error() {
+        stage_ownership(
+            "root users: User; \
+             struct User { name: String, roles: &List<Role> } \
+             struct Role { name: String, users: &List<User> } \
+             rel Role.users <<->> User.roles via user_roles[role_id -> roles.id, user_id -> users.id];",
+            |b| {
+                assert_eq!(codes(&b.diags), vec!["SV0024"]);
+                assert_eq!(b.roots.len(), 1);
+                assert_eq!(b.roots[0].name, "users");
+            },
+        );
+    }
+
+    #[test]
+    fn unowned_non_root_self_ref_error() {
+        stage_ownership(
+            "struct S { manager: &?S, subordinates: &List<S> } \
+             rel S.manager <<-> S.subordinates (s.manager_id -> s.id);",
+            |b| {
+                assert_eq!(codes(&b.diags), vec!["SV0024"]);
             },
         );
     }
