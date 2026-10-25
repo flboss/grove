@@ -98,6 +98,10 @@ pub enum SchemaValidationError {
         root: String,
         struct_name: String,
     },
+    UnrootedOwnership {
+        span: Span,
+        struct_name: String,
+    },
     NonOwningNonRef {
         span: Span,
         struct_name: String,
@@ -371,6 +375,17 @@ impl From<SchemaValidationError> for Diagnostic {
                 "`&` on a non-reference",
             )
             .with_note("`&` is only valid on a struct reference: `S`, `?S`, or `List<S>`"),
+            UnrootedOwnership { span, struct_name } => error_simple(
+                "SV0022",
+                format!(
+                    "struct `{struct_name}` is owned but its ownership chain contains circular ownership"
+                ),
+                span,
+                "ownership without a root",
+            )
+            .with_note(
+                "every struct must either be owned by another struct through a relation or be declared as a root",
+            ),
         }
     }
 }

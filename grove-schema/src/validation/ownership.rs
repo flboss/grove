@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::{
     validated::{Relation, StructId},
@@ -9,10 +9,9 @@ use super::Builder;
 
 impl<'s> Builder<'s> {
     pub(super) fn stage_ownership(&mut self) {
-        let owned: HashSet<StructId> = self
-            .relations
-            .iter()
-            .filter_map(|r| match r {
+        let mut owners: HashMap<StructId, Vec<StructId>> = HashMap::new();
+        for relation in &self.relations {
+            let (child, parent) = match relation {
                 Relation::OneToOne {
                     child_ref,
                     parent_ref,
@@ -22,16 +21,19 @@ impl<'s> Builder<'s> {
                     child_ref,
                     parent_ref,
                     ..
-                } if child_ref.struct_id() != parent_ref.struct_id() => Some(child_ref.struct_id()),
-                _ => None,
-            })
-            .collect();
+                } => (child_ref.struct_id(), parent_ref.struct_id()),
+                _ => continue,
+            };
+            if child != parent {
+                owners.entry(child).or_default().push(parent);
+            }
+        }
 
         for root in &self.schema.roots {
             let Some(&sid) = self.struct_index.get(root.struct_name.as_str()) else {
                 continue;
             };
-            if owned.contains(&sid) {
+            if owners.contains_key(&sid) {
                 self.emit_error(SchemaValidationError::OwnedAsRoot {
                     span: root.struct_name.span,
                     root: root.name.value.clone(),
@@ -40,8 +42,62 @@ impl<'s> Builder<'s> {
             }
         }
 
-        self.roots.retain(|root| !owned.contains(&root.struct_id));
+        let declared_roots: HashSet<StructId> =
+            self.roots.iter().map(|root| root.struct_id).collect();
+        let mut terminated: HashMap<StructId, bool> = HashMap::new();
+        let mut starts: Vec<StructId> = owners.keys().copied().collect();
+        starts.sort_by_key(|sid| sid.index());
+        for start in starts {
+            if !reaches_root(
+                start,
+                &owners,
+                &declared_roots,
+                &mut terminated,
+                &mut Vec::new(),
+            ) {
+                let struct_name = self.structs[start.index()].name.clone();
+                let span = self
+                    .schema
+                    .structs
+                    .iter()
+                    .find(|def| def.name.value == struct_name)
+                    .map(|def| def.name.span)
+                    .unwrap_or_default();
+                self.emit_error(SchemaValidationError::UnrootedOwnership { span, struct_name });
+            }
+        }
+
+        self.roots
+            .retain(|root| !owners.contains_key(&root.struct_id));
     }
+}
+
+fn reaches_root(
+    sid: StructId,
+    owners: &HashMap<StructId, Vec<StructId>>,
+    roots: &HashSet<StructId>,
+    terminated: &mut HashMap<StructId, bool>,
+    visiting: &mut Vec<StructId>,
+) -> bool {
+    if roots.contains(&sid) {
+        return true;
+    }
+    if let Some(&done) = terminated.get(&sid) {
+        return done;
+    }
+    if visiting.contains(&sid) {
+        return false;
+    }
+    let Some(parents) = owners.get(&sid) else {
+        return false;
+    };
+    visiting.push(sid);
+    let done = parents
+        .iter()
+        .all(|parent| reaches_root(*parent, owners, roots, terminated, visiting));
+    visiting.pop();
+    terminated.insert(sid, done);
+    done
 }
 
 #[cfg(test)]
@@ -120,6 +176,50 @@ mod tests {
             |b| {
                 assert!(b.diags.is_empty());
                 assert_eq!(b.roots.len(), 1);
+            },
+        );
+    }
+
+    #[test]
+    fn linear_ownership_chain_rooted() {
+        stage_ownership(
+            "root users: User; \
+             struct User { orders: List<Order> } \
+             struct Order { user: &User, items: List<Item> } \
+             struct Item { order: &Order } \
+             rel Order.user <<-> User.orders (orders.user_id -> users.id); \
+             rel Item.order <<-> Order.items (items.order_id -> orders.id);",
+            |b| {
+                assert!(b.diags.is_empty());
+                assert_eq!(b.roots.len(), 1);
+            },
+        );
+    }
+
+    #[test]
+    fn circular_ownership_unrooted_error() {
+        stage_ownership(
+            "struct A { as_child: &B, as_parent: List<B> } \
+             struct B { as_child: &A, as_parent: List<A> } \
+             rel A.as_child <<-> B.as_parent (a.fk_to_b -> b.id); \
+             rel B.as_child <<-> A.as_parent (b.fk_to_a -> a.id);",
+            |b| {
+                assert_eq!(codes(&b.diags), vec!["SV0022", "SV0022"]);
+                assert!(b.roots.is_empty());
+            },
+        );
+    }
+
+    #[test]
+    fn ownership_chain_unrooted_error() {
+        stage_ownership(
+            "struct Middle { items: List<Leaf>, top: &Top } \
+             struct Leaf { middle: &Middle } \
+             struct Top { middles: List<Middle> } \
+             rel Leaf.middle <<-> Middle.items (leaf.middle_id -> middle.id); \
+             rel Middle.top <<-> Top.middles (middle.top_id -> top.id);",
+            |b| {
+                assert_eq!(codes(&b.diags), vec!["SV0022", "SV0022"]);
             },
         );
     }
