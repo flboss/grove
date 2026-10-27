@@ -221,18 +221,20 @@ fn resolve_field(
 fn splice_owning(value: Val, resolved: &HashMap<(FieldId, Key), Val>) -> Result<Val, ExecError> {
     match value {
         Val::Record(record) => {
-            let mut out = Vec::with_capacity(record.len());
-            for (name, field_value) in record {
-                out.push((name, splice_owning(field_value, resolved)?));
-            }
-            Ok(Val::Record(out))
+            let spliced = record
+                .into_iter()
+                .map(|(name, field_value)| {
+                    splice_owning(field_value, resolved).map(|val| (name, val))
+                })
+                .collect::<Result<_, _>>()?;
+            Ok(Val::Record(spliced))
         }
         Val::List(items) => {
-            let mut out = Vec::with_capacity(items.len());
-            for item in items {
-                out.push(splice_owning(item, resolved)?);
-            }
-            Ok(Val::List(out))
+            let spliced = items
+                .into_iter()
+                .map(|item| splice_owning(item, resolved))
+                .collect::<Result<_, _>>()?;
+            Ok(Val::List(spliced))
         }
         Val::Ref { field, parent } => Ok(resolved
             .get(&(field, parent))
