@@ -4,10 +4,12 @@ use std::fmt::{self, Write};
 use std::sync::Arc;
 
 use chrono::{DateTime, TimeDelta, Utc};
+use grove_schema::validated::FieldId;
 use grove_types::Span;
 use rust_decimal::Decimal;
 
 use crate::error::ExecError;
+use crate::storage::Key;
 
 /// A scalar Grove value
 #[derive(Debug, Clone, PartialEq)]
@@ -44,6 +46,11 @@ pub enum Val {
     List(Vec<Val>),
     Tuple(Vec<Val>),
     Record(Vec<(Arc<str>, Val)>),
+    /// Unresolved navigation link of the `parent` row
+    Ref {
+        field: FieldId,
+        parent: Key,
+    },
 }
 
 impl Val {
@@ -102,6 +109,7 @@ impl Val {
                         x.eq(y).map(|equal| all_equal & equal)
                     })
             }
+            (Val::Ref { .. }, _) | (_, Val::Ref { .. }) => None,
             _ => None,
         }
     }
@@ -271,6 +279,9 @@ impl fmt::Display for Val {
                     write!(f, "{name}: {value}")?;
                 }
                 write!(f, "}}")
+            }
+            Val::Ref { field, .. } => {
+                write!(f, "ref({}:{})", field.struct_id().index(), field.local())
             }
         }
     }
