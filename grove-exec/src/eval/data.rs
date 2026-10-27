@@ -380,7 +380,11 @@ mod tests {
         match run_seeded("users") {
             Ok(Val::List(rows)) => {
                 let text = rows[0].to_string();
-                assert!(text.contains("ref(...)"), "expected link rendering: {text}");
+                assert_eq!(
+                    text.split("ref(").count(),
+                    7,
+                    "expected link rendering: {text}"
+                );
             }
             got => panic!("expected user rows, got {got:?}"),
         }
@@ -394,7 +398,10 @@ mod tests {
             field: manager_field,
             parent: Key(1),
         };
-        assert_eq!(link.to_string(), "ref(...)");
+        assert_eq!(
+            link.to_string(),
+            format!("ref({}:{})", user_struct.index(), manager_field.local())
+        );
         assert_eq!(
             link.eq(&Val::Scalar(Scalar::Int(1))),
             None,
