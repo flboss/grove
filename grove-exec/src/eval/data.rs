@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use grove_query::typecheck::types::TypedExpr;
-use grove_schema::validated::{Field, FieldId, StructId};
+use grove_schema::validated::{Field, FieldId, StructId, ValidatedSchema};
 
 use crate::error::ExecError;
 use crate::eval::{EvalCtx, eval};
@@ -99,7 +99,7 @@ fn collect_owning(
     items: &[Val],
     by_field: &mut HashMap<FieldId, Vec<Key>>,
     order: &mut Vec<FieldId>,
-    schema: &grove_schema::validated::ValidatedSchema,
+    schema: &ValidatedSchema,
 ) -> Result<(), ExecError> {
     for item in items {
         let Val::Record(record) = item else {
@@ -133,21 +133,16 @@ fn collect_owning(
     Ok(())
 }
 
-/// Fetch an owning Ref field for a batch of parents
+/// Fetch a Ref field for a batch of parents;
+/// recursively resolve contained owning Refs
 fn resolve_field(
     ctx: &mut EvalCtx,
     field: FieldId,
     parents: &[Key],
 ) -> Result<Vec<ResolvedLink>, ExecError> {
-    let (target, optional, is_list, field_name) =
+    let (target, field_name) =
         match &ctx.schema.structs[field.struct_id().index()].fields[field.local()] {
-            Field::Ref {
-                target,
-                optional,
-                is_list,
-                name,
-                ..
-            } => (*target, *optional, *is_list, name),
+            Field::Ref { target, name, .. } => (*target, name),
             _ => {
                 return Err(ExecError::Integrity {
                     message: "Ref link names a non-Ref field (internal error)".to_string(),
@@ -169,52 +164,68 @@ fn resolve_field(
     for (parent, group) in parents.iter().zip(groups) {
         // Recursion terminates: ownership chain ends at a root
         let value = materialize(ctx, target, group)?;
-        let wrapped = if is_list {
-            value
-        // ?List<...> refs don't exist in schema
-        } else if optional {
-            match value {
-                Val::List(mut items) => match items.len() {
-                    0 => Val::None,
-                    1 => Val::Some(Box::new(items.pop().unwrap())),
-                    n => {
-                        return Err(ExecError::Integrity {
-                            message: format!(
-                                "optional Ref `{field_name}` resolved to {n} rows (for parent key {})",
-                                parent.0
-                            ),
-                        });
-                    }
-                },
-                other => {
-                    return Err(ExecError::Integrity {
-                        message: format!("optional Ref resolved to {other} (internal error)"),
-                    });
-                }
-            }
-        } else {
-            match value {
-                Val::List(mut items) => match items.len() {
-                    1 => items.pop().unwrap(),
-                    n => {
-                        return Err(ExecError::Integrity {
-                            message: format!(
-                                "required Ref `{field_name} resolved to {n} rows (for parent key {})",
-                                parent.0
-                            ),
-                        });
-                    }
-                },
-                other => {
-                    return Err(ExecError::Integrity {
-                        message: format!("required Ref resolved to {other} (internal error)"),
-                    });
-                }
-            }
-        };
+        let wrapped = wrap_fetched(value, field, *parent, ctx.schema)?;
         resolved_pairs.push(((field, *parent), wrapped));
     }
     Ok(resolved_pairs)
+}
+
+/// Wrap one fetch result according to the Ref field's shape
+fn wrap_fetched(
+    value: Val,
+    field: FieldId,
+    parent: Key,
+    schema: &ValidatedSchema,
+) -> Result<Val, ExecError> {
+    let (optional, is_list, field_name) =
+        match &schema.structs[field.struct_id().index()].fields[field.local()] {
+            Field::Ref {
+                optional,
+                is_list,
+                name,
+                ..
+            } => (*optional, *is_list, name),
+            _ => {
+                return Err(ExecError::Integrity {
+                    message: "Ref link names a non-Ref field (internal error)".to_string(),
+                });
+            }
+        };
+    if is_list {
+        return Ok(value);
+    }
+    // ?List<...> refs are not possible
+    if optional {
+        return match value {
+            Val::List(mut items) => match items.len() {
+                0 => Ok(Val::None),
+                1 => Ok(Val::Some(Box::new(items.pop().unwrap()))),
+                n => Err(ExecError::Integrity {
+                    message: format!(
+                        "optional Ref `{field_name}` resolved to {n} rows (for parent key {})",
+                        parent.0
+                    ),
+                }),
+            },
+            other => Err(ExecError::Integrity {
+                message: format!("optional Ref resolved to {other} (internal error)"),
+            }),
+        };
+    }
+    match value {
+        Val::List(mut items) => match items.len() {
+            1 => Ok(items.pop().unwrap()),
+            n => Err(ExecError::Integrity {
+                message: format!(
+                    "required Ref `{field_name}` resolved to {n} rows (for parent key {})",
+                    parent.0
+                ),
+            }),
+        },
+        other => Err(ExecError::Integrity {
+            message: format!("required Ref resolved to {other} (internal error)"),
+        }),
+    }
 }
 
 /// Recursively replace owning links with resolved data
@@ -257,8 +268,8 @@ pub(crate) fn exec_field(
         (true, Val::Some(v)) => *v,
         (_, v) => v,
     };
-    match base {
-        Val::Record(fields) => record_field(fields, name),
+    let result = match base {
+        Val::Record(fields) => record_field(fields, name)?,
         Val::List(items) => {
             let mut mapped = Vec::with_capacity(items.len());
             for item in items {
@@ -274,11 +285,60 @@ pub(crate) fn exec_field(
                     }
                 }
             }
-            Ok(Val::List(mapped))
+            Val::List(mapped)
         }
-        _ => Err(ExecError::Integrity {
-            message: format!("field `{name}` on non-record value (internal error)"),
-        }),
+        _ => {
+            return Err(ExecError::Integrity {
+                message: format!("field `{name}` on non-record value (internal error)"),
+            });
+        }
+    };
+    resolve_refs(ctx, optional, result)
+}
+
+/// Resolve top-level (non-owning) Refs in a field access result
+fn resolve_refs(ctx: &mut EvalCtx, optional: bool, value: Val) -> Result<Val, ExecError> {
+    let mut by_field: HashMap<FieldId, Vec<Key>> = HashMap::new();
+    let mut order: Vec<FieldId> = Vec::new();
+    collect_refs(&value, &mut by_field, &mut order)?;
+    let mut resolved: HashMap<(FieldId, Key), Val> = HashMap::new();
+    for field in order {
+        let parents = &by_field[&field];
+        resolved.extend(resolve_field(ctx, field, parents)?);
+    }
+    let resolved_value = splice_refs(value, &resolved)?;
+    // FIXME: probably wrong
+    if optional && !matches!(resolved_value, Val::None) {
+        Ok(Val::Some(Box::new(resolved_value)))
+    } else {
+        Ok(resolved_value)
+    }
+}
+
+/// Gather parent rowids from top-level standalone non-owning Ref fields
+fn collect_refs(
+    value: &Val,
+    by_field: &mut HashMap<FieldId, Vec<Key>>,
+    order: &mut Vec<FieldId>,
+) -> Result<(), ExecError> {
+    match value {
+        Val::List(items) => {
+            for item in items {
+                collect_refs(item, by_field, order)?;
+            }
+            Ok(())
+        }
+        Val::Ref { field, parent } => {
+            by_field
+                .entry(*field)
+                .or_insert_with(|| {
+                    order.push(*field);
+                    Vec::new()
+                })
+                .push(*parent);
+            Ok(())
+        }
+        Val::Record(_) | Val::Some(_) | Val::None | Val::Scalar(_) | Val::Tuple(_) => Ok(()),
     }
 }
 
@@ -295,11 +355,36 @@ fn record_field(
         })
 }
 
+/// Replace top-level (non-owning) links with resolved data
+fn splice_refs(value: Val, resolved: &HashMap<(FieldId, Key), Val>) -> Result<Val, ExecError> {
+    match value {
+        Val::List(items) => {
+            let spliced = items
+                .into_iter()
+                .map(|item| splice_refs(item, resolved))
+                .collect::<Result<_, _>>()?;
+            Ok(Val::List(spliced))
+        }
+        Val::Ref { field, parent } => {
+            resolved
+                .get(&(field, parent))
+                .cloned()
+                .ok_or_else(|| ExecError::Integrity {
+                    message: "Ref data missing from batch fetch result (internal error)"
+                        .to_string(),
+                })
+        }
+        other => Ok(other),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use grove_schema::validated::{FieldId, StructId, ValidatedSchema};
+
     use super::*;
 
-    use crate::{eval::harness::*, testdata, value::Scalar};
+    use crate::{eval::harness::*, storage::Storage, testdata, value::Scalar};
 
     #[test]
     fn root_owning_resolved() {
@@ -408,6 +493,199 @@ mod tests {
             "Ref equality is unknown, not false"
         );
         assert_eq!(link.eq(&link.clone()), None);
+    }
+
+    #[test]
+    fn field_optional_ref_resolved() {
+        match run_seeded("users.manager") {
+            Ok(Val::List(rows)) => {
+                assert_eq!(rows.len(), 5);
+                let names: Vec<Option<&str>> = rows
+                    .iter()
+                    .map(|row| match row {
+                        Val::Some(user) => match user.as_ref() {
+                            Val::Record(fields) => Some(
+                                fields
+                                    .iter()
+                                    .find(|(name, _)| name.as_ref() == "name")
+                                    .map(|(_, value)| match value {
+                                        Val::Scalar(Scalar::String(s)) => s.as_str(),
+                                        other => panic!("expected name string, got {other}"),
+                                    })
+                                    .expect("name field"),
+                            ),
+                            other => panic!("expected manager record, got {other}"),
+                        },
+                        Val::None => None,
+                        other => panic!("expected optional manager, got {other}"),
+                    })
+                    .collect();
+                assert_eq!(names, [Some("Bob"), None, Some("Bob"), Some("Ada"), None]);
+            }
+            got => panic!("expected manager list, got {got:?}"),
+        }
+    }
+
+    #[test]
+    fn field_list_ref_resolved() {
+        match run_seeded("users.roles") {
+            Ok(Val::List(rows)) => {
+                assert_eq!(rows.len(), 5);
+                let role_names: Vec<Vec<&str>> = rows
+                    .iter()
+                    .map(|row| match row {
+                        Val::List(roles) => roles
+                            .iter()
+                            .map(|role| match role {
+                                Val::Record(fields) => fields
+                                    .iter()
+                                    .find(|(name, _)| name.as_ref() == "name")
+                                    .map(|(_, value)| match value {
+                                        Val::Scalar(Scalar::String(s)) => s.as_str(),
+                                        other => panic!("expected name string, got {other}"),
+                                    })
+                                    .expect("name field"),
+                                other => panic!("expected role record, got {other}"),
+                            })
+                            .collect(),
+                        other => panic!("expected role list, got {other}"),
+                    })
+                    .collect();
+                assert_eq!(
+                    role_names,
+                    [
+                        vec!["admin", "editor", "editor"],
+                        vec![],
+                        vec!["editor"],
+                        vec![],
+                        vec![],
+                    ]
+                );
+            }
+            got => panic!("expected roles list, got {got:?}"),
+        }
+    }
+
+    #[test]
+    fn field_unowned_shallow_ref_resolution() {
+        match run_seeded("users.manager") {
+            Ok(Val::List(rows)) => match &rows[0] {
+                Val::Some(user) => {
+                    let Val::Record(fields) = user.as_ref() else {
+                        panic!("expected manager record");
+                    };
+                    assert!(fields.iter().any(|(name, value)| {
+                        name.as_ref() == "manager" && matches!(value, Val::Ref { .. })
+                    }));
+                }
+                other => panic!("expected some(manager), got {other}"),
+            },
+            got => panic!("expected manager list, got {got:?}"),
+        }
+    }
+
+    #[test]
+    fn field_owned_shallow_ref_resolution() {
+        match run_seeded("users.profile") {
+            Ok(Val::List(rows)) => {
+                assert_eq!(rows.len(), 5);
+                match &rows[0] {
+                    Val::Some(profile) => {
+                        let Val::Record(profile) = profile.as_ref() else {
+                            panic!("expected profile record");
+                        };
+                        assert!(profile.iter().any(|(name, value)| {
+                            name.as_ref() == "user" && matches!(value, Val::Ref { .. })
+                        }));
+                        assert!(profile.iter().any(|(name, value)| {
+                            name.as_ref() == "bio" && *value == str("AdaBio")
+                        }));
+                    }
+                    other => panic!("expected some(profile), got {other}"),
+                }
+                assert!(matches!(&rows[1], Val::None));
+            }
+            got => panic!("expected profile list, got {got:?}"),
+        }
+    }
+
+    #[test]
+    fn field_optional_owning_resolved() {
+        match run_seeded("users.profile") {
+            Ok(Val::List(rows)) => {
+                assert_eq!(rows.len(), 5);
+                match &rows[0] {
+                    Val::Some(profile) => {
+                        let Val::Record(profile) = profile.as_ref() else {
+                            panic!("expected profile record");
+                        };
+                        assert!(profile.iter().any(|(name, value)| {
+                            name.as_ref() == "bio" && *value == str("AdaBio")
+                        }));
+                    }
+                    other => panic!("expected some(profile), got {other}"),
+                }
+                assert!(matches!(&rows[1], Val::None));
+            }
+            got => panic!("expected profile list, got {got:?}"),
+        }
+    }
+
+    #[test]
+    fn dangling_fk_required_ref_error() {
+        let schema = testdata::schema();
+        let user_struct = testdata::struct_id(&schema, "User");
+        let order_struct = testdata::struct_id(&schema, "Order");
+        let user_field = testdata::field_id(&schema, order_struct, "user");
+        let orders_field = testdata::field_id(&schema, user_struct, "orders");
+        let relation = schema.relation_of_field(user_field).expect("user relation");
+        assert_eq!(
+            schema.relations[relation.index()].endpoints(),
+            [user_field, orders_field],
+        );
+        let mut conn =
+            rusqlite::Connection::open_in_memory().expect("in-memory database should open");
+        testdata::seed(&mut conn).expect("testdata initialization should succeed");
+        let backend =
+            crate::sqlite::SqliteBackend::new(conn, &schema).expect("backend should verify");
+        // 100/Ada, 200/Ada, 300/NULL, 400/Bob
+        let rows = backend
+            .fetch(
+                order_struct,
+                &[testdata::field_id(&schema, order_struct, "amount")],
+            )
+            .expect("fetch orders");
+        assert_eq!(rows.len(), 4);
+        let keys: Vec<Key> = rows.iter().map(|row| row.rowid).collect();
+        let groups = Storage::fetch_related(
+            &backend,
+            relation,
+            true,
+            &keys,
+            &testdata_value_fields(&schema, user_struct),
+        )
+        .expect("fetch_related succeeds");
+        assert_eq!(groups.len(), 4);
+        assert_eq!(groups[0].len(), 1);
+        assert_eq!(groups[3].len(), 1);
+        let empty: Val = Val::List(Vec::new());
+        match wrap_fetched(empty, user_field, Key(2), &schema) {
+            Err(ExecError::Integrity { message }) => assert!(
+                message.contains("resolved to 0 rows"),
+                "expected dangling-FK message, got: {message}"
+            ),
+            got => panic!("expected integrity error, got {got:?}"),
+        }
+    }
+
+    fn testdata_value_fields(schema: &ValidatedSchema, struct_id: StructId) -> Vec<FieldId> {
+        schema.structs[struct_id.index()]
+            .fields
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| !matches!(field, Field::Ref { .. }))
+            .map(|(local, _)| FieldId::new(struct_id, local))
+            .collect()
     }
 
     #[test]
