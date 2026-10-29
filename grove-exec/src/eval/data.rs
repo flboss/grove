@@ -255,6 +255,30 @@ fn splice_owning(value: Val, resolved: &HashMap<(FieldId, Key), Val>) -> Result<
     }
 }
 
+/// Resolve a bare Ref base before field extraction
+fn resolve_base_link(ctx: &mut EvalCtx, base: Val) -> Result<Val, ExecError> {
+    match base {
+        Val::Ref { field, parent } => {
+            let mut resolved = resolve_field(ctx, field, &[parent])?;
+            match resolved.pop() {
+                Some((_, value)) => Ok(value),
+                None => Err(ExecError::Integrity {
+                    message: "base Ref resolved to no value (internal error)".to_string(),
+                }),
+            }
+        }
+        Val::List(items) => {
+            let mut resolved_items = Vec::with_capacity(items.len());
+            for item in items {
+                resolved_items.push(resolve_base_link(ctx, item)?);
+            }
+            Ok(Val::List(resolved_items))
+        }
+        Val::None => Ok(Val::None),
+        Val::Record(_) | Val::Some(_) | Val::Scalar(_) | Val::Tuple(_) => Ok(base),
+    }
+}
+
 /// Perform a record field access
 pub(crate) fn exec_field(
     base: &TypedExpr,
@@ -268,6 +292,7 @@ pub(crate) fn exec_field(
         (true, Val::Some(v)) => *v,
         (_, v) => v,
     };
+    let base = resolve_base_link(ctx, base)?;
     let result = match base {
         Val::Record(fields) => record_field(fields, name)?,
         Val::List(items) => {
@@ -718,6 +743,33 @@ mod tests {
                 }));
             }
             got => panic!("expected role rows, got {got:?}"),
+        }
+    }
+
+    #[test]
+    fn field_access_ref_base_resolved() {
+        match run_seeded("users { o = orders { n = user.name } }") {
+            Ok(Val::List(rows)) => {
+                assert_eq!(rows.len(), 5);
+                let Val::Record(first) = &rows[0] else {
+                    panic!("expected record");
+                };
+                match first.iter().find(|(name, _)| name.as_ref() == "o") {
+                    Some((_, Val::List(orders))) => {
+                        assert_eq!(orders.len(), 2);
+                        for order in orders {
+                            let Val::Record(order) = order else {
+                                panic!("expected order record, got {order}");
+                            };
+                            assert!(order.iter().any(|(name, value)| {
+                                name.as_ref() == "n" && *value == str("Ada")
+                            }));
+                        }
+                    }
+                    got => panic!("expected orders list, got {got:?}"),
+                }
+            }
+            got => panic!("expected projected users, got {got:?}"),
         }
     }
 }
