@@ -182,75 +182,61 @@ fn materialize(ctx: &mut EvalCtx, struct_id: StructId, rows: Vec<Row>) -> Result
 type ResolvedLink = ((FieldId, Key), Val);
 
 /// Recursively resolve owning Refs
-fn resolve_owning(ctx: &mut EvalCtx, items: Vec<Val>) -> Result<Val, ExecError> {
+fn resolve_owning(ctx: &mut EvalCtx, mut items: Vec<Val>) -> Result<Val, ExecError> {
     let mut by_field: HashMap<FieldId, Vec<Key>> = HashMap::new();
     let mut order: Vec<FieldId> = Vec::new();
-    collect_owning(&items, &mut by_field, &mut order, ctx.schema)?;
+    items
+        .iter()
+        .try_for_each(|item| collect_owning(item, &mut by_field, &mut order, ctx.schema))?;
     let resolved = batch_fetch(ctx, &by_field, &order)?;
-    let spliced = items
-        .into_iter()
-        .map(|item| splice_owning(item, &resolved))
-        .collect::<Result<_, _>>()?;
-    Ok(Val::List(spliced))
+    items
+        .iter_mut()
+        .for_each(|item| splice_owning(item, &resolved));
+    Ok(Val::List(items))
 }
 
 /// Gather parent rowids from top-level owning Ref fields
 fn collect_owning(
-    items: &[Val],
+    value: &Val,
     by_field: &mut HashMap<FieldId, Vec<Key>>,
     order: &mut Vec<FieldId>,
     schema: &ValidatedSchema,
 ) -> Result<(), ExecError> {
-    for item in items {
-        let Val::Record(record) = item else {
-            return Err(ExecError::Integrity {
-                message: "materialized value is not a record (internal error)".to_string(),
-            });
+    let Val::Record(record) = value else {
+        return Err(ExecError::Integrity {
+            message: "materialized value is not a record (internal error)".to_string(),
+        });
+    };
+    for (_, field_value) in record {
+        let Val::Ref { field, parent } = field_value else {
+            continue;
         };
-        for value in record.iter().map(|(_, v)| v) {
-            let Val::Ref { field, parent } = value else {
-                continue;
-            };
-            let owning = match &schema.structs[field.struct_id().index()].fields[field.local()] {
-                Field::Ref { owning, .. } => *owning,
-                _ => {
-                    return Err(ExecError::Integrity {
-                        message: "Ref link names a non-Ref field (internal error)".to_string(),
-                    });
-                }
-            };
-            if owning {
-                push_ref(by_field, order, *field, *parent);
+        let owning = match &schema.structs[field.struct_id().index()].fields[field.local()] {
+            Field::Ref { owning, .. } => *owning,
+            Field::Value { name, .. } | Field::Array { name, .. } => {
+                return Err(ExecError::Integrity {
+                    message: format!("Ref link names a non-Ref field `{name}` (internal error)"),
+                });
             }
+        };
+        if owning {
+            push_ref(by_field, order, *field, *parent);
         }
     }
     Ok(())
 }
 
-/// Recursively replace owning links with resolved data
-fn splice_owning(value: Val, resolved: &HashMap<(FieldId, Key), Val>) -> Result<Val, ExecError> {
-    match value {
-        Val::Record(record) => {
-            let spliced = record
-                .into_iter()
-                .map(|(name, field_value)| {
-                    splice_owning(field_value, resolved).map(|val| (name, val))
-                })
-                .collect::<Result<_, _>>()?;
-            Ok(Val::Record(spliced))
+/// Replace top-level owning Refs with resolved data
+fn splice_owning(value: &mut Val, resolved: &HashMap<(FieldId, Key), Val>) {
+    let Val::Record(record) = value else {
+        return;
+    };
+    for (_, field_value) in record {
+        if let Val::Ref { field, parent } = field_value
+            && let Some(resolved_value) = resolved.get(&(*field, *parent)).cloned()
+        {
+            *field_value = resolved_value
         }
-        Val::List(items) => {
-            let spliced = items
-                .into_iter()
-                .map(|item| splice_owning(item, resolved))
-                .collect::<Result<_, _>>()?;
-            Ok(Val::List(spliced))
-        }
-        Val::Ref { field, parent } => Ok(resolved
-            .get(&(field, parent))
-            .cloned()
-            .unwrap_or(Val::Ref { field, parent })),
-        other => Ok(other),
     }
 }
 
