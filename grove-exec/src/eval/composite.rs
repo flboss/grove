@@ -51,9 +51,7 @@ pub(crate) fn eval_projection(
             let mut projected = Vec::with_capacity(rows.len());
             for row in rows {
                 match row {
-                    Val::Record(record) => {
-                        projected.push(project_record(record, items, ctx)?);
-                    }
+                    Val::Record(record) => projected.push(project_record(record, items, ctx)?),
                     Val::None => projected.push(Val::None),
                     other => {
                         return Err(ExecError::Integrity {
@@ -184,6 +182,40 @@ mod tests {
                     },
                     other => panic!("expected record, got {other}"),
                 }
+            }
+            got => panic!("expected projected users, got {got:?}"),
+        }
+    }
+
+    #[test]
+    fn projection_untouched_nested_refs_unresolved() {
+        match run_seeded("users { orders }") {
+            Ok(Val::List(rows)) => {
+                assert_eq!(rows.len(), 5);
+                let Val::Record(first) = &rows[0] else {
+                    panic!("expected record");
+                };
+                match first.iter().find(|(name, _)| name.as_ref() == "orders") {
+                    Some((_, Val::List(orders))) => {
+                        assert_eq!(orders.len(), 2);
+                        for order in orders {
+                            let Val::Record(order) = order else {
+                                panic!("expected order record, got {order}");
+                            };
+                            assert!(order.iter().any(|(name, value)| {
+                                name.as_ref() == "user" && matches!(value, Val::Ref { .. })
+                            }));
+                        }
+                    }
+                    got => panic!("expected orders list, got {got:?}"),
+                }
+                let Val::Record(fifth) = &rows[4] else {
+                    panic!("expected record");
+                };
+                assert!(fifth.iter().any(|(name, value)| {
+                    name.as_ref() == "orders"
+                        && matches!(value, Val::List(items) if items.is_empty())
+                }));
             }
             got => panic!("expected projected users, got {got:?}"),
         }

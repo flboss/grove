@@ -18,6 +18,7 @@ pub(crate) fn exec_root(ctx: &mut EvalCtx, root_idx: usize) -> Result<Val, ExecE
         .ok_or_else(|| ExecError::Integrity {
             message: format!("unknown root {root_idx} (internal error)"),
         })?;
+    // TODO: field selection pushdown
     let fields = value_and_array_fields(ctx, root.struct_id);
     let rows = ctx.storage.fetch(root.struct_id, &fields)?;
     materialize(ctx, root.struct_id, rows)
@@ -34,105 +35,6 @@ fn value_and_array_fields(ctx: &EvalCtx, struct_id: StructId) -> Vec<FieldId> {
         .collect()
 }
 
-/// Build Records from storage rows, resolving owning Refs
-pub(crate) fn materialize(
-    ctx: &mut EvalCtx,
-    struct_id: StructId,
-    rows: Vec<Row>,
-) -> Result<Val, ExecError> {
-    let struct_ = &ctx.schema.structs[struct_id.index()];
-    let mut items = Vec::with_capacity(rows.len());
-    for row in rows {
-        let mut values = row.values.into_iter();
-        let mut record = Vec::with_capacity(struct_.fields.len());
-        for (local, field) in struct_.fields.iter().enumerate() {
-            let name = ctx.interner.intern(field.name());
-            match field {
-                Field::Ref { .. } => record.push((
-                    name,
-                    Val::Ref {
-                        field: FieldId::new(struct_id, local),
-                        parent: row.rowid,
-                    },
-                )),
-                _ => record.push((
-                    name,
-                    values.next().ok_or_else(|| ExecError::Integrity {
-                        message: "row has fewer values than fields (internal error)".to_string(),
-                    })?,
-                )),
-            }
-        }
-        if values.next().is_some() {
-            return Err(ExecError::Integrity {
-                message: "row has more values than fields (internal error)".to_string(),
-            });
-        }
-        items.push(Val::Record(record));
-    }
-    resolve_owning(ctx, items)
-}
-
-type ResolvedLink = ((FieldId, Key), Val);
-
-/// Recursively resolve owning Refs
-fn resolve_owning(ctx: &mut EvalCtx, items: Vec<Val>) -> Result<Val, ExecError> {
-    let mut by_field: HashMap<FieldId, Vec<Key>> = HashMap::new();
-    let mut order: Vec<FieldId> = Vec::new();
-    collect_owning(&items, &mut by_field, &mut order, ctx.schema)?;
-    // batched fetch per distinct field
-    let mut resolved: HashMap<(FieldId, Key), Val> =
-        HashMap::with_capacity(order.len() + by_field.values().map(Vec::len).sum::<usize>());
-    for field in order {
-        let parents = &by_field[&field];
-        resolved.extend(resolve_field(ctx, field, parents)?);
-    }
-    let spliced = items
-        .into_iter()
-        .map(|item| splice_owning(item, &resolved))
-        .collect::<Result<_, _>>()?;
-    Ok(Val::List(spliced))
-}
-
-/// Gather parent rowids from top-level owning Ref fields
-fn collect_owning(
-    items: &[Val],
-    by_field: &mut HashMap<FieldId, Vec<Key>>,
-    order: &mut Vec<FieldId>,
-    schema: &ValidatedSchema,
-) -> Result<(), ExecError> {
-    for item in items {
-        let Val::Record(record) = item else {
-            return Err(ExecError::Integrity {
-                message: "materialized value is not a record (internal error)".to_string(),
-            });
-        };
-        for value in record.iter().map(|(_, v)| v) {
-            let Val::Ref { field, parent } = value else {
-                continue;
-            };
-            let owning = match &schema.structs[field.struct_id().index()].fields[field.local()] {
-                Field::Ref { owning, .. } => *owning,
-                _ => {
-                    return Err(ExecError::Integrity {
-                        message: "Ref link names a non-Ref field (internal error)".to_string(),
-                    });
-                }
-            };
-            if owning {
-                by_field
-                    .entry(*field)
-                    .or_insert_with(|| {
-                        order.push(*field);
-                        Vec::new()
-                    })
-                    .push(*parent);
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Fetch a Ref field for a batch of parents;
 /// recursively resolve contained owning Refs
 fn resolve_field(
@@ -143,9 +45,9 @@ fn resolve_field(
     let (target, field_name) =
         match &ctx.schema.structs[field.struct_id().index()].fields[field.local()] {
             Field::Ref { target, name, .. } => (*target, name),
-            _ => {
+            Field::Value { name, .. } | Field::Array { name, .. } => {
                 return Err(ExecError::Integrity {
-                    message: "Ref link names a non-Ref field (internal error)".to_string(),
+                    message: format!("Ref link names a non-Ref field `{name}` (internal error)"),
                 });
             }
         };
@@ -156,6 +58,7 @@ fn resolve_field(
             message: format!("Ref field `{field_name}` has no relation (internal error)"),
         })?;
     let fetch_from_first = ctx.schema.relations[relation.index()].endpoints()[0] == field;
+    // TODO: field selection pushdown
     let fields = value_and_array_fields(ctx, target);
     let groups = ctx
         .storage
@@ -170,7 +73,7 @@ fn resolve_field(
     Ok(resolved_pairs)
 }
 
-/// Wrap one fetch result according to the Ref field's shape
+/// Wrap fetch result according to the Ref field's shape
 fn wrap_fetched(
     value: Val,
     field: FieldId,
@@ -228,6 +131,102 @@ fn wrap_fetched(
     }
 }
 
+/// Execute batched `fetch_related` per distinct field
+fn batch_fetch(
+    ctx: &mut EvalCtx,
+    by_field: &HashMap<FieldId, Vec<Key>>,
+    order: &[FieldId],
+) -> Result<HashMap<(FieldId, Key), Val>, ExecError> {
+    let mut resolved = HashMap::with_capacity(by_field.values().map(Vec::len).sum());
+    for field in order {
+        resolved.extend(resolve_field(ctx, *field, &by_field[field])?);
+    }
+    Ok(resolved)
+}
+
+/// Build Records from storage rows, resolving owning Refs
+fn materialize(ctx: &mut EvalCtx, struct_id: StructId, rows: Vec<Row>) -> Result<Val, ExecError> {
+    let struct_ = &ctx.schema.structs[struct_id.index()];
+    let mut items = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut values = row.values.into_iter();
+        let mut record = Vec::with_capacity(struct_.fields.len());
+        for (local, field) in struct_.fields.iter().enumerate() {
+            let name = ctx.interner.intern(field.name());
+            match field {
+                Field::Ref { .. } => record.push((
+                    name,
+                    Val::Ref {
+                        field: FieldId::new(struct_id, local),
+                        parent: row.rowid,
+                    },
+                )),
+                _ => record.push((
+                    name,
+                    values.next().ok_or_else(|| ExecError::Integrity {
+                        message: "row has fewer values than fields (internal error)".to_string(),
+                    })?,
+                )),
+            }
+        }
+        if values.next().is_some() {
+            return Err(ExecError::Integrity {
+                message: "row has more values than fields (internal error)".to_string(),
+            });
+        }
+        items.push(Val::Record(record));
+    }
+    resolve_owning(ctx, items)
+}
+
+type ResolvedLink = ((FieldId, Key), Val);
+
+/// Recursively resolve owning Refs
+fn resolve_owning(ctx: &mut EvalCtx, items: Vec<Val>) -> Result<Val, ExecError> {
+    let mut by_field: HashMap<FieldId, Vec<Key>> = HashMap::new();
+    let mut order: Vec<FieldId> = Vec::new();
+    collect_owning(&items, &mut by_field, &mut order, ctx.schema)?;
+    let resolved = batch_fetch(ctx, &by_field, &order)?;
+    let spliced = items
+        .into_iter()
+        .map(|item| splice_owning(item, &resolved))
+        .collect::<Result<_, _>>()?;
+    Ok(Val::List(spliced))
+}
+
+/// Gather parent rowids from top-level owning Ref fields
+fn collect_owning(
+    items: &[Val],
+    by_field: &mut HashMap<FieldId, Vec<Key>>,
+    order: &mut Vec<FieldId>,
+    schema: &ValidatedSchema,
+) -> Result<(), ExecError> {
+    for item in items {
+        let Val::Record(record) = item else {
+            return Err(ExecError::Integrity {
+                message: "materialized value is not a record (internal error)".to_string(),
+            });
+        };
+        for value in record.iter().map(|(_, v)| v) {
+            let Val::Ref { field, parent } = value else {
+                continue;
+            };
+            let owning = match &schema.structs[field.struct_id().index()].fields[field.local()] {
+                Field::Ref { owning, .. } => *owning,
+                _ => {
+                    return Err(ExecError::Integrity {
+                        message: "Ref link names a non-Ref field (internal error)".to_string(),
+                    });
+                }
+            };
+            if owning {
+                push_ref(by_field, order, *field, *parent);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Recursively replace owning links with resolved data
 fn splice_owning(value: Val, resolved: &HashMap<(FieldId, Key), Val>) -> Result<Val, ExecError> {
     match value {
@@ -252,30 +251,6 @@ fn splice_owning(value: Val, resolved: &HashMap<(FieldId, Key), Val>) -> Result<
             .cloned()
             .unwrap_or(Val::Ref { field, parent })),
         other => Ok(other),
-    }
-}
-
-/// Resolve a bare Ref base before field extraction
-fn resolve_base_link(ctx: &mut EvalCtx, base: Val) -> Result<Val, ExecError> {
-    match base {
-        Val::Ref { field, parent } => {
-            let mut resolved = resolve_field(ctx, field, &[parent])?;
-            match resolved.pop() {
-                Some((_, value)) => Ok(value),
-                None => Err(ExecError::Integrity {
-                    message: "base Ref resolved to no value (internal error)".to_string(),
-                }),
-            }
-        }
-        Val::List(items) => {
-            let mut resolved_items = Vec::with_capacity(items.len());
-            for item in items {
-                resolved_items.push(resolve_base_link(ctx, item)?);
-            }
-            Ok(Val::List(resolved_items))
-        }
-        Val::None => Ok(Val::None),
-        Val::Record(_) | Val::Some(_) | Val::Scalar(_) | Val::Tuple(_) => Ok(base),
     }
 }
 
@@ -321,125 +296,26 @@ pub(crate) fn exec_field(
     resolve_refs(ctx, optional, result)
 }
 
-/// Resolve top-level (non-owning) Refs in a field access result
-fn resolve_refs(ctx: &mut EvalCtx, optional: bool, value: Val) -> Result<Val, ExecError> {
-    let mut by_field: HashMap<FieldId, Vec<Key>> = HashMap::new();
-    let mut order: Vec<FieldId> = Vec::new();
-    collect_refs(&value, &mut by_field, &mut order)?;
-    let mut resolved: HashMap<(FieldId, Key), Val> = HashMap::new();
-    for field in order {
-        let parents = &by_field[&field];
-        resolved.extend(resolve_field(ctx, field, parents)?);
-    }
-    let resolved_value = splice_refs(value, &resolved)?;
-    // FIXME: probably wrong
-    if optional && !matches!(resolved_value, Val::None) {
-        Ok(Val::Some(Box::new(resolved_value)))
-    } else {
-        Ok(resolved_value)
-    }
-}
-
-/// Gather parent rowids from top-level standalone non-owning Ref fields
-fn collect_refs(
-    value: &Val,
-    by_field: &mut HashMap<FieldId, Vec<Key>>,
-    order: &mut Vec<FieldId>,
-) -> Result<(), ExecError> {
-    match value {
+/// Resolve a bare Ref base before field access
+fn resolve_base_link(ctx: &mut EvalCtx, base: Val) -> Result<Val, ExecError> {
+    match base {
+        Val::Ref { field, parent } => {
+            let mut resolved = resolve_field(ctx, field, &[parent])?;
+            match resolved.pop() {
+                Some((_, value)) => Ok(value),
+                None => Err(ExecError::Integrity {
+                    message: "base Ref resolved to no value (internal error)".to_string(),
+                }),
+            }
+        }
         Val::List(items) => {
+            let mut resolved_items = Vec::with_capacity(items.len());
             for item in items {
-                collect_refs(item, by_field, order)?;
+                resolved_items.push(resolve_base_link(ctx, item)?);
             }
-            Ok(())
+            Ok(Val::List(resolved_items))
         }
-        Val::Ref { field, parent } => {
-            by_field
-                .entry(*field)
-                .or_insert_with(|| {
-                    order.push(*field);
-                    Vec::new()
-                })
-                .push(*parent);
-            Ok(())
-        }
-        Val::Record(_) | Val::Some(_) | Val::None | Val::Scalar(_) | Val::Tuple(_) => Ok(()),
-    }
-}
-
-/// Resolve output links of projection items one level
-pub(crate) fn resolve_projection_refs(ctx: &mut EvalCtx, value: Val) -> Result<Val, ExecError> {
-    let mut by_field: HashMap<FieldId, Vec<Key>> = HashMap::new();
-    let mut order: Vec<FieldId> = Vec::new();
-    collect_projection_refs(&value, &mut by_field, &mut order);
-    let mut resolved: HashMap<(FieldId, Key), Val> = HashMap::new();
-    for field in order {
-        let parents = &by_field[&field];
-        resolved.extend(resolve_field(ctx, field, parents)?);
-    }
-    splice_projection_refs(value, &resolved)
-}
-
-/// Gather bare links in projection output positions
-fn collect_projection_refs(
-    value: &Val,
-    by_field: &mut HashMap<FieldId, Vec<Key>>,
-    order: &mut Vec<FieldId>,
-) {
-    match value {
-        Val::Record(record) => {
-            for (_, item) in record {
-                collect_projection_refs(item, by_field, order);
-            }
-        }
-        Val::List(items) => {
-            for item in items {
-                collect_projection_refs(item, by_field, order);
-            }
-        }
-        Val::Ref { field, parent } => {
-            by_field
-                .entry(*field)
-                .or_insert_with(|| {
-                    order.push(*field);
-                    Vec::new()
-                })
-                .push(*parent);
-        }
-        Val::Some(_) | Val::None | Val::Scalar(_) | Val::Tuple(_) => {}
-    }
-}
-
-/// Replace bare links in projection output positions
-fn splice_projection_refs(
-    value: Val,
-    resolved: &HashMap<(FieldId, Key), Val>,
-) -> Result<Val, ExecError> {
-    match value {
-        Val::Record(record) => {
-            let spliced = record
-                .into_iter()
-                .map(|(name, item)| splice_projection_refs(item, resolved).map(|val| (name, val)))
-                .collect::<Result<_, _>>()?;
-            Ok(Val::Record(spliced))
-        }
-        Val::List(items) => {
-            let spliced = items
-                .into_iter()
-                .map(|item| splice_projection_refs(item, resolved))
-                .collect::<Result<_, _>>()?;
-            Ok(Val::List(spliced))
-        }
-        Val::Ref { field, parent } => {
-            resolved
-                .get(&(field, parent))
-                .cloned()
-                .ok_or_else(|| ExecError::Integrity {
-                    message: "Ref data missing from batch fetch result (internal error)"
-                        .to_string(),
-                })
-        }
-        other => Ok(other),
+        Val::Record(_) | Val::Some(_) | Val::None | Val::Scalar(_) | Val::Tuple(_) => Ok(base),
     }
 }
 
@@ -456,9 +332,45 @@ fn record_field(
         })
 }
 
-/// Replace top-level (non-owning) links with resolved data
+/// Resolve bare top-level (non-owning) Refs in a field access result
+fn resolve_refs(ctx: &mut EvalCtx, optional: bool, value: Val) -> Result<Val, ExecError> {
+    let mut by_field: HashMap<FieldId, Vec<Key>> = HashMap::new();
+    let mut order: Vec<FieldId> = Vec::new();
+    collect_refs(&value, &mut by_field, &mut order)?;
+    let resolved = batch_fetch(ctx, &by_field, &order)?;
+    let resolved_value = splice_refs(value, &resolved)?;
+    if optional && !matches!(resolved_value, Val::None) {
+        Ok(Val::Some(Box::new(resolved_value)))
+    } else {
+        Ok(resolved_value)
+    }
+}
+
+/// Gather parent rowids from bare (non-owning) Ref fields
+fn collect_refs(
+    value: &Val,
+    by_field: &mut HashMap<FieldId, Vec<Key>>,
+    order: &mut Vec<FieldId>,
+) -> Result<(), ExecError> {
+    match value {
+        Val::Ref { field, parent } => {
+            push_ref(by_field, order, *field, *parent);
+            Ok(())
+        }
+        Val::List(items) => {
+            for item in items {
+                collect_refs(item, by_field, order)?;
+            }
+            Ok(())
+        }
+        Val::Record(_) | Val::Some(_) | Val::None | Val::Scalar(_) | Val::Tuple(_) => Ok(()),
+    }
+}
+
+/// Replace bare (non-owning) Refs with resolved data
 fn splice_refs(value: Val, resolved: &HashMap<(FieldId, Key), Val>) -> Result<Val, ExecError> {
     match value {
+        Val::Ref { field, parent } => lookup_ref(field, parent, resolved),
         Val::List(items) => {
             let spliced = items
                 .into_iter()
@@ -466,14 +378,141 @@ fn splice_refs(value: Val, resolved: &HashMap<(FieldId, Key), Val>) -> Result<Va
                 .collect::<Result<_, _>>()?;
             Ok(Val::List(spliced))
         }
-        Val::Ref { field, parent } => {
-            resolved
-                .get(&(field, parent))
-                .cloned()
-                .ok_or_else(|| ExecError::Integrity {
-                    message: "Ref data missing from batch fetch result (internal error)"
-                        .to_string(),
+        other => Ok(other),
+    }
+}
+
+/// Record one parent rowid for a link
+fn push_ref(
+    by_field: &mut HashMap<FieldId, Vec<Key>>,
+    order: &mut Vec<FieldId>,
+    field: FieldId,
+    parent: Key,
+) {
+    by_field
+        .entry(field)
+        .or_insert_with(|| {
+            order.push(field);
+            Vec::new()
+        })
+        .push(parent);
+}
+
+/// Look up one resolved link (absence invalid)
+fn lookup_ref(
+    field: FieldId,
+    parent: Key,
+    resolved: &HashMap<(FieldId, Key), Val>,
+) -> Result<Val, ExecError> {
+    resolved
+        .get(&(field, parent))
+        .cloned()
+        .ok_or_else(|| ExecError::Integrity {
+            message: "Ref data missing from batch fetch result (internal error)".to_string(),
+        })
+}
+
+/// Resolve Refs at projection output positions one level
+pub(crate) fn resolve_projection_refs(ctx: &mut EvalCtx, value: Val) -> Result<Val, ExecError> {
+    let mut by_field: HashMap<FieldId, Vec<Key>> = HashMap::new();
+    let mut order: Vec<FieldId> = Vec::new();
+    collect_projection_refs(&value, &mut by_field, &mut order);
+    let resolved = batch_fetch(ctx, &by_field, &order)?;
+    splice_projection_refs(value, &resolved)
+}
+
+/// Gather parent rowids from top-level Ref fields in projection output
+fn collect_projection_refs(
+    value: &Val,
+    by_field: &mut HashMap<FieldId, Vec<Key>>,
+    order: &mut Vec<FieldId>,
+) {
+    match value {
+        Val::Record(record) => {
+            for (_, item) in record {
+                collect_item_refs(item, by_field, order);
+            }
+        }
+        Val::List(elements) => {
+            for element in elements {
+                if let Val::Record(record) = element {
+                    for (_, item) in record {
+                        collect_item_refs(item, by_field, order);
+                    }
+                }
+            }
+        }
+        Val::Ref { .. } | Val::Some(_) | Val::None | Val::Scalar(_) | Val::Tuple(_) => {}
+    }
+}
+
+/// Gather bare links at one item position
+fn collect_item_refs(
+    value: &Val,
+    by_field: &mut HashMap<FieldId, Vec<Key>>,
+    order: &mut Vec<FieldId>,
+) {
+    match value {
+        Val::Ref { field, parent } => push_ref(by_field, order, *field, *parent),
+        Val::List(items) => {
+            for item in items {
+                if let Val::Ref { field, parent } = item {
+                    push_ref(by_field, order, *field, *parent);
+                }
+            }
+        }
+        Val::Record(_) | Val::Some(_) | Val::None | Val::Scalar(_) | Val::Tuple(_) => {}
+    }
+}
+
+/// Replace top-level Ref fields in projection output
+fn splice_projection_refs(
+    value: Val,
+    resolved: &HashMap<(FieldId, Key), Val>,
+) -> Result<Val, ExecError> {
+    match value {
+        Val::Record(record) => {
+            let spliced = record
+                .into_iter()
+                .map(|(name, item)| splice_item_refs(item, resolved).map(|val| (name, val)))
+                .collect::<Result<_, _>>()?;
+            Ok(Val::Record(spliced))
+        }
+        Val::List(rows) => {
+            let spliced = rows
+                .into_iter()
+                .map(|row| match row {
+                    Val::Record(record) => {
+                        let spliced = record
+                            .into_iter()
+                            .map(|(name, item)| {
+                                splice_item_refs(item, resolved).map(|val| (name, val))
+                            })
+                            .collect::<Result<_, _>>()?;
+                        Ok(Val::Record(spliced))
+                    }
+                    other => Ok(other),
                 })
+                .collect::<Result<_, _>>()?;
+            Ok(Val::List(spliced))
+        }
+        other => Ok(other),
+    }
+}
+
+/// Replace bare links at one item position
+fn splice_item_refs(value: Val, resolved: &HashMap<(FieldId, Key), Val>) -> Result<Val, ExecError> {
+    match value {
+        Val::Ref { field, parent } => lookup_ref(field, parent, resolved),
+        Val::List(items) => {
+            let spliced = items
+                .into_iter()
+                .map(|item| match item {
+                    Val::Ref { field, parent } => lookup_ref(field, parent, resolved),
+                    other => Ok(other),
+                })
+                .collect::<Result<_, _>>()?;
+            Ok(Val::List(spliced))
         }
         other => Ok(other),
     }
