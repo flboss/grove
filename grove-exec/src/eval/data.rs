@@ -367,6 +367,82 @@ fn collect_refs(
     }
 }
 
+/// Resolve output links of projection items one level
+pub(crate) fn resolve_projection_refs(ctx: &mut EvalCtx, value: Val) -> Result<Val, ExecError> {
+    let mut by_field: HashMap<FieldId, Vec<Key>> = HashMap::new();
+    let mut order: Vec<FieldId> = Vec::new();
+    collect_projection_refs(&value, &mut by_field, &mut order);
+    let mut resolved: HashMap<(FieldId, Key), Val> = HashMap::new();
+    for field in order {
+        let parents = &by_field[&field];
+        resolved.extend(resolve_field(ctx, field, parents)?);
+    }
+    splice_projection_refs(value, &resolved)
+}
+
+/// Gather bare links in projection output positions
+fn collect_projection_refs(
+    value: &Val,
+    by_field: &mut HashMap<FieldId, Vec<Key>>,
+    order: &mut Vec<FieldId>,
+) {
+    match value {
+        Val::Record(record) => {
+            for (_, item) in record {
+                collect_projection_refs(item, by_field, order);
+            }
+        }
+        Val::List(items) => {
+            for item in items {
+                collect_projection_refs(item, by_field, order);
+            }
+        }
+        Val::Ref { field, parent } => {
+            by_field
+                .entry(*field)
+                .or_insert_with(|| {
+                    order.push(*field);
+                    Vec::new()
+                })
+                .push(*parent);
+        }
+        Val::Some(_) | Val::None | Val::Scalar(_) | Val::Tuple(_) => {}
+    }
+}
+
+/// Replace bare links in projection output positions
+fn splice_projection_refs(
+    value: Val,
+    resolved: &HashMap<(FieldId, Key), Val>,
+) -> Result<Val, ExecError> {
+    match value {
+        Val::Record(record) => {
+            let spliced = record
+                .into_iter()
+                .map(|(name, item)| splice_projection_refs(item, resolved).map(|val| (name, val)))
+                .collect::<Result<_, _>>()?;
+            Ok(Val::Record(spliced))
+        }
+        Val::List(items) => {
+            let spliced = items
+                .into_iter()
+                .map(|item| splice_projection_refs(item, resolved))
+                .collect::<Result<_, _>>()?;
+            Ok(Val::List(spliced))
+        }
+        Val::Ref { field, parent } => {
+            resolved
+                .get(&(field, parent))
+                .cloned()
+                .ok_or_else(|| ExecError::Integrity {
+                    message: "Ref data missing from batch fetch result (internal error)"
+                        .to_string(),
+                })
+        }
+        other => Ok(other),
+    }
+}
+
 fn record_field(
     fields: impl IntoIterator<Item = (Arc<str>, Val)>,
     name: &str,
