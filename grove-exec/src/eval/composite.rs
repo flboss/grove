@@ -5,7 +5,7 @@ use grove_types::Spanned;
 
 use super::{EvalCtx, eval};
 use crate::error::ExecError;
-use crate::eval::data::resolve_projection_refs;
+use crate::eval::data::{resolve_base_link, resolve_projection_refs};
 use crate::value::Val;
 
 pub(crate) fn eval_tuple(elements: &[TypedExpr], ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
@@ -42,6 +42,7 @@ pub(crate) fn eval_projection(
     ctx: &mut EvalCtx<'_>,
 ) -> Result<Val, ExecError> {
     let base = eval(base, ctx)?;
+    let base = resolve_base_link(ctx, base)?;
     match base {
         Val::Record(record) => {
             let projected = project_record(record, items, ctx)?;
@@ -273,6 +274,79 @@ mod tests {
                 }
             }
             got => panic!("expected projected users, got {got:?}"),
+        }
+    }
+
+    #[test]
+    fn projection_self_ref_chain_resolved() {
+        match run_seeded("users { s = subordinates { m = manager } }") {
+            Ok(Val::List(rows)) => {
+                assert_eq!(rows.len(), 5);
+                let Val::Record(second) = &rows[1] else {
+                    panic!("expected record");
+                };
+                match second.iter().find(|(name, _)| name.as_ref() == "s") {
+                    Some((_, Val::List(subs))) => {
+                        assert_eq!(subs.len(), 2);
+                        for sub in subs {
+                            let Val::Record(sub) = sub else {
+                                panic!("expected subordinate record, got {sub}");
+                            };
+                            match sub.iter().find(|(name, _)| name.as_ref() == "m") {
+                                Some((_, Val::Some(manager))) => {
+                                    let Val::Record(manager) = manager.as_ref() else {
+                                        panic!("expected manager record");
+                                    };
+                                    assert!(manager.iter().any(|(name, value)| {
+                                        name.as_ref() == "name" && *value == str("Bob")
+                                    }));
+                                }
+                                got => panic!("expected some(manager), got {got:?}"),
+                            }
+                        }
+                    }
+                    got => panic!("expected subordinates list, got {got:?}"),
+                }
+                let Val::Record(fifth) = &rows[4] else {
+                    panic!("expected record");
+                };
+                assert!(fifth.iter().any(|(name, value)| {
+                    name.as_ref() == "s" && matches!(value, Val::List(items) if items.is_empty())
+                }));
+            }
+            got => panic!("expected projected users, got {got:?}"),
+        }
+    }
+
+    #[test]
+    fn projection_m2m() {
+        match run_seeded("roles { u = users }") {
+            Ok(Val::List(rows)) => {
+                assert_eq!(rows.len(), 2);
+                let Val::Record(admin) = &rows[0] else {
+                    panic!("expected record");
+                };
+                match admin.iter().find(|(name, _)| name.as_ref() == "u") {
+                    Some((_, Val::List(users))) => {
+                        assert_eq!(users.len(), 1);
+                        let Val::Record(user) = &users[0] else {
+                            panic!("expected user record");
+                        };
+                        assert!(user.iter().any(|(name, value)| {
+                            name.as_ref() == "name" && *value == str("Ada")
+                        }));
+                    }
+                    got => panic!("expected users list, got {got:?}"),
+                }
+                let Val::Record(editor) = &rows[1] else {
+                    panic!("expected record");
+                };
+                match editor.iter().find(|(name, _)| name.as_ref() == "u") {
+                    Some((_, Val::List(users))) => assert_eq!(users.len(), 3),
+                    got => panic!("expected users list, got {got:?}"),
+                }
+            }
+            got => panic!("expected projected roles, got {got:?}"),
         }
     }
 

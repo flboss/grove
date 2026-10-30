@@ -282,8 +282,8 @@ pub(crate) fn exec_field(
     resolve_refs(ctx, optional, result)
 }
 
-/// Resolve a bare Ref base before field access
-fn resolve_base_link(ctx: &mut EvalCtx, base: Val) -> Result<Val, ExecError> {
+/// Resolve a bare Ref base before navigation
+pub(crate) fn resolve_base_link(ctx: &mut EvalCtx, base: Val) -> Result<Val, ExecError> {
     match base {
         Val::Ref { field, parent } => {
             let mut resolved = resolve_field(ctx, field, &[parent])?;
