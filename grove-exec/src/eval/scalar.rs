@@ -627,12 +627,53 @@ pub(crate) fn eval_method(
     for arg in args {
         arg_vals.push(eval(&arg.expr, ctx)?);
     }
+    if name == "flatten" {
+        return eval_flatten(base, optional);
+    }
     let scalar = eval_scalar_method(&base, name, &arg_vals, span)?;
     let value = Val::Scalar(scalar);
     Ok(if optional {
         Val::Some(Box::new(value))
     } else {
         value
+    })
+}
+
+/// Concatenate one nesting level
+fn eval_flatten(base: Val, optional: bool) -> Result<Val, ExecError> {
+    let items = match (optional, base) {
+        (true, Val::None) => return Ok(Val::None),
+        (true, Val::Some(v)) => match *v {
+            Val::List(items) => items,
+            other => {
+                return Err(ExecError::Integrity {
+                    message: format!("`?.flatten()` on non-list value: {other} (internal error)"),
+                });
+            }
+        },
+        (_, Val::List(items)) => items,
+        (_, other) => {
+            return Err(ExecError::Integrity {
+                message: format!("`flatten()` on non-list value: {other} (internal error)"),
+            });
+        }
+    };
+    let mut flat = Vec::new();
+    for item in items {
+        match item {
+            Val::List(inner) => flat.extend(inner),
+            other => {
+                return Err(ExecError::Integrity {
+                    message: format!("`flatten()` over non-list element: {other} (internal error)"),
+                });
+            }
+        }
+    }
+    let flat = Val::List(flat);
+    Ok(if optional {
+        Val::Some(Box::new(flat))
+    } else {
+        flat
     })
 }
 
@@ -816,6 +857,28 @@ mod tests {
     use crate::value::{Scalar, Val};
     use chrono::{DateTime, TimeDelta};
     use rust_decimal::{Decimal, dec};
+
+    #[test]
+    fn method_flatten() {
+        match run_seeded("users.orders.flatten()") {
+            Ok(Val::List(orders)) => {
+                let amounts: Vec<i64> = orders
+                    .iter()
+                    .map(|order| match order {
+                        Val::Record(fields) => {
+                            match fields.iter().find(|(name, _)| name.as_ref() == "amount") {
+                                Some((_, Val::Scalar(Scalar::Int(n)))) => *n,
+                                got => panic!("expected amount, got {got:?}"),
+                            }
+                        }
+                        other => panic!("expected order record, got {other}"),
+                    })
+                    .collect();
+                assert_eq!(amounts, [100, 200, 400]);
+            }
+            got => panic!("expected flat orders, got {got:?}"),
+        }
+    }
 
     #[test]
     fn eval_literals() {
