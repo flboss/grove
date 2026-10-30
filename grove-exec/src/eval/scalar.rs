@@ -630,8 +630,8 @@ pub(crate) fn eval_method(
     if name == "flatten" {
         return eval_flatten(base, optional);
     }
-    if matches!(name, "take" | "skip") {
-        return eval_take_skip(name, base, optional, &arg_vals, span);
+    if matches!(name, "take" | "skip" | "first" | "nth") {
+        return eval_slice(name, base, optional, &arg_vals, span);
     }
     if name == "len" {
         match &base {
@@ -654,8 +654,8 @@ pub(crate) fn eval_method(
     })
 }
 
-/// Slice a List according to take/skip method (negative bounds abort)
-fn eval_take_skip(
+/// Slice a List according to take/skip/first/nth method
+fn eval_slice(
     name: &str,
     base: Val,
     optional: bool,
@@ -679,33 +679,63 @@ fn eval_take_skip(
             });
         }
     };
-    let [arg] = args else {
-        return Err(ExecError::Integrity {
-            message: format!("`{name}()` expects one argument (internal error)"),
-        });
+    let index_arg = |method: &str| -> Result<i64, ExecError> {
+        let [arg] = args else {
+            return Err(ExecError::Integrity {
+                message: format!("`{method}()` expects one argument (internal error)"),
+            });
+        };
+        match arg {
+            Val::Scalar(Scalar::Int(n)) => Ok(*n),
+            _ => Err(ExecError::Integrity {
+                message: format!("`{method}()` expects an Int argument (internal error)"),
+            }),
+        }
     };
-    let Val::Scalar(Scalar::Int(n)) = arg else {
-        return Err(ExecError::Integrity {
-            message: format!("`{name}()` expects an Int argument (internal error)"),
-        });
+    let result = match name {
+        // take/skip: negative bounds abort
+        "take" | "skip" => {
+            let n = index_arg(name)?;
+            if n < 0 {
+                return Err(ExecError::Abort {
+                    message: format!("`{name}()` called with negative bound {n}"),
+                    span,
+                });
+            }
+            let n = (n as usize).min(items.len());
+            if name == "take" {
+                items.truncate(n);
+            } else {
+                items.drain(..n);
+            }
+            Val::List(items)
+        }
+        // first: head or None
+        "first" => match items.into_iter().next() {
+            Some(head) => Val::Some(Box::new(head)),
+            None => Val::None,
+        },
+        // nth: 0-based, negative indices from back, out-of-range is None
+        "nth" => {
+            let n = index_arg(name)?;
+            let len = items.len() as i64;
+            let index = if n >= 0 { n } else { len + n };
+            if index < 0 || index >= len {
+                Val::None
+            } else {
+                Val::Some(Box::new(items.swap_remove(index as usize)))
+            }
+        }
+        _ => {
+            return Err(ExecError::Integrity {
+                message: format!("unknown slice method `{name}` (internal error)"),
+            });
+        }
     };
-    if *n < 0 {
-        return Err(ExecError::Abort {
-            message: format!("`{name}()` called with negative bound {n}"),
-            span,
-        });
-    }
-    let n = (*n).min(items.len() as i64) as usize;
-    if name == "take" {
-        items.truncate(n);
-    } else {
-        items.drain(..n);
-    };
-    let taken = Val::List(items);
     Ok(if wrap {
-        Val::Some(Box::new(taken))
+        Val::Some(Box::new(result))
     } else {
-        taken
+        result
     })
 }
 
@@ -1505,6 +1535,33 @@ mod tests {
             Err(ExecError::Abort { .. }) => {}
             got => panic!("expected abort, got {got:?}"),
         }
+    }
+
+    #[test]
+    fn method_first_nth() {
+        let nth_name = |src: &str| match run_seeded(src) {
+            Ok(Val::Some(user)) => match *user {
+                Val::Record(user) => user
+                    .into_iter()
+                    .find_map(|(name, value)| (name.as_ref() == "name").then_some(value)),
+                other => panic!("expected user record, got {other}"),
+            },
+            Ok(Val::None) => None,
+            got => panic!("expected optional user for {src}, got {got:?}"),
+        };
+        assert_eq!(nth_name("users.nth(0)"), Some(str("Ada")));
+        assert_eq!(nth_name("users.nth(4)"), Some(str("Eli")));
+        assert_eq!(nth_name("users.nth(-1)"), Some(str("Eli")));
+        assert_eq!(nth_name("users.nth(-5)"), Some(str("Ada")));
+        assert_eq!(nth_name("users.nth(5)"), None);
+        assert_eq!(nth_name("users.nth(-6)"), None);
+        assert_eq!(nth_name("users.skip(5).nth(0)"), None);
+        assert_eq!(nth_name("users.skip(5).nth(-1)"), None);
+        assert_eq!(nth_name("users.take(2).first()"), Some(str("Ada")));
+        assert_eq!(nth_name("users.skip(5).first()"), None);
+        assert_eq!(nth_name("users.skip(2).first()"), Some(str("Cyd")));
+        assert_eq!(nth_name("users.skip(2).nth(-1)"), Some(str("Eli")));
+        assert_eq!(nth_name("users.take(3).nth(2)"), Some(str("Cyd")));
     }
 
     #[test]
