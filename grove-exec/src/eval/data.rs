@@ -248,12 +248,12 @@ pub(crate) fn exec_field(
     ctx: &mut EvalCtx,
 ) -> Result<Val, ExecError> {
     let base = eval(base, ctx)?;
+    let base = resolve_base_link(ctx, base)?;
     let base = match (optional, base) {
         (true, Val::None) => return Ok(Val::None),
         (true, Val::Some(v)) => *v,
         (_, v) => v,
     };
-    let base = resolve_base_link(ctx, base)?;
     let result = match base {
         Val::Record(fields) => record_field(fields, name)?,
         Val::List(items) => {
@@ -871,6 +871,28 @@ mod tests {
                 }
             }
             got => panic!("expected projected users, got {got:?}"),
+        }
+    }
+
+    #[test]
+    fn field_access_optional_ref_base_resolved() {
+        match run_seeded("users { m = manager?.name }") {
+            Ok(Val::List(rows)) => {
+                let Val::Record(first) = &rows[0] else {
+                    panic!("expected record");
+                };
+                match first.iter().find(|(name, _)| name.as_ref() == "m") {
+                    Some((_, Val::Some(name))) => {
+                        assert!(matches!(name.as_ref(), Val::Scalar(_)));
+                    }
+                    got => panic!("expected some(name), got {got:?}"),
+                }
+                assert!(matches!(
+                    &rows[1], Val::Record(second)
+                      if matches!(second.first().unwrap().1, Val::None)
+                ));
+            }
+            got => panic!("expected projected records, got {got:?}"),
         }
     }
 }
