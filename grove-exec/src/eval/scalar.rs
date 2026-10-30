@@ -630,12 +630,51 @@ pub(crate) fn eval_method(
     if name == "flatten" {
         return eval_flatten(base, optional);
     }
+    if name == "len" {
+        match &base {
+            Val::List(_) => return eval_list_len(base, optional),
+            // String::len falls through
+            Val::Scalar(_) => {}
+            _ => {
+                return Err(ExecError::Integrity {
+                    message: format!("`.len()` on unsupported value: {base} (internal error)"),
+                });
+            }
+        }
+    }
     let scalar = eval_scalar_method(&base, name, &arg_vals, span)?;
     let value = Val::Scalar(scalar);
     Ok(if optional {
         Val::Some(Box::new(value))
     } else {
         value
+    })
+}
+
+/// Element count of a List
+fn eval_list_len(base: Val, optional: bool) -> Result<Val, ExecError> {
+    let count = match (optional, base) {
+        (true, Val::None) => return Ok(Val::None),
+        (true, Val::Some(v)) => match *v {
+            Val::List(items) => items.len(),
+            other => {
+                return Err(ExecError::Integrity {
+                    message: format!("`?.len()` on non-list value: {other} (internal error)"),
+                });
+            }
+        },
+        (_, Val::List(items)) => items.len(),
+        (_, other) => {
+            return Err(ExecError::Integrity {
+                message: format!("`.len()` on non-list value: {other} (internal error)"),
+            });
+        }
+    };
+    let len = Val::Scalar(Scalar::Int(count as i64));
+    Ok(if optional {
+        Val::Some(Box::new(len))
+    } else {
+        len
     })
 }
 
@@ -1353,6 +1392,32 @@ mod tests {
         let off = r#"config { float_checks = false }"#;
         let err = run_src_config("(0.0f / 0.0f) as Dec", off).unwrap_err();
         assert!(err.to_string().contains("NaN"), "{err}");
+    }
+
+    #[test]
+    fn method_list_len() {
+        assert_eq!(run_seeded("users.len()"), Ok(int(5)));
+        assert_eq!(run_seeded("roles.len()"), Ok(int(2)));
+        match run_seeded("users { n = orders.len() }") {
+            Ok(Val::List(rows)) => {
+                let counts: Vec<i64> = rows
+                    .iter()
+                    .map(|row| match row {
+                        Val::Record(fields) => {
+                            match fields.iter().find(|(name, _)| name.as_ref() == "n") {
+                                Some((_, Val::Scalar(Scalar::Int(n)))) => *n,
+                                got => panic!("expected count, got {got:?}"),
+                            }
+                        }
+                        other => panic!("expected record, got {other}"),
+                    })
+                    .collect();
+                assert_eq!(counts, [2, 1, 0, 0, 0]);
+            }
+            got => panic!("expected projected users, got {got:?}"),
+        }
+        assert_eq!(run_seeded("users.roles.len()"), Ok(int(5)));
+        assert_eq!(run_seeded("users.roles.flatten().len()"), Ok(int(4)));
     }
 
     #[test]
