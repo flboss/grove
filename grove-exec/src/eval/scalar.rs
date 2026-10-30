@@ -630,6 +630,9 @@ pub(crate) fn eval_method(
     if name == "flatten" {
         return eval_flatten(base, optional);
     }
+    if matches!(name, "take" | "skip") {
+        return eval_take_skip(name, base, optional, &arg_vals, span);
+    }
     if name == "len" {
         match &base {
             Val::List(_) => return eval_list_len(base, optional),
@@ -648,6 +651,61 @@ pub(crate) fn eval_method(
         Val::Some(Box::new(value))
     } else {
         value
+    })
+}
+
+/// Slice a List according to take/skip method (negative bounds abort)
+fn eval_take_skip(
+    name: &str,
+    base: Val,
+    optional: bool,
+    args: &[Val],
+    span: Span,
+) -> Result<Val, ExecError> {
+    let (mut items, wrap) = match (optional, base) {
+        (true, Val::None) => return Ok(Val::None),
+        (true, Val::Some(v)) => match *v {
+            Val::List(items) => (items, true),
+            other => {
+                return Err(ExecError::Integrity {
+                    message: format!("`?.{name}()` on non-list value: {other} (internal error)"),
+                });
+            }
+        },
+        (_, Val::List(items)) => (items, optional),
+        (_, other) => {
+            return Err(ExecError::Integrity {
+                message: format!("`{name}()` on non-list value: {other} (internal error)"),
+            });
+        }
+    };
+    let [arg] = args else {
+        return Err(ExecError::Integrity {
+            message: format!("`{name}()` expects one argument (internal error)"),
+        });
+    };
+    let Val::Scalar(Scalar::Int(n)) = arg else {
+        return Err(ExecError::Integrity {
+            message: format!("`{name}()` expects an Int argument (internal error)"),
+        });
+    };
+    if *n < 0 {
+        return Err(ExecError::Abort {
+            message: format!("`{name}()` called with negative bound {n}"),
+            span,
+        });
+    }
+    let n = (*n).min(items.len() as i64) as usize;
+    if name == "take" {
+        items.truncate(n);
+    } else {
+        items.drain(..n);
+    };
+    let taken = Val::List(items);
+    Ok(if wrap {
+        Val::Some(Box::new(taken))
+    } else {
+        taken
     })
 }
 
@@ -1395,9 +1453,66 @@ mod tests {
     }
 
     #[test]
+    fn method_take_skip() {
+        let names = |src: &str| match run_seeded(src) {
+            Ok(Val::List(rows)) => rows
+                .into_iter()
+                .map(|row| match row {
+                    Val::Record(fields) => fields
+                        .into_iter()
+                        .find_map(|(name, value)| (name.as_ref() == "name").then_some(value))
+                        .expect("expected `name` field"),
+                    other => panic!("expected record, got {other}"),
+                })
+                .collect::<Vec<_>>(),
+            got => panic!("expected rows for {src}, got {got:?}"),
+        };
+        assert_eq!(names("users.take(2)"), [str("Ada"), str("Bob")]);
+        assert_eq!(names("users.skip(3)"), [str("Dan"), str("Eli")]);
+        assert_eq!(names("users.take(0)"), Vec::new());
+        assert_eq!(names("users.skip(5)"), Vec::new());
+        assert_eq!(names("users.take(99)").len(), 5);
+        assert_eq!(names("users.skip(99)"), Vec::new());
+        assert_eq!(names("users.skip(1).take(2)"), [str("Bob"), str("Cyd")]);
+        assert_eq!(names("users.take(5).skip(3)"), [str("Dan"), str("Eli")]);
+        assert_eq!(names("users.take(2).take(5)").len(), 2);
+        assert_eq!(names("users.skip(1).skip(2)").len(), 2);
+        match run_seeded("users { o = orders.take(1) }") {
+            Ok(Val::List(rows)) => {
+                let counts: Vec<usize> = rows
+                    .iter()
+                    .map(|row| match row {
+                        Val::Record(fields) => {
+                            match fields.iter().find(|(name, _)| name.as_ref() == "o") {
+                                Some((_, Val::List(orders))) => orders.len(),
+                                got => panic!("expected orders list, got {got:?}"),
+                            }
+                        }
+                        other => panic!("expected record, got {other}"),
+                    })
+                    .collect();
+                assert_eq!(counts, [1, 1, 0, 0, 0]);
+            }
+            got => panic!("expected projected users, got {got:?}"),
+        }
+        match run_seeded("users.take(-1)") {
+            Err(ExecError::Abort { message, .. }) => {
+                assert!(message.contains("negative bound"), "got: {message}")
+            }
+            got => panic!("expected abort, got {got:?}"),
+        }
+        match run_seeded("users.skip(-2)") {
+            Err(ExecError::Abort { .. }) => {}
+            got => panic!("expected abort, got {got:?}"),
+        }
+    }
+
+    #[test]
     fn method_list_len() {
         assert_eq!(run_seeded("users.len()"), Ok(int(5)));
         assert_eq!(run_seeded("roles.len()"), Ok(int(2)));
+        assert_eq!(run_seeded("users.take(2).len()"), Ok(int(2)));
+        assert_eq!(run_seeded("users.skip(5).len()"), Ok(int(0)));
         match run_seeded("users { n = orders.len() }") {
             Ok(Val::List(rows)) => {
                 let counts: Vec<i64> = rows
