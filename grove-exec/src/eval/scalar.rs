@@ -13,6 +13,7 @@ use rust_decimal::{Decimal, RoundingStrategy};
 
 use super::{EvalCtx, eval};
 use crate::error::ExecError;
+use crate::eval::data::resolve_base_link;
 use crate::value::{
     NANOS_PER_DAY, NANOS_PER_HOUR, NANOS_PER_MIN, NANOS_PER_SEC, Scalar, Val, total_nanos,
 };
@@ -620,6 +621,7 @@ pub(crate) fn eval_method(
     span: Span,
 ) -> Result<Val, ExecError> {
     let base = eval(base, ctx)?;
+    let base = resolve_base_link(ctx, base)?;
     // `?.` on none returns none without evaluating args
     let base = match (optional, base) {
         (true, Val::None) => return Ok(Val::None),
@@ -883,6 +885,7 @@ fn sort_keyless(items: &mut [Val], kind: SortKind, span: Span) -> Result<(), Exe
     result
 }
 
+// TODO: batch eval first key
 /// Keyed sort (stable) with per-key expressions, directions
 fn sort_by_keys(
     items: &mut Vec<Val>,
@@ -936,7 +939,13 @@ fn compare_keys_eval_cached(
             let key = eval_key(ctx, arg, b)?;
             cache_b.borrow_mut().push(key);
         }
-        match cache_a.borrow()[i].cmp(&cache_b.borrow()[i], span)? {
+        let key_a = &cache_a.borrow()[i];
+        let key_b = &cache_b.borrow()[i];
+        // Refs are considered undecidable for now
+        if key_a.contains_ref() || key_b.contains_ref() {
+            continue;
+        }
+        match key_a.cmp(key_b, span)? {
             std::cmp::Ordering::Equal => continue,
             non_equal => {
                 return Ok(
@@ -952,6 +961,7 @@ fn compare_keys_eval_cached(
     Ok(std::cmp::Ordering::Equal)
 }
 
+// TODO: resolve owning Refs
 /// Evaluate one sort key expr against an element scope
 fn eval_key(ctx: &mut EvalCtx<'_>, arg: &TypedMethodArg, item: &Val) -> Result<Val, ExecError> {
     let (scope, map_element): (HashMap<Arc<str>, Val>, _) = match item {
@@ -975,12 +985,12 @@ fn eval_key(ctx: &mut EvalCtx<'_>, arg: &TypedMethodArg, item: &Val) -> Result<V
         }
     };
     ctx.env.push_scope(scope);
-    let key = eval(&arg.expr, ctx);
+    let key = eval(&arg.expr, ctx).map(|key| resolve_base_link(ctx, key));
     ctx.env.pop_scope();
     if map_element {
         ctx.env.element_depth -= 1;
     }
-    key
+    key?
 }
 
 /// Concatenate one nesting level

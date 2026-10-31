@@ -113,6 +113,16 @@ impl Val {
             _ => None,
         }
     }
+
+    pub fn contains_ref(&self) -> bool {
+        match self {
+            Val::Some(val) => val.contains_ref(),
+            Val::List(vals) | Val::Tuple(vals) => vals.iter().any(Val::contains_ref),
+            Val::Record(items) => items.iter().any(|(_, val)| val.contains_ref()),
+            Val::Ref { .. } => true,
+            _ => false,
+        }
+    }
 }
 
 impl Scalar {
