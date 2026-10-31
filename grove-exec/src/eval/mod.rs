@@ -23,12 +23,14 @@ use scalar::{eval_binary, eval_cast, eval_method, eval_unary};
 #[derive(Debug, Default)]
 pub struct Env {
     scopes: Vec<HashMap<Arc<str>, Val>>,
+    pub(crate) element_depth: usize,
 }
 
 impl Env {
     pub fn new() -> Self {
         Env {
             scopes: vec![HashMap::new()],
+            element_depth: 0,
         }
     }
 
@@ -88,26 +90,33 @@ pub fn eval(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
             name,
             binding,
             depth,
-        } => match binding {
-            IdentBinding::Let => {
-                ctx.env
-                    .lookup(&name.value, *depth)
-                    .cloned()
-                    .ok_or_else(|| ExecError::Integrity {
-                        message: format!("unbound variable `{}` (internal error)", name.value),
+        } => {
+            match binding {
+                IdentBinding::Let => {
+                    ctx.env.lookup(&name.value, *depth).cloned().ok_or_else(|| {
+                        ExecError::Integrity {
+                            message: format!("unbound variable `{}` (internal error)", name.value),
+                        }
                     })
+                }
+                IdentBinding::Root { root_idx } => exec_root(ctx, *root_idx),
+                IdentBinding::Field(_) | IdentBinding::ProjectedField { .. } => {
+                    ctx.env.lookup(&name.value, *depth).cloned().ok_or_else(|| {
+                        ExecError::Integrity {
+                            message: format!("unbound field `{}` (internal error)", name.value),
+                        }
+                    })
+                }
+                IdentBinding::ListElement => {
+                    ctx.env.lookup(&name.value, *depth).cloned().ok_or_else(|| {
+                        ExecError::Integrity {
+                            message: format!("unbound element `{}` (internal error)", name.value),
+                        }
+                    })
+                }
+                IdentBinding::Prev { .. } => todo!("prev with mutations"),
             }
-            IdentBinding::Root { root_idx } => exec_root(ctx, *root_idx),
-            IdentBinding::Field(_) | IdentBinding::ProjectedField { .. } => ctx
-                .env
-                .lookup(&name.value, *depth)
-                .cloned()
-                .ok_or_else(|| ExecError::Integrity {
-                    message: format!("unbound field `{}` (internal error)", name.value),
-                }),
-            IdentBinding::Prev { .. } => todo!("prev with mutations"),
-            IdentBinding::ListElement => todo!("element references inside collection operators"),
-        },
+        }
         TypedExprKind::Some { value } => eval(value, ctx).map(|v| Val::Some(Box::new(v))),
         TypedExprKind::TypeConstant { ty, name } => {
             Ok(scalar::eval_type_constant(ty.value, name.value))
