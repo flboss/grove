@@ -31,7 +31,7 @@ pub enum TypeError {
     RefFieldInMutation { field: String, struct_name: String, span: Span },
     UnexpectedType { expected: String, got: String, span: Span },
     TupleAccessOnNonTuple { base_ty: String, span: Span },
-    TupleIndexOutOfRange { index: i64, len: usize, span: Span },
+    TupleIndexOutOfRange { index: usize, len: usize, span: Span },
 }
 
 impl From<TypeError> for Diagnostic {
@@ -270,7 +270,7 @@ impl From<TypeError> for Diagnostic {
                 "QT0029",
                 format!("tuple index `.{index}` out of range for tuple of length {len}"),
                 span,
-                format!("valid indices are .1 through .{len}"),
+                format!("valid indices are .0 through .{}", len - 1),
             ),
         }
     }

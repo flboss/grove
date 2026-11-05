@@ -632,15 +632,14 @@ fn infer_tuple_access(
             span: index.span,
         });
     };
-    let n = index.value;
-    if n < 1 || (n as usize) > elems.len() {
+    let pos = index.value as usize;
+    if pos >= elems.len() {
         return Err(TypeError::TupleIndexOutOfRange {
-            index: n,
+            index: pos,
             len: elems.len(),
             span: index.span,
         });
     }
-    let pos = n as usize - 1;
     let mut elem_ty = elems[pos].clone();
     if optional {
         elem_ty = elem_ty.wrap_optional();
@@ -2542,10 +2541,10 @@ mod tests {
     fn tuple_access() {
         let schema = test_schema();
         let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("(\"a\", 1).1");
+        let (file, _diags) = crate::parse_query("(\"a\", 1).0");
         let result = infer(&file.unwrap().result, &mut env).unwrap();
         assert_eq!(result.ty, QueryType::Scalar(ScalarType::String));
-        let (file, _diags) = crate::parse_query("(\"a\", 1).2");
+        let (file, _diags) = crate::parse_query("(\"a\", 1).1");
         let result = infer(&file.unwrap().result, &mut env).unwrap();
         assert_eq!(result.ty, QueryType::Scalar(ScalarType::Int));
     }
@@ -2554,7 +2553,7 @@ mod tests {
     fn tuple_access_chained() {
         let schema = test_schema();
         let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("((\"a\", 1), 2).1.2");
+        let (file, _diags) = crate::parse_query("((\"a\", 1), 2).0.1");
         let result = infer(&file.unwrap().result, &mut env).unwrap();
         assert_eq!(result.ty, QueryType::Scalar(ScalarType::Int));
     }
@@ -2563,7 +2562,7 @@ mod tests {
     fn tuple_access_optional() {
         let schema = test_schema();
         let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("(\"a\", 1)?.1");
+        let (file, _diags) = crate::parse_query("(\"a\", 1)?.0");
         assert!(infer(&file.unwrap().result, &mut env).is_err());
     }
 
@@ -2571,7 +2570,7 @@ mod tests {
     fn tuple_access_out_of_range() {
         let schema = test_schema();
         let mut env = TypeEnv::new(&schema);
-        for query in ["(\"a\", 1).3", "(\"a\", 1).0"] {
+        for query in ["(\"a\", 1).2", "(\"a\", 1).1000"] {
             let (file, _diags) = crate::parse_query(query);
             assert!(infer(&file.unwrap().result, &mut env).is_err(), "{query}");
         }
@@ -2581,7 +2580,7 @@ mod tests {
     fn tuple_access_on_non_tuple() {
         let schema = test_schema();
         let mut env = TypeEnv::new(&schema);
-        for query in ["\"a\".1", "users.1", "[1, 2].1"] {
+        for query in ["\"a\".0", "users.0", "[1, 2].0"] {
             let (file, _diags) = crate::parse_query(query);
             assert!(infer(&file.unwrap().result, &mut env).is_err(), "{query}");
         }
@@ -2591,7 +2590,7 @@ mod tests {
     fn tuple_access_optional_tuple() {
         let schema = test_schema();
         let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("[(\"a\", 1)].first()?.1");
+        let (file, _diags) = crate::parse_query("[(\"a\", 1)].first()?.0");
         let result = infer(&file.unwrap().result, &mut env).unwrap();
         assert_eq!(
             result.ty,
@@ -2603,10 +2602,10 @@ mod tests {
     fn tuple_access_optional_schema_field() {
         let schema = test_schema();
         let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("users { x = maybe_pos?.1 }");
+        let (file, _diags) = crate::parse_query("users { x = maybe_pos?.0 }");
         let result = infer(&file.unwrap().result, &mut env).unwrap();
         assert!(matches!(result.ty, QueryType::List(_)));
-        let (file, _diags) = crate::parse_query("users { x = maybe_pos.1 }");
+        let (file, _diags) = crate::parse_query("users { x = maybe_pos.0 }");
         assert!(infer(&file.unwrap().result, &mut env).is_err());
     }
 
@@ -2614,7 +2613,7 @@ mod tests {
     fn tuple_access_over_scope() {
         let schema = test_schema();
         let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("users { x = (\"a\", age).2 }");
+        let (file, _diags) = crate::parse_query("users { x = (\"a\", age).1 }");
         let result = infer(&file.unwrap().result, &mut env).unwrap();
         assert!(matches!(result.ty, QueryType::List(_)));
     }
