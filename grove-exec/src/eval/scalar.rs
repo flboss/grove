@@ -635,7 +635,7 @@ pub(crate) fn eval_method(
         return eval_filter(base, optional, args, ctx);
     }
     if let Some(opt_kind) = OptMethodKind::from_str(name) {
-        return eval_optional(opt_kind, base, args, ctx, span);
+        return eval_optional(opt_kind, base, optional, args, ctx, span);
     }
     let arg_vals = args
         .iter()
@@ -1105,6 +1105,7 @@ impl fmt::Display for OptMethodKind {
 fn eval_optional(
     kind: OptMethodKind,
     base: Val,
+    optional: bool,
     args: &[TypedMethodArg],
     ctx: &mut EvalCtx<'_>,
     span: Span,
@@ -1120,13 +1121,22 @@ fn eval_optional(
         });
     }
     // dispatch already unwraps outer optional on `?.`
-    match base {
-        Val::None => eval_opt_absent(kind, args, ctx, span),
-        Val::Some(v) => eval_opt_present(kind, *v),
-        _ => Err(ExecError::Integrity {
-            message: format!("`{kind}()` called on non-optional value: {base} (internal error)"),
-        }),
-    }
+    let result = match base {
+        Val::None => eval_opt_absent(kind, args, ctx, span)?,
+        Val::Some(v) => eval_opt_present(kind, *v)?,
+        _ => {
+            return Err(ExecError::Integrity {
+                message: format!(
+                    "`{kind}()` called on non-optional value: {base} (internal error)"
+                ),
+            });
+        }
+    };
+    Ok(if optional {
+        Val::Some(Box::new(result))
+    } else {
+        result
+    })
 }
 
 fn eval_opt_present(kind: OptMethodKind, value: Val) -> Result<Val, ExecError> {
@@ -2390,7 +2400,11 @@ mod tests {
             }
             got => panic!("expected abort, got {got:?}"),
         }
-        assert_eq!(run_src("some(some(1))?.unwrap()"), Ok(int(1)));
+        assert_eq!(run_src("some(some(1))?.unwrap()"), Ok(some(int(1))));
+        assert_eq!(
+            run_seeded("users.first()?.nickname?.is_some()"),
+            Ok(some(bool(true)))
+        );
     }
 
     #[test]
@@ -2401,7 +2415,7 @@ mod tests {
             Ok(some(int(1)))
         );
         assert_eq!(run_src("some(1).unwrap_or(1 / 0)"), Ok(int(1)));
-        assert_eq!(run_src("some(some(1))?.unwrap_or(1 / 0)"), Ok(int(1)));
+        assert_eq!(run_src("some(some(1))?.unwrap_or(1 / 0)"), Ok(some(int(1))));
         assert_eq!(
             run_seeded("users.skip(1).first()?.nickname.unwrap_or(some(\"anon\"))"),
             Ok(some(str("anon")))
