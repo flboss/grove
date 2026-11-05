@@ -16,7 +16,7 @@ pub mod data;
 pub mod scalar;
 
 use composite::{eval_array, eval_projection, eval_struct, eval_tuple};
-use data::{exec_field, exec_root};
+use data::{exec_field, exec_root, resolve_base_link};
 use scalar::{eval_binary, eval_cast, eval_method, eval_unary};
 
 /// Lexical value scope chain
@@ -142,7 +142,11 @@ pub fn eval(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
             name,
             optional,
         } => exec_field(base, &name.value, *optional, ctx),
-        TypedExprKind::TupleAccess { .. } => todo!("tuple access"),
+        TypedExprKind::TupleAccess {
+            base,
+            index,
+            optional,
+        } => eval_tuple_access(base, *index, *optional, ctx),
         TypedExprKind::Method {
             base,
             name,
@@ -157,6 +161,41 @@ pub fn eval(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
         TypedExprKind::Array { elements } => eval_array(elements, ctx),
         TypedExprKind::Struct { fields } => eval_struct(fields, ctx),
         TypedExprKind::Projection { base, items } => eval_projection(base, items, ctx),
+    }
+}
+
+/// Evaluate 0-based tuple element access
+pub fn eval_tuple_access(
+    base: &TypedExpr,
+    index: usize,
+    optional: bool,
+    ctx: &mut EvalCtx<'_>,
+) -> Result<Val, ExecError> {
+    let base = eval(base, ctx)?;
+    let base = resolve_base_link(ctx, base)?;
+    let base = match (optional, base) {
+        (true, Val::None) => return Ok(Val::None),
+        (true, Val::Some(v)) => *v,
+        (_, v) => v,
+    };
+    match base {
+        Val::Tuple(elements) => elements.into_iter().nth(index).map_or_else(
+            || {
+                Err(ExecError::Integrity {
+                    message: format!("tuple index {index} out of range (internal error)"),
+                })
+            },
+            |element| {
+                Ok(if optional {
+                    Val::Some(Box::new(element))
+                } else {
+                    element
+                })
+            },
+        ),
+        other => Err(ExecError::Integrity {
+            message: format!("tuple access on non-tuple value: {other} (internal error)"),
+        }),
     }
 }
 
@@ -314,6 +353,114 @@ mod tests {
             Ok(str("hello"))
         );
         assert_eq!(run_src("let a = 1; let b = a; b"), Ok(int(1)));
+    }
+
+    #[test]
+    fn eval_tuple_access() {
+        assert_eq!(run_src("(\"a\", 1).0"), Ok(str("a")));
+        assert_eq!(run_src("(\"a\", 1).1"), Ok(int(1)));
+        assert_eq!(run_src("((1, 2), 3).0.1"), Ok(int(2)));
+        assert_eq!(
+            run_src("(10, 5, 7, 15, 8, 13, 3, 2, 14, 4, 16, 1, 9, 6, 11, (1,2,3,4)).15.3"),
+            Ok(int(4))
+        );
+        assert_eq!(
+            run_src("(1.5, -2.5).0"),
+            Ok(Val::Scalar(Scalar::Dec(rust_decimal::dec!(1.5))))
+        );
+        assert_eq!(run_src("[(\"a\", 1)].first()?.0"), Ok(some(str("a"))));
+        assert_eq!(run_src("[(\"a\", 1)].skip(5).first()?.1"), Ok(Val::None));
+        match run_seeded("users { x = pos.0 }") {
+            Ok(Val::List(rows)) => {
+                let firsts: Vec<Val> = rows
+                    .iter()
+                    .map(|row| match row {
+                        Val::Record(fields) => {
+                            match fields.iter().find(|(name, _)| name.as_ref() == "x") {
+                                Some((_, value)) => value.clone(),
+                                got => panic!("expected x, got {got:?}"),
+                            }
+                        }
+                        other => panic!("expected record, got {other}"),
+                    })
+                    .collect();
+                assert_eq!(
+                    firsts,
+                    [float(1.5), float(0.0), float(-1.25), float(2.0), float(9.5)]
+                );
+            }
+            got => panic!("expected projected users, got {got:?}"),
+        }
+        match run_seeded("users { x = home?.1 }") {
+            Ok(Val::List(rows)) => {
+                let seconds: Vec<Val> = rows
+                    .iter()
+                    .map(|row| match row {
+                        Val::Record(fields) => {
+                            match fields.iter().find(|(name, _)| name.as_ref() == "x") {
+                                Some((_, value)) => value.clone(),
+                                got => panic!("expected x, got {got:?}"),
+                            }
+                        }
+                        other => panic!("expected record, got {other}"),
+                    })
+                    .collect();
+                assert_eq!(
+                    seconds,
+                    [
+                        some(float(4.0)),
+                        Val::None,
+                        Val::None,
+                        some(float(1.0)),
+                        Val::None
+                    ]
+                );
+            }
+            got => panic!("expected projected users, got {got:?}"),
+        }
+        assert_eq!(
+            run_seeded("users.first().unwrap().extra.1.len()"),
+            Ok(int(2))
+        );
+        match run_seeded("users { e = extra.1.len() }") {
+            Ok(Val::List(rows)) => {
+                let counts: Vec<Val> = rows
+                    .iter()
+                    .map(|row| match row {
+                        Val::Record(fields) => {
+                            match fields.iter().find(|(name, _)| name.as_ref() == "e") {
+                                Some((_, value)) => value.clone(),
+                                got => panic!("expected e, got {got:?}"),
+                            }
+                        }
+                        other => panic!("expected record, got {other}"),
+                    })
+                    .collect();
+                assert_eq!(counts, [int(2), int(0), int(0), int(1), int(0)]);
+            }
+            got => panic!("expected projected users, got {got:?}"),
+        }
+        match run_seeded("users { f = scores.first()?.0 }") {
+            Ok(Val::List(rows)) => {
+                let firsts: Vec<Val> = rows
+                    .iter()
+                    .map(|row| match row {
+                        Val::Record(fields) => {
+                            match fields.iter().find(|(name, _)| name.as_ref() == "f") {
+                                Some((_, value)) => value.clone(),
+                                got => panic!("expected f, got {got:?}"),
+                            }
+                        }
+                        other => panic!("expected record, got {other}"),
+                    })
+                    .collect();
+                assert_eq!(
+                    firsts,
+                    [some(int(1)), Val::None, Val::None, some(int(3)), Val::None]
+                );
+            }
+            got => panic!("expected projected users, got {got:?}"),
+        }
     }
 
     #[test]
