@@ -1123,7 +1123,7 @@ fn eval_optional(
     // dispatch already unwraps outer optional on `?.`
     let result = match base {
         Val::None => eval_opt_absent(kind, args, ctx, span)?,
-        Val::Some(v) => eval_opt_present(kind, *v)?,
+        Val::Some(v) => eval_opt_present(kind, *v),
         _ => {
             return Err(ExecError::Integrity {
                 message: format!(
@@ -1139,11 +1139,11 @@ fn eval_optional(
     })
 }
 
-fn eval_opt_present(kind: OptMethodKind, value: Val) -> Result<Val, ExecError> {
+fn eval_opt_present(kind: OptMethodKind, value: Val) -> Val {
     match kind {
-        OptMethodKind::IsSome => Ok(Val::Scalar(Scalar::Bool(true))),
-        OptMethodKind::IsNone => Ok(Val::Scalar(Scalar::Bool(false))),
-        _ => Ok(value),
+        OptMethodKind::IsSome => Val::Scalar(Scalar::Bool(true)),
+        OptMethodKind::IsNone => Val::Scalar(Scalar::Bool(false)),
+        _ => value,
     }
 }
 
@@ -1166,7 +1166,7 @@ fn eval_opt_absent(
                     message: "`unwrap_or()` expects one argument (internal error)".to_string(),
                 });
             };
-            eval_opt_present(kind, eval(&arg.expr, ctx)?)
+            Ok(eval_opt_present(kind, eval(&arg.expr, ctx)?))
         }
     }
 }
