@@ -905,16 +905,16 @@ fn infer_binary_in(
         _ => return Err(TypeError::InRequiresTuple { span }),
     };
     for elem in rhs_inner {
-        if !types_compatible(lhs, elem, schema) {
-            return Err(TypeError::BinaryOpTypeMismatch {
-                left: lhs.to_string(),
-                op: "in".into(),
-                right: rhs.to_string(),
-                span,
-            });
+        if types_compatible(lhs, elem, schema) {
+            return Ok(QueryType::Scalar(ScalarType::Bool));
         }
     }
-    Ok(QueryType::Scalar(ScalarType::Bool))
+    Err(TypeError::BinaryOpTypeMismatch {
+        left: lhs.to_string(),
+        op: "in".into(),
+        right: rhs.to_string(),
+        span,
+    })
 }
 
 fn infer_equality_op(
