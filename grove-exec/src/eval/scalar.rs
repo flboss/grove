@@ -291,7 +291,9 @@ pub(crate) fn eval_binary(
         return eval_equality(op, &l, &r);
     }
     let scalar = match (op.value, l, r) {
-        (BinaryOp::In, _, _) => todo!("membership"),
+        (BinaryOp::In, needle, Val::Tuple(members)) => {
+            Scalar::Bool(members.iter().any(|member| needle.eq(member) == Some(true)))
+        }
         (op, Val::Scalar(Scalar::Int(a)), Val::Scalar(Scalar::Int(b))) if op.is_arithmetic() => {
             int_arith(
                 a,
@@ -662,6 +664,14 @@ pub(crate) fn eval_method(
             }
         }
     }
+    if name == "contains" && matches!(&base, Val::List(_)) {
+        let [needle] = arg_vals.as_slice() else {
+            return Err(ExecError::Integrity {
+                message: "`contains()` expects one argument (internal error)".to_string(),
+            });
+        };
+        return eval_list_contains(base, optional, needle);
+    }
     let scalar = eval_scalar_method(&base, name, &arg_vals, span)?;
     let value = Val::Scalar(scalar);
     Ok(if optional {
@@ -780,6 +790,34 @@ fn eval_list_len(base: Val, optional: bool) -> Result<Val, ExecError> {
         Val::Some(Box::new(len))
     } else {
         len
+    })
+}
+
+/// List membership by element equality
+fn eval_list_contains(base: Val, optional: bool, needle: &Val) -> Result<Val, ExecError> {
+    let (items, wrap) = match (optional, base) {
+        (true, Val::None) => return Ok(Val::None),
+        (true, Val::Some(v)) => match *v {
+            Val::List(items) => (items, true),
+            other => {
+                return Err(ExecError::Integrity {
+                    message: format!("`?.contains()` on non-list value: {other} (internal error)"),
+                });
+            }
+        },
+        (_, Val::List(items)) => (items, optional),
+        (_, other) => {
+            return Err(ExecError::Integrity {
+                message: format!("`.contains()` on non-list value: {other} (internal error)"),
+            });
+        }
+    };
+    let found = items.iter().any(|item| item.eq(needle) == Some(true));
+    let result = Val::Scalar(Scalar::Bool(found));
+    Ok(if wrap {
+        Val::Some(Box::new(result))
+    } else {
+        result
     })
 }
 
@@ -1479,15 +1517,9 @@ mod tests {
         assert_eq!(run_src("42"), Ok(int(42)));
         assert_eq!(run_src("1.5f"), Ok(float(1.5)));
         assert_eq!(run_src("30.00"), Ok(dec(dec!(30.00))));
-        assert_eq!(
-            run_src("\"hi\""),
-            Ok(str("hi"))
-        );
+        assert_eq!(run_src("\"hi\""), Ok(str("hi")));
         assert_eq!(run_src("true"), Ok(bool(true)));
-        assert_eq!(
-            run_src("some(1)"),
-            Ok(Val::Some(Box::new(int(1)))),
-        );
+        assert_eq!(run_src("some(1)"), Ok(Val::Some(Box::new(int(1)))),);
     }
 
     #[test]
@@ -1522,18 +1554,9 @@ mod tests {
     #[test]
     fn eval_type_constants() {
         assert_eq!(run_src("Int::MIN"), Ok(int(i64::MIN)));
-        assert_eq!(
-            run_src("Float::MAX"),
-            Ok(float(f64::MAX))
-        );
-        assert_eq!(
-            run_src("Dec::MIN"),
-            Ok(dec(Decimal::MIN))
-        );
-        assert_eq!(
-            run_src("Dec::MAX"),
-            Ok(dec(Decimal::MAX))
-        );
+        assert_eq!(run_src("Float::MAX"), Ok(float(f64::MAX)));
+        assert_eq!(run_src("Dec::MIN"), Ok(dec(Decimal::MIN)));
+        assert_eq!(run_src("Dec::MAX"), Ok(dec(Decimal::MAX)));
     }
 
     #[test]
@@ -1656,14 +1679,8 @@ mod tests {
     #[test]
     fn eval_dec_saturating() {
         let sat = r#"config { dec_arithmetic = "saturating" }"#;
-        assert_eq!(
-            run_src_config("Dec::MAX + 1.0", sat),
-            Ok(dec(Decimal::MAX))
-        );
-        assert_eq!(
-            run_src_config("Dec::MIN - 1.0", sat),
-            Ok(dec(Decimal::MIN))
-        );
+        assert_eq!(run_src_config("Dec::MAX + 1.0", sat), Ok(dec(Decimal::MAX)));
+        assert_eq!(run_src_config("Dec::MIN - 1.0", sat), Ok(dec(Decimal::MIN)));
         assert_eq!(
             run_src_config("Dec::MAX * 10.0", sat),
             Ok(dec(Decimal::MAX))
@@ -1860,6 +1877,57 @@ mod tests {
     }
 
     #[test]
+    fn eval_in() {
+        for (src, expected) in [
+            ("1 in (1, 2, false)", true),
+            ("9 in (1, 2, 3)", false),
+            ("\"a\" in ([true], 1.0, \"a\")", true),
+            ("\"z\" in (\"a\", 0.0f)", false),
+            ("2 in (1, \"a\")", false),
+            ("\"b\" in (1, \"a\")", false),
+            ("some(1) in (some(1), 2)", true),
+            ("some(3) in (some(2), 3)", false),
+            ("{ b = 2, a = 1 } in ({ a = 1, b = 2 }, { a = 0 })", true),
+            ("{ b = 2, a = 9 } in ({ a = 1, b = 2 }, { a = 0 })", false),
+        ] {
+            assert_eq!(run_src(src), Ok(bool(expected)), "{src}");
+        }
+    }
+
+    #[test]
+    fn eval_in_composite() {
+        let names = |src: &str| match run_seeded(src) {
+            Ok(Val::List(rows)) => rows
+                .into_iter()
+                .map(|row| match row {
+                    Val::Record(fields) => fields
+                        .into_iter()
+                        .find_map(|(name, value)| (name.as_ref() == "name").then_some(value))
+                        .expect("expected `name` field"),
+                    other => panic!("expected record, got {other}"),
+                })
+                .collect::<Vec<_>>(),
+            got => panic!("expected rows for {src}, got {got:?}"),
+        };
+        assert_eq!(names("users[id in (1, 3)]"), [str("Ada"), str("Cyd")]);
+        assert_eq!(
+            names("users[name in (\"Ada\", \"Eli\")]"),
+            [str("Ada"), str("Eli")]
+        );
+        assert_eq!(names("users[id in (2, \"x\")]"), [str("Bob")]);
+        assert_eq!(
+            names(
+                "users[if nickname.is_some() {nickname.unwrap() in (\"A\", \"C\")} else {false}]"
+            ),
+            [str("Ada"), str("Cyd")]
+        );
+        assert_eq!(
+            names("users[nickname in (none, some(\"A\"))]"),
+            [str("Ada"), str("Bob"), str("Dan")]
+        );
+    }
+
+    #[test]
     fn eval_logic() {
         for (src, expected) in [
             ("true && true", true),
@@ -2031,6 +2099,76 @@ mod tests {
         }
         assert_eq!(run_seeded("users.roles.len()"), Ok(int(5)));
         assert_eq!(run_seeded("users.roles.flatten().len()"), Ok(int(4)));
+    }
+
+    #[test]
+    fn method_contains() {
+        for src in [
+            "[1, 2, 3].contains(2)",
+            "[\"a\", \"bb\"].contains(\"bb\")",
+            "[(1, 2), (3, 4)].contains((3, 4))",
+            "users.tags.flatten().contains(\"a1\")",
+        ] {
+            assert_eq!(run_seeded(src), Ok(bool(true)), "{src}");
+        }
+        for src in [
+            "[1, 2, 3].contains(9)",
+            "[(1, 2)].contains((1, 3))",
+            "users.tags.flatten().contains(\"zzz\")",
+        ] {
+            assert_eq!(run_seeded(src), Ok(bool(false)), "{src}");
+        }
+        match run_seeded("users { t = tags.contains(\"a1\") }") {
+            Ok(Val::List(rows)) => {
+                let flags: Vec<Val> = rows
+                    .iter()
+                    .map(|row| match row {
+                        Val::Record(fields) => {
+                            match fields.iter().find(|(name, _)| name.as_ref() == "t") {
+                                Some((_, value)) => value.clone(),
+                                got => panic!("expected flag, got {got:?}"),
+                            }
+                        }
+                        other => panic!("expected record, got {other}"),
+                    })
+                    .collect();
+                assert_eq!(
+                    flags,
+                    [
+                        bool(true),
+                        bool(false),
+                        bool(false),
+                        bool(false),
+                        bool(true)
+                    ]
+                );
+            }
+            got => panic!("expected projected users, got {got:?}"),
+        }
+        assert_eq!(
+            run_seeded("users.scores.flatten().contains((1, \"one\"))"),
+            Ok(bool(true))
+        );
+        assert_eq!(
+            run_seeded("users.scores.flatten().contains((9, \"nine\"))"),
+            Ok(bool(false))
+        );
+        assert_eq!(
+            run_seeded("users.first()?.tags?.contains(\"a1\")"),
+            Ok(some(bool(true)))
+        );
+        assert_eq!(
+            run_seeded("users { id, name }.contains({ name = \"Ada\", id = 1 })"),
+            Ok(bool(true))
+        );
+        assert_eq!(
+            run_seeded("users { id, name }.contains({ id = 1, name = \"Ada\" })"),
+            Ok(bool(true))
+        );
+        assert_eq!(
+            run_seeded("users { id, name }.contains({ id = 9, name = \"A\" })"),
+            Ok(bool(false))
+        );
     }
 
     #[test]
