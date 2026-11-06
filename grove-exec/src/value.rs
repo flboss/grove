@@ -100,14 +100,13 @@ impl Val {
                 })
             }
             (Val::Record(xs), Val::Record(ys)) => {
-                if xs.len() != ys.len() || xs.iter().zip(ys).any(|((nx, _), (ny, _))| nx != ny) {
+                if xs.len() != ys.len() {
                     return None;
                 }
-                xs.iter()
-                    .zip(ys)
-                    .try_fold(true, |all_equal, ((_, x), (_, y))| {
-                        x.eq(y).map(|equal| all_equal & equal)
-                    })
+                xs.iter().try_fold(true, |all_equal, (name, x)| {
+                    let (_, y) = ys.iter().find(|(n, _)| n == name)?;
+                    x.eq(y).map(|equal| all_equal & equal)
+                })
             }
             (Val::Ref { .. }, _) | (_, Val::Ref { .. }) => None,
             _ => None,
@@ -299,6 +298,8 @@ impl fmt::Display for Val {
 
 #[cfg(test)]
 mod tests {
+    use crate::eval::harness::{int, rec};
+
     use super::*;
     use rust_decimal::dec;
 
@@ -357,6 +358,37 @@ mod tests {
         assert_eq!(at(123_456_000), "2023-11-14T22:13:20.123456Z");
         assert_eq!(at(123_456_789), "2023-11-14T22:13:20.123456789Z");
         assert_eq!(at(1), "2023-11-14T22:13:20.000000001Z");
+    }
+
+    #[test]
+    fn record_eq_order_independent() {
+        assert_eq!(
+            rec(vec![("b", int(2)), ("a", int(1))]).eq(&rec(vec![("a", int(1)), ("b", int(2))])),
+            Some(true)
+        );
+        assert_eq!(
+            rec(vec![("b", int(2)), ("a", int(1))]).eq(&rec(vec![("a", int(9)), ("b", int(2))])),
+            Some(false)
+        );
+        assert_eq!(
+            rec(vec![("b", int(2)), ("a", int(1))]).eq(&rec(vec![("a", int(1)), ("c", int(2))])),
+            None
+        );
+        assert_eq!(
+            rec(vec![("a", int(1))]).eq(&rec(vec![("a", int(1)), ("b", int(2))])),
+            None
+        );
+        assert_eq!(
+            rec(vec![
+                ("outer", rec(vec![("y", int(2)), ("x", int(1))])),
+                ("z", int(3))
+            ])
+            .eq(&rec(vec![
+                ("z", int(3)),
+                ("outer", rec(vec![("x", int(1)), ("y", int(2))]))
+            ])),
+            Some(true)
+        );
     }
 
     #[test]
