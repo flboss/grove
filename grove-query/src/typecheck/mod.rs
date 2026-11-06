@@ -1271,11 +1271,14 @@ fn method_signature(base: &QueryType, method: &str) -> Option<MethodSig> {
                 QueryType::List(inner.clone()),
                 QueryType::Scalar(Int),
             )),
-            "sum_over" | "avg_over" => Some(MethodSig::scoped_fixed(
+            "sum_over" => Some(MethodSig::scoped_fixed(
                 QueryType::Unknown,
                 1,
                 QueryType::is_summable,
             )),
+            "avg_over" => Some(MethodSig::scoped_fixed(QueryType::Unknown, 1, |ty| {
+                ty.is_summable() || matches!(ty, QueryType::Scalar(ScalarType::Instant))
+            })),
             "max_by" | "min_by" => Some(MethodSig::scoped_fixed(
                 inner.clone().wrap_optional(),
                 1,
