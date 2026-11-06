@@ -1414,17 +1414,17 @@ mod tests {
 
     #[test]
     fn eval_literals() {
-        assert_eq!(run_src("42"), Ok(Val::Scalar(Scalar::Int(42))));
-        assert_eq!(run_src("1.5f"), Ok(Val::Scalar(Scalar::Float(1.5))));
-        assert_eq!(run_src("30.00"), Ok(Val::Scalar(Scalar::Dec(dec!(30.00)))));
+        assert_eq!(run_src("42"), Ok(int(42)));
+        assert_eq!(run_src("1.5f"), Ok(float(1.5)));
+        assert_eq!(run_src("30.00"), Ok(dec(dec!(30.00))));
         assert_eq!(
             run_src("\"hi\""),
-            Ok(Val::Scalar(Scalar::String("hi".to_string())))
+            Ok(str("hi"))
         );
-        assert_eq!(run_src("true"), Ok(Val::Scalar(Scalar::Bool(true))));
+        assert_eq!(run_src("true"), Ok(bool(true)));
         assert_eq!(
             run_src("some(1)"),
-            Ok(Val::Some(Box::new(Val::Scalar(Scalar::Int(1))))),
+            Ok(Val::Some(Box::new(int(1)))),
         );
     }
 
@@ -1459,18 +1459,18 @@ mod tests {
 
     #[test]
     fn eval_type_constants() {
-        assert_eq!(run_src("Int::MIN"), Ok(Val::Scalar(Scalar::Int(i64::MIN))));
+        assert_eq!(run_src("Int::MIN"), Ok(int(i64::MIN)));
         assert_eq!(
             run_src("Float::MAX"),
-            Ok(Val::Scalar(Scalar::Float(f64::MAX)))
+            Ok(float(f64::MAX))
         );
         assert_eq!(
             run_src("Dec::MIN"),
-            Ok(Val::Scalar(Scalar::Dec(Decimal::MIN)))
+            Ok(dec(Decimal::MIN))
         );
         assert_eq!(
             run_src("Dec::MAX"),
-            Ok(Val::Scalar(Scalar::Dec(Decimal::MAX)))
+            Ok(dec(Decimal::MAX))
         );
     }
 
@@ -1561,40 +1561,17 @@ mod tests {
 
     #[test]
     fn eval_dec_arithmetic() {
-        assert_eq!(
-            run_src("1.5 + 2.5"),
-            Ok(Val::Scalar(Scalar::Dec(dec!(4.0))))
-        );
-        assert_eq!(
-            run_src("5.00 / 2.0"),
-            Ok(Val::Scalar(Scalar::Dec(dec!(2.5))))
-        );
+        assert_eq!(run_src("1.5 + 2.5"), Ok(dec(dec!(4.0))));
+        assert_eq!(run_src("5.00 / 2.0"), Ok(dec(dec!(2.5))));
         assert_eq!(
             run_src("1.0 / 3.0"),
-            Ok(Val::Scalar(Scalar::Dec(dec!(
-                0.3333333333333333333333333333
-            ))))
+            Ok(dec(dec!(0.3333333333333333333333333333)))
         );
-        assert_eq!(
-            run_src("1.10 + 2.20"),
-            Ok(Val::Scalar(Scalar::Dec(dec!(3.3))))
-        );
-        assert_eq!(
-            run_src("-7.0 % 3.0"),
-            Ok(Val::Scalar(Scalar::Dec(dec!(-1))))
-        );
-        assert_eq!(
-            run_src("-7.0 mod 3.0"),
-            Ok(Val::Scalar(Scalar::Dec(dec!(2))))
-        );
-        assert_eq!(
-            run_src("7.0 mod -3.0"),
-            Ok(Val::Scalar(Scalar::Dec(dec!(1))))
-        );
-        assert_eq!(
-            run_src("-7.0 mod -3.0"),
-            Ok(Val::Scalar(Scalar::Dec(dec!(2))))
-        );
+        assert_eq!(run_src("1.10 + 2.20"), Ok(dec(dec!(3.3))));
+        assert_eq!(run_src("-7.0 % 3.0"), Ok(dec(dec!(-1))));
+        assert_eq!(run_src("-7.0 mod 3.0"), Ok(dec(dec!(2))));
+        assert_eq!(run_src("7.0 mod -3.0"), Ok(dec(dec!(1))));
+        assert_eq!(run_src("-7.0 mod -3.0"), Ok(dec(dec!(2))));
     }
 
     #[test]
@@ -1619,15 +1596,15 @@ mod tests {
         let sat = r#"config { dec_arithmetic = "saturating" }"#;
         assert_eq!(
             run_src_config("Dec::MAX + 1.0", sat),
-            Ok(Val::Scalar(Scalar::Dec(Decimal::MAX)))
+            Ok(dec(Decimal::MAX))
         );
         assert_eq!(
             run_src_config("Dec::MIN - 1.0", sat),
-            Ok(Val::Scalar(Scalar::Dec(Decimal::MIN)))
+            Ok(dec(Decimal::MIN))
         );
         assert_eq!(
             run_src_config("Dec::MAX * 10.0", sat),
-            Ok(Val::Scalar(Scalar::Dec(Decimal::MAX)))
+            Ok(dec(Decimal::MAX))
         );
         assert!(
             run_src_config("1.0 / 0.0", sat)
@@ -1657,10 +1634,7 @@ mod tests {
                 FIXED_NOW.signed_duration_since(DateTime::from_timestamp(1792454400, 0).unwrap())
             )))
         );
-        assert_eq!(
-            run_src("#75s / #30s"),
-            Ok(Val::Scalar(Scalar::Dec(dec!(2.5))))
-        );
+        assert_eq!(run_src("#75s / #30s"), Ok(dec(dec!(2.5))));
         assert_eq!(
             run_src("-#90s % #7s"),
             Ok(Val::Scalar(Scalar::Duration(TimeDelta::seconds(-6))))
@@ -1857,14 +1831,14 @@ mod tests {
     fn eval_casts() {
         for (src, expected) in [
             ("5 as Float", float(5.0)),
-            ("5 as Dec", Val::Scalar(Scalar::Dec(dec!(5)))),
+            ("5 as Dec", dec(dec!(5))),
             ("5 as Int", int(5)),
             ("1.9f as Int", int(1)),
             ("-1.9f as Int", int(-1)),
             ("1e300f as Int", int(i64::MAX)),
             ("(-1e300f) as Int", int(i64::MIN)),
-            ("1.5f as Dec", Val::Scalar(Scalar::Dec(dec!(1.5)))),
-            ("1e300f as Dec", Val::Scalar(Scalar::Dec(Decimal::MAX))),
+            ("1.5f as Dec", dec(dec!(1.5))),
+            ("1e300f as Dec", dec(Decimal::MAX)),
             ("5.9 as Int", int(5)),
             ("-5.9 as Int", int(-5)),
             ("30.00 as Int", int(30)),
@@ -2508,20 +2482,14 @@ mod tests {
             ("@2026-10-25.weekday()", int(0)),
             ("@2026-10-20_14:30:45.hour()", int(14)),
             ("@2026-10-20_14:30:45.minute()", int(30)),
-            (
-                "@2026-10-20_14:30:45.second()",
-                Val::Scalar(Scalar::Dec(dec!(45))),
-            ),
+            ("@2026-10-20_14:30:45.second()", dec(dec!(45))),
             (
                 "@2026-10-20_14:30:45.123456789.second()",
-                Val::Scalar(Scalar::Dec(dec!(45.123456789))),
+                dec(dec!(45.123456789)),
             ),
-            ("@1970-01-01.epoch()", Val::Scalar(Scalar::Dec(dec!(0)))),
-            ("@1970-01-02.epoch()", Val::Scalar(Scalar::Dec(dec!(86400)))),
-            (
-                "@1970-01-01_00:00:01.5.epoch()",
-                Val::Scalar(Scalar::Dec(dec!(1.5))),
-            ),
+            ("@1970-01-01.epoch()", dec(dec!(0))),
+            ("@1970-01-02.epoch()", dec(dec!(86400))),
+            ("@1970-01-01_00:00:01.5.epoch()", dec(dec!(1.5))),
             (
                 "@2026-10-20_14:30:45.to_rfc3339()",
                 str("2026-10-20T14:30:45Z"),
@@ -2538,13 +2506,13 @@ mod tests {
     #[test]
     fn eval_duration_methods() {
         for (src, expected) in [
-            ("#90s.as_seconds()", Val::Scalar(Scalar::Dec(dec!(90)))),
-            ("#1.5s.as_seconds()", Val::Scalar(Scalar::Dec(dec!(1.5)))),
-            ("(-#90s).as_seconds()", Val::Scalar(Scalar::Dec(dec!(-90)))),
-            ("#3600s.as_minutes()", Val::Scalar(Scalar::Dec(dec!(60)))),
-            ("#3600s.as_hours()", Val::Scalar(Scalar::Dec(dec!(1)))),
-            ("#86400s.as_days()", Val::Scalar(Scalar::Dec(dec!(1)))),
-            ("#90s.as_hours()", Val::Scalar(Scalar::Dec(dec!(0.025)))),
+            ("#90s.as_seconds()", dec(dec!(90))),
+            ("#1.5s.as_seconds()", dec(dec!(1.5))),
+            ("(-#90s).as_seconds()", dec(dec!(-90))),
+            ("#3600s.as_minutes()", dec(dec!(60))),
+            ("#3600s.as_hours()", dec(dec!(1))),
+            ("#86400s.as_days()", dec(dec!(1))),
+            ("#90s.as_hours()", dec(dec!(0.025))),
         ] {
             assert_eq!(run_src(src), Ok(expected), "{src}");
         }
@@ -2560,12 +2528,12 @@ mod tests {
     #[test]
     fn eval_dec_methods() {
         for (src, expected) in [
-            ("2.5.round_dp(0)", Val::Scalar(Scalar::Dec(dec!(2)))),
-            ("3.5.round_dp(0)", Val::Scalar(Scalar::Dec(dec!(4)))),
-            ("2.675.round_dp(2)", Val::Scalar(Scalar::Dec(dec!(2.68)))),
-            ("2.665.round_dp(2)", Val::Scalar(Scalar::Dec(dec!(2.66)))),
-            ("2.567.round_dp(2)", Val::Scalar(Scalar::Dec(dec!(2.57)))),
-            ("1.5.round_dp(100)", Val::Scalar(Scalar::Dec(dec!(1.5)))),
+            ("2.5.round_dp(0)", dec(dec!(2))),
+            ("3.5.round_dp(0)", dec(dec!(4))),
+            ("2.675.round_dp(2)", dec(dec!(2.68))),
+            ("2.665.round_dp(2)", dec(dec!(2.66))),
+            ("2.567.round_dp(2)", dec(dec!(2.57))),
+            ("1.5.round_dp(100)", dec(dec!(1.5))),
             ("30.00.to_string()", str("30.0")),
             ("2.5.to_string()", str("2.5")),
             ("(123456789 as Dec).to_string()", str("123456789.0")),

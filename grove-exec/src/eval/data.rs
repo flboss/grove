@@ -613,11 +613,7 @@ mod tests {
             link.to_string(),
             format!("ref({}:{})", user_struct.index(), manager_field.local())
         );
-        assert_eq!(
-            link.eq(&Val::Scalar(Scalar::Int(1))),
-            None,
-            "Ref equality is unknown, not false"
-        );
+        assert_eq!(link.eq(&int(1)), None);
         assert_eq!(link.eq(&link.clone()), None);
     }
 

@@ -312,6 +312,10 @@ pub(crate) mod harness {
         Val::Scalar(crate::value::Scalar::Float(x))
     }
 
+    pub(crate) fn dec(x: rust_decimal::Decimal) -> Val {
+        Val::Scalar(crate::value::Scalar::Dec(x))
+    }
+
     pub(crate) fn str(s: &str) -> Val {
         Val::Scalar(crate::value::Scalar::String(s.to_string()))
     }
@@ -338,10 +342,11 @@ pub(crate) mod harness {
 mod tests {
     use super::harness::*;
     use super::{Env, EvalCtx, eval};
-    use crate::value::{Scalar, Val};
+    use crate::value::Val;
     use grove_query::typecheck::types::{IdentBinding, QueryType, TypedExpr, TypedExprKind};
     use grove_schema::validated::{ScalarType, ValidatedSchema};
     use grove_types::{Span, Spanned};
+    use rust_decimal::dec;
     use std::sync::Arc;
 
     #[test]
@@ -364,10 +369,7 @@ mod tests {
             run_src("(10, 5, 7, 15, 8, 13, 3, 2, 14, 4, 16, 1, 9, 6, 11, (1,2,3,4)).15.3"),
             Ok(int(4))
         );
-        assert_eq!(
-            run_src("(1.5, -2.5).0"),
-            Ok(Val::Scalar(Scalar::Dec(rust_decimal::dec!(1.5))))
-        );
+        assert_eq!(run_src("(1.5, -2.5).0"), Ok(dec(dec!(1.5))),);
         assert_eq!(run_src("[(\"a\", 1)].first()?.0"), Ok(some(str("a"))));
         assert_eq!(run_src("[(\"a\", 1)].skip(5).first()?.1"), Ok(Val::None));
         match run_seeded("users { x = pos.0 }") {
@@ -476,10 +478,7 @@ mod tests {
     #[test]
     fn eval_env_depth_collections() {
         let mut env = Env::new();
-        env.define(
-            Arc::from("xs"),
-            Val::List(vec![Val::Scalar(Scalar::Int(1)), Val::None]),
-        );
+        env.define(Arc::from("xs"), Val::List(vec![int(1), Val::None]));
         let schema = ValidatedSchema::default();
         let mut ctx = EvalCtx::new(env, FIXED_NOW, &NoStorage, &schema);
         let span = Span::new(0, 0);
@@ -500,7 +499,7 @@ mod tests {
         };
         assert_eq!(
             eval(&expr, &mut ctx),
-            Ok(Val::List(vec![Val::Scalar(Scalar::Int(1)), Val::None]))
+            Ok(Val::List(vec![int(1), Val::None]))
         );
     }
 
