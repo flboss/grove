@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::rc::Rc;
 
 use grove_query::typecheck::types::TypedExpr;
 use grove_schema::validated::{Field, FieldId, StructId, ValidatedSchema};
@@ -306,7 +306,7 @@ pub(crate) fn resolve_base_link(ctx: &mut EvalCtx, base: Val) -> Result<Val, Exe
 }
 
 fn record_field(
-    fields: impl IntoIterator<Item = (Arc<str>, Val)>,
+    fields: impl IntoIterator<Item = (Rc<str>, Val)>,
     name: &str,
 ) -> Result<Val, ExecError> {
     fields

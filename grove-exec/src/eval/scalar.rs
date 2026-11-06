@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
+use std::rc::Rc;
 
 use chrono::{DateTime, Datelike, NaiveTime, SecondsFormat, TimeDelta, Timelike, Utc};
 use grove_query::ast::{BinaryOp, ConstantName, Literal, SortDir, TypeName, UnaryOp};
@@ -1030,7 +1030,7 @@ fn eval_sort_key(
 /// Push a record-fields or `$` element scope;
 /// returns whether generic `$`-element was bound
 fn push_element_scope(ctx: &mut EvalCtx<'_>, item: &Val) -> bool {
-    let (scope, map_element): (HashMap<Arc<str>, Val>, _) = match item {
+    let (scope, map_element): (HashMap<Rc<str>, Val>, _) = match item {
         Val::Record(record) => (
             record
                 .iter()
@@ -1120,7 +1120,7 @@ fn eval_filter(
 /// Push a `$`-element scope
 fn push_map_scope(ctx: &mut EvalCtx<'_>, item: Val) {
     ctx.env.element_depth += 1;
-    let scope: HashMap<Arc<str>, Val> =
+    let scope: HashMap<Rc<str>, Val> =
         [(ctx.interner.intern("$".repeat(ctx.env.element_depth)), item)].into();
     ctx.env.push_scope(scope);
 }

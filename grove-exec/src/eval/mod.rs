@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::rc::Rc;
 
 use chrono::{DateTime, Utc};
 use grove_query::typecheck::types::{
@@ -22,7 +22,7 @@ use scalar::{eval_binary, eval_cast, eval_method, eval_unary};
 /// Lexical value scope chain
 #[derive(Debug, Default)]
 pub struct Env {
-    scopes: Vec<HashMap<Arc<str>, Val>>,
+    scopes: Vec<HashMap<Rc<str>, Val>>,
     pub(crate) element_depth: usize,
 }
 
@@ -34,7 +34,7 @@ impl Env {
         }
     }
 
-    pub fn define(&mut self, name: Arc<str>, value: Val) {
+    pub fn define(&mut self, name: Rc<str>, value: Val) {
         self.scopes
             .last_mut()
             .expect("env always has a scope")
@@ -46,7 +46,7 @@ impl Env {
         self.scopes.iter().rev().nth(depth)?.get(name)
     }
 
-    pub(crate) fn push_scope(&mut self, scope: HashMap<Arc<str>, Val>) {
+    pub(crate) fn push_scope(&mut self, scope: HashMap<Rc<str>, Val>) {
         self.scopes.push(scope);
     }
 
@@ -328,7 +328,7 @@ pub(crate) mod harness {
         Val::Record(
             fields
                 .into_iter()
-                .map(|(name, value)| (std::sync::Arc::from(name), value))
+                .map(|(name, value)| (Rc::from(name), value))
                 .collect(),
         )
     }
@@ -347,7 +347,7 @@ mod tests {
     use grove_schema::validated::{ScalarType, ValidatedSchema};
     use grove_types::{Span, Spanned};
     use rust_decimal::dec;
-    use std::sync::Arc;
+    use std::rc::Rc;
 
     #[test]
     fn eval_let_binding() {
@@ -478,7 +478,7 @@ mod tests {
     #[test]
     fn eval_env_depth_collections() {
         let mut env = Env::new();
-        env.define(Arc::from("xs"), Val::List(vec![int(1), Val::None]));
+        env.define(Rc::from("xs"), Val::List(vec![int(1), Val::None]));
         let schema = ValidatedSchema::default();
         let mut ctx = EvalCtx::new(env, FIXED_NOW, &NoStorage, &schema);
         let span = Span::new(0, 0);

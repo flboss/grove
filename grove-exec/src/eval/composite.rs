@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::rc::Rc;
 
 use grove_query::typecheck::types::{TypedExpr, TypedProjectionItem};
 use grove_types::Spanned;
@@ -72,7 +72,7 @@ pub(crate) fn eval_projection(
 }
 
 fn project_record(
-    record: impl IntoIterator<Item = (Arc<str>, Val)>,
+    record: impl IntoIterator<Item = (Rc<str>, Val)>,
     items: &[TypedProjectionItem],
     ctx: &mut EvalCtx<'_>,
 ) -> Result<Val, ExecError> {

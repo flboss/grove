@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fmt::{self, Write};
-use std::sync::Arc;
+use std::rc::Rc;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use grove_schema::validated::FieldId;
@@ -45,7 +45,7 @@ pub enum Val {
     Scalar(Scalar),
     List(Vec<Val>),
     Tuple(Vec<Val>),
-    Record(Vec<(Arc<str>, Val)>),
+    Record(Vec<(Rc<str>, Val)>),
     /// Unresolved navigation link of the `parent` row
     Ref {
         field: FieldId,
@@ -162,17 +162,17 @@ impl Scalar {
 /// Field-name interner owned by the executor
 #[derive(Debug, Default)]
 pub struct Interner {
-    names: HashSet<Arc<str>>,
+    names: HashSet<Rc<str>>,
 }
 
 impl Interner {
-    pub fn intern<'a>(&mut self, name: impl Into<Cow<'a, str>>) -> Arc<str> {
+    pub fn intern<'a>(&mut self, name: impl Into<Cow<'a, str>>) -> Rc<str> {
         let name = name.into();
         if let Some(existing) = self.names.get(name.as_ref()) {
-            return Arc::clone(existing);
+            return Rc::clone(existing);
         }
-        let arc: Arc<str> = Arc::from(name.into_owned());
-        self.names.insert(Arc::clone(&arc));
+        let arc: Rc<str> = Rc::from(name.into_owned());
+        self.names.insert(Rc::clone(&arc));
         arc
     }
 
@@ -396,8 +396,8 @@ mod tests {
         let mut interner = Interner::default();
         let x = interner.intern("x");
         let y = interner.intern("y");
-        assert!(Arc::ptr_eq(&x, &interner.intern("x")));
-        assert!(!Arc::ptr_eq(&x, &y));
+        assert!(Rc::ptr_eq(&x, &interner.intern("x")));
+        assert!(!Rc::ptr_eq(&x, &y));
         assert_eq!(interner.len(), 2);
         let list = Val::List(vec![Val::Scalar(Scalar::Int(1)), Val::None]);
         assert_eq!(list.to_string(), "[1, none]");
