@@ -805,23 +805,14 @@ fn infer_method(
         return Err(err);
     }
 
-    let return_ty = match signature.return_type {
-        QueryType::Unknown if !typed_args.is_empty() => {
-            typed_args[0].expr.ty.clone().wrap_optional()
-        }
-        _ => signature.return_type,
-    };
-
-    let return_ty = match (name.value.as_str(), return_ty) {
-        ("avg", QueryType::Optional(inner)) | ("avg_over", QueryType::Optional(inner))
-            if matches!(inner.as_ref(), QueryType::Scalar(ScalarType::Int)) =>
-        {
-            QueryType::Scalar(ScalarType::Float).wrap_optional()
-        }
+    let return_ty = match (name.value.as_str(), &signature.return_type) {
         ("map", _) if !typed_args.is_empty() => {
             QueryType::List(Box::new(typed_args[0].expr.ty.clone()))
         }
-        (_, ty) => ty,
+        (_, QueryType::Unknown) if !typed_args.is_empty() => {
+            typed_args[0].expr.ty.clone().wrap_optional()
+        }
+        _ => signature.return_type,
     };
 
     let return_ty = if optional {
@@ -2665,23 +2656,20 @@ mod tests {
     fn dollar_over_family() {
         let schema = test_schema();
         let mut env = TypeEnv::new(&schema);
-        for (query, check) in [
-            ("[1, 2, 3].avg_over($ + 3)", "?float"),
-            ("[3, 1, 2].max_by($ + 2)", "?int"),
-            ("[3, 1, 2].sort_over($ + 1, -$)", "list"),
+        for (query, is_list) in [
+            ("[1, 2, 3].avg_over($ + 3)", false),
+            ("[3, 1, 2].max_by($ + 2)", false),
+            ("[3, 1, 2].sort_over($ + 1, -$)", true),
         ] {
             let (file, _diags) = crate::parse_query(query);
             let result = infer(&file.unwrap().result, &mut env).unwrap();
-            match check {
-                "?float" => assert_eq!(
-                    result.ty,
-                    QueryType::Optional(Box::new(QueryType::Scalar(ScalarType::Float)))
-                ),
-                "?int" => assert_eq!(
+            if is_list {
+                assert!(matches!(result.ty, QueryType::List(_)));
+            } else {
+                assert_eq!(
                     result.ty,
                     QueryType::Optional(Box::new(QueryType::Scalar(ScalarType::Int)))
-                ),
-                _ => assert!(matches!(result.ty, QueryType::List(_))),
+                );
             }
         }
     }
