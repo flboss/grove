@@ -689,17 +689,17 @@ fn eval_slice(
     args: &[Val],
     span: Span,
 ) -> Result<Val, ExecError> {
-    let (mut items, wrap) = match (optional, base) {
+    let mut items = match (optional, base) {
         (true, Val::None) => return Ok(Val::None),
         (true, Val::Some(v)) => match *v {
-            Val::List(items) => (items, true),
+            Val::List(items) => items,
             other => {
                 return Err(ExecError::Integrity {
                     message: format!("`?.{name}()` on non-list value: {other} (internal error)"),
                 });
             }
         },
-        (_, Val::List(items)) => (items, optional),
+        (_, Val::List(items)) => items,
         (_, other) => {
             return Err(ExecError::Integrity {
                 message: format!("`{name}()` on non-list value: {other} (internal error)"),
@@ -759,7 +759,7 @@ fn eval_slice(
             });
         }
     };
-    Ok(if wrap {
+    Ok(if optional {
         Val::Some(Box::new(result))
     } else {
         result
@@ -795,17 +795,17 @@ fn eval_list_len(base: Val, optional: bool) -> Result<Val, ExecError> {
 
 /// List membership by element equality
 fn eval_list_contains(base: Val, optional: bool, needle: &Val) -> Result<Val, ExecError> {
-    let (items, wrap) = match (optional, base) {
+    let items = match (optional, base) {
         (true, Val::None) => return Ok(Val::None),
         (true, Val::Some(v)) => match *v {
-            Val::List(items) => (items, true),
+            Val::List(items) => items,
             other => {
                 return Err(ExecError::Integrity {
                     message: format!("`?.contains()` on non-list value: {other} (internal error)"),
                 });
             }
         },
-        (_, Val::List(items)) => (items, optional),
+        (_, Val::List(items)) => items,
         (_, other) => {
             return Err(ExecError::Integrity {
                 message: format!("`.contains()` on non-list value: {other} (internal error)"),
@@ -814,7 +814,7 @@ fn eval_list_contains(base: Val, optional: bool, needle: &Val) -> Result<Val, Ex
     };
     let found = items.iter().any(|item| item.eq(needle) == Some(true));
     let result = Val::Scalar(Scalar::Bool(found));
-    Ok(if wrap {
+    Ok(if optional {
         Val::Some(Box::new(result))
     } else {
         result
@@ -876,10 +876,10 @@ fn eval_sort(
     ctx: &mut EvalCtx<'_>,
     span: Span,
 ) -> Result<Val, ExecError> {
-    let (mut items, wrap) = match (optional, base) {
+    let mut items = match (optional, base) {
         (true, Val::None) => return Ok(Val::None),
         (true, Val::Some(v)) => match *v {
-            Val::List(items) => (items, true),
+            Val::List(items) => items,
             other => {
                 return Err(ExecError::Integrity {
                     message: format!(
@@ -888,7 +888,7 @@ fn eval_sort(
                 });
             }
         },
-        (_, Val::List(items)) => (items, optional),
+        (_, Val::List(items)) => items,
         (_, other) => {
             return Err(ExecError::Integrity {
                 message: format!("`{kind}()` called on non-list value: {other} (internal error)"),
@@ -905,7 +905,7 @@ fn eval_sort(
         sort_keyless(&mut items, kind, span)?;
     }
     let sorted = Val::List(items);
-    Ok(if wrap {
+    Ok(if optional {
         Val::Some(Box::new(sorted))
     } else {
         sorted
@@ -1062,10 +1062,10 @@ fn eval_filter(
     args: &[TypedMethodArg],
     ctx: &mut EvalCtx<'_>,
 ) -> Result<Val, ExecError> {
-    let (items, wrap) = match (optional, base) {
+    let items = match (optional, base) {
         (true, Val::None) => return Ok(Val::None),
         (true, Val::Some(v)) => match *v {
-            Val::List(items) => (items, true),
+            Val::List(items) => items,
             other => {
                 return Err(ExecError::Integrity {
                     message: format!(
@@ -1074,7 +1074,7 @@ fn eval_filter(
                 });
             }
         },
-        (_, Val::List(items)) => (items, optional),
+        (_, Val::List(items)) => items,
         (_, other) => {
             return Err(ExecError::Integrity {
                 message: format!("`filter()` called on non-list value: {other} (internal error)"),
@@ -1104,7 +1104,7 @@ fn eval_filter(
         }
     }
     let filtered = Val::List(kept);
-    Ok(if wrap {
+    Ok(if optional {
         Val::Some(Box::new(filtered))
     } else {
         filtered
@@ -1131,10 +1131,10 @@ fn eval_map(
     args: &[TypedMethodArg],
     ctx: &mut EvalCtx<'_>,
 ) -> Result<Val, ExecError> {
-    let (items, wrap) = match (optional, base) {
+    let items = match (optional, base) {
         (true, Val::None) => return Ok(Val::None),
         (true, Val::Some(v)) => match *v {
-            Val::List(items) => (items, true),
+            Val::List(items) => items,
             other => {
                 return Err(ExecError::Integrity {
                     message: format!(
@@ -1143,7 +1143,7 @@ fn eval_map(
                 });
             }
         },
-        (_, Val::List(items)) => (items, optional),
+        (_, Val::List(items)) => items,
         (_, other) => {
             return Err(ExecError::Integrity {
                 message: format!("`map()` called on non-list value: {other} (internal error)"),
@@ -1163,7 +1163,7 @@ fn eval_map(
         mapped.push(value?);
     }
     let mapped = Val::List(mapped);
-    Ok(if wrap {
+    Ok(if optional {
         Val::Some(Box::new(mapped))
     } else {
         mapped
