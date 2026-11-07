@@ -11,13 +11,18 @@ use crate::error::ExecError;
 use crate::storage::Storage;
 use crate::value::{Interner, Scalar, Val};
 
+mod arithmetic;
 pub mod composite;
 pub mod data;
-pub mod scalar;
+mod literals;
+mod methods;
+mod operators;
 
 use composite::{eval_array, eval_projection, eval_struct, eval_tuple};
 use data::{exec_field, exec_root, resolve_base_link};
-use scalar::{eval_binary, eval_cast, eval_method, eval_unary};
+use literals::{decode_literal, eval_type_constant};
+use methods::eval_method;
+use operators::{eval_binary, eval_cast, eval_unary};
 
 /// Lexical value scope chain
 #[derive(Debug, Default)]
@@ -85,7 +90,7 @@ impl<'a> EvalCtx<'a> {
 /// Evaluate an expression
 pub fn eval(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
     match &expr.kind {
-        TypedExprKind::Literal(lit) => Ok(scalar::decode_literal(lit, ctx.now)),
+        TypedExprKind::Literal(lit) => Ok(decode_literal(lit, ctx.now)),
         TypedExprKind::Ident {
             name,
             binding,
@@ -118,9 +123,7 @@ pub fn eval(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
             }
         }
         TypedExprKind::Some { value } => eval(value, ctx).map(|v| Val::Some(Box::new(v))),
-        TypedExprKind::TypeConstant { ty, name } => {
-            Ok(scalar::eval_type_constant(ty.value, name.value))
-        }
+        TypedExprKind::TypeConstant { ty, name } => Ok(eval_type_constant(ty.value, name.value)),
         TypedExprKind::If { arms, default } => {
             for (cond, value) in arms {
                 match eval(cond, ctx)? {
