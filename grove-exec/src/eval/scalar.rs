@@ -655,20 +655,14 @@ pub(crate) fn eval_method(
     if name == "flatten" {
         return eval_flatten(base, optional);
     }
+    if name == "extend" {
+        return eval_extend(base, optional, arg_vals);
+    }
     if matches!(name, "take" | "skip" | "first" | "nth") {
         return eval_slice(name, base, optional, &arg_vals, span);
     }
-    if name == "len" {
-        match &base {
-            Val::List(_) => return eval_list_len(base, optional),
-            // String::len falls through
-            Val::Scalar(_) => {}
-            _ => {
-                return Err(ExecError::Integrity {
-                    message: format!("`.len()` on unsupported value: {base} (internal error)"),
-                });
-            }
-        }
+    if name == "len" && matches!(base, Val::List(_)) {
+        return eval_list_len(base, optional);
     }
     if name == "contains" && matches!(&base, Val::List(_)) {
         let [needle] = arg_vals.as_slice() else {
@@ -1670,6 +1664,39 @@ fn eval_flatten(base: Val, optional: bool) -> Result<Val, ExecError> {
     })
 }
 
+/// Concatenate two compatible lists
+fn eval_extend(base: Val, optional: bool, mut args: Vec<Val>) -> Result<Val, ExecError> {
+    let mut items = match (optional, base) {
+        (true, Val::None) => return Ok(Val::None),
+        (true, Val::Some(v)) => match *v {
+            Val::List(items) => items,
+            other => {
+                return Err(ExecError::Integrity {
+                    message: format!("`?.extend()` on non-list value: {other} (internal error)"),
+                });
+            }
+        },
+        (_, Val::List(items)) => items,
+        (_, other) => {
+            return Err(ExecError::Integrity {
+                message: format!("`extend()` on non-list value: {other} (internal error)"),
+            });
+        }
+    };
+    let Some(Val::List(other)) = args.pop() else {
+        return Err(ExecError::Integrity {
+            message: "`extend()` expects one list argument (internal error)".to_string(),
+        });
+    };
+    items.extend(other);
+    let extended = Val::List(items);
+    Ok(if optional {
+        Val::Some(Box::new(extended))
+    } else {
+        extended
+    })
+}
+
 fn method_arg<'a>(args: &'a [Val], method: &str, index: usize) -> Result<&'a Val, ExecError> {
     args.get(index).ok_or_else(|| ExecError::Integrity {
         message: format!("missing argument {index} for `{method}` (internal error)"),
@@ -1868,6 +1895,23 @@ mod tests {
             }
             got => panic!("expected flat orders, got {got:?}"),
         }
+    }
+
+    #[test]
+    fn method_extend() {
+        assert_eq!(
+            run_src("[0, -2, 3].extend([4, -6])"),
+            Ok(Val::List(vec![int(0), int(-2), int(3), int(4), int(-6)])),
+        );
+        assert_eq!(run_src("[\"\"].skip(1).extend([])"), Ok(Val::List(vec![])),);
+        assert_eq!(
+            run_seeded("users.first()?.orders?.extend(users.nth(1)?.orders.unwrap_or([]))?.amount",),
+            Ok(some(Val::List(vec![int(100), int(200), int(400)]))),
+        );
+        assert_eq!(
+            run_seeded("users.extend(users).len() == users.len() * 2"),
+            Ok(bool(true)),
+        );
     }
 
     #[test]

@@ -1227,6 +1227,10 @@ fn method_signature(base: &QueryType, method: &str) -> Option<MethodSig> {
             "flatten" if matches!(inner.as_ref(), QueryType::List(_)) => {
                 Some(MethodSig::no_args(inner.as_ref().clone()))
             }
+            "extend" => Some(MethodSig::one_arg(
+                QueryType::List(inner.clone()),
+                QueryType::List(inner.clone()),
+            )),
             "contains" => Some(MethodSig::one_arg(
                 QueryType::Scalar(Bool),
                 inner.as_ref().clone(),
