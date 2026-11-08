@@ -9,7 +9,7 @@ use crate::value::{Scalar, Val};
 pub(crate) const MIDNIGHT: NaiveTime =
     NaiveTime::from_hms_opt(0, 0, 0).expect("midnight is a valid time");
 
-pub(super) fn decode_literal(lit: &Spanned<Literal>, now: DateTime<Utc>) -> Val {
+pub(crate) fn decode_literal(lit: &Spanned<Literal>, now: DateTime<Utc>) -> Val {
     match &lit.value {
         Literal::Int(n) => Val::Scalar(Scalar::Int(*n)),
         Literal::Float(x) => Val::Scalar(Scalar::Float(*x)),
@@ -28,7 +28,7 @@ pub(super) fn decode_literal(lit: &Spanned<Literal>, now: DateTime<Utc>) -> Val 
     }
 }
 
-pub(super) fn eval_type_constant(ty: TypeName, name: ConstantName) -> Val {
+pub(crate) fn eval_type_constant(ty: TypeName, name: ConstantName) -> Val {
     let scalar = match (ty, name) {
         (TypeName::Int, ConstantName::Min) => Scalar::Int(i64::MIN),
         (TypeName::Int, ConstantName::Max) => Scalar::Int(i64::MAX),

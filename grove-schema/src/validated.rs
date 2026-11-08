@@ -141,6 +141,13 @@ impl ValidatedSchema {
     pub fn column_name(&self, column_id: ColumnId) -> &str {
         &self.tables[column_id.table_id().index()].columns[column_id.local()].name
     }
+
+    pub fn field(&self, field: FieldId) -> Option<&Field> {
+        self.structs
+            .get(field.struct_id().index())?
+            .fields
+            .get(field.local())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

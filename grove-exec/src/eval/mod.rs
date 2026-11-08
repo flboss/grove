@@ -14,7 +14,7 @@ use crate::value::{Interner, Scalar, Val};
 mod arithmetic;
 pub mod composite;
 pub mod data;
-mod literals;
+pub(crate) mod literals;
 mod methods;
 mod operators;
 
