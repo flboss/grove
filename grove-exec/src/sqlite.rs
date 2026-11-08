@@ -12,6 +12,7 @@ use rusqlite::types::{Value, ValueRef};
 
 use crate::codec;
 use crate::error::ExecError;
+use crate::pushdown::FetchConstraints;
 use crate::storage::{Key, Row, Storage};
 use crate::value::{Scalar, Val};
 
@@ -786,7 +787,12 @@ impl SqliteBackend<'_> {
 }
 
 impl Storage for SqliteBackend<'_> {
-    fn fetch(&self, struct_id: StructId, fields: &[FieldId]) -> Result<Vec<Row>, ExecError> {
+    fn fetch(
+        &self,
+        struct_id: StructId,
+        fields: &[FieldId],
+        _constraints: &FetchConstraints,
+    ) -> Result<Vec<Row>, ExecError> {
         let struct_def =
             self.schema
                 .structs
@@ -821,7 +827,13 @@ impl Storage for SqliteBackend<'_> {
         fetch_from_first: bool,
         parents: &[Key],
         fields: &[FieldId],
+        _constraints: &FetchConstraints,
     ) -> Result<Vec<Vec<Row>>, ExecError> {
+        debug_assert_eq!(
+            _constraints,
+            &FetchConstraints::EMPTY,
+            "related fetch constraints are not yet implemented"
+        );
         let mut groups: Vec<Vec<Row>> = parents.iter().map(|_| Vec::new()).collect();
         if parents.is_empty() {
             return Ok(groups);
@@ -1058,7 +1070,7 @@ mod tests {
                 .unwrap();
             let backend = SqliteBackend::new(conn, &schema).unwrap();
             let sid = StructId::new(0);
-            backend.fetch(sid, &[FieldId::new(sid, 0)])
+            backend.fetch(sid, &[FieldId::new(sid, 0)], &FetchConstraints::EMPTY)
         }
         match fetch_null_float(false).unwrap()[0].values[0] {
             Val::Scalar(Scalar::Float(x)) => assert!(x.is_nan()),
@@ -1152,6 +1164,7 @@ mod tests {
                     user_field(&schema, sid, "elapsed"),
                     user_field(&schema, sid, "active"),
                 ],
+                &FetchConstraints::EMPTY,
             )
             .unwrap();
         assert_eq!(rows.len(), 5);
@@ -1198,6 +1211,7 @@ mod tests {
                     user_field(&schema, sid, "pos"),
                     user_field(&schema, sid, "home"),
                 ],
+                &FetchConstraints::EMPTY,
             )
             .unwrap();
         assert_eq!(rows.len(), 5);
@@ -1240,7 +1254,11 @@ mod tests {
             .unwrap();
         let sid = user_struct(&schema);
         let err = backend
-            .fetch(sid, &[user_field(&schema, sid, "home")])
+            .fetch(
+                sid,
+                &[user_field(&schema, sid, "home")],
+                &FetchConstraints::EMPTY,
+            )
             .unwrap_err();
         assert!(matches!(err, ExecError::Integrity { .. }), "{err:?}");
         assert!(err.to_string().contains("User.home"), "{err}");
@@ -1251,13 +1269,17 @@ mod tests {
         let schema = testdata::schema();
         let backend = test_backend(&schema);
         let sid = user_struct(&schema);
-        let rows = backend.fetch(sid, &[]).unwrap();
+        let rows = backend.fetch(sid, &[], &FetchConstraints::EMPTY).unwrap();
         assert_eq!(rows.len(), 5);
         assert!(rows[0].values.is_empty());
         assert_eq!(rows[4].rowid, Key(5));
         backend.conn.execute("DELETE FROM users", []).unwrap();
         let rows = backend
-            .fetch(sid, &[user_field(&schema, sid, "id")])
+            .fetch(
+                sid,
+                &[user_field(&schema, sid, "id")],
+                &FetchConstraints::EMPTY,
+            )
             .unwrap();
         assert!(rows.is_empty());
     }
@@ -1276,7 +1298,11 @@ mod tests {
             .unwrap();
         let sid = user_struct(&schema);
         let rows = backend
-            .fetch(sid, &[user_field(&schema, sid, "id")])
+            .fetch(
+                sid,
+                &[user_field(&schema, sid, "id")],
+                &FetchConstraints::EMPTY,
+            )
             .unwrap();
         assert_eq!(
             rows.iter().map(|r| r.rowid).collect::<Vec<_>>(),
@@ -1308,6 +1334,7 @@ mod tests {
                     user_field(&schema, sid, "scores"),
                     user_field(&schema, sid, "lucky"),
                 ],
+                &FetchConstraints::EMPTY,
             )
             .unwrap();
         assert_eq!(rows.len(), 5);
@@ -1396,7 +1423,11 @@ mod tests {
         conn.execute_batch("CREATE TABLE t(x INTEGER)").unwrap();
         let backend = SqliteBackend::new(conn, &schema).unwrap();
         let err = backend
-            .fetch(StructId::new(0), &[FieldId::new(StructId::new(0), 0)])
+            .fetch(
+                StructId::new(0),
+                &[FieldId::new(StructId::new(0), 0)],
+                &FetchConstraints::EMPTY,
+            )
             .unwrap_err();
         assert!(matches!(err, ExecError::Integrity { .. }), "{err:?}");
         assert!(err.to_string().contains("Ref field `S.r`"), "{err}");
@@ -1435,7 +1466,9 @@ mod tests {
         ] {
             backend.conn.execute_batch("DELETE FROM users").unwrap();
             backend.conn.execute_batch(setup).unwrap();
-            let err = backend.fetch(sid, &[field]).unwrap_err();
+            let err = backend
+                .fetch(sid, &[field], &FetchConstraints::EMPTY)
+                .unwrap_err();
             assert!(matches!(err, ExecError::Integrity { .. }), "{err:?}");
             assert!(err.to_string().contains(label), "{err}");
         }
@@ -1447,12 +1480,18 @@ mod tests {
         let backend = test_backend(&schema);
         let sid = user_struct(&schema);
         assert!(matches!(
-            backend.fetch(StructId::new(99), &[]).unwrap_err(),
+            backend
+                .fetch(StructId::new(99), &[], &FetchConstraints::EMPTY)
+                .unwrap_err(),
             ExecError::Integrity { .. }
         ));
         assert!(matches!(
             backend
-                .fetch(sid, &[FieldId::new(StructId::new(7), 0)])
+                .fetch(
+                    sid,
+                    &[FieldId::new(StructId::new(7), 0)],
+                    &FetchConstraints::EMPTY
+                )
                 .unwrap_err(),
             ExecError::Integrity { .. }
         ));
@@ -1590,7 +1629,11 @@ mod tests {
         let backend = test_backend(&schema);
         let sid = user_struct(&schema);
         let rows = backend
-            .fetch(sid, &[user_field(&schema, sid, "matrix")])
+            .fetch(
+                sid,
+                &[user_field(&schema, sid, "matrix")],
+                &FetchConstraints::EMPTY,
+            )
             .unwrap();
         assert_eq!(rows.len(), 5);
         assert_eq!(
@@ -1625,6 +1668,7 @@ mod tests {
                     user_field(&schema, sid, "id"),
                     user_field(&schema, sid, "deep_branches"),
                 ],
+                &FetchConstraints::EMPTY,
             )
             .unwrap();
         assert_eq!(rows.len(), 5);
@@ -1660,6 +1704,7 @@ mod tests {
                     user_field(&schema, sid, "id"),
                     user_field(&schema, sid, "extra"),
                 ],
+                &FetchConstraints::EMPTY,
             )
             .unwrap();
         assert_eq!(rows.len(), 5);
@@ -1700,6 +1745,7 @@ mod tests {
                     user_field(&schema, sid, "id"),
                     user_field(&schema, sid, "opt_extra"),
                 ],
+                &FetchConstraints::EMPTY,
             )
             .unwrap();
         assert_eq!(rows.len(), 5);
@@ -1751,7 +1797,13 @@ mod tests {
         let rel = rel_named(&schema, "Profile", "user", "User", "profile");
         let bio = testdata::field_id(&schema, profiles, "bio");
         let groups = backend
-            .fetch_related(rel, false, &[Key(1), Key(2), Key(3)], &[bio])
+            .fetch_related(
+                rel,
+                false,
+                &[Key(1), Key(2), Key(3)],
+                &[bio],
+                &FetchConstraints::EMPTY,
+            )
             .unwrap();
         assert_eq!(
             firsts(&groups),
@@ -1759,7 +1811,13 @@ mod tests {
         );
         let name = testdata::field_id(&schema, users, "name");
         let groups = backend
-            .fetch_related(rel, true, &[Key(1), Key(2)], &[name])
+            .fetch_related(
+                rel,
+                true,
+                &[Key(1), Key(2)],
+                &[name],
+                &FetchConstraints::EMPTY,
+            )
             .unwrap();
         assert_eq!(firsts(&groups), vec![vec![str("Ada")], vec![str("Cyd")]]);
     }
@@ -1773,7 +1831,13 @@ mod tests {
         let rel = rel_named(&schema, "Order", "user", "User", "orders");
         let name = testdata::field_id(&schema, users, "name");
         let groups = backend
-            .fetch_related(rel, true, &[Key(1), Key(2), Key(3), Key(4)], &[name])
+            .fetch_related(
+                rel,
+                true,
+                &[Key(1), Key(2), Key(3), Key(4)],
+                &[name],
+                &FetchConstraints::EMPTY,
+            )
             .unwrap();
         assert_eq!(
             firsts(&groups),
@@ -1781,7 +1845,13 @@ mod tests {
         );
         let amount = testdata::field_id(&schema, orders, "amount");
         let groups = backend
-            .fetch_related(rel, false, &[Key(1), Key(2), Key(3)], &[amount])
+            .fetch_related(
+                rel,
+                false,
+                &[Key(1), Key(2), Key(3)],
+                &[amount],
+                &FetchConstraints::EMPTY,
+            )
             .unwrap();
         assert_eq!(
             firsts(&groups),
@@ -1798,7 +1868,13 @@ mod tests {
         let rel = rel_named(&schema, "Image", "messages", "Message", "image");
         let body = testdata::field_id(&schema, messages, "body");
         let groups = backend
-            .fetch_related(rel, true, &[Key(1), Key(2)], &[body])
+            .fetch_related(
+                rel,
+                true,
+                &[Key(1), Key(2)],
+                &[body],
+                &FetchConstraints::EMPTY,
+            )
             .unwrap();
         assert_eq!(
             firsts(&groups),
@@ -1806,7 +1882,13 @@ mod tests {
         );
         let title = testdata::field_id(&schema, images, "title");
         let groups = backend
-            .fetch_related(rel, false, &[Key(1), Key(4)], &[title])
+            .fetch_related(
+                rel,
+                false,
+                &[Key(1), Key(4)],
+                &[title],
+                &FetchConstraints::EMPTY,
+            )
             .unwrap();
         assert_eq!(firsts(&groups), vec![vec![str("Sunset")], vec![]]);
     }
@@ -1820,7 +1902,13 @@ mod tests {
         let rel = rel_named(&schema, "Role", "users", "User", "roles");
         let rname = testdata::field_id(&schema, roles, "name");
         let groups = backend
-            .fetch_related(rel, false, &[Key(1), Key(3), Key(2)], &[rname])
+            .fetch_related(
+                rel,
+                false,
+                &[Key(1), Key(3), Key(2)],
+                &[rname],
+                &FetchConstraints::EMPTY,
+            )
             .unwrap();
         assert_eq!(
             firsts(&groups),
@@ -1836,7 +1924,13 @@ mod tests {
         );
         let uname = testdata::field_id(&schema, users, "name");
         let groups = backend
-            .fetch_related(rel, true, &[Key(2), Key(1)], &[uname])
+            .fetch_related(
+                rel,
+                true,
+                &[Key(2), Key(1)],
+                &[uname],
+                &FetchConstraints::EMPTY,
+            )
             .unwrap();
         assert_eq!(
             firsts(&groups),
@@ -1856,14 +1950,26 @@ mod tests {
         let rel = rel_named(&schema, "User", "manager", "User", "subordinates");
         let name = testdata::field_id(&schema, users, "name");
         let groups = backend
-            .fetch_related(rel, false, &[Key(2), Key(1)], &[name])
+            .fetch_related(
+                rel,
+                false,
+                &[Key(2), Key(1)],
+                &[name],
+                &FetchConstraints::EMPTY,
+            )
             .unwrap();
         assert_eq!(
             firsts(&groups),
             vec![vec![str("Ada"), str("Cyd")], vec![str("Dan")]]
         );
         let groups = backend
-            .fetch_related(rel, true, &[Key(1), Key(4), Key(2)], &[name])
+            .fetch_related(
+                rel,
+                true,
+                &[Key(1), Key(4), Key(2)],
+                &[name],
+                &FetchConstraints::EMPTY,
+            )
             .unwrap();
         assert_eq!(
             firsts(&groups),
@@ -1886,6 +1992,7 @@ mod tests {
                     testdata::field_id(&schema, profiles, "bio"),
                     testdata::field_id(&schema, profiles, "notes"),
                 ],
+                &FetchConstraints::EMPTY,
             )
             .unwrap();
         assert_eq!(groups.len(), 2);
@@ -1902,10 +2009,18 @@ mod tests {
         let backend = test_backend(&schema);
         let rel = rel_named(&schema, "Profile", "user", "User", "profile");
         // empty parents: no rows, fields arg irrelevant (never resolved)
-        let groups = backend.fetch_related(rel, true, &[], &[]).unwrap();
+        let groups = backend
+            .fetch_related(rel, true, &[], &[], &FetchConstraints::EMPTY)
+            .unwrap();
         assert!(groups.is_empty());
         let err = backend
-            .fetch_related(RelationId::new(99), true, &[Key(1)], &[])
+            .fetch_related(
+                RelationId::new(99),
+                true,
+                &[Key(1)],
+                &[],
+                &FetchConstraints::EMPTY,
+            )
             .unwrap_err();
         assert!(matches!(err, ExecError::Integrity { .. }), "{err:?}");
     }

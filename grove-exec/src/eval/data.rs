@@ -6,6 +6,7 @@ use grove_schema::validated::{Field, FieldId, StructId, ValidatedSchema};
 
 use crate::error::ExecError;
 use crate::eval::{EvalCtx, eval};
+use crate::pushdown::FetchConstraints;
 use crate::storage::{Key, Row};
 use crate::value::Val;
 
@@ -20,7 +21,9 @@ pub(crate) fn exec_root(ctx: &mut EvalCtx, root_idx: usize) -> Result<Val, ExecE
         })?;
     // TODO: field selection pushdown
     let fields = value_and_array_fields(ctx, root.struct_id);
-    let rows = ctx.storage.fetch(root.struct_id, &fields)?;
+    let rows = ctx
+        .storage
+        .fetch(root.struct_id, &fields, &FetchConstraints::EMPTY)?;
     materialize(ctx, root.struct_id, rows)
 }
 
@@ -60,9 +63,13 @@ fn resolve_field(
     let fetch_from_first = ctx.schema.relations[relation.index()].endpoints()[0] == field;
     // TODO: field selection pushdown
     let fields = value_and_array_fields(ctx, target);
-    let groups = ctx
-        .storage
-        .fetch_related(relation, fetch_from_first, parents, &fields)?;
+    let groups = ctx.storage.fetch_related(
+        relation,
+        fetch_from_first,
+        parents,
+        &fields,
+        &FetchConstraints::EMPTY,
+    )?;
     let mut resolved_pairs = Vec::with_capacity(parents.len());
     for (parent, group) in parents.iter().zip(groups) {
         // Recursion terminates: ownership chain ends at a root
@@ -775,6 +782,7 @@ mod tests {
             .fetch(
                 order_struct,
                 &[testdata::field_id(&schema, order_struct, "amount")],
+                &FetchConstraints::EMPTY,
             )
             .expect("fetch orders");
         assert_eq!(rows.len(), 4);
@@ -785,6 +793,7 @@ mod tests {
             true,
             &keys,
             &testdata_value_fields(&schema, user_struct),
+            &FetchConstraints::EMPTY,
         )
         .expect("fetch_related succeeds");
         assert_eq!(groups.len(), 4);

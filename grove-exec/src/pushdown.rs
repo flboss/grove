@@ -23,6 +23,15 @@ pub struct FetchConstraints {
     pub limit: Option<u64>,
 }
 
+impl FetchConstraints {
+    pub const EMPTY: FetchConstraints = FetchConstraints {
+        filters: Vec::new(),
+        sort: Vec::new(),
+        offset: 0,
+        limit: None,
+    };
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SortKey {
     pub field: FieldId,

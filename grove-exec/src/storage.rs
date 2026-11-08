@@ -1,6 +1,7 @@
 use grove_schema::validated::{FieldId, RelationId, StructId};
 
 use crate::error::ExecError;
+use crate::pushdown::FetchConstraints;
 use crate::value::Val;
 
 /// A decoded storage row
@@ -16,7 +17,12 @@ pub struct Key(pub i64);
 
 pub trait Storage {
     /// Read `fields` of every row of the struct's table
-    fn fetch(&self, struct_id: StructId, fields: &[FieldId]) -> Result<Vec<Row>, ExecError>;
+    fn fetch(
+        &self,
+        struct_id: StructId,
+        fields: &[FieldId],
+        constraints: &FetchConstraints,
+    ) -> Result<Vec<Row>, ExecError>;
 
     /// `fields` of rows on the other side of `rel`, grouped per requested rowid
     fn fetch_related(
@@ -25,6 +31,7 @@ pub trait Storage {
         fetch_from_first: bool,
         parents: &[Key],
         fields: &[FieldId],
+        constraints: &FetchConstraints,
     ) -> Result<Vec<Vec<Row>>, ExecError>;
 }
 
@@ -38,7 +45,12 @@ mod tests {
     }
 
     impl Storage for Stub {
-        fn fetch(&self, _struct_id: StructId, _fields: &[FieldId]) -> Result<Vec<Row>, ExecError> {
+        fn fetch(
+            &self,
+            _struct_id: StructId,
+            _fields: &[FieldId],
+            _constraints: &FetchConstraints,
+        ) -> Result<Vec<Row>, ExecError> {
             Ok(self.rows.clone())
         }
 
@@ -48,6 +60,7 @@ mod tests {
             _fetch_from_first: bool,
             parents: &[Key],
             _fields: &[FieldId],
+            _constraints: &FetchConstraints,
         ) -> Result<Vec<Vec<Row>>, ExecError> {
             Ok(parents
                 .iter()
@@ -85,7 +98,7 @@ mod tests {
         let backend = Stub { rows };
         let rel = RelationId::new(0);
         let groups = backend
-            .fetch_related(rel, true, &[Key(2), Key(9)], &[])
+            .fetch_related(rel, true, &[Key(2), Key(9)], &[], &FetchConstraints::EMPTY)
             .unwrap();
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].len(), 1);
