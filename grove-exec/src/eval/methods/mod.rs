@@ -67,7 +67,7 @@ pub(super) fn eval_method(
     if let Some(opt_kind) = OptMethodKind::from_str(name) {
         return eval_optional(opt_kind, base, optional, args, ctx, span);
     }
-    let arg_vals = args
+    let mut arg_vals = args
         .iter()
         .map(|arg| eval(&arg.expr, ctx))
         .collect::<Result<Vec<_>, _>>()?;
@@ -84,12 +84,12 @@ pub(super) fn eval_method(
         return eval_list_len(base, optional);
     }
     if name == "contains" && matches!(&base, Val::List(_)) {
-        let [needle] = arg_vals.as_slice() else {
+        let Some(needle) = arg_vals.pop() else {
             return Err(ExecError::Integrity {
                 message: "`contains()` expects one argument (internal error)".to_string(),
             });
         };
-        return eval_list_contains(base, optional, needle);
+        return eval_list_contains(ctx, base, optional, needle);
     }
     let scalar = eval_scalar_method(&base, name, &arg_vals, span)?;
     let value = Val::Scalar(scalar);

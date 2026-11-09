@@ -195,69 +195,10 @@ fn materialize(
         }
         items.push(Val::Record(record));
     }
-    resolve_owning(ctx, items)
-}
-
-type ResolvedLink = ((FieldId, Key), Val);
-
-/// Recursively resolve owning Refs
-fn resolve_owning(ctx: &mut EvalCtx, mut items: Vec<Val>) -> Result<Val, ExecError> {
-    let mut by_field: HashMap<FieldId, Vec<Key>> = HashMap::new();
-    let mut order: Vec<FieldId> = Vec::new();
-    items
-        .iter()
-        .try_for_each(|item| collect_owning(item, &mut by_field, &mut order, ctx.schema))?;
-    let resolved = batch_fetch(ctx, &by_field, &order)?;
-    items
-        .iter_mut()
-        .for_each(|item| splice_owning(item, &resolved));
     Ok(Val::List(items))
 }
 
-/// Gather parent rowids from top-level owning Ref fields
-fn collect_owning(
-    value: &Val,
-    by_field: &mut HashMap<FieldId, Vec<Key>>,
-    order: &mut Vec<FieldId>,
-    schema: &ValidatedSchema,
-) -> Result<(), ExecError> {
-    let Val::Record(record) = value else {
-        return Err(ExecError::Integrity {
-            message: "materialized value is not a record (internal error)".to_string(),
-        });
-    };
-    for (_, field_value) in record {
-        let Val::Ref { field, parent } = field_value else {
-            continue;
-        };
-        let owning = match &schema.structs[field.struct_id().index()].fields[field.local()] {
-            Field::Ref { owning, .. } => *owning,
-            Field::Value { name, .. } | Field::Array { name, .. } => {
-                return Err(ExecError::Integrity {
-                    message: format!("Ref link names a non-Ref field `{name}` (internal error)"),
-                });
-            }
-        };
-        if owning {
-            push_ref(by_field, order, *field, *parent);
-        }
-    }
-    Ok(())
-}
-
-/// Replace top-level owning Refs with resolved data
-fn splice_owning(value: &mut Val, resolved: &HashMap<(FieldId, Key), Val>) {
-    let Val::Record(record) = value else {
-        return;
-    };
-    for (_, field_value) in record {
-        if let Val::Ref { field, parent } = field_value
-            && let Some(resolved_value) = resolved.get(&(*field, *parent)).cloned()
-        {
-            *field_value = resolved_value
-        }
-    }
-}
+type ResolvedLink = ((FieldId, Key), Val);
 
 /// Determine whether a Ref field is owning
 fn is_owning_ref(schema: &ValidatedSchema, field: FieldId) -> Result<bool, ExecError> {
@@ -365,6 +306,24 @@ pub(crate) fn resolve_owning_values(
         for value in values.iter_mut() {
             splice_owning_refs(value, &resolved, filter, ctx.schema)?;
         }
+    }
+}
+
+/// Resolve an owning Ref value
+pub(crate) fn resolve_owning_ident(
+    ctx: &mut EvalCtx,
+    field: FieldId,
+    value: Val,
+) -> Result<Val, ExecError> {
+    if matches!(value, Val::Ref { .. })
+        && matches!(
+            ctx.schema.field(field),
+            Some(Field::Ref { owning: true, .. })
+        )
+    {
+        resolve_base_link(ctx, value)
+    } else {
+        Ok(value)
     }
 }
 
@@ -1095,8 +1054,7 @@ mod tests {
         let name = testdata::field_id(&schema, user, "name");
         assert_eq!(*recording.fetches.borrow(), vec![(user, vec![name])]);
         let related = recording.related_fetches.borrow();
-        assert!(!related.is_empty(), "owning refs are still resolved");
-        assert!(related.iter().all(|(_, _, fields)| fields.is_empty()));
+        assert!(related.is_empty(), "ref not lazily resolved: {related:?}");
     }
 
     #[test]

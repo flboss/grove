@@ -6,6 +6,7 @@ use num_traits::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 
 use super::arithmetic::{dec_arith, duration_from_nanos, float_arith, int_arith, scale_duration};
+use super::data::resolve_owning_values;
 use super::{EvalCtx, eval};
 use crate::error::ExecError;
 use crate::value::{Scalar, Val, total_nanos};
@@ -20,8 +21,11 @@ pub(super) fn eval_binary(
     if matches!(op.value, BinaryOp::And | BinaryOp::Or) {
         return eval_logic(op, lhs, rhs, ctx);
     }
-    let l = eval(lhs, ctx)?;
-    let r = eval(rhs, ctx)?;
+    let mut operands = [eval(lhs, ctx)?, eval(rhs, ctx)?];
+    if matches!(op.value, BinaryOp::Eq | BinaryOp::Ne | BinaryOp::In) {
+        resolve_owning_values(ctx, &mut operands, None)?;
+    }
+    let [l, r] = operands;
     if matches!(
         op.value,
         BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Ge

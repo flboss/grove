@@ -1,6 +1,7 @@
 use grove_types::Span;
 
 use crate::error::ExecError;
+use crate::eval::{EvalCtx, data::resolve_owning_values};
 use crate::value::{Scalar, Val};
 
 pub(super) fn eval_slice(
@@ -116,10 +117,14 @@ pub(super) fn eval_list_len(base: Val, optional: bool) -> Result<Val, ExecError>
 
 /// List membership by element equality
 pub(super) fn eval_list_contains(
+    ctx: &mut EvalCtx<'_>,
     base: Val,
     optional: bool,
-    needle: &Val,
+    needle: Val,
 ) -> Result<Val, ExecError> {
+    let mut operands = [base, needle];
+    resolve_owning_values(ctx, &mut operands, None)?;
+    let [base, needle] = operands;
     let items = match (optional, base) {
         (true, Val::None) => return Ok(Val::None),
         (true, Val::Some(v)) => match *v {
@@ -137,7 +142,7 @@ pub(super) fn eval_list_contains(
             });
         }
     };
-    let found = items.iter().any(|item| item.eq(needle) == Some(true));
+    let found = items.iter().any(|item| item.eq(&needle) == Some(true));
     let result = Val::Scalar(Scalar::Bool(found));
     Ok(if optional {
         Val::Some(Box::new(result))
