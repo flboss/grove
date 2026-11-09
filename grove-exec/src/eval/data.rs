@@ -1271,7 +1271,15 @@ mod tests {
             vec![(user, testdata_value_fields(&schema, user))]
         );
         let related = recording.related_fetches.borrow();
-        assert!(!related.is_empty());
+        assert_eq!(
+            related.len(),
+            3,
+            "expected profile, orders, items: {related:?}"
+        );
+        assert_eq!(
+            recording.related_parent_counts.borrow().as_slice(),
+            &[5, 5, 3]
+        );
         for (rel, from_first, fields) in related.iter() {
             let relation = &schema.relations[rel.index()];
             let endpoint = if *from_first {
@@ -1611,34 +1619,13 @@ mod tests {
 
     #[test]
     fn prefetch_nested_owned_scopes() {
-        let schema_src = r#"
-            root users: User;
-            struct User { id: Int, orders: List<Order> }
-            struct Order { id: Int, amount: Int, user: &User, items: List<Item> }
-            struct Item { sku: String, order: &Order }
-            rel Order.user <<-> User.orders (orders.user_id -> users.id);
-            rel Item.order <<-> Order.items (items.order_id -> orders.id);
-        "#;
-        let (schema, parse_diags) = grove_schema::parse_schema(schema_src);
-        assert!(parse_diags.is_empty(), "{parse_diags:?}");
-        let (schema, validation_diags) = grove_schema::validate(schema.expect("schema parses"));
-        assert!(validation_diags.is_empty(), "{validation_diags:?}");
-        let schema = schema.expect("schema validates");
-
-        let conn = rusqlite::Connection::open_in_memory().expect("in-memory database");
-        conn.execute_batch(
-            "CREATE TABLE users(id INTEGER);
-             CREATE TABLE orders(id INTEGER, amount INTEGER, user_id INTEGER);
-             CREATE TABLE items(sku TEXT, order_id INTEGER);
-             INSERT INTO users VALUES (1), (2);
-             INSERT INTO orders VALUES (100, 10, 1), (101, 20, 1), (102, 30, 2);
-             INSERT INTO items VALUES ('a', 100), ('b', 100), ('c', 102);",
-        )
-        .expect("seed database");
+        let schema = testdata::schema();
+        let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory database");
+        testdata::seed(&mut conn).expect("testdata initialization");
         let backend = SqliteBackend::new(conn, &schema).expect("backend");
         let recording = RecordingBackend::new(&backend);
         let result = run_with_storage_opts(
-            "users[orders[items.len() > 0].len() > 0] { id }",
+            "users[orders[items.len() > 0].len() > 0] { name }",
             &schema,
             &recording,
             ExecOptions::default(),
@@ -1648,12 +1635,53 @@ mod tests {
         let counts = recording.related_parent_counts.borrow();
         assert_eq!(
             counts.as_slice(),
-            &[2, 3],
+            &[5, 3],
             "expected batched User.orders then Order.items fetches: {counts:?}"
         );
+        assert_eq!(result, Val::List(vec![rec(vec![("name", str("Bob"))])]));
+    }
+
+    #[test]
+    fn first_record_projection_no_owning_refs_fetched() {
+        let schema = testdata::schema();
+        let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory database");
+        testdata::seed(&mut conn).expect("testdata initialization");
+        let backend = SqliteBackend::new(conn, &schema).expect("backend");
+        let recording = RecordingBackend::new(&backend);
+        run_with_storage_opts(
+            "users.first()?.name",
+            &schema,
+            &recording,
+            ExecOptions::default(),
+        )
+        .expect("query");
+        assert!(recording.related_fetches.borrow().is_empty(),);
+    }
+
+    #[test]
+    fn projection_prefetch_only_needed_owning_ref() {
+        let schema = testdata::schema();
+        let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory database");
+        testdata::seed(&mut conn).expect("testdata initialization");
+        let backend = SqliteBackend::new(conn, &schema).expect("backend");
+        let recording = RecordingBackend::new(&backend);
+        run_with_storage_opts(
+            "users { o = orders.len() }",
+            &schema,
+            &recording,
+            ExecOptions::default(),
+        )
+        .expect("query");
+        let user = testdata::struct_id(&schema, "User");
+        let orders = testdata::field_id(&schema, user, "orders");
+        let profile = testdata::field_id(&schema, user, "profile");
+        let related = recording.related_fetches.borrow();
+        assert_eq!(related.len(), 1, "expected only orders: {related:?}");
         assert_eq!(
-            result,
-            Val::List(vec![rec(vec![("id", int(1))]), rec(vec![("id", int(2))]),])
+            related_fields_for(&schema, &related, orders),
+            Some([].as_slice())
         );
+        assert_eq!(related_fields_for(&schema, &related, profile), None);
+        assert_eq!(recording.related_parent_counts.borrow().as_slice(), &[5]);
     }
 }

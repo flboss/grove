@@ -682,8 +682,8 @@ impl<'a> PlanBuilder<'a> {
     }
 }
 
-/// Whole records expose their eagerly resolved owning Refs, so whole-ness
-/// propagates through owning Ref fields
+/// Whole records expose owning Refs at output/structural observation, so
+/// whole-ness propagates through owning Ref fields (resolution is lazy)
 fn expand_whole(schema: &ValidatedSchema, usage: &mut HashMap<StructId, FieldPlan>) {
     let mut queue: Vec<StructId> = usage
         .iter()

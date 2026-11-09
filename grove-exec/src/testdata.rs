@@ -39,8 +39,14 @@ struct Profile {
   notes: List<String>@notes_ref via profile_notes[profile_key, note],
 }
 struct Order {
+  oid: Int,
   amount: Int,
   user: &User,
+  items: List<Item>,
+}
+struct Item {
+  sku: String,
+  order: &Order,
 }
 struct Image {
   title: String,
@@ -56,6 +62,7 @@ struct Role {
 }
 rel Profile.user <-> User.profile (profiles.user_id -> users.id);
 rel Order.user <<-> User.orders (orders.user_id -> users.id);
+rel Item.order <<-> Order.items (items.order_id -> orders.oid);
 rel Image.messages <->> Message.image (messages.image_id -> images.id);
 rel Role.users <<->> User.roles via user_roles[role_id -> roles.id, user_id -> users.id];
 rel User.manager <<-> User.subordinates (users.manager_id -> users.id);
@@ -123,7 +130,8 @@ pub fn seed(conn: &mut Connection) -> rusqlite::Result<()> {
          INSERT INTO opt_tags(okey, oval) VALUES (960, 'p');
          CREATE TABLE profiles(bio TEXT, user_id INTEGER, notes_ref INTEGER);
          CREATE TABLE profile_notes(profile_key INTEGER, note TEXT);
-         CREATE TABLE orders(amount INTEGER, user_id INTEGER);
+         CREATE TABLE orders(oid INTEGER, amount INTEGER, user_id INTEGER);
+         CREATE TABLE items(sku TEXT, order_id INTEGER);
          CREATE TABLE images(id INTEGER, title TEXT);
          CREATE TABLE messages(body TEXT, image_id INTEGER);
          CREATE TABLE roles(id INTEGER, name TEXT);
@@ -131,7 +139,9 @@ pub fn seed(conn: &mut Connection) -> rusqlite::Result<()> {
          INSERT INTO profiles(bio, user_id, notes_ref) VALUES
            ('AdaBio', 1, 501), ('CydBio', 3, NULL);
          INSERT INTO profile_notes(profile_key, note) VALUES (501, 'a-note');
-         INSERT INTO orders(amount, user_id) VALUES (100, 1), (200, 1), (300, NULL), (400, 2);
+         INSERT INTO orders(oid, amount, user_id) VALUES
+           (10, 100, 1), (20, 200, 1), (30, 300, NULL), (40, 400, 2);
+         INSERT INTO items(sku, order_id) VALUES ('b-1', 40), ('b-2', 40);
          INSERT INTO images(id, title) VALUES (1, 'Sunset'), (2, 'Portrait');
          INSERT INTO messages(body, image_id) VALUES
            ('nice', 1), ('wow', 1), ('meh', 2), ('lost', NULL);
