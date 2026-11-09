@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use grove_query::typecheck::types::TypedExpr;
+use grove_query::typecheck::types::{IdentBinding, TypedExpr, TypedExprKind};
 use grove_schema::validated::{Field, FieldId, StructId, ValidatedSchema};
 use grove_types::NodeId;
 
@@ -324,6 +324,92 @@ pub(crate) fn resolve_owning_ident(
         resolve_base_link(ctx, value)
     } else {
         Ok(value)
+    }
+}
+
+/// Owning Ref fields referenced by an expression (depth ignored)
+pub(crate) fn owning_refs_in(expr: &TypedExpr, schema: &ValidatedSchema) -> HashSet<FieldId> {
+    let mut fields = HashSet::new();
+    collect_owning_refs_in(expr, schema, &mut fields);
+    fields
+}
+
+/// Resolve the given owning Ref fields across values before per-element work
+pub(crate) fn prefetch_owning(
+    ctx: &mut EvalCtx,
+    values: &mut [Val],
+    fields: &HashSet<FieldId>,
+) -> Result<(), ExecError> {
+    if fields.is_empty() {
+        return Ok(());
+    }
+    resolve_owning_values(ctx, values, Some(fields))
+}
+
+/// Owning Ref fields referenced by an expression (depth ignored)
+pub(crate) fn collect_owning_refs_in(
+    expr: &TypedExpr,
+    schema: &ValidatedSchema,
+    fields: &mut HashSet<FieldId>,
+) {
+    match &expr.kind {
+        TypedExprKind::Ident {
+            binding: IdentBinding::Field(field),
+            ..
+        } => {
+            if schema.field_is_ref_owning(*field) == Some(true) {
+                fields.insert(*field);
+            }
+        }
+        TypedExprKind::Field { base, name, .. } => {
+            if let Some(struct_id) = base.ty.schema_record()
+                && let Some((field, _)) = schema.struct_field(struct_id, &name.value)
+                && schema.field_is_ref_owning(field) == Some(true)
+            {
+                fields.insert(field);
+            }
+            collect_owning_refs_in(base, schema, fields);
+        }
+        TypedExprKind::Method { base, args, .. } => {
+            collect_owning_refs_in(base, schema, fields);
+            for arg in args {
+                collect_owning_refs_in(&arg.expr, schema, fields);
+            }
+        }
+        TypedExprKind::TupleAccess { base, .. } => collect_owning_refs_in(base, schema, fields),
+        TypedExprKind::Binary { lhs, rhs, .. } => {
+            collect_owning_refs_in(lhs, schema, fields);
+            collect_owning_refs_in(rhs, schema, fields);
+        }
+        TypedExprKind::Unary { expr, .. }
+        | TypedExprKind::Cast { expr, .. }
+        | TypedExprKind::Some { value: expr } => collect_owning_refs_in(expr, schema, fields),
+        TypedExprKind::If { arms, default } => {
+            for (condition, value) in arms {
+                collect_owning_refs_in(condition, schema, fields);
+                collect_owning_refs_in(value, schema, fields);
+            }
+            collect_owning_refs_in(default, schema, fields);
+        }
+        TypedExprKind::Tuple { elements } | TypedExprKind::Array { elements } => {
+            for element in elements {
+                collect_owning_refs_in(element, schema, fields);
+            }
+        }
+        TypedExprKind::Struct { fields: values } => {
+            for (_, value) in values {
+                collect_owning_refs_in(value, schema, fields);
+            }
+        }
+        TypedExprKind::Projection { base, items } => {
+            collect_owning_refs_in(base, schema, fields);
+            for item in items {
+                collect_owning_refs_in(&item.value, schema, fields);
+            }
+        }
+        TypedExprKind::Literal(_)
+        | TypedExprKind::TypeConstant { .. }
+        | TypedExprKind::Ident { .. } => {}
     }
 }
 
@@ -1283,5 +1369,97 @@ mod tests {
         resolve_owning_values(&mut ctx, std::slice::from_mut(&mut value), None)
             .expect("resolve remaining owning refs");
         assert!(matches!(record_field_value(&value, "p"), Val::Some(_)));
+    }
+
+    fn related_fields_for<'a>(
+        schema: &ValidatedSchema,
+        related: &'a [(RelationId, bool, Vec<FieldId>)],
+        field: FieldId,
+    ) -> Option<&'a [FieldId]> {
+        let relation = schema.relation_of_field(field).expect("relation for field");
+        related
+            .iter()
+            .find(|(rel, _, _)| *rel == relation)
+            .map(|(_, _, fields)| fields.as_slice())
+    }
+
+    #[test]
+    fn filter_prefetch_batched_owning_refs() {
+        let schema = testdata::schema();
+        let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory database");
+        testdata::seed(&mut conn).expect("testdata initialization");
+        let backend = SqliteBackend::new(conn, &schema).expect("backend");
+        let recording = RecordingBackend::new(&backend);
+        run_with_storage_opts(
+            "users[orders.len() > 1] { name }",
+            &schema,
+            &recording,
+            ExecOptions::default(),
+        )
+        .expect("query");
+        let orders = testdata::field_id(&schema, testdata::struct_id(&schema, "User"), "orders");
+        let related = recording.related_fetches.borrow();
+        assert_eq!(related.len(), 1, "expected one batched fetch: {related:?}");
+        assert_eq!(
+            related_fields_for(&schema, &related, orders),
+            Some([].as_slice())
+        );
+    }
+
+    #[test]
+    fn projection_prefetch_batched_owning_refs() {
+        let schema = testdata::schema();
+        let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory database");
+        testdata::seed(&mut conn).expect("testdata initialization");
+        let backend = SqliteBackend::new(conn, &schema).expect("backend");
+        let recording = RecordingBackend::new(&backend);
+        run_with_storage_opts(
+            "users { o = orders.len(), p = profile?.bio }",
+            &schema,
+            &recording,
+            ExecOptions::default(),
+        )
+        .expect("query");
+        let user = testdata::struct_id(&schema, "User");
+        let profile = testdata::field_id(&schema, user, "profile");
+        let orders = testdata::field_id(&schema, user, "orders");
+        let bio = testdata::field_id(&schema, testdata::struct_id(&schema, "Profile"), "bio");
+        let related = recording.related_fetches.borrow();
+        assert_eq!(
+            related.len(),
+            2,
+            "expected two batched fetches: {related:?}"
+        );
+        assert_eq!(
+            related_fields_for(&schema, &related, orders),
+            Some([].as_slice())
+        );
+        assert_eq!(
+            related_fields_for(&schema, &related, profile),
+            Some([bio].as_slice())
+        );
+    }
+
+    #[test]
+    fn map_prefetch_batched_record_field_refs() {
+        let schema = testdata::schema();
+        let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory database");
+        testdata::seed(&mut conn).expect("testdata initialization");
+        let backend = SqliteBackend::new(conn, &schema).expect("backend");
+        let recording = RecordingBackend::new(&backend);
+        run_with_storage_opts(
+            "users.map($.orders.len())",
+            &schema,
+            &recording,
+            ExecOptions::default(),
+        )
+        .expect("query");
+        let orders = testdata::field_id(&schema, testdata::struct_id(&schema, "User"), "orders");
+        let related = recording.related_fetches.borrow();
+        assert_eq!(related.len(), 1, "expected one batched fetch: {related:?}");
+        assert_eq!(
+            related_fields_for(&schema, &related, orders),
+            Some([].as_slice())
+        );
     }
 }

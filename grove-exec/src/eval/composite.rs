@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use grove_query::typecheck::types::{TypedExpr, TypedProjectionItem};
@@ -5,7 +6,9 @@ use grove_types::Spanned;
 
 use super::{EvalCtx, eval};
 use crate::error::ExecError;
-use crate::eval::data::{resolve_base_link, resolve_projection_refs};
+use crate::eval::data::{
+    collect_owning_refs_in, prefetch_owning, resolve_base_link, resolve_projection_refs,
+};
 use crate::value::Val;
 
 pub(crate) fn eval_tuple(elements: &[TypedExpr], ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
@@ -42,7 +45,12 @@ pub(crate) fn eval_projection(
     ctx: &mut EvalCtx<'_>,
 ) -> Result<Val, ExecError> {
     let base = eval(base, ctx)?;
-    let base = resolve_base_link(ctx, base)?;
+    let mut base = resolve_base_link(ctx, base)?;
+    let mut fields = HashSet::new();
+    for item in items {
+        collect_owning_refs_in(&item.value, ctx.schema, &mut fields);
+    }
+    prefetch_owning(ctx, std::slice::from_mut(&mut base), &fields)?;
     match base {
         Val::Record(record) => {
             let projected = project_record(record, items, ctx)?;

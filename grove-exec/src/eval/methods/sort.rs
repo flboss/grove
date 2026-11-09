@@ -1,14 +1,16 @@
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::fmt;
 
 use grove_query::ast::SortDir;
 use grove_query::typecheck::types::TypedMethodArg;
 use grove_types::Span;
 
-use super::super::data::resolve_base_link;
+use super::super::data::{prefetch_owning, resolve_base_link};
 use super::super::{EvalCtx, eval};
 use super::{pop_element_scope, push_element_scope};
 use crate::error::ExecError;
+use crate::eval::data::collect_owning_refs_in;
 use crate::value::Val;
 
 #[derive(Debug, Clone, Copy)]
@@ -86,6 +88,11 @@ pub(super) fn eval_sort(
         }
     };
     if kind.is_keyed() {
+        let mut fields = HashSet::new();
+        for arg in args {
+            collect_owning_refs_in(&arg.expr, ctx.schema, &mut fields);
+        }
+        prefetch_owning(ctx, &mut items, &fields)?;
         sort_by_keys(&mut items, kind, args, ctx, span)?;
     } else if !args.is_empty() {
         return Err(ExecError::Integrity {

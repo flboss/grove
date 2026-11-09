@@ -148,6 +148,13 @@ impl ValidatedSchema {
             .fields
             .get(field.local())
     }
+
+    pub fn field_is_ref_owning(&self, field: FieldId) -> Option<bool> {
+        let Some(Field::Ref { owning, .. }) = self.field(field) else {
+            return None;
+        };
+        Some(*owning)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

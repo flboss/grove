@@ -1,6 +1,6 @@
 use grove_query::typecheck::types::TypedMethodArg;
 
-use super::super::data::resolve_base_link;
+use super::super::data::{owning_refs_in, prefetch_owning, resolve_base_link};
 use super::super::{EvalCtx, eval};
 use super::{pop_element_scope, push_element_scope};
 use crate::error::ExecError;
@@ -12,7 +12,7 @@ pub(super) fn eval_filter(
     args: &[TypedMethodArg],
     ctx: &mut EvalCtx<'_>,
 ) -> Result<Val, ExecError> {
-    let items = match (optional, base) {
+    let mut items = match (optional, base) {
         (true, Val::None) => return Ok(Val::None),
         (true, Val::Some(v)) => match *v {
             Val::List(items) => items,
@@ -36,6 +36,8 @@ pub(super) fn eval_filter(
             message: "`filter()` expects one argument (internal error)".to_string(),
         });
     };
+    let fields = owning_refs_in(&arg.expr, ctx.schema);
+    prefetch_owning(ctx, &mut items, &fields)?;
     let mut kept = Vec::with_capacity(items.len());
     for item in items {
         let map_element = push_element_scope(ctx, &item);

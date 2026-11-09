@@ -357,7 +357,7 @@ impl<'a> PlanBuilder<'a> {
     }
 
     fn visit_field_access(&mut self, base: &TypedExpr, name: &str) {
-        if let Some(struct_id) = schema_record_of(&base.ty)
+        if let Some(struct_id) = base.ty.schema_record()
             && let Some((field, _)) = self.schema.struct_field(struct_id, name)
         {
             self.mark_used_field(field);
@@ -720,14 +720,6 @@ fn method_base_need(method: &str, output: Need) -> Need {
         | "sort_desc_over" | "take" | "skip" | "first" | "nth" | "flatten" | "extend"
         | "unwrap" | "unwrap_or" => output,
         _ => Need::Whole,
-    }
-}
-
-fn schema_record_of(ty: &QueryType) -> Option<StructId> {
-    match ty {
-        QueryType::Record(RecordSource::Schema(struct_id)) => Some(*struct_id),
-        QueryType::Optional(inner) | QueryType::List(inner) => schema_record_of(inner),
-        _ => None,
     }
 }
 

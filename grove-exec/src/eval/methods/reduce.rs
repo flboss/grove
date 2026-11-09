@@ -7,7 +7,7 @@ use grove_types::Span;
 use rust_decimal::Decimal;
 
 use super::super::arithmetic::{ArithOp, dec_arith, float_arith, int_arith, scale_duration};
-use super::super::data::resolve_base_link;
+use super::super::data::{owning_refs_in, prefetch_owning, resolve_base_link};
 use super::super::{EvalCtx, eval};
 use super::{pop_element_scope, push_element_scope};
 use crate::error::ExecError;
@@ -141,7 +141,7 @@ pub(super) fn eval_reduce_over(
     ctx: &mut EvalCtx<'_>,
     span: Span,
 ) -> Result<Val, ExecError> {
-    let items = match (optional, base) {
+    let mut items = match (optional, base) {
         (true, Val::None) => return Ok(Val::None),
         (true, Val::Some(v)) => match *v {
             Val::List(items) => items,
@@ -165,6 +165,8 @@ pub(super) fn eval_reduce_over(
             message: format!("`{kind}()` expects one key argument (internal error)"),
         });
     };
+    let fields = owning_refs_in(&arg.expr, ctx.schema);
+    prefetch_owning(ctx, &mut items, &fields)?;
     let config = &ctx.schema.config;
     let reduced = if items.is_empty() {
         Val::None
