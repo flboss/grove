@@ -92,6 +92,10 @@ enum Command {
         /// Display diagnostics as raw Debug output instead of using ariadne
         #[arg(long)]
         raw: bool,
+
+        /// Disable operation pushdown and always evaluate in Rust
+        #[arg(long)]
+        no_pushdown: bool,
     },
 }
 
@@ -109,7 +113,8 @@ fn main() {
             schema,
             db,
             raw,
-        } => exec_run(&query, &schema, &db, raw),
+            no_pushdown,
+        } => exec_run(&query, &schema, &db, raw, no_pushdown),
     }
 }
 
@@ -353,7 +358,13 @@ fn print_diagnostics(
     }
 }
 
-fn exec_run(query_path: &PathBuf, schema_path: &PathBuf, db_path: &PathBuf, raw: bool) {
+fn exec_run(
+    query_path: &PathBuf,
+    schema_path: &PathBuf,
+    db_path: &PathBuf,
+    raw: bool,
+    no_pushdown: bool,
+) {
     let (query_name, query_source) = read_input(query_path, "query");
     let (schema_name, schema_source) = read_input(schema_path, "schema");
 
@@ -426,8 +437,16 @@ fn exec_run(query_path: &PathBuf, schema_path: &PathBuf, db_path: &PathBuf, raw:
             return;
         }
     };
-    match grove_exec::eval::exec_file(&typed_file, &backend, &validated_schema, chrono::Utc::now())
-    {
+    let options = grove_exec::eval::ExecOptions {
+        pushdown: !no_pushdown,
+    };
+    match grove_exec::eval::exec_file_with_options(
+        &typed_file,
+        &backend,
+        &validated_schema,
+        chrono::Utc::now(),
+        options,
+    ) {
         Ok(value) => println!("{value}"),
         Err(e) => println!("No result. (execution failed: {e})"),
     }
