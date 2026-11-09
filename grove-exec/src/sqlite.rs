@@ -12,7 +12,7 @@ use rusqlite::types::{Value, ValueRef};
 
 use crate::codec;
 use crate::error::ExecError;
-use crate::pushdown::FetchConstraints;
+use crate::pushdown::{CmpOp, FetchConstraints, PushExpr, StringOp};
 use crate::storage::{Key, Row, Storage};
 use crate::value::{Scalar, Val};
 
@@ -137,6 +137,19 @@ fn stored_class(value: &ValueRef<'_>) -> &'static str {
 
 fn quote(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Encode a scalar literal as a SQLite value
+fn scalar_value(value: &Scalar) -> Value {
+    match value {
+        Scalar::Int(n) => Value::Integer(*n),
+        Scalar::Float(x) => Value::Real(*x),
+        Scalar::Dec(d) => Value::Blob(Vec::from(codec::encode_dec(*d))),
+        Scalar::String(s) => Value::Text(s.clone()),
+        Scalar::Bool(b) => Value::Integer(if *b { 1 } else { 0 }),
+        Scalar::Instant(t) => Value::Blob(Vec::from(codec::encode_instant(*t))),
+        Scalar::Duration(d) => Value::Blob(Vec::from(codec::encode_duration(*d))),
+    }
 }
 
 /// An owned link-key value for grouping array elements by parent row
@@ -605,6 +618,133 @@ impl SqliteBackend<'_> {
         Ok(items)
     }
 
+    /// Validate a pushdown field and resolve its quoted column and scalar type
+    fn pushdown_field(
+        &self,
+        struct_id: StructId,
+        field: FieldId,
+    ) -> Result<(String, ScalarType), ExecError> {
+        if field.struct_id() != struct_id {
+            return Err(ExecError::Integrity {
+                message: format!(
+                    "pushdown field {:?} does not belong to struct {} (internal error)",
+                    field,
+                    struct_id.index()
+                ),
+            });
+        }
+        let struct_def =
+            self.schema
+                .structs
+                .get(struct_id.index())
+                .ok_or_else(|| ExecError::Integrity {
+                    message: format!("unknown struct id {} (internal error)", struct_id.index()),
+                })?;
+        match struct_def.fields.get(field.local()) {
+            Some(Field::Value {
+                ty: ValueType::Scalar(scalar),
+                columns,
+                ..
+            }) if columns.len() == 1 => Ok((quote(self.schema.column_name(columns[0])), *scalar)),
+            Some(other) => Err(ExecError::Integrity {
+                message: format!(
+                    "pushdown field `{}.{}` is not a single-column scalar (internal error)",
+                    struct_def.name,
+                    other.name()
+                ),
+            }),
+            None => Err(ExecError::Integrity {
+                message: format!("unknown field {field:?} (internal error)"),
+            }),
+        }
+    }
+
+    /// Render a pushdown expression
+    fn push_expr_sql(
+        &self,
+        struct_id: StructId,
+        expr: &PushExpr,
+        qualifier: &str,
+        params: &mut Vec<Value>,
+    ) -> Result<String, ExecError> {
+        match expr {
+            PushExpr::Field(field) => {
+                let (column, scalar) = self.pushdown_field(struct_id, *field)?;
+                if scalar == ScalarType::Bool {
+                    // TODO: reject non-0/1?
+                    Ok(format!("({qualifier}.{column} = 1)"))
+                } else {
+                    Ok(format!("{qualifier}.{column}"))
+                }
+            }
+            PushExpr::Literal(value) => {
+                params.push(scalar_value(value));
+                Ok("?".to_string())
+            }
+            PushExpr::Cmp { op, lhs, rhs } => {
+                let lhs = self.push_expr_sql(struct_id, lhs, qualifier, params)?;
+                let rhs = self.push_expr_sql(struct_id, rhs, qualifier, params)?;
+                let op = match op {
+                    CmpOp::Eq => "=",
+                    CmpOp::Ne => "<>",
+                    CmpOp::Lt => "<",
+                    CmpOp::Le => "<=",
+                    CmpOp::Gt => ">",
+                    CmpOp::Ge => ">=",
+                };
+                Ok(format!("({lhs} {op} {rhs})"))
+            }
+            PushExpr::And(lhs, rhs) => {
+                let lhs = self.push_expr_sql(struct_id, lhs, qualifier, params)?;
+                let rhs = self.push_expr_sql(struct_id, rhs, qualifier, params)?;
+                Ok(format!("({lhs} AND {rhs})"))
+            }
+            PushExpr::Or(lhs, rhs) => {
+                let lhs = self.push_expr_sql(struct_id, lhs, qualifier, params)?;
+                let rhs = self.push_expr_sql(struct_id, rhs, qualifier, params)?;
+                Ok(format!("({lhs} OR {rhs})"))
+            }
+            PushExpr::Not(inner) => {
+                let inner = self.push_expr_sql(struct_id, inner, qualifier, params)?;
+                Ok(format!("(NOT {inner})"))
+            }
+            PushExpr::In { lhs, items } => {
+                let lhs = self.push_expr_sql(struct_id, lhs, qualifier, params)?;
+                let mut rendered = Vec::with_capacity(items.len());
+                for item in items {
+                    rendered.push(self.push_expr_sql(struct_id, item, qualifier, params)?);
+                }
+                Ok(format!("({lhs} IN ({}))", rendered.join(", ")))
+            }
+            PushExpr::StringOp { op, base, needle } => match op {
+                StringOp::Contains => {
+                    let base = self.push_expr_sql(struct_id, base, qualifier, params)?;
+                    let needle = self.push_expr_sql(struct_id, needle, qualifier, params)?;
+                    Ok(format!("(instr({base}, {needle}) > 0)"))
+                }
+                StringOp::StartsWith => {
+                    let base = self.push_expr_sql(struct_id, base, qualifier, params)?;
+                    let needle = self.push_expr_sql(struct_id, needle, qualifier, params)?;
+                    Ok(format!("(instr({base}, {needle}) = 1)"))
+                }
+                StringOp::EndsWith => {
+                    let needle_len = self.push_expr_sql(struct_id, needle, qualifier, params)?;
+                    let base = self.push_expr_sql(struct_id, base, qualifier, params)?;
+                    let needle_len2 = self.push_expr_sql(struct_id, needle, qualifier, params)?;
+                    let needle = self.push_expr_sql(struct_id, needle, qualifier, params)?;
+                    Ok(format!(
+                        "(length({needle_len}) = 0 OR \
+                        substr({base}, -length({needle_len2})) = {needle})"
+                    ))
+                }
+            },
+            PushExpr::StringLen(inner) => {
+                let inner = self.push_expr_sql(struct_id, inner, qualifier, params)?;
+                Ok(format!("(length({inner}))"))
+            }
+        }
+    }
+
     /// Plan field slots, appending qualified columns to `select`
     fn plan_fields(
         &self,
@@ -791,7 +931,7 @@ impl Storage for SqliteBackend<'_> {
         &self,
         struct_id: StructId,
         fields: &[FieldId],
-        _constraints: &FetchConstraints,
+        constraints: &FetchConstraints,
     ) -> Result<Vec<Row>, ExecError> {
         let struct_def =
             self.schema
@@ -805,13 +945,39 @@ impl Storage for SqliteBackend<'_> {
         let ctx = format!("fetch {struct_name}");
         let mut select = vec!["_rowid_".to_string()];
         let mut slots = self.plan_fields(struct_id, fields, &table, &mut select, &ctx)?;
-        let sql = format!("SELECT {} FROM {table} ORDER BY _rowid_", select.join(", "));
+        let mut params = Vec::new();
+        let mut filters = Vec::with_capacity(constraints.filters.len());
+        for filter in &constraints.filters {
+            filters.push(self.push_expr_sql(struct_id, filter, &table, &mut params)?);
+        }
+        let mut sort = Vec::with_capacity(constraints.sort.len() + 1);
+        for key in &constraints.sort {
+            let (column, _) = self.pushdown_field(struct_id, key.field)?;
+            let direction = if key.desc { "DESC" } else { "ASC" };
+            sort.push(format!("{table}.{column} {direction}"));
+        }
+        sort.push("_rowid_ ASC".to_string());
+        let mut sql = format!("SELECT {} FROM {table}", select.join(", "));
+        if !filters.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&filters.join(" AND "));
+        }
+        sql.push_str(" ORDER BY ");
+        sql.push_str(&sort.join(", "));
+        if let Some(limit) = constraints.limit {
+            sql.push_str(&format!(" LIMIT {limit}"));
+            if constraints.offset != 0 {
+                sql.push_str(&format!(" OFFSET {}", constraints.offset));
+            }
+        } else if constraints.offset != 0 {
+            sql.push_str(&format!(" LIMIT -1 OFFSET {}", constraints.offset));
+        }
         let mut stmt = self
             .conn
             .prepare(&sql)
             .map_err(|err| Self::storage_error(&ctx, err))?;
         let mut rows = stmt
-            .query([])
+            .query(params_from_iter(params))
             .map_err(|err| Self::storage_error(&ctx, err))?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().map_err(|err| Self::storage_error(&ctx, err))? {
@@ -965,6 +1131,7 @@ impl Storage for SqliteBackend<'_> {
 
 #[cfg(test)]
 mod tests {
+    use crate::pushdown::SortKey;
     use crate::testdata;
 
     use super::*;
@@ -2020,6 +2187,395 @@ mod tests {
                 &[Key(1)],
                 &[],
                 &FetchConstraints::EMPTY,
+            )
+            .unwrap_err();
+        assert!(matches!(err, ExecError::Integrity { .. }), "{err:?}");
+    }
+
+    fn push_field(schema: &ValidatedSchema, name: &str) -> PushExpr {
+        PushExpr::Field(user_field(schema, user_struct(schema), name))
+    }
+
+    fn push_int(value: i64) -> PushExpr {
+        PushExpr::Literal(Scalar::Int(value))
+    }
+
+    fn push_str(value: &str) -> PushExpr {
+        PushExpr::Literal(Scalar::String(value.to_string()))
+    }
+
+    fn push_cmp(op: CmpOp, lhs: PushExpr, rhs: PushExpr) -> PushExpr {
+        PushExpr::Cmp {
+            op,
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        }
+    }
+
+    fn user_names(
+        backend: &SqliteBackend<'_>,
+        schema: &ValidatedSchema,
+        filters: Vec<PushExpr>,
+        sort: Vec<SortKey>,
+        offset: u64,
+        limit: Option<u64>,
+    ) -> Vec<String> {
+        let sid = user_struct(schema);
+        let rows = backend
+            .fetch(
+                sid,
+                &[user_field(schema, sid, "name")],
+                &FetchConstraints {
+                    filters,
+                    sort,
+                    offset,
+                    limit,
+                },
+            )
+            .unwrap();
+        rows.into_iter()
+            .map(|row| match row.values.as_slice() {
+                [Val::Scalar(Scalar::String(name))] => name.clone(),
+                other => panic!("expected one name value, got {other:?}"),
+            })
+            .collect()
+    }
+
+    fn names(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn fetch_filter_comparisons() {
+        let schema = testdata::schema();
+        let backend = test_backend(&schema);
+
+        let filters = vec![push_cmp(CmpOp::Gt, push_field(&schema, "id"), push_int(2))];
+        assert_eq!(
+            user_names(&backend, &schema, filters, vec![], 0, None),
+            names(&["Cyd", "Dan", "Eli"])
+        );
+
+        let filters = vec![push_cmp(
+            CmpOp::Eq,
+            push_field(&schema, "name"),
+            push_str("Bob"),
+        )];
+        assert_eq!(
+            user_names(&backend, &schema, filters, vec![], 0, None),
+            names(&["Bob"])
+        );
+
+        let filters = vec![push_cmp(CmpOp::Ne, push_field(&schema, "id"), push_int(1))];
+        assert_eq!(
+            user_names(&backend, &schema, filters, vec![], 0, None),
+            names(&["Bob", "Cyd", "Dan", "Eli"])
+        );
+
+        let filters = vec![push_cmp(
+            CmpOp::Eq,
+            push_field(&schema, "active"),
+            PushExpr::Literal(Scalar::Bool(false)),
+        )];
+        assert_eq!(
+            user_names(&backend, &schema, filters, vec![], 0, None),
+            names(&["Cyd", "Eli"])
+        );
+
+        let filters = vec![PushExpr::In {
+            lhs: Box::new(push_field(&schema, "id")),
+            items: vec![push_int(1), push_int(3), push_int(5)],
+        }];
+        assert_eq!(
+            user_names(&backend, &schema, filters, vec![], 0, None),
+            names(&["Ada", "Cyd", "Eli"])
+        );
+
+        let filters = vec![PushExpr::And(
+            Box::new(push_field(&schema, "active")),
+            Box::new(push_cmp(CmpOp::Gt, push_field(&schema, "id"), push_int(1))),
+        )];
+        assert_eq!(
+            user_names(&backend, &schema, filters, vec![], 0, None),
+            names(&["Bob", "Dan"])
+        );
+
+        let filters = vec![PushExpr::Or(
+            Box::new(push_cmp(CmpOp::Eq, push_field(&schema, "id"), push_int(1))),
+            Box::new(push_cmp(CmpOp::Eq, push_field(&schema, "id"), push_int(5))),
+        )];
+        assert_eq!(
+            user_names(&backend, &schema, filters, vec![], 0, None),
+            names(&["Ada", "Eli"])
+        );
+
+        let filters = vec![PushExpr::Not(Box::new(push_field(&schema, "active")))];
+        assert_eq!(
+            user_names(&backend, &schema, filters, vec![], 0, None),
+            names(&["Cyd", "Eli"])
+        );
+    }
+
+    #[test]
+    fn fetch_filter_string_operations() {
+        let schema = testdata::schema();
+        let backend = test_backend(&schema);
+
+        let string_op = |op: StringOp, needle: &str| {
+            vec![PushExpr::StringOp {
+                op,
+                base: Box::new(push_field(&schema, "name")),
+                needle: Box::new(push_str(needle)),
+            }]
+        };
+        assert_eq!(
+            user_names(
+                &backend,
+                &schema,
+                string_op(StringOp::Contains, "a"),
+                vec![],
+                0,
+                None
+            ),
+            names(&["Ada", "Dan"])
+        );
+        assert_eq!(
+            user_names(
+                &backend,
+                &schema,
+                string_op(StringOp::Contains, ""),
+                vec![],
+                0,
+                None
+            ),
+            names(&["Ada", "Bob", "Cyd", "Dan", "Eli"])
+        );
+
+        assert_eq!(
+            user_names(
+                &backend,
+                &schema,
+                string_op(StringOp::StartsWith, "A"),
+                vec![],
+                0,
+                None
+            ),
+            names(&["Ada"])
+        );
+        assert_eq!(
+            user_names(
+                &backend,
+                &schema,
+                string_op(StringOp::StartsWith, ""),
+                vec![],
+                0,
+                None
+            ),
+            names(&["Ada", "Bob", "Cyd", "Dan", "Eli"])
+        );
+
+        assert_eq!(
+            user_names(
+                &backend,
+                &schema,
+                string_op(StringOp::EndsWith, "d"),
+                vec![],
+                0,
+                None
+            ),
+            names(&["Cyd"])
+        );
+        assert_eq!(
+            user_names(
+                &backend,
+                &schema,
+                string_op(StringOp::EndsWith, ""),
+                vec![],
+                0,
+                None
+            ),
+            names(&["Ada", "Bob", "Cyd", "Dan", "Eli"])
+        );
+
+        let filters = vec![push_cmp(
+            CmpOp::Ge,
+            PushExpr::StringLen(Box::new(push_field(&schema, "name"))),
+            push_int(3),
+        )];
+        assert_eq!(
+            user_names(&backend, &schema, filters, vec![], 0, None),
+            names(&["Ada", "Bob", "Cyd", "Dan", "Eli"])
+        );
+    }
+
+    #[test]
+    fn fetch_filter_temporal_and_decimal() {
+        let schema = testdata::schema();
+        let backend = test_backend(&schema);
+
+        let filters = vec![push_cmp(
+            CmpOp::Gt,
+            push_field(&schema, "balance"),
+            PushExpr::Literal(Scalar::Dec(dec!(30.00))),
+        )];
+        assert_eq!(
+            user_names(&backend, &schema, filters, vec![], 0, None),
+            names(&["Dan"])
+        );
+
+        let filters = vec![push_cmp(
+            CmpOp::Ge,
+            push_field(&schema, "balance"),
+            PushExpr::Literal(Scalar::Dec(dec!(30.00))),
+        )];
+        assert_eq!(
+            user_names(&backend, &schema, filters, vec![], 0, None),
+            names(&["Ada", "Dan"])
+        );
+
+        let filters = vec![push_cmp(
+            CmpOp::Ge,
+            push_field(&schema, "created"),
+            PushExpr::Literal(Scalar::Instant(
+                DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            )),
+        )];
+        assert_eq!(
+            user_names(&backend, &schema, filters, vec![], 0, None),
+            names(&["Ada", "Dan", "Eli"])
+        );
+
+        let filters = vec![push_cmp(
+            CmpOp::Gt,
+            push_field(&schema, "elapsed"),
+            PushExpr::Literal(Scalar::Duration(TimeDelta::zero())),
+        )];
+        assert_eq!(
+            user_names(&backend, &schema, filters, vec![], 0, None),
+            names(&["Ada", "Dan", "Eli"])
+        );
+    }
+
+    #[test]
+    fn fetch_sort_limit_offset() {
+        let schema = testdata::schema();
+        let backend = test_backend(&schema);
+        let sid = user_struct(&schema);
+
+        let sort = vec![SortKey {
+            field: user_field(&schema, sid, "id"),
+            desc: true,
+        }];
+        assert_eq!(
+            user_names(&backend, &schema, vec![], sort, 0, None),
+            names(&["Eli", "Dan", "Cyd", "Bob", "Ada"])
+        );
+
+        let sort = vec![
+            SortKey {
+                field: user_field(&schema, sid, "active"),
+                desc: true,
+            },
+            SortKey {
+                field: user_field(&schema, sid, "id"),
+                desc: false,
+            },
+        ];
+        assert_eq!(
+            user_names(&backend, &schema, vec![], sort, 0, None),
+            names(&["Ada", "Bob", "Dan", "Cyd", "Eli"])
+        );
+
+        let sort = vec![SortKey {
+            field: user_field(&schema, sid, "active"),
+            desc: false,
+        }];
+        assert_eq!(
+            user_names(&backend, &schema, vec![], sort, 0, None),
+            names(&["Cyd", "Eli", "Ada", "Bob", "Dan"])
+        );
+
+        assert_eq!(
+            user_names(&backend, &schema, vec![], vec![], 0, Some(2)),
+            names(&["Ada", "Bob"])
+        );
+        assert_eq!(
+            user_names(&backend, &schema, vec![], vec![], 2, None),
+            names(&["Cyd", "Dan", "Eli"])
+        );
+        assert_eq!(
+            user_names(&backend, &schema, vec![], vec![], 3, Some(1)),
+            names(&["Dan"])
+        );
+        assert_eq!(
+            user_names(&backend, &schema, vec![], vec![], 0, Some(0)),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            user_names(&backend, &schema, vec![], vec![], 10, None),
+            Vec::<String>::new()
+        );
+
+        let sort = vec![SortKey {
+            field: user_field(&schema, sid, "name"),
+            desc: true,
+        }];
+        assert_eq!(
+            user_names(&backend, &schema, vec![], sort, 0, Some(2)),
+            names(&["Eli", "Dan"])
+        );
+    }
+
+    #[test]
+    fn fetch_constraints_rejected_fields() {
+        let schema = testdata::schema();
+        let backend = test_backend(&schema);
+        let sid = user_struct(&schema);
+
+        let order = testdata::struct_id(&schema, "Order");
+        let amount = testdata::field_id(&schema, order, "amount");
+        let err = backend
+            .fetch(
+                sid,
+                &[user_field(&schema, sid, "name")],
+                &FetchConstraints {
+                    filters: vec![PushExpr::Field(amount)],
+                    sort: vec![],
+                    offset: 0,
+                    limit: None,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, ExecError::Integrity { .. }), "{err:?}");
+
+        let pos = user_field(&schema, sid, "pos");
+        let err = backend
+            .fetch(
+                sid,
+                &[user_field(&schema, sid, "name")],
+                &FetchConstraints {
+                    filters: vec![PushExpr::Field(pos)],
+                    sort: vec![],
+                    offset: 0,
+                    limit: None,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, ExecError::Integrity { .. }), "{err:?}");
+
+        let err = backend
+            .fetch(
+                sid,
+                &[user_field(&schema, sid, "name")],
+                &FetchConstraints {
+                    filters: vec![],
+                    sort: vec![SortKey {
+                        field: pos,
+                        desc: false,
+                    }],
+                    offset: 0,
+                    limit: None,
+                },
             )
             .unwrap_err();
         assert!(matches!(err, ExecError::Integrity { .. }), "{err:?}");

@@ -9,7 +9,6 @@ fn malformed(what: &str, detail: String) -> ExecError {
     }
 }
 
-#[allow(dead_code)]
 /// Encode a `Dec` as its canonical 13-byte memcmp-ordered blob
 pub(crate) fn encode_dec(value: Decimal) -> [u8; 13] {
     let normalized = value.normalize();
@@ -123,7 +122,6 @@ fn decode_secs_nanos(blob: &[u8], what: &str) -> Result<(i64, u32), ExecError> {
     Ok((secs, nanos))
 }
 
-#[allow(dead_code)]
 /// Encode an `Instant` as its 12-byte memcmp-ordered blob
 pub(crate) fn encode_instant(t: DateTime<Utc>) -> [u8; 12] {
     encode_secs_nanos(t.timestamp(), t.timestamp_subsec_nanos())
@@ -136,7 +134,6 @@ pub(crate) fn decode_instant(blob: &[u8]) -> Result<DateTime<Utc>, ExecError> {
         .ok_or_else(|| malformed("Instant", format!("seconds {secs} out of range")))
 }
 
-#[allow(dead_code)]
 /// Encode a `Duration` as its 12-byte memcmp-ordered blob
 pub(crate) fn encode_duration(d: TimeDelta) -> [u8; 12] {
     let secs = d.num_seconds();
