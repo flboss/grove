@@ -20,7 +20,7 @@ mod methods;
 mod operators;
 
 use composite::{eval_array, eval_projection, eval_struct, eval_tuple};
-use data::{exec_field, exec_root, resolve_base_link};
+use data::{exec_field, exec_root, resolve_base_link, resolve_owning_values};
 use literals::{decode_literal, eval_type_constant};
 use methods::eval_method;
 use operators::{eval_binary, eval_cast, eval_unary};
@@ -258,7 +258,9 @@ pub fn exec_file_with_options(
             TypedStatement::Mutation(_) => todo!("mutations"),
         }
     }
-    eval(&file.result, &mut ctx)
+    let mut result = eval(&file.result, &mut ctx)?;
+    resolve_owning_values(&mut ctx, std::slice::from_mut(&mut result), None)?;
+    Ok(result)
 }
 
 #[cfg(test)]

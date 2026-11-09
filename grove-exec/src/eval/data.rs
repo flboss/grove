@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use grove_query::typecheck::types::TypedExpr;
@@ -255,6 +255,115 @@ fn splice_owning(value: &mut Val, resolved: &HashMap<(FieldId, Key), Val>) {
             && let Some(resolved_value) = resolved.get(&(*field, *parent)).cloned()
         {
             *field_value = resolved_value
+        }
+    }
+}
+
+/// Determine whether a Ref field is owning
+fn is_owning_ref(schema: &ValidatedSchema, field: FieldId) -> Result<bool, ExecError> {
+    let struct_ = schema
+        .structs
+        .get(field.struct_id().index())
+        .ok_or_else(|| ExecError::Integrity {
+            message: format!(
+                "unknown struct id {} (internal error)",
+                field.struct_id().index()
+            ),
+        })?;
+    match struct_.fields.get(field.local()) {
+        Some(Field::Ref { owning, .. }) => Ok(*owning),
+        Some(Field::Value { name, .. } | Field::Array { name, .. }) => Err(ExecError::Integrity {
+            message: format!("Ref link names a non-Ref field `{name}` (internal error)"),
+        }),
+        None => Err(ExecError::Integrity {
+            message: format!("unknown field {field:?} (internal error)"),
+        }),
+    }
+}
+
+/// Gather parent rowids from owning Refs anywhere in a value tree
+fn collect_owning_refs(
+    value: &Val,
+    filter: Option<&HashSet<FieldId>>,
+    by_field: &mut HashMap<FieldId, Vec<Key>>,
+    order: &mut Vec<FieldId>,
+    schema: &ValidatedSchema,
+) -> Result<(), ExecError> {
+    match value {
+        Val::Ref { field, parent } => {
+            if is_owning_ref(schema, *field)? && filter.is_none_or(|fields| fields.contains(field))
+            {
+                push_ref(by_field, order, *field, *parent);
+            }
+            Ok(())
+        }
+        Val::List(items) | Val::Tuple(items) => {
+            for item in items {
+                collect_owning_refs(item, filter, by_field, order, schema)?;
+            }
+            Ok(())
+        }
+        Val::Some(inner) => collect_owning_refs(inner, filter, by_field, order, schema),
+        Val::Record(fields) => {
+            for (_, field_value) in fields {
+                collect_owning_refs(field_value, filter, by_field, order, schema)?;
+            }
+            Ok(())
+        }
+        Val::None | Val::Scalar(_) => Ok(()),
+    }
+}
+
+/// Replace owning Refs anywhere in a value tree with resolved data
+fn splice_owning_refs(
+    value: &mut Val,
+    resolved: &HashMap<(FieldId, Key), Val>,
+    filter: Option<&HashSet<FieldId>>,
+    schema: &ValidatedSchema,
+) -> Result<(), ExecError> {
+    match value {
+        Val::Ref { field, parent } => {
+            if is_owning_ref(schema, *field)? && filter.is_none_or(|fields| fields.contains(field))
+            {
+                *value = lookup_ref(*field, *parent, resolved)?;
+            }
+            Ok(())
+        }
+        Val::List(items) | Val::Tuple(items) => {
+            for item in items {
+                splice_owning_refs(item, resolved, filter, schema)?;
+            }
+            Ok(())
+        }
+        Val::Some(inner) => splice_owning_refs(inner, resolved, filter, schema),
+        Val::Record(fields) => {
+            for (_, field_value) in fields {
+                splice_owning_refs(field_value, resolved, filter, schema)?;
+            }
+            Ok(())
+        }
+        Val::None | Val::Scalar(_) => Ok(()),
+    }
+}
+
+/// Resolve owning Refs anywhere in the given values, batching per FieldId
+pub(crate) fn resolve_owning_values(
+    ctx: &mut EvalCtx,
+    values: &mut [Val],
+    filter: Option<&HashSet<FieldId>>,
+) -> Result<(), ExecError> {
+    loop {
+        let mut by_field: HashMap<FieldId, Vec<Key>> = HashMap::new();
+        let mut order: Vec<FieldId> = Vec::new();
+        for value in values.iter() {
+            collect_owning_refs(value, filter, &mut by_field, &mut order, ctx.schema)?;
+        }
+        if order.is_empty() {
+            return Ok(());
+        }
+        let resolved = batch_fetch(ctx, &by_field, &order)?;
+        for value in values.iter_mut() {
+            splice_owning_refs(value, &resolved, filter, ctx.schema)?;
         }
     }
 }
@@ -526,13 +635,15 @@ fn splice_item_refs(value: Val, resolved: &HashMap<(FieldId, Key), Val>) -> Resu
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::collections::HashSet;
 
     use grove_schema::validated::{Field, FieldId, RelationId, StructId, ValidatedSchema};
 
     use super::*;
 
     use crate::{
-        eval::{ExecOptions, harness::*},
+        eval::{Env, ExecOptions, harness::*},
+        pushdown::PushdownPlan,
         sqlite::SqliteBackend,
         storage::Storage,
         testdata,
@@ -1078,5 +1189,141 @@ mod tests {
             run_seeded("users.skip(1).nth(2)?.name"),
             Ok(some(str("Dan")))
         );
+    }
+
+    fn record_field_value<'a>(value: &'a Val, name: &str) -> &'a Val {
+        let Val::Record(fields) = value else {
+            panic!("expected record, got {value:?}");
+        };
+        fields
+            .iter()
+            .find(|(field_name, _)| field_name.as_ref() == name)
+            .map(|(_, value)| value)
+            .expect("expected record field")
+    }
+
+    #[test]
+    fn deep_resolver_value_shape_traversal() {
+        let schema = testdata::schema();
+        let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory database");
+        testdata::seed(&mut conn).expect("testdata initialization");
+        let backend = SqliteBackend::new(conn, &schema).expect("backend");
+        let plan = PushdownPlan::disabled(&schema);
+        let mut ctx = EvalCtx::new(Env::new(), FIXED_NOW, &backend, &schema, &plan);
+
+        let user = testdata::struct_id(&schema, "User");
+        let order = testdata::struct_id(&schema, "Order");
+        let profile_field = testdata::field_id(&schema, user, "profile");
+        let orders_field = testdata::field_id(&schema, user, "orders");
+        let order_user_field = testdata::field_id(&schema, order, "user");
+
+        let mut value = Val::Tuple(vec![
+            some(rec(vec![(
+                "p",
+                Val::Ref {
+                    field: profile_field,
+                    parent: Key(1),
+                },
+            )])),
+            Val::List(vec![Val::Tuple(vec![Val::Ref {
+                field: orders_field,
+                parent: Key(1),
+            }])]),
+            rec(vec![(
+                "n",
+                Val::Ref {
+                    field: order_user_field,
+                    parent: Key(1),
+                },
+            )]),
+        ]);
+
+        resolve_owning_values(&mut ctx, std::slice::from_mut(&mut value), None)
+            .expect("resolve owning refs");
+
+        let Val::Tuple(parts) = &value else {
+            panic!("expected tuple");
+        };
+        let Val::Some(slot) = &parts[0] else {
+            panic!("expected some slot");
+        };
+        let profile_value = record_field_value(slot, "p");
+        let Val::Some(profile) = profile_value else {
+            panic!("expected some(profile), got {profile_value:?}");
+        };
+        assert_eq!(record_field_value(profile, "bio"), &str("AdaBio"));
+        assert!(matches!(
+            record_field_value(profile, "user"),
+            Val::Ref { .. }
+        ));
+
+        let Val::List(wrapper) = &parts[1] else {
+            panic!("expected list wrapper");
+        };
+        let Val::Tuple(inner) = &wrapper[0] else {
+            panic!("expected tuple wrapper");
+        };
+        let Val::List(orders) = &inner[0] else {
+            panic!("expected resolved orders, got {:?}", inner[0]);
+        };
+        assert_eq!(orders.len(), 2);
+        assert_eq!(record_field_value(&orders[0], "amount"), &int(100));
+        assert_eq!(record_field_value(&orders[1], "amount"), &int(200));
+        assert!(matches!(
+            record_field_value(&orders[0], "user"),
+            Val::Ref { .. }
+        ));
+        assert!(matches!(
+            record_field_value(&parts[2], "n"),
+            Val::Ref { .. }
+        ));
+    }
+
+    #[test]
+    fn deep_resolver_field_filter() {
+        let schema = testdata::schema();
+        let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory database");
+        testdata::seed(&mut conn).expect("testdata initialization");
+        let backend = SqliteBackend::new(conn, &schema).expect("backend");
+        let plan = PushdownPlan::disabled(&schema);
+        let mut ctx = EvalCtx::new(Env::new(), FIXED_NOW, &backend, &schema, &plan);
+
+        let user = testdata::struct_id(&schema, "User");
+        let profile_field = testdata::field_id(&schema, user, "profile");
+        let orders_field = testdata::field_id(&schema, user, "orders");
+
+        let mut value = rec(vec![
+            (
+                "p",
+                Val::Ref {
+                    field: profile_field,
+                    parent: Key(1),
+                },
+            ),
+            (
+                "o",
+                Val::Ref {
+                    field: orders_field,
+                    parent: Key(1),
+                },
+            ),
+        ]);
+
+        let only_orders: HashSet<FieldId> = [orders_field].into_iter().collect();
+        resolve_owning_values(
+            &mut ctx,
+            std::slice::from_mut(&mut value),
+            Some(&only_orders),
+        )
+        .expect("resolve filtered owning refs");
+        assert!(matches!(record_field_value(&value, "p"), Val::Ref { .. }));
+        assert!(matches!(
+            record_field_value(&value, "o"),
+            Val::List(rows) if rows.len() == 2
+        ));
+
+        resolve_owning_values(&mut ctx, std::slice::from_mut(&mut value), None)
+            .expect("resolve remaining owning refs");
+        assert!(matches!(record_field_value(&value, "p"), Val::Some(_)));
     }
 }
