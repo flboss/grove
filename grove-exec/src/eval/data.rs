@@ -26,7 +26,7 @@ pub(crate) fn exec_root(
         })?;
     let fields = ctx.plan.fields_for(root.struct_id).to_vec();
     let rows = if let Some(constraints) = ctx.plan.constraints_for(node) {
-        ctx.storage.fetch(root.struct_id, &fields, &constraints)?
+        ctx.storage.fetch(root.struct_id, &fields, constraints)?
     } else {
         ctx.storage
             .fetch(root.struct_id, &fields, &FetchConstraints::EMPTY)?
@@ -532,7 +532,11 @@ mod tests {
     use super::*;
 
     use crate::{
-        eval::harness::*, sqlite::SqliteBackend, storage::Storage, testdata, value::Scalar,
+        eval::{ExecOptions, harness::*},
+        sqlite::SqliteBackend,
+        storage::Storage,
+        testdata,
+        value::Scalar,
     };
 
     #[test]
@@ -969,7 +973,13 @@ mod tests {
         testdata::seed(&mut conn).expect("testdata initialization");
         let backend = SqliteBackend::new(conn, &schema).expect("backend");
         let recording = RecordingBackend::new(&backend);
-        run_with_storage("users { name }", &schema, &recording).expect("query");
+        run_with_storage_opts(
+            "users { name }",
+            &schema,
+            &recording,
+            ExecOptions::default(),
+        )
+        .expect("query");
         let user = testdata::struct_id(&schema, "User");
         let name = testdata::field_id(&schema, user, "name");
         assert_eq!(*recording.fetches.borrow(), vec![(user, vec![name])]);
@@ -985,7 +995,7 @@ mod tests {
         testdata::seed(&mut conn).expect("testdata initialization");
         let backend = SqliteBackend::new(conn, &schema).expect("backend");
         let recording = RecordingBackend::new(&backend);
-        run_with_storage("users", &schema, &recording).expect("query");
+        run_with_storage_opts("users", &schema, &recording, ExecOptions::default()).expect("query");
         let user = testdata::struct_id(&schema, "User");
         assert_eq!(
             *recording.fetches.borrow(),
@@ -1016,8 +1026,13 @@ mod tests {
         testdata::seed(&mut conn).expect("testdata initialization");
         let backend = SqliteBackend::new(conn, &schema).expect("backend");
         let recording = RecordingBackend::new(&backend);
-        run_with_storage("users[id > 2].sort_over(name).take(2)", &schema, &recording)
-            .expect("query");
+        run_with_storage_opts(
+            "users[id > 2].sort_over(name).take(2)",
+            &schema,
+            &recording,
+            ExecOptions::default(),
+        )
+        .expect("query");
         let constraints = recording.constraints.borrow();
         let first = constraints.first().expect("root fetch");
         assert_eq!(first.filters.len(), 1);

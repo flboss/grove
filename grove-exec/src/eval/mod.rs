@@ -213,14 +213,42 @@ pub fn eval_let(stmt: &TypedLetStmt, ctx: &mut EvalCtx<'_>) -> Result<(), ExecEr
     Ok(())
 }
 
-/// Run a typed query file consisting of statements and a result against storage
+/// Execution options
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecOptions {
+    /// Push simple operations into the storage backend
+    pub pushdown: bool,
+}
+
+impl Default for ExecOptions {
+    fn default() -> Self {
+        ExecOptions { pushdown: true }
+    }
+}
+
+/// Run a typed query file against storage
 pub fn exec_file(
     file: &TypedQueryFile,
     storage: &dyn Storage,
     schema: &ValidatedSchema,
     now: DateTime<Utc>,
 ) -> Result<Val, ExecError> {
-    let plan = PushdownPlan::analyze(file, schema, now);
+    exec_file_with_options(file, storage, schema, now, ExecOptions::default())
+}
+
+/// Run a typed query file against storage with explicit execution options
+pub fn exec_file_with_options(
+    file: &TypedQueryFile,
+    storage: &dyn Storage,
+    schema: &ValidatedSchema,
+    now: DateTime<Utc>,
+    options: ExecOptions,
+) -> Result<Val, ExecError> {
+    let plan = if options.pushdown {
+        PushdownPlan::analyze(file, schema, now)
+    } else {
+        PushdownPlan::disabled(schema)
+    };
     let mut ctx = EvalCtx::new(Env::new(), now, storage, schema, &plan);
     for stmt in &file.statements {
         match stmt {
@@ -264,6 +292,67 @@ pub(crate) mod harness {
         schema: &ValidatedSchema,
         storage: &S,
     ) -> Result<Val, ExecError> {
+        let typed = typed_for(src, schema);
+        let pushed =
+            exec_file_with_options(&typed, storage, schema, FIXED_NOW, ExecOptions::default());
+        let unpushed = exec_file_with_options(
+            &typed,
+            storage,
+            schema,
+            FIXED_NOW,
+            ExecOptions { pushdown: false },
+        );
+        assert_pushdown_parity(src, &pushed, &unpushed);
+        pushed
+    }
+
+    fn assert_pushdown_parity(
+        src: &str,
+        pushed: &Result<Val, ExecError>,
+        unpushed: &Result<Val, ExecError>,
+    ) {
+        match (pushed, unpushed) {
+            (Ok(left), Ok(right)) => assert!(
+                same_value(left, right),
+                "pushdown changed the result for `{src}`: {left:?} vs {right:?}"
+            ),
+            (Err(left), Err(right)) => {
+                assert_eq!(left, right, "pushdown changed the error for `{src}`")
+            }
+            _ => panic!("pushdown changed success/error for `{src}`: {pushed:?} vs {unpushed:?}"),
+        }
+    }
+
+    fn same_value(left: &Val, right: &Val) -> bool {
+        match (left, right) {
+            (Val::Scalar(Scalar::Float(a)), Val::Scalar(Scalar::Float(b))) => {
+                (a.is_nan() && b.is_nan()) || a == b
+            }
+            (Val::Some(a), Val::Some(b)) => same_value(a, b),
+            (Val::List(a), Val::List(b)) | (Val::Tuple(a), Val::Tuple(b)) => {
+                a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same_value(a, b))
+            }
+            (Val::Record(a), Val::Record(b)) => {
+                a.len() == b.len()
+                    && a.iter()
+                        .zip(b)
+                        .all(|((name_a, a), (name_b, b))| name_a == name_b && same_value(a, b))
+            }
+            _ => left == right,
+        }
+    }
+
+    pub(crate) fn run_with_storage_opts<S: Storage>(
+        src: &str,
+        schema: &ValidatedSchema,
+        storage: &S,
+        options: ExecOptions,
+    ) -> Result<Val, ExecError> {
+        let typed = typed_for(src, schema);
+        exec_file_with_options(&typed, storage, schema, FIXED_NOW, options)
+    }
+
+    fn typed_for(src: &str, schema: &ValidatedSchema) -> TypedQueryFile {
         let (file, parse_diags) = grove_query::parse_query(src);
         assert!(
             parse_diags
@@ -273,7 +362,7 @@ pub(crate) mod harness {
         );
         let (typed, diags) = grove_query::typecheck::typecheck(file.unwrap(), schema);
         assert!(diags.is_empty(), "{diags:?}");
-        exec_file(&typed.unwrap(), storage, schema, FIXED_NOW)
+        typed.unwrap()
     }
 
     pub(crate) fn run_seeded(src: &str) -> Result<Val, ExecError> {
