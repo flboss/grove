@@ -8,6 +8,7 @@ use grove_query::typecheck::types::{
 use grove_schema::validated::ValidatedSchema;
 
 use crate::error::ExecError;
+use crate::pushdown::PushdownPlan;
 use crate::storage::Storage;
 use crate::value::{Interner, Scalar, Val};
 
@@ -68,6 +69,7 @@ pub struct EvalCtx<'a> {
     pub(crate) interner: Interner,
     pub(crate) storage: &'a dyn Storage,
     pub(crate) schema: &'a ValidatedSchema,
+    pub(crate) plan: &'a PushdownPlan,
 }
 
 impl<'a> EvalCtx<'a> {
@@ -76,6 +78,7 @@ impl<'a> EvalCtx<'a> {
         now: DateTime<Utc>,
         storage: &'a dyn Storage,
         schema: &'a ValidatedSchema,
+        plan: &'a PushdownPlan,
     ) -> Self {
         EvalCtx {
             env,
@@ -83,6 +86,7 @@ impl<'a> EvalCtx<'a> {
             interner: Interner::default(),
             storage,
             schema,
+            plan,
         }
     }
 }
@@ -216,7 +220,8 @@ pub fn exec_file(
     schema: &ValidatedSchema,
     now: DateTime<Utc>,
 ) -> Result<Val, ExecError> {
-    let mut ctx = EvalCtx::new(Env::new(), now, storage, schema);
+    let plan = PushdownPlan::analyze(file, schema, now);
+    let mut ctx = EvalCtx::new(Env::new(), now, storage, schema, &plan);
     for stmt in &file.statements {
         match stmt {
             TypedStatement::Let(let_stmt) => eval_let(let_stmt, &mut ctx)?,
@@ -251,12 +256,12 @@ pub(crate) mod harness {
 
     pub(crate) fn run_with(src: &str, schema: ValidatedSchema) -> Result<Val, ExecError> {
         let storage = NoStorage;
-        run_with_storage(src, schema, &storage)
+        run_with_storage(src, &schema, &storage)
     }
 
     pub(crate) fn run_with_storage<S: Storage>(
         src: &str,
-        schema: ValidatedSchema,
+        schema: &ValidatedSchema,
         storage: &S,
     ) -> Result<Val, ExecError> {
         let (file, parse_diags) = grove_query::parse_query(src);
@@ -276,7 +281,7 @@ pub(crate) mod harness {
         let mut conn = Connection::open_in_memory().expect("in-memory database should open");
         testdata::seed(&mut conn).expect("testdata initialization should succeed");
         let backend = SqliteBackend::new(conn, &schema).expect("backend should verify");
-        run_with_storage(src, schema.clone(), &backend)
+        run_with_storage(src, &schema, &backend)
     }
 
     pub(crate) const FIXED_NOW: DateTime<Utc> = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
@@ -347,6 +352,7 @@ pub(crate) mod harness {
 mod tests {
     use super::harness::*;
     use super::{Env, EvalCtx, eval};
+    use crate::pushdown::PushdownPlan;
     use crate::value::Val;
     use grove_query::typecheck::types::{IdentBinding, QueryType, TypedExpr, TypedExprKind};
     use grove_schema::validated::{ScalarType, ValidatedSchema};
@@ -485,7 +491,8 @@ mod tests {
         let mut env = Env::new();
         env.define(Rc::from("xs"), Val::List(vec![int(1), Val::None]));
         let schema = ValidatedSchema::default();
-        let mut ctx = EvalCtx::new(env, FIXED_NOW, &NoStorage, &schema);
+        let plan = PushdownPlan::disabled(&schema);
+        let mut ctx = EvalCtx::new(env, FIXED_NOW, &NoStorage, &schema, &plan);
         let span = Span::new(0, 0);
         let expr = TypedExpr {
             kind: TypedExprKind::Ident {

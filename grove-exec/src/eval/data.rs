@@ -19,23 +19,11 @@ pub(crate) fn exec_root(ctx: &mut EvalCtx, root_idx: usize) -> Result<Val, ExecE
         .ok_or_else(|| ExecError::Integrity {
             message: format!("unknown root {root_idx} (internal error)"),
         })?;
-    // TODO: field selection pushdown
-    let fields = value_and_array_fields(ctx, root.struct_id);
+    let fields = ctx.plan.fields_for(root.struct_id).to_vec();
     let rows = ctx
         .storage
         .fetch(root.struct_id, &fields, &FetchConstraints::EMPTY)?;
-    materialize(ctx, root.struct_id, rows)
-}
-
-/// FieldIds in declaration order, excluding Refs
-fn value_and_array_fields(ctx: &EvalCtx, struct_id: StructId) -> Vec<FieldId> {
-    ctx.schema.structs[struct_id.index()]
-        .fields
-        .iter()
-        .enumerate()
-        .filter(|(_, field)| !matches!(field, Field::Ref { .. }))
-        .map(|(local, _)| FieldId::new(struct_id, local))
-        .collect()
+    materialize(ctx, root.struct_id, &fields, rows)
 }
 
 /// Fetch a Ref field for a batch of parents;
@@ -61,8 +49,7 @@ fn resolve_field(
             message: format!("Ref field `{field_name}` has no relation (internal error)"),
         })?;
     let fetch_from_first = ctx.schema.relations[relation.index()].endpoints()[0] == field;
-    // TODO: field selection pushdown
-    let fields = value_and_array_fields(ctx, target);
+    let fields = ctx.plan.fields_for(target).to_vec();
     let groups = ctx.storage.fetch_related(
         relation,
         fetch_from_first,
@@ -73,7 +60,7 @@ fn resolve_field(
     let mut resolved_pairs = Vec::with_capacity(parents.len());
     for (parent, group) in parents.iter().zip(groups) {
         // Recursion terminates: ownership chain ends at a root
-        let value = materialize(ctx, target, group)?;
+        let value = materialize(ctx, target, &fields, group)?;
         let wrapped = wrap_fetched(value, field, *parent, ctx.schema)?;
         resolved_pairs.push(((field, *parent), wrapped));
     }
@@ -152,12 +139,18 @@ fn batch_fetch(
 }
 
 /// Build Records from storage rows, resolving owning Refs
-fn materialize(ctx: &mut EvalCtx, struct_id: StructId, rows: Vec<Row>) -> Result<Val, ExecError> {
+fn materialize(
+    ctx: &mut EvalCtx,
+    struct_id: StructId,
+    fields: &[FieldId],
+    rows: Vec<Row>,
+) -> Result<Val, ExecError> {
     let struct_ = &ctx.schema.structs[struct_id.index()];
     let mut items = Vec::with_capacity(rows.len());
     for row in rows {
         let mut values = row.values.into_iter();
         let mut record = Vec::with_capacity(struct_.fields.len());
+        let mut next_field = 0;
         for (local, field) in struct_.fields.iter().enumerate() {
             let name = ctx.interner.intern(field.name());
             match field {
@@ -168,13 +161,24 @@ fn materialize(ctx: &mut EvalCtx, struct_id: StructId, rows: Vec<Row>) -> Result
                         parent: row.rowid,
                     },
                 )),
-                _ => record.push((
-                    name,
-                    values.next().ok_or_else(|| ExecError::Integrity {
-                        message: "row has fewer values than fields (internal error)".to_string(),
-                    })?,
-                )),
+                _ => {
+                    if next_field < fields.len() && fields[next_field].local() == local {
+                        record.push((
+                            name,
+                            values.next().ok_or_else(|| ExecError::Integrity {
+                                message: "row has fewer values than fields (internal error)"
+                                    .to_string(),
+                            })?,
+                        ));
+                        next_field += 1;
+                    }
+                }
             }
+        }
+        if next_field != fields.len() {
+            return Err(ExecError::Integrity {
+                message: "row is missing requested fields (internal error)".to_string(),
+            });
         }
         if values.next().is_some() {
             return Err(ExecError::Integrity {
@@ -513,11 +517,15 @@ fn splice_item_refs(value: Val, resolved: &HashMap<(FieldId, Key), Val>) -> Resu
 
 #[cfg(test)]
 mod tests {
-    use grove_schema::validated::{FieldId, StructId, ValidatedSchema};
+    use std::cell::RefCell;
+
+    use grove_schema::validated::{Field, FieldId, RelationId, StructId, ValidatedSchema};
 
     use super::*;
 
-    use crate::{eval::harness::*, storage::Storage, testdata, value::Scalar};
+    use crate::{
+        eval::harness::*, sqlite::SqliteBackend, storage::Storage, testdata, value::Scalar,
+    };
 
     #[test]
     fn root_owning_resolved() {
@@ -775,8 +783,7 @@ mod tests {
         let mut conn =
             rusqlite::Connection::open_in_memory().expect("in-memory database should open");
         testdata::seed(&mut conn).expect("testdata initialization should succeed");
-        let backend =
-            crate::sqlite::SqliteBackend::new(conn, &schema).expect("backend should verify");
+        let backend = SqliteBackend::new(conn, &schema).expect("backend should verify");
         // 100/Ada, 200/Ada, 300/NULL, 400/Bob
         let rows = backend
             .fetch(
@@ -898,6 +905,96 @@ mod tests {
                 ));
             }
             got => panic!("expected projected records, got {got:?}"),
+        }
+    }
+
+    struct RecordingBackend<'a, 's> {
+        inner: &'a SqliteBackend<'s>,
+        fetches: RefCell<Vec<(StructId, Vec<FieldId>)>>,
+        related_fetches: RefCell<Vec<(RelationId, bool, Vec<FieldId>)>>,
+    }
+
+    impl<'a, 's> RecordingBackend<'a, 's> {
+        pub fn new(backend: &'a SqliteBackend<'s>) -> RecordingBackend<'a, 's> {
+            RecordingBackend {
+                inner: backend,
+                fetches: RefCell::new(Vec::new()),
+                related_fetches: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Storage for RecordingBackend<'_, '_> {
+        fn fetch(
+            &self,
+            struct_id: StructId,
+            fields: &[FieldId],
+            constraints: &FetchConstraints,
+        ) -> Result<Vec<Row>, ExecError> {
+            self.fetches.borrow_mut().push((struct_id, fields.to_vec()));
+            self.inner.fetch(struct_id, fields, constraints)
+        }
+
+        fn fetch_related(
+            &self,
+            rel: RelationId,
+            fetch_from_first: bool,
+            parents: &[Key],
+            fields: &[FieldId],
+            constraints: &FetchConstraints,
+        ) -> Result<Vec<Vec<Row>>, ExecError> {
+            self.related_fetches
+                .borrow_mut()
+                .push((rel, fetch_from_first, fields.to_vec()));
+            self.inner
+                .fetch_related(rel, fetch_from_first, parents, fields, constraints)
+        }
+    }
+
+    #[test]
+    fn field_pushdown_projection_fields_pruned() {
+        let schema = testdata::schema();
+        let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory database");
+        testdata::seed(&mut conn).expect("testdata initialization");
+        let backend = SqliteBackend::new(conn, &schema).expect("backend");
+        let recording = RecordingBackend::new(&backend);
+        run_with_storage("users { name }", &schema, &recording).expect("query");
+        let user = testdata::struct_id(&schema, "User");
+        let name = testdata::field_id(&schema, user, "name");
+        assert_eq!(*recording.fetches.borrow(), vec![(user, vec![name])]);
+        let related = recording.related_fetches.borrow();
+        assert!(!related.is_empty(), "owning refs are still resolved");
+        assert!(related.iter().all(|(_, _, fields)| fields.is_empty()));
+    }
+
+    #[test]
+    fn field_pushdown_whole_record_fields_kept() {
+        let schema = testdata::schema();
+        let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory database");
+        testdata::seed(&mut conn).expect("testdata initialization");
+        let backend = SqliteBackend::new(conn, &schema).expect("backend");
+        let recording = RecordingBackend::new(&backend);
+        run_with_storage("users", &schema, &recording).expect("query");
+        let user = testdata::struct_id(&schema, "User");
+        assert_eq!(
+            *recording.fetches.borrow(),
+            vec![(user, testdata_value_fields(&schema, user))]
+        );
+        let related = recording.related_fetches.borrow();
+        assert!(!related.is_empty());
+        for (rel, from_first, fields) in related.iter() {
+            let relation = &schema.relations[rel.index()];
+            let endpoint = if *from_first {
+                relation.endpoints()[0]
+            } else {
+                relation.endpoints()[1]
+            };
+            let target =
+                match &schema.structs[endpoint.struct_id().index()].fields[endpoint.local()] {
+                    Field::Ref { target, .. } => *target,
+                    _ => panic!("relation endpoint is not a ref"),
+                };
+            assert_eq!(fields, &testdata_value_fields(&schema, target));
         }
     }
 }

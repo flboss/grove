@@ -227,10 +227,11 @@ impl<'a> PlanBuilder<'a> {
         let PlanBuilder {
             schema,
             chains,
-            usage,
+            mut usage,
             applied_caps,
             ..
         } = self;
+        expand_whole(schema, &mut usage);
         let fields = schema
             .structs
             .iter()
@@ -677,6 +678,35 @@ impl<'a> PlanBuilder<'a> {
                 }
             }
             _ => None,
+        }
+    }
+}
+
+/// Whole records expose their eagerly resolved owning Refs, so whole-ness
+/// propagates through owning Ref fields
+fn expand_whole(schema: &ValidatedSchema, usage: &mut HashMap<StructId, FieldPlan>) {
+    let mut queue: Vec<StructId> = usage
+        .iter()
+        .filter(|(_, plan)| plan.whole)
+        .map(|(struct_id, _)| *struct_id)
+        .collect();
+    while let Some(struct_id) = queue.pop() {
+        let Some(struct_def) = schema.structs.get(struct_id.index()) else {
+            continue;
+        };
+        for field in &struct_def.fields {
+            if let Field::Ref {
+                owning: true,
+                target,
+                ..
+            } = field
+            {
+                let plan = usage.entry(*target).or_default();
+                if !plan.whole {
+                    plan.whole = true;
+                    queue.push(*target);
+                }
+            }
         }
     }
 }
@@ -1185,6 +1215,19 @@ mod tests {
             "User",
             &non_ref_field_names(&schema, "User"),
         );
+        assert_fields(
+            &plan,
+            &schema,
+            "Profile",
+            &non_ref_field_names(&schema, "Profile"),
+        );
+        assert_fields(
+            &plan,
+            &schema,
+            "Order",
+            &non_ref_field_names(&schema, "Order"),
+        );
+        assert_fields(&plan, &schema, "Role", &[]);
 
         let (_file, plan, schema) = typed_and_plan("users { m = manager }");
         assert_fields(
@@ -1201,6 +1244,15 @@ mod tests {
             "User",
             &non_ref_field_names(&schema, "User"),
         );
+
+        let (_file, plan, schema) = typed_and_plan("roles");
+        assert_fields(
+            &plan,
+            &schema,
+            "Role",
+            &non_ref_field_names(&schema, "Role"),
+        );
+        assert_fields(&plan, &schema, "User", &[]);
     }
 
     #[test]
@@ -1229,7 +1281,12 @@ mod tests {
             "User",
             &non_ref_field_names(&schema, "User"),
         );
-        assert_fields(&plan, &schema, "Order", &[]);
+        assert_fields(
+            &plan,
+            &schema,
+            "Order",
+            &non_ref_field_names(&schema, "Order"),
+        );
 
         let (_file, plan, schema) = typed_and_plan("users.len()");
         assert_fields(&plan, &schema, "User", &[]);
