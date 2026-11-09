@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use grove_query::typecheck::types::{TypedExpr, TypedMethodArg};
-use grove_types::Span;
+use grove_types::{NodeId, Span};
 
 use self::filter::eval_filter;
 use self::list::{eval_extend, eval_flatten, eval_list_contains, eval_list_len, eval_slice};
@@ -22,6 +22,7 @@ use self::sort::{SortKind, eval_sort};
 use super::data::resolve_base_link;
 use super::{EvalCtx, eval};
 use crate::error::ExecError;
+use crate::pushdown::CapRewrite;
 use crate::value::{Scalar, Val};
 
 pub(super) fn eval_method(
@@ -29,6 +30,7 @@ pub(super) fn eval_method(
     name: &str,
     args: &[TypedMethodArg],
     optional: bool,
+    node: NodeId,
     ctx: &mut EvalCtx<'_>,
     span: Span,
 ) -> Result<Val, ExecError> {
@@ -40,6 +42,13 @@ pub(super) fn eval_method(
         (true, Val::Some(v)) => *v,
         (_, v) => v,
     };
+    if let Some(rewrite) = ctx.plan.cap_rewrite(node) {
+        match (rewrite, name) {
+            (CapRewrite::Skip, "take" | "skip") => return Ok(base),
+            (CapRewrite::First, "nth") => return eval_slice("first", base, optional, &[], span),
+            _ => {}
+        }
+    }
     if let Some(sort_kind) = SortKind::from_str(name) {
         return eval_sort(sort_kind, base, optional, args, ctx, span);
     }

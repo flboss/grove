@@ -108,7 +108,7 @@ pub fn eval(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
                         }
                     })
                 }
-                IdentBinding::Root { root_idx } => exec_root(ctx, *root_idx),
+                IdentBinding::Root { root_idx } => exec_root(ctx, *root_idx, expr.id),
                 IdentBinding::Field(_) | IdentBinding::ProjectedField { .. } => {
                     ctx.env.lookup(&name.value, *depth).cloned().ok_or_else(|| {
                         ExecError::Integrity {
@@ -159,7 +159,7 @@ pub fn eval(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
             name,
             args,
             optional,
-        } => eval_method(base, &name.value, args, *optional, ctx, expr.span),
+        } => eval_method(base, &name.value, args, *optional, expr.id, ctx, expr.span),
         TypedExprKind::Cast { expr: inner, ty } => {
             let value = eval(inner, ctx)?;
             eval_cast(value, ty.value, expr.span)
@@ -271,9 +271,9 @@ pub(crate) mod harness {
                 .all(|d| d.severity == grove_types::Severity::Warning),
             "{parse_diags:?}"
         );
-        let (typed, diags) = grove_query::typecheck::typecheck(file.unwrap(), &schema);
+        let (typed, diags) = grove_query::typecheck::typecheck(file.unwrap(), schema);
         assert!(diags.is_empty(), "{diags:?}");
-        exec_file(&typed.unwrap(), storage, &schema, FIXED_NOW)
+        exec_file(&typed.unwrap(), storage, schema, FIXED_NOW)
     }
 
     pub(crate) fn run_seeded(src: &str) -> Result<Val, ExecError> {

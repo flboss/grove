@@ -3,6 +3,7 @@ use std::rc::Rc;
 
 use grove_query::typecheck::types::TypedExpr;
 use grove_schema::validated::{Field, FieldId, StructId, ValidatedSchema};
+use grove_types::NodeId;
 
 use crate::error::ExecError;
 use crate::eval::{EvalCtx, eval};
@@ -11,7 +12,11 @@ use crate::storage::{Key, Row};
 use crate::value::Val;
 
 /// Read root table into a List<Record> (owning Refs resolved)
-pub(crate) fn exec_root(ctx: &mut EvalCtx, root_idx: usize) -> Result<Val, ExecError> {
+pub(crate) fn exec_root(
+    ctx: &mut EvalCtx,
+    root_idx: usize,
+    node: NodeId,
+) -> Result<Val, ExecError> {
     let root = ctx
         .schema
         .roots
@@ -20,9 +25,12 @@ pub(crate) fn exec_root(ctx: &mut EvalCtx, root_idx: usize) -> Result<Val, ExecE
             message: format!("unknown root {root_idx} (internal error)"),
         })?;
     let fields = ctx.plan.fields_for(root.struct_id).to_vec();
-    let rows = ctx
-        .storage
-        .fetch(root.struct_id, &fields, &FetchConstraints::EMPTY)?;
+    let rows = if let Some(constraints) = ctx.plan.constraints_for(node) {
+        ctx.storage.fetch(root.struct_id, &fields, &constraints)?
+    } else {
+        ctx.storage
+            .fetch(root.struct_id, &fields, &FetchConstraints::EMPTY)?
+    };
     materialize(ctx, root.struct_id, &fields, rows)
 }
 
@@ -911,6 +919,7 @@ mod tests {
     struct RecordingBackend<'a, 's> {
         inner: &'a SqliteBackend<'s>,
         fetches: RefCell<Vec<(StructId, Vec<FieldId>)>>,
+        constraints: RefCell<Vec<FetchConstraints>>,
         related_fetches: RefCell<Vec<(RelationId, bool, Vec<FieldId>)>>,
     }
 
@@ -919,6 +928,7 @@ mod tests {
             RecordingBackend {
                 inner: backend,
                 fetches: RefCell::new(Vec::new()),
+                constraints: RefCell::new(Vec::new()),
                 related_fetches: RefCell::new(Vec::new()),
             }
         }
@@ -932,6 +942,7 @@ mod tests {
             constraints: &FetchConstraints,
         ) -> Result<Vec<Row>, ExecError> {
             self.fetches.borrow_mut().push((struct_id, fields.to_vec()));
+            self.constraints.borrow_mut().push(constraints.clone());
             self.inner.fetch(struct_id, fields, constraints)
         }
 
@@ -996,5 +1007,61 @@ mod tests {
                 };
             assert_eq!(fields, &testdata_value_fields(&schema, target));
         }
+    }
+
+    #[test]
+    fn root_fetch_constraints_reach_storage() {
+        let schema = testdata::schema();
+        let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory database");
+        testdata::seed(&mut conn).expect("testdata initialization");
+        let backend = SqliteBackend::new(conn, &schema).expect("backend");
+        let recording = RecordingBackend::new(&backend);
+        run_with_storage("users[id > 2].sort_over(name).take(2)", &schema, &recording)
+            .expect("query");
+        let constraints = recording.constraints.borrow();
+        let first = constraints.first().expect("root fetch");
+        assert_eq!(first.filters.len(), 1);
+        assert_eq!(first.sort.len(), 1);
+        assert_eq!(
+            first.sort[0].field,
+            testdata::field_id(&schema, testdata::struct_id(&schema, "User"), "name")
+        );
+        assert!(!first.sort[0].desc);
+        assert_eq!(first.offset, 0);
+        assert_eq!(first.limit, Some(2));
+    }
+
+    #[test]
+    fn pushed_root_operations_correctness() {
+        assert_eq!(
+            run_seeded("users.sort_desc_over(name).take(2).name"),
+            Ok(Val::List(vec![str("Eli"), str("Dan")]))
+        );
+        assert_eq!(
+            run_seeded("users.skip(1).take(2).name"),
+            Ok(Val::List(vec![str("Bob"), str("Cyd")]))
+        );
+        assert_eq!(
+            run_seeded("users.take(2).sort_desc_over(name).name"),
+            Ok(Val::List(vec![str("Bob"), str("Ada")]))
+        );
+        assert_eq!(
+            run_seeded("users.sort_over(name).take(10).skip(2).take(2).name"),
+            Ok(Val::List(vec![str("Cyd"), str("Dan")]))
+        );
+        assert_eq!(
+            run_seeded("users[id > 2][orders.len() > 1].map($.name)"),
+            Ok(Val::List(Vec::new()))
+        );
+        assert_eq!(run_seeded("users.first()?.name"), Ok(some(str("Ada"))));
+        assert_eq!(run_seeded("users.nth(-1)?.name"), Ok(some(str("Eli"))));
+        assert_eq!(
+            run_seeded("users.take(10).nth(3)?.name"),
+            Ok(some(str("Dan")))
+        );
+        assert_eq!(
+            run_seeded("users.skip(1).nth(2)?.name"),
+            Ok(some(str("Dan")))
+        );
     }
 }
