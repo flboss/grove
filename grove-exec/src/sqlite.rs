@@ -152,6 +152,10 @@ fn scalar_value(value: &Scalar) -> Value {
     }
 }
 
+fn saturating_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
 /// An owned link-key value for grouping array elements by parent row
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum LinkKey {
@@ -993,13 +997,8 @@ impl Storage for SqliteBackend<'_> {
         fetch_from_first: bool,
         parents: &[Key],
         fields: &[FieldId],
-        _constraints: &FetchConstraints,
+        constraints: &FetchConstraints,
     ) -> Result<Vec<Vec<Row>>, ExecError> {
-        debug_assert_eq!(
-            _constraints,
-            &FetchConstraints::EMPTY,
-            "related fetch constraints are not yet implemented"
-        );
         let mut groups: Vec<Vec<Row>> = parents.iter().map(|_| Vec::new()).collect();
         if parents.is_empty() {
             return Ok(groups);
@@ -1089,19 +1088,65 @@ impl Storage for SqliteBackend<'_> {
         let mut select = vec!["g$f._rowid_".to_string()];
         let mut slots = self.plan_fields(target, fields, "g$f", &mut select, &ctx)?;
         let parent_col = select.len();
-        select.push("g$k._rowid_".to_string());
         let placeholders = vec!["?"; parents.len()].join(", ");
-        let sql = format!(
-            "SELECT {} FROM {from} WHERE g$k._rowid_ IN ({placeholders}) ORDER BY g$f._rowid_",
-            select.join(", ")
-        );
-        let parent_ids: Vec<i64> = parents.iter().map(|key| key.0).collect();
+        let mut filter_params = Vec::new();
+        let mut filters = Vec::with_capacity(constraints.filters.len());
+        for filter in &constraints.filters {
+            filters.push(self.push_expr_sql(target, filter, "g$f", &mut filter_params)?);
+        }
+        let mut sort = Vec::with_capacity(constraints.sort.len() + 1);
+        for key in &constraints.sort {
+            let (column, _) = self.pushdown_field(target, key.field)?;
+            let direction = if key.desc { "DESC" } else { "ASC" };
+            sort.push(format!("g$f.{column} {direction}"));
+        }
+        sort.push("g$f._rowid_ ASC".to_string());
+        let mut where_clause = format!("g$k._rowid_ IN ({placeholders})");
+        if !filters.is_empty() {
+            where_clause.push_str(" AND ");
+            where_clause.push_str(&filters.join(" AND "));
+        }
+        let mut bind: Vec<Value> = parents.iter().map(|key| Value::Integer(key.0)).collect();
+        bind.extend(filter_params);
+        let caps = constraints.limit.is_some() || constraints.offset != 0;
+        let sql = if caps {
+            let mut inner = select;
+            inner.push("g$k._rowid_ AS g$p".to_string());
+            inner.push(format!(
+                "ROW_NUMBER() OVER (PARTITION BY g$k._rowid_ ORDER BY {}) AS g$rn",
+                sort.join(", ")
+            ));
+            let mut outer_where = Vec::new();
+            if constraints.offset != 0 {
+                outer_where.push("g$rn > ?".to_string());
+                bind.push(Value::Integer(saturating_i64(constraints.offset)));
+            }
+            if let Some(limit) = constraints.limit {
+                outer_where.push("g$rn <= ?".to_string());
+                bind.push(Value::Integer(saturating_i64(
+                    constraints.offset.saturating_add(limit),
+                )));
+            }
+            format!(
+                "SELECT * FROM (SELECT {} FROM {from} WHERE {where_clause}) \
+                 WHERE {} ORDER BY g$p, g$rn",
+                inner.join(", "),
+                outer_where.join(" AND ")
+            )
+        } else {
+            select.push("g$k._rowid_".to_string());
+            format!(
+                "SELECT {} FROM {from} WHERE {where_clause} ORDER BY {}",
+                select.join(", "),
+                sort.join(", ")
+            )
+        };
         let mut stmt = self
             .conn
             .prepare(&sql)
             .map_err(|err| Self::storage_error(&ctx, err))?;
         let mut rows = stmt
-            .query(params_from_iter(parent_ids))
+            .query(params_from_iter(bind))
             .map_err(|err| Self::storage_error(&ctx, err))?;
         let mut index: HashMap<Key, Vec<usize>> = HashMap::new();
         for (i, key) in parents.iter().enumerate() {
@@ -2027,6 +2072,134 @@ mod tests {
     }
 
     #[test]
+    fn fetch_related_constraints_filter_sort() {
+        let schema = testdata::schema();
+        let backend = test_backend(&schema);
+        let amount = testdata::field_id(&schema, testdata::struct_id(&schema, "Order"), "amount");
+        let rel = rel_named(&schema, "Order", "user", "User", "orders");
+        let constraints = FetchConstraints {
+            filters: vec![push_cmp(
+                CmpOp::Gt,
+                target_field(&schema, "Order", "amount"),
+                PushExpr::Literal(Scalar::Int(150)),
+            )],
+            sort: vec![SortKey {
+                field: amount,
+                desc: true,
+            }],
+            offset: 0,
+            limit: None,
+        };
+        let groups = backend
+            .fetch_related(
+                rel,
+                false,
+                &[Key(1), Key(2), Key(3)],
+                &[amount],
+                &constraints,
+            )
+            .unwrap();
+        assert_eq!(
+            firsts(&groups),
+            vec![vec![int(200)], vec![int(400)], vec![]]
+        );
+    }
+
+    #[test]
+    fn fetch_related_caps_per_parent() {
+        let schema = testdata::schema();
+        let backend = test_backend(&schema);
+        let amount = testdata::field_id(&schema, testdata::struct_id(&schema, "Order"), "amount");
+        let rel = rel_named(&schema, "Order", "user", "User", "orders");
+
+        let groups = backend
+            .fetch_related(
+                rel,
+                false,
+                &[Key(1), Key(2), Key(3)],
+                &[amount],
+                &FetchConstraints {
+                    filters: vec![],
+                    sort: vec![],
+                    offset: 0,
+                    limit: Some(1),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            firsts(&groups),
+            vec![vec![int(100)], vec![int(400)], vec![]]
+        );
+
+        let groups = backend
+            .fetch_related(
+                rel,
+                false,
+                &[Key(1), Key(2), Key(3)],
+                &[amount],
+                &FetchConstraints {
+                    filters: vec![],
+                    sort: vec![],
+                    offset: 1,
+                    limit: Some(1),
+                },
+            )
+            .unwrap();
+        assert_eq!(firsts(&groups), vec![vec![int(200)], vec![], vec![]]);
+    }
+
+    #[test]
+    fn fetch_related_non_owning_constraints() {
+        let schema = testdata::schema();
+        let backend = test_backend(&schema);
+        let name = testdata::field_id(&schema, testdata::struct_id(&schema, "Role"), "name");
+        let rel = rel_named(&schema, "Role", "users", "User", "roles");
+        let constraints = FetchConstraints {
+            filters: vec![push_cmp(
+                CmpOp::Eq,
+                target_field(&schema, "Role", "name"),
+                PushExpr::Literal(Scalar::String("editor".to_string())),
+            )],
+            sort: vec![],
+            offset: 0,
+            limit: Some(1),
+        };
+        let groups = backend
+            .fetch_related(rel, false, &[Key(1), Key(3), Key(2)], &[name], &constraints)
+            .unwrap();
+        assert_eq!(
+            firsts(&groups),
+            vec![vec![str("editor")], vec![str("editor")], vec![]]
+        );
+    }
+
+    #[test]
+    fn fetch_related_offset_only() {
+        let schema = testdata::schema();
+        let backend = test_backend(&schema);
+        let amount = testdata::field_id(&schema, testdata::struct_id(&schema, "Order"), "amount");
+        let rel = rel_named(&schema, "Order", "user", "User", "orders");
+        let groups = backend
+            .fetch_related(
+                rel,
+                false,
+                &[Key(1), Key(2)],
+                &[amount],
+                &FetchConstraints {
+                    filters: vec![],
+                    sort: vec![SortKey {
+                        field: amount,
+                        desc: false,
+                    }],
+                    offset: 1,
+                    limit: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(firsts(&groups), vec![vec![int(200)], vec![]]);
+    }
+
+    #[test]
     fn fetch_related_one_to_many() {
         let schema = testdata::schema();
         let backend = test_backend(&schema);
@@ -2194,6 +2367,14 @@ mod tests {
 
     fn push_field(schema: &ValidatedSchema, name: &str) -> PushExpr {
         PushExpr::Field(user_field(schema, user_struct(schema), name))
+    }
+
+    fn target_field(schema: &ValidatedSchema, struct_name: &str, name: &str) -> PushExpr {
+        PushExpr::Field(testdata::field_id(
+            schema,
+            testdata::struct_id(schema, struct_name),
+            name,
+        ))
     }
 
     fn push_int(value: i64) -> PushExpr {
