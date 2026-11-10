@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fmt::{self, Write};
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 use chrono::{DateTime, TimeDelta, Utc};
@@ -33,6 +34,48 @@ impl Scalar {
             Scalar::Bool(_) => "Bool",
             Scalar::Instant(_) => "Instant",
             Scalar::Duration(_) => "Duration",
+        }
+    }
+}
+
+impl Hash for Scalar {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            Scalar::Int(n) => {
+                0u8.hash(state);
+                n.hash(state);
+            }
+            Scalar::Float(x) => {
+                1u8.hash(state);
+                let bits = if x.is_nan() {
+                    f64::NAN.to_bits()
+                } else if *x == 0.0 {
+                    0.0f64.to_bits()
+                } else {
+                    x.to_bits()
+                };
+                bits.hash(state);
+            }
+            Scalar::Dec(d) => {
+                2u8.hash(state);
+                d.hash(state);
+            }
+            Scalar::String(s) => {
+                3u8.hash(state);
+                s.hash(state);
+            }
+            Scalar::Bool(b) => {
+                4u8.hash(state);
+                b.hash(state);
+            }
+            Scalar::Instant(t) => {
+                5u8.hash(state);
+                t.hash(state);
+            }
+            Scalar::Duration(d) => {
+                6u8.hash(state);
+                d.hash(state);
+            }
         }
     }
 }

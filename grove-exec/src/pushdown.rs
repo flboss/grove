@@ -13,7 +13,7 @@ use crate::eval::literals::{decode_literal, eval_type_constant};
 use crate::value::{Scalar, Val};
 
 /// Backend-agnostic constraint set attached to a storage read
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, Hash)]
 pub struct FetchConstraints {
     /// WHERE predicates connected by AND
     pub filters: Vec<PushExpr>,
@@ -36,13 +36,13 @@ impl FetchConstraints {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SortKey {
     pub field: FieldId,
     pub desc: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub enum PushExpr {
     /// Non-optional single-column scalar
     Field(FieldId),
@@ -68,7 +68,7 @@ pub enum PushExpr {
     StringLen(Box<PushExpr>),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CmpOp {
     Eq,
     Ne,
@@ -78,7 +78,7 @@ pub enum CmpOp {
     Ge,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StringOp {
     Contains,
     StartsWith,
