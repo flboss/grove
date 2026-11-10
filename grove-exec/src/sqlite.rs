@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
@@ -22,46 +23,109 @@ use crate::value::{Scalar, Val};
 pub struct SqliteBackend<'a> {
     conn: Connection,
     schema: &'a ValidatedSchema,
-    sql_cache: RefCell<HashMap<SqlCacheKey, Rc<CachedSql>>>,
+    sql_cache: RefCell<HashMap<u64, Vec<SqlCacheEntry>>>,
 }
 
-#[derive(Debug, Clone)]
-struct ConstraintKey(FetchConstraints);
-
-impl PartialEq for ConstraintKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
-    }
-}
-
-impl Eq for ConstraintKey {}
-
-impl Hash for ConstraintKey {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.hash(state);
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq)]
 enum SqlCacheKey {
     Fetch {
         struct_id: StructId,
         fields: Vec<FieldId>,
-        constraints: ConstraintKey,
+        constraints: FetchConstraints,
     },
     Related {
         rel: RelationId,
         fetch_from_first: bool,
         fields: Vec<FieldId>,
-        constraints: ConstraintKey,
+        constraints: FetchConstraints,
         parents: usize,
     },
+}
+
+impl SqlCacheKey {
+    fn matches_fetch(
+        &self,
+        struct_id: StructId,
+        fields: &[FieldId],
+        constraints: &FetchConstraints,
+    ) -> bool {
+        matches!(
+            self,
+            SqlCacheKey::Fetch {
+                struct_id: key_struct,
+                fields: key_fields,
+                constraints: key_constraints,
+            } if *key_struct == struct_id
+                && key_fields.as_slice() == fields
+                && key_constraints == constraints
+        )
+    }
+
+    fn matches_related(
+        &self,
+        rel: RelationId,
+        fetch_from_first: bool,
+        fields: &[FieldId],
+        constraints: &FetchConstraints,
+        parents: usize,
+    ) -> bool {
+        matches!(
+            self,
+            SqlCacheKey::Related {
+                rel: key_rel,
+                fetch_from_first: key_first,
+                fields: key_fields,
+                constraints: key_constraints,
+                parents: key_parents,
+            } if *key_rel == rel
+                && *key_first == fetch_from_first
+                && key_fields.as_slice() == fields
+                && key_constraints == constraints
+                && *key_parents == parents
+        )
+    }
+}
+
+#[derive(Debug)]
+struct SqlCacheEntry {
+    key: SqlCacheKey,
+    cached: Rc<CachedSql>,
 }
 
 #[derive(Debug)]
 struct CachedSql {
     sql: String,
     params: Vec<Value>,
+}
+
+fn fingerprint_fetch(
+    struct_id: StructId,
+    fields: &[FieldId],
+    constraints: &FetchConstraints,
+) -> u64 {
+    let mut state = DefaultHasher::new();
+    0u8.hash(&mut state);
+    struct_id.hash(&mut state);
+    fields.hash(&mut state);
+    constraints.hash(&mut state);
+    state.finish()
+}
+
+fn fingerprint_fetch_related(
+    rel: RelationId,
+    fetch_from_first: bool,
+    fields: &[FieldId],
+    constraints: &FetchConstraints,
+    parents: usize,
+) -> u64 {
+    let mut state = DefaultHasher::new();
+    1u8.hash(&mut state);
+    rel.hash(&mut state);
+    fetch_from_first.hash(&mut state);
+    fields.hash(&mut state);
+    constraints.hash(&mut state);
+    parents.hash(&mut state);
+    state.finish()
 }
 
 impl<'a> SqliteBackend<'a> {
@@ -97,15 +161,34 @@ impl<'a> SqliteBackend<'a> {
 
     fn cached_sql(
         &self,
-        key: SqlCacheKey,
+        fingerprint: u64,
+        matches: impl Fn(&SqlCacheKey) -> bool,
+        build_key: impl FnOnce() -> SqlCacheKey,
         build: impl FnOnce() -> Result<(String, Vec<Value>), ExecError>,
     ) -> Result<Rc<CachedSql>, ExecError> {
-        if let Some(cached) = self.sql_cache.borrow().get(&key) {
-            return Ok(Rc::clone(cached));
+        if let Some(cached) = self
+            .sql_cache
+            .borrow()
+            .get(&fingerprint)
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|entry| matches(&entry.key))
+                    .map(|entry| Rc::clone(&entry.cached))
+            })
+        {
+            return Ok(cached);
         }
         let (sql, params) = build()?;
         let cached = Rc::new(CachedSql { sql, params });
-        self.sql_cache.borrow_mut().insert(key, Rc::clone(&cached));
+        self.sql_cache
+            .borrow_mut()
+            .entry(fingerprint)
+            .or_default()
+            .push(SqlCacheEntry {
+                key: build_key(),
+                cached: Rc::clone(&cached),
+            });
         Ok(cached)
     }
 
@@ -1010,41 +1093,46 @@ impl Storage for SqliteBackend<'_> {
         let ctx = format!("fetch {struct_name}");
         let mut select = vec!["_rowid_".to_string()];
         let mut slots = self.plan_fields(struct_id, fields, &table, &mut select, &ctx)?;
-        let key = SqlCacheKey::Fetch {
-            struct_id,
-            fields: fields.to_vec(),
-            constraints: ConstraintKey(constraints.clone()),
-        };
-        let cached = self.cached_sql(key, || {
-            let mut params = Vec::new();
-            let mut filters = Vec::with_capacity(constraints.filters.len());
-            for filter in &constraints.filters {
-                filters.push(self.push_expr_sql(struct_id, filter, &table, &mut params)?);
-            }
-            let mut sort = Vec::with_capacity(constraints.sort.len() + 1);
-            for key in &constraints.sort {
-                let (column, _) = self.pushdown_field(struct_id, key.field)?;
-                let direction = if key.desc { "DESC" } else { "ASC" };
-                sort.push(format!("{table}.{column} {direction}"));
-            }
-            sort.push("_rowid_ ASC".to_string());
-            let mut sql = format!("SELECT {} FROM {table}", select.join(", "));
-            if !filters.is_empty() {
-                sql.push_str(" WHERE ");
-                sql.push_str(&filters.join(" AND "));
-            }
-            sql.push_str(" ORDER BY ");
-            sql.push_str(&sort.join(", "));
-            if let Some(limit) = constraints.limit {
-                sql.push_str(&format!(" LIMIT {limit}"));
-                if constraints.offset != 0 {
-                    sql.push_str(&format!(" OFFSET {}", constraints.offset));
+        let fingerprint = fingerprint_fetch(struct_id, fields, constraints);
+        let cached = self.cached_sql(
+            fingerprint,
+            |key| key.matches_fetch(struct_id, fields, constraints),
+            || SqlCacheKey::Fetch {
+                struct_id,
+                fields: fields.to_vec(),
+                constraints: constraints.clone(),
+            },
+            || {
+                let mut params = Vec::new();
+                let mut filters = Vec::with_capacity(constraints.filters.len());
+                for filter in &constraints.filters {
+                    filters.push(self.push_expr_sql(struct_id, filter, &table, &mut params)?);
                 }
-            } else if constraints.offset != 0 {
-                sql.push_str(&format!(" LIMIT -1 OFFSET {}", constraints.offset));
-            }
-            Ok((sql, params))
-        })?;
+                let mut sort = Vec::with_capacity(constraints.sort.len() + 1);
+                for key in &constraints.sort {
+                    let (column, _) = self.pushdown_field(struct_id, key.field)?;
+                    let direction = if key.desc { "DESC" } else { "ASC" };
+                    sort.push(format!("{table}.{column} {direction}"));
+                }
+                sort.push("_rowid_ ASC".to_string());
+                let mut sql = format!("SELECT {} FROM {table}", select.join(", "));
+                if !filters.is_empty() {
+                    sql.push_str(" WHERE ");
+                    sql.push_str(&filters.join(" AND "));
+                }
+                sql.push_str(" ORDER BY ");
+                sql.push_str(&sort.join(", "));
+                if let Some(limit) = constraints.limit {
+                    sql.push_str(&format!(" LIMIT {limit}"));
+                    if constraints.offset != 0 {
+                        sql.push_str(&format!(" OFFSET {}", constraints.offset));
+                    }
+                } else if constraints.offset != 0 {
+                    sql.push_str(&format!(" LIMIT -1 OFFSET {}", constraints.offset));
+                }
+                Ok((sql, params))
+            },
+        )?;
         let mut stmt = self
             .conn
             .prepare_cached(&cached.sql)
@@ -1100,124 +1188,130 @@ impl Storage for SqliteBackend<'_> {
         let mut select = vec!["g$f._rowid_".to_string()];
         let mut slots = self.plan_fields(target, fields, "g$f", &mut select, &ctx)?;
         let parent_col = select.len();
-        let key = SqlCacheKey::Related {
-            rel,
-            fetch_from_first,
-            fields: fields.to_vec(),
-            constraints: ConstraintKey(constraints.clone()),
-            parents: parents.len(),
-        };
-        let cached = self.cached_sql(key, || {
-            let target_def = &schema.structs[target.index()];
-            let fetched_table = quote(&schema.tables[target_def.table.index()].name);
-            let known_table = quote(&schema.tables[parent_def.table.index()].name);
-            let from = match relation {
-                Relation::OneToOne {
-                    child_ref, fk, pk, ..
-                }
-                | Relation::ManyToOne {
-                    child_ref, fk, pk, ..
-                } => {
-                    let fk_col = quote(schema.column_name(*fk));
-                    let pk_col = quote(schema.column_name(*pk));
-                    let on = if fetch_ep != *child_ref {
-                        format!("g$f.{fk_col} = g$k.{pk_col}")
-                    } else {
-                        format!("g$f.{pk_col} = g$k.{fk_col}")
-                    };
-                    format!("{fetched_table} AS g$f JOIN {known_table} AS g$k ON {on}")
-                }
-                Relation::OneToMany { b_ref, fk, pk, .. } => {
-                    let fk_col = quote(schema.column_name(*fk));
-                    let pk_col = quote(schema.column_name(*pk));
-                    let on = if fetch_ep != *b_ref {
-                        format!("g$f.{fk_col} = g$k.{pk_col}")
-                    } else {
-                        format!("g$f.{pk_col} = g$k.{fk_col}")
-                    };
-                    format!("{fetched_table} AS g$f JOIN {known_table} AS g$k ON {on}")
-                }
-                Relation::ManyToMany {
-                    a_ref,
-                    b_ref: _,
-                    join_table,
-                    a_col,
-                    a_pk,
-                    b_col,
-                    b_pk,
-                } => {
-                    // Endpoints point across (b endpoint's target is the a-side struct),
-                    // so fetching through b reads a-side rows
-                    let (x_col, x_pk, y_col, y_pk) = if fetch_ep != *a_ref {
-                        (a_col, a_pk, b_col, b_pk)
-                    } else {
-                        (b_col, b_pk, a_col, a_pk)
-                    };
-                    let join_table = quote(&schema.tables[join_table.index()].name);
-                    let x_col = quote(schema.column_name(*x_col));
-                    let x_pk = quote(schema.column_name(*x_pk));
-                    let y_col = quote(schema.column_name(*y_col));
-                    let y_pk = quote(schema.column_name(*y_pk));
-                    format!(
-                        "{fetched_table} AS g$f \
+        let fingerprint =
+            fingerprint_fetch_related(rel, fetch_from_first, fields, constraints, parents.len());
+        let cached = self.cached_sql(
+            fingerprint,
+            |key| key.matches_related(rel, fetch_from_first, fields, constraints, parents.len()),
+            || SqlCacheKey::Related {
+                rel,
+                fetch_from_first,
+                fields: fields.to_vec(),
+                constraints: constraints.clone(),
+                parents: parents.len(),
+            },
+            || {
+                let target_def = &schema.structs[target.index()];
+                let fetched_table = quote(&schema.tables[target_def.table.index()].name);
+                let known_table = quote(&schema.tables[parent_def.table.index()].name);
+                let from = match relation {
+                    Relation::OneToOne {
+                        child_ref, fk, pk, ..
+                    }
+                    | Relation::ManyToOne {
+                        child_ref, fk, pk, ..
+                    } => {
+                        let fk_col = quote(schema.column_name(*fk));
+                        let pk_col = quote(schema.column_name(*pk));
+                        let on = if fetch_ep != *child_ref {
+                            format!("g$f.{fk_col} = g$k.{pk_col}")
+                        } else {
+                            format!("g$f.{pk_col} = g$k.{fk_col}")
+                        };
+                        format!("{fetched_table} AS g$f JOIN {known_table} AS g$k ON {on}")
+                    }
+                    Relation::OneToMany { b_ref, fk, pk, .. } => {
+                        let fk_col = quote(schema.column_name(*fk));
+                        let pk_col = quote(schema.column_name(*pk));
+                        let on = if fetch_ep != *b_ref {
+                            format!("g$f.{fk_col} = g$k.{pk_col}")
+                        } else {
+                            format!("g$f.{pk_col} = g$k.{fk_col}")
+                        };
+                        format!("{fetched_table} AS g$f JOIN {known_table} AS g$k ON {on}")
+                    }
+                    Relation::ManyToMany {
+                        a_ref,
+                        b_ref: _,
+                        join_table,
+                        a_col,
+                        a_pk,
+                        b_col,
+                        b_pk,
+                    } => {
+                        // Endpoints point across (b endpoint's target is the a-side struct),
+                        // so fetching through b reads a-side rows
+                        let (x_col, x_pk, y_col, y_pk) = if fetch_ep != *a_ref {
+                            (a_col, a_pk, b_col, b_pk)
+                        } else {
+                            (b_col, b_pk, a_col, a_pk)
+                        };
+                        let join_table = quote(&schema.tables[join_table.index()].name);
+                        let x_col = quote(schema.column_name(*x_col));
+                        let x_pk = quote(schema.column_name(*x_pk));
+                        let y_col = quote(schema.column_name(*y_col));
+                        let y_pk = quote(schema.column_name(*y_pk));
+                        format!(
+                            "{fetched_table} AS g$f \
                          JOIN {join_table} AS g$j ON g$j.{x_col} = g$f.{x_pk} \
                          JOIN {known_table} AS g$k ON g$j.{y_col} = g$k.{y_pk}"
-                    )
+                        )
+                    }
+                };
+                let placeholders = vec!["?"; parents.len()].join(", ");
+                let mut params = Vec::new();
+                let mut filters = Vec::with_capacity(constraints.filters.len());
+                for filter in &constraints.filters {
+                    filters.push(self.push_expr_sql(target, filter, "g$f", &mut params)?);
                 }
-            };
-            let placeholders = vec!["?"; parents.len()].join(", ");
-            let mut params = Vec::new();
-            let mut filters = Vec::with_capacity(constraints.filters.len());
-            for filter in &constraints.filters {
-                filters.push(self.push_expr_sql(target, filter, "g$f", &mut params)?);
-            }
-            let mut sort = Vec::with_capacity(constraints.sort.len() + 1);
-            for key in &constraints.sort {
-                let (column, _) = self.pushdown_field(target, key.field)?;
-                let direction = if key.desc { "DESC" } else { "ASC" };
-                sort.push(format!("g$f.{column} {direction}"));
-            }
-            sort.push("g$f._rowid_ ASC".to_string());
-            let mut where_clause = format!("g$k._rowid_ IN ({placeholders})");
-            if !filters.is_empty() {
-                where_clause.push_str(" AND ");
-                where_clause.push_str(&filters.join(" AND "));
-            }
-            let caps = constraints.limit.is_some() || constraints.offset != 0;
-            let sql = if caps {
-                let mut inner = select;
-                inner.push("g$k._rowid_ AS g$p".to_string());
-                inner.push(format!(
-                    "ROW_NUMBER() OVER (PARTITION BY g$k._rowid_ ORDER BY {}) AS g$rn",
-                    sort.join(", ")
-                ));
-                let mut outer_where = Vec::new();
-                if constraints.offset != 0 {
-                    outer_where.push("g$rn > ?".to_string());
-                    params.push(Value::Integer(saturating_i64(constraints.offset)));
+                let mut sort = Vec::with_capacity(constraints.sort.len() + 1);
+                for key in &constraints.sort {
+                    let (column, _) = self.pushdown_field(target, key.field)?;
+                    let direction = if key.desc { "DESC" } else { "ASC" };
+                    sort.push(format!("g$f.{column} {direction}"));
                 }
-                if let Some(limit) = constraints.limit {
-                    outer_where.push("g$rn <= ?".to_string());
-                    params.push(Value::Integer(saturating_i64(
-                        constraints.offset.saturating_add(limit),
-                    )));
+                sort.push("g$f._rowid_ ASC".to_string());
+                let mut where_clause = format!("g$k._rowid_ IN ({placeholders})");
+                if !filters.is_empty() {
+                    where_clause.push_str(" AND ");
+                    where_clause.push_str(&filters.join(" AND "));
                 }
-                format!(
-                    "SELECT * FROM (SELECT {} FROM {from} WHERE {where_clause}) \
+                let caps = constraints.limit.is_some() || constraints.offset != 0;
+                let sql = if caps {
+                    let mut inner = select;
+                    inner.push("g$k._rowid_ AS g$p".to_string());
+                    inner.push(format!(
+                        "ROW_NUMBER() OVER (PARTITION BY g$k._rowid_ ORDER BY {}) AS g$rn",
+                        sort.join(", ")
+                    ));
+                    let mut outer_where = Vec::new();
+                    if constraints.offset != 0 {
+                        outer_where.push("g$rn > ?".to_string());
+                        params.push(Value::Integer(saturating_i64(constraints.offset)));
+                    }
+                    if let Some(limit) = constraints.limit {
+                        outer_where.push("g$rn <= ?".to_string());
+                        params.push(Value::Integer(saturating_i64(
+                            constraints.offset.saturating_add(limit),
+                        )));
+                    }
+                    format!(
+                        "SELECT * FROM (SELECT {} FROM {from} WHERE {where_clause}) \
                      WHERE {} ORDER BY g$p, g$rn",
-                    inner.join(", "),
-                    outer_where.join(" AND ")
-                )
-            } else {
-                select.push("g$k._rowid_".to_string());
-                format!(
-                    "SELECT {} FROM {from} WHERE {where_clause} ORDER BY {}",
-                    select.join(", "),
-                    sort.join(", ")
-                )
-            };
-            Ok((sql, params))
-        })?;
+                        inner.join(", "),
+                        outer_where.join(" AND ")
+                    )
+                } else {
+                    select.push("g$k._rowid_".to_string());
+                    format!(
+                        "SELECT {} FROM {from} WHERE {where_clause} ORDER BY {}",
+                        select.join(", "),
+                        sort.join(", ")
+                    )
+                };
+                Ok((sql, params))
+            },
+        )?;
         let mut bind: Vec<Value> = parents.iter().map(|key| Value::Integer(key.0)).collect();
         bind.extend(cached.params.iter().cloned());
         let mut stmt = self
