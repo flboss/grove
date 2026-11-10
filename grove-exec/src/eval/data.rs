@@ -572,6 +572,7 @@ pub(crate) fn exec_field(
     base: &TypedExpr,
     name: &str,
     optional: bool,
+    node: NodeId,
     ctx: &mut EvalCtx,
 ) -> Result<Val, ExecError> {
     let base = eval(base, ctx)?;
@@ -582,7 +583,34 @@ pub(crate) fn exec_field(
         (_, v) => v,
     };
     let result = match base {
-        Val::Record(fields) => record_field(fields, name)?,
+        Val::Record(fields) => {
+            let value = record_field(fields, name)?;
+            let constraints = ctx
+                .plan
+                .constraints_for(node)
+                .filter(|constraints| !constraints.is_empty());
+            match (constraints, value) {
+                (Some(constraints), Val::Ref { field, parent }) => {
+                    let mut resolved = resolve_field(ctx, field, &[parent], constraints)?;
+                    ctx.applied_triggers.insert(node);
+                    let value = match resolved.pop() {
+                        Some((_, value)) => value,
+                        None => {
+                            return Err(ExecError::Integrity {
+                                message: "constrained Ref resolved to no value (internal error)"
+                                    .to_string(),
+                            });
+                        }
+                    };
+                    return Ok(if optional && !matches!(value, Val::None) {
+                        Val::Some(Box::new(value))
+                    } else {
+                        value
+                    });
+                }
+                (_, value) => value,
+            }
+        }
         Val::List(items) => {
             let mut mapped = Vec::with_capacity(items.len());
             for item in items {
@@ -1922,5 +1950,57 @@ mod tests {
         );
         assert_eq!(related_fields_for(&schema, &related, profile), None);
         assert_eq!(recording.related_parent_counts.borrow().as_slice(), &[5]);
+    }
+
+    #[test]
+    fn field_trigger_owning_pushes_into_fetch_related() {
+        let schema = testdata::schema();
+        let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory database");
+        testdata::seed(&mut conn).expect("testdata initialization");
+        let backend = SqliteBackend::new(conn, &schema).expect("backend");
+        let recording = RecordingBackend::new(&backend);
+        let result = run_with_storage_opts(
+            "users[id <= 2].map($.orders[amount > 150].take(1).len())",
+            &schema,
+            &recording,
+            ExecOptions::default(),
+        )
+        .expect("query");
+
+        let related = recording.related_constraints.borrow();
+        assert_eq!(related.len(), 2);
+        for constraints in related.iter() {
+            assert_eq!(constraints.filters.len(), 1);
+            assert!(constraints.sort.is_empty());
+            assert_eq!(constraints.offset, 0);
+            assert_eq!(constraints.limit, Some(1));
+        }
+        assert_eq!(result, Val::List(vec![int(1), int(1)]));
+    }
+
+    #[test]
+    fn field_trigger_non_owning_pushes_into_fetch_related() {
+        let schema = testdata::schema();
+        let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory database");
+        testdata::seed(&mut conn).expect("testdata initialization");
+        let backend = SqliteBackend::new(conn, &schema).expect("backend");
+        let recording = RecordingBackend::new(&backend);
+        let result = run_with_storage_opts(
+            "users[id <= 2].map($.roles.take(1).len())",
+            &schema,
+            &recording,
+            ExecOptions::default(),
+        )
+        .expect("query");
+
+        let related = recording.related_constraints.borrow();
+        assert_eq!(related.len(), 2);
+        for constraints in related.iter() {
+            assert!(constraints.filters.is_empty());
+            assert!(constraints.sort.is_empty());
+            assert_eq!(constraints.offset, 0);
+            assert_eq!(constraints.limit, Some(1));
+        }
+        assert_eq!(result, Val::List(vec![int(1), int(0)]));
     }
 }

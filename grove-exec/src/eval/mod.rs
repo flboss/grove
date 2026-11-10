@@ -161,7 +161,7 @@ pub fn eval(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
             base,
             name,
             optional,
-        } => exec_field(base, &name.value, *optional, ctx),
+        } => exec_field(base, &name.value, *optional, expr.id, ctx),
         TypedExprKind::TupleAccess {
             base,
             index,
