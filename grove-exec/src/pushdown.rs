@@ -30,6 +30,10 @@ impl FetchConstraints {
         offset: 0,
         limit: None,
     };
+
+    pub fn is_empty(&self) -> bool {
+        self.filters.is_empty() && self.sort.is_empty() && self.offset == 0 && self.limit.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,12 +93,21 @@ pub enum CapRewrite {
     First,
 }
 
+/// Folded cap node rewrite mode, trigger fetch which applied it
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapPlan {
+    pub rewrite: CapRewrite,
+    pub trigger: NodeId,
+}
+
 /// Annotation map for pushdown
 #[derive(Debug, Clone, Default)]
 pub struct PushdownPlan {
     fetches: HashMap<NodeId, FetchConstraints>,
     fields: HashMap<StructId, Vec<FieldId>>,
-    applied_caps: HashMap<NodeId, CapRewrite>,
+    caps: HashMap<NodeId, CapPlan>,
+    #[allow(dead_code)] // prefetch does not yet consider this
+    prefetch_skip: HashSet<FieldId>,
     enabled: bool,
 }
 
@@ -109,8 +122,9 @@ impl PushdownPlan {
             schema,
             now,
             chains: HashMap::new(),
+            ref_sites: HashMap::new(),
             usage: HashMap::new(),
-            applied_caps: HashMap::new(),
+            caps: HashMap::new(),
         };
         for statement in &file.statements {
             match statement {
@@ -128,7 +142,8 @@ impl PushdownPlan {
         PushdownPlan {
             fetches: HashMap::new(),
             fields: all_struct_fields(schema),
-            applied_caps: HashMap::new(),
+            caps: HashMap::new(),
+            prefetch_skip: HashSet::new(),
             enabled: false,
         }
     }
@@ -149,7 +164,11 @@ impl PushdownPlan {
     }
 
     pub fn cap_rewrite(&self, node: NodeId) -> Option<CapRewrite> {
-        self.applied_caps.get(&node).copied()
+        self.caps.get(&node).map(|cap| cap.rewrite)
+    }
+
+    pub fn cap_plan(&self, node: NodeId) -> Option<CapPlan> {
+        self.caps.get(&node).copied()
     }
 }
 
@@ -218,8 +237,9 @@ struct PlanBuilder<'a> {
     schema: &'a ValidatedSchema,
     now: DateTime<Utc>,
     chains: HashMap<NodeId, ChainState>,
+    ref_sites: HashMap<NodeId, FieldId>,
     usage: HashMap<StructId, FieldPlan>,
-    applied_caps: HashMap<NodeId, CapRewrite>,
+    caps: HashMap<NodeId, CapPlan>,
 }
 
 impl<'a> PlanBuilder<'a> {
@@ -227,8 +247,9 @@ impl<'a> PlanBuilder<'a> {
         let PlanBuilder {
             schema,
             chains,
+            ref_sites,
             mut usage,
-            applied_caps,
+            caps,
             ..
         } = self;
         expand_whole(schema, &mut usage);
@@ -251,13 +272,22 @@ impl<'a> PlanBuilder<'a> {
                 (struct_id, subset)
             })
             .collect();
+        let fetches: HashMap<NodeId, FetchConstraints> = chains
+            .into_iter()
+            .map(|(node, state)| (node, state.into_constraints()))
+            .collect();
+        let prefetch_skip = ref_sites
+            .into_iter()
+            .filter_map(|(node, field)| {
+                let constraints = fetches.get(&node)?;
+                (!constraints.is_empty()).then_some(field)
+            })
+            .collect();
         PushdownPlan {
-            fetches: chains
-                .into_iter()
-                .map(|(node, state)| (node, state.into_constraints()))
-                .collect(),
+            fetches,
             fields,
-            applied_caps,
+            caps,
+            prefetch_skip,
             enabled: true,
         }
     }
@@ -273,7 +303,14 @@ impl<'a> PlanBuilder<'a> {
             TypedExprKind::Ident { binding, .. } => self.visit_ident(expr, binding),
             TypedExprKind::Field { base, name, .. } => {
                 self.visit_field_access(base, &name.value);
-                None
+                let trigger = base
+                    .ty
+                    .single_schema_record()
+                    .and_then(|struct_id| self.schema.struct_field(struct_id, &name.value))
+                    .and_then(|(field, _)| {
+                        self.list_ref_target(field).map(|target| (field, target))
+                    });
+                trigger.map(|(field, target)| self.start_ref_chain(expr.id, field, target))
             }
             TypedExprKind::TupleAccess { base, .. } => {
                 self.visit(base, Need::Narrow);
@@ -347,12 +384,33 @@ impl<'a> PlanBuilder<'a> {
             }
             IdentBinding::Field(field) => {
                 self.mark_used_field(*field);
-                None
+                let target = self.list_ref_target(*field)?;
+                Some(self.start_ref_chain(expr.id, *field, target))
             }
             IdentBinding::ProjectedField { .. }
             | IdentBinding::Prev { .. }
             | IdentBinding::ListElement
             | IdentBinding::Let => None,
+        }
+    }
+
+    fn list_ref_target(&self, field: FieldId) -> Option<StructId> {
+        match self.schema.field(field)? {
+            Field::Ref {
+                target,
+                is_list: true,
+                ..
+            } => Some(*target),
+            _ => None,
+        }
+    }
+
+    fn start_ref_chain(&mut self, site: NodeId, field: FieldId, target: StructId) -> ChainSummary {
+        self.ref_sites.insert(site, field);
+        self.chains.entry(site).or_default();
+        ChainSummary {
+            site,
+            struct_id: target,
         }
     }
 
@@ -472,7 +530,13 @@ impl<'a> PlanBuilder<'a> {
                 } else {
                     apply_skip(state, bound);
                 }
-                self.applied_caps.insert(node, CapRewrite::Skip);
+                self.caps.insert(
+                    node,
+                    CapPlan {
+                        rewrite: CapRewrite::Skip,
+                        trigger: chain.site,
+                    },
+                );
                 Some(chain)
             }
             "first" => {
@@ -508,7 +572,13 @@ impl<'a> PlanBuilder<'a> {
                 }
                 apply_skip(state, index);
                 apply_take(state, 1);
-                self.applied_caps.insert(node, CapRewrite::First);
+                self.caps.insert(
+                    node,
+                    CapPlan {
+                        rewrite: CapRewrite::First,
+                        trigger: chain.site,
+                    },
+                );
                 Some(chain)
             }
             _ => None,
@@ -833,7 +903,7 @@ mod tests {
         walk(&file.result, f);
     }
 
-    fn root_ids(file: &TypedQueryFile) -> Vec<NodeId> {
+    fn root_nodes(file: &TypedQueryFile) -> Vec<NodeId> {
         let mut ids = Vec::new();
         walk_file(file, &mut |expr| {
             if matches!(
@@ -849,7 +919,7 @@ mod tests {
         ids
     }
 
-    fn method_ids(file: &TypedQueryFile, name: &str) -> Vec<NodeId> {
+    fn method_nodes(file: &TypedQueryFile, name: &str) -> Vec<NodeId> {
         let mut ids = Vec::new();
         walk_file(file, &mut |expr| {
             if let TypedExprKind::Method {
@@ -863,8 +933,23 @@ mod tests {
         ids
     }
 
+    fn field_ident_nodes(file: &TypedQueryFile, field: FieldId) -> Vec<NodeId> {
+        let mut ids = Vec::new();
+        walk_file(file, &mut |expr| {
+            if let TypedExprKind::Ident {
+                binding: IdentBinding::Field(bound),
+                ..
+            } = &expr.kind
+                && *bound == field
+            {
+                ids.push(expr.id);
+            }
+        });
+        ids
+    }
+
     fn root_constraints<'a>(plan: &'a PushdownPlan, file: &TypedQueryFile) -> &'a FetchConstraints {
-        let roots = root_ids(file);
+        let roots = root_nodes(file);
         assert_eq!(roots.len(), 1, "expected exactly one root");
         plan.constraints_for(roots[0])
             .expect("root trigger has a constraints entry")
@@ -1016,7 +1101,7 @@ mod tests {
         let constraints = root_constraints(&plan, &file);
         assert!(constraints.filters.is_empty());
         assert_eq!(constraints.limit, None);
-        let take = method_ids(&file, "take");
+        let take = method_nodes(&file, "take");
         assert_eq!(take.len(), 1);
         assert_eq!(plan.cap_rewrite(take[0]), None);
     }
@@ -1085,7 +1170,7 @@ mod tests {
                 "{source}"
             );
             for name in ["take", "skip"] {
-                for node in method_ids(&file, name) {
+                for node in method_nodes(&file, name) {
                     assert_eq!(
                         plan.cap_rewrite(node),
                         Some(CapRewrite::Skip),
@@ -1101,17 +1186,17 @@ mod tests {
         let (file, plan, _schema) = typed_and_plan("users.first()");
         let constraints = root_constraints(&plan, &file);
         assert_eq!((constraints.offset, constraints.limit), (0, Some(1)));
-        for node in method_ids(&file, "first") {
+        for node in method_nodes(&file, "first") {
             assert_eq!(plan.cap_rewrite(node), None);
         }
 
         let (file, plan, _schema) = typed_and_plan("users.skip(2).nth(3)");
         let constraints = root_constraints(&plan, &file);
         assert_eq!((constraints.offset, constraints.limit), (5, Some(1)));
-        for node in method_ids(&file, "skip") {
+        for node in method_nodes(&file, "skip") {
             assert_eq!(plan.cap_rewrite(node), Some(CapRewrite::Skip));
         }
-        for node in method_ids(&file, "nth") {
+        for node in method_nodes(&file, "nth") {
             assert_eq!(plan.cap_rewrite(node), Some(CapRewrite::First));
         }
 
@@ -1122,7 +1207,7 @@ mod tests {
         let (file, plan, _schema) = typed_and_plan("users.nth(-1)");
         let constraints = root_constraints(&plan, &file);
         assert_eq!((constraints.offset, constraints.limit), (0, None));
-        for node in method_ids(&file, "nth") {
+        for node in method_nodes(&file, "nth") {
             assert_eq!(plan.cap_rewrite(node), None);
         }
     }
@@ -1134,6 +1219,14 @@ mod tests {
         assert_eq!(constraints.filters.len(), 1);
         assert_eq!(constraints.sort.len(), 1);
         assert_eq!((constraints.offset, constraints.limit), (0, Some(3)));
+        let roots = root_nodes(&file);
+        assert_eq!(roots.len(), 1);
+        for take in method_nodes(&file, "take") {
+            assert_eq!(
+                plan.cap_plan(take).expect("take cap planned").trigger,
+                roots[0]
+            );
+        }
 
         let (file, plan, _schema) = typed_and_plan("users[id > 2].take(3).sort_over(name)");
         let constraints = root_constraints(&plan, &file);
@@ -1160,12 +1253,116 @@ mod tests {
         assert_eq!((constraints.offset, constraints.limit), (0, Some(3)));
         assert_fields(&plan, &schema, "User", &["id", "name"]);
 
-        let (file, plan, _schema) = typed_and_plan("users { o = orders.take(2) }");
+        let (file, plan, schema) = typed_and_plan("users { o = orders.take(2) }");
         let constraints = root_constraints(&plan, &file);
         assert_eq!((constraints.offset, constraints.limit), (0, None));
-        let take = method_ids(&file, "take");
+        let orders = testdata::field_id(&schema, testdata::struct_id(&schema, "User"), "orders");
+        let orders_sites = field_ident_nodes(&file, orders);
+        assert_eq!(orders_sites.len(), 1);
+        assert_eq!(
+            plan.constraints_for(orders_sites[0]),
+            Some(&FetchConstraints {
+                filters: vec![],
+                sort: vec![],
+                offset: 0,
+                limit: Some(2),
+            })
+        );
+        let take = method_nodes(&file, "take");
         assert_eq!(take.len(), 1);
-        assert_eq!(plan.cap_rewrite(take[0]), None, "related caps unpushed");
+        assert_eq!(
+            plan.cap_plan(take[0]),
+            Some(CapPlan {
+                rewrite: CapRewrite::Skip,
+                trigger: orders_sites[0],
+            })
+        );
+        assert!(plan.prefetch_skip.contains(&orders));
+    }
+
+    #[test]
+    fn related_ident_chains() {
+        let (file, plan, schema) =
+            typed_and_plan("users { o = orders[amount > 100].take(1), r = roles.take(1) }");
+        let user = testdata::struct_id(&schema, "User");
+        let orders = testdata::field_id(&schema, user, "orders");
+        let roles = testdata::field_id(&schema, user, "roles");
+
+        let orders_sites = field_ident_nodes(&file, orders);
+        assert_eq!(orders_sites.len(), 1);
+        let orders_plan = plan
+            .constraints_for(orders_sites[0])
+            .expect("orders trigger constraints");
+        assert_eq!(orders_plan.filters.len(), 1);
+        assert_eq!(orders_plan.limit, Some(1));
+
+        let roles_sites = field_ident_nodes(&file, roles);
+        assert_eq!(roles_sites.len(), 1);
+        let roles_plan = plan
+            .constraints_for(roles_sites[0])
+            .expect("roles trigger constraints");
+        assert!(roles_plan.filters.is_empty());
+        assert_eq!(roles_plan.limit, Some(1));
+
+        assert!(plan.prefetch_skip.contains(&orders));
+        assert!(plan.prefetch_skip.contains(&roles));
+        for take in method_nodes(&file, "take") {
+            let cap = plan.cap_plan(take).expect("take cap planned");
+            assert_eq!(cap.rewrite, CapRewrite::Skip);
+        }
+    }
+
+    #[test]
+    fn related_empty_chain() {
+        let (file, plan, schema) = typed_and_plan("users { o = orders.len() }");
+        let orders = testdata::field_id(&schema, testdata::struct_id(&schema, "User"), "orders");
+        let sites = field_ident_nodes(&file, orders);
+        assert_eq!(sites.len(), 1);
+        let constraints = plan
+            .constraints_for(sites[0])
+            .expect("related chain entry exists");
+        assert!(constraints.is_empty());
+        assert!(!plan.prefetch_skip.contains(&orders));
+        let len = method_nodes(&file, "len");
+        assert_eq!(len.len(), 1);
+        assert_eq!(plan.cap_plan(len[0]), None);
+    }
+
+    #[test]
+    fn related_field_chains() {
+        let (file, plan, schema) = typed_and_plan("users.map($.orders.take(2).len())");
+        let orders = testdata::field_id(&schema, testdata::struct_id(&schema, "User"), "orders");
+        let take = method_nodes(&file, "take");
+        assert_eq!(take.len(), 1);
+        let cap = plan.cap_plan(take[0]).expect("take cap planned");
+        assert_eq!(cap.rewrite, CapRewrite::Skip);
+        let constraints = plan
+            .constraints_for(cap.trigger)
+            .expect("field trigger constraints");
+        assert_eq!(constraints.limit, Some(2));
+        assert!(plan.prefetch_skip.contains(&orders));
+
+        let (file, plan, _schema) = typed_and_plan("users.map($.roles.skip(1).len())");
+        let skip = method_nodes(&file, "skip");
+        assert_eq!(skip.len(), 1);
+        let cap = plan.cap_plan(skip[0]).expect("take cap planned");
+        assert_eq!(
+            plan.constraints_for(cap.trigger)
+                .expect("field trigger constraints")
+                .offset,
+            1
+        );
+        let roles = testdata::field_id(&schema, testdata::struct_id(&schema, "User"), "roles");
+        assert!(plan.prefetch_skip.contains(&roles));
+    }
+
+    #[test]
+    fn list_base_field_access_is_not_pushdown_trigger() {
+        let (file, plan, _schema) = typed_and_plan("users.orders.take(2).len()");
+        let take = method_nodes(&file, "take");
+        assert_eq!(take.len(), 1);
+        assert_eq!(plan.cap_plan(take[0]), None);
+        assert!(plan.prefetch_skip.is_empty());
     }
 
     #[test]
@@ -1174,7 +1371,7 @@ mod tests {
         let constraints = root_constraints(&plan, &file);
         assert_eq!(constraints.filters.len(), 1);
         assert_eq!((constraints.offset, constraints.limit), (0, Some(3)));
-        for node in method_ids(&file, "take") {
+        for node in method_nodes(&file, "take") {
             assert_eq!(plan.cap_rewrite(node), Some(CapRewrite::Skip));
         }
     }
@@ -1182,7 +1379,7 @@ mod tests {
     #[test]
     fn discarded_statements_ignored() {
         let (file, plan, schema) = typed_and_plan("users[id > 2]; users { name }");
-        let roots = root_ids(&file);
+        let roots = root_nodes(&file);
         assert_eq!(roots.len(), 2);
         assert!(plan.constraints_for(roots[0]).is_none());
         assert!(plan.constraints_for(roots[1]).is_some());
@@ -1303,7 +1500,8 @@ mod tests {
         let plan = PushdownPlan::disabled(&schema);
         assert!(!plan.is_enabled());
         assert!(plan.fetches.is_empty());
-        assert!(plan.applied_caps.is_empty());
+        assert!(plan.caps.is_empty());
+        assert!(plan.prefetch_skip.is_empty());
         for struct_def in &schema.structs {
             let struct_id = testdata::struct_id(&schema, &struct_def.name);
             let expected: Vec<&str> = struct_def

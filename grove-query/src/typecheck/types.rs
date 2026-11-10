@@ -225,6 +225,14 @@ impl QueryType {
             _ => None,
         }
     }
+
+    pub fn single_schema_record(&self) -> Option<StructId> {
+        match self {
+            QueryType::Record(RecordSource::Schema(struct_id)) => Some(*struct_id),
+            QueryType::Optional(inner) => inner.single_schema_record(),
+            _ => None,
+        }
+    }
 }
 
 impl From<&ValueType> for QueryType {

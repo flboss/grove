@@ -31,6 +31,7 @@ pub(crate) fn exec_root(
         ctx.storage
             .fetch(root.struct_id, &fields, &FetchConstraints::EMPTY)?
     };
+    ctx.applied_triggers.insert(node);
     materialize(ctx, root.struct_id, &fields, rows)
 }
 

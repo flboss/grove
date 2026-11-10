@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use chrono::{DateTime, Utc};
@@ -6,6 +6,7 @@ use grove_query::typecheck::types::{
     IdentBinding, TypedExpr, TypedExprKind, TypedLetStmt, TypedQueryFile, TypedStatement,
 };
 use grove_schema::validated::ValidatedSchema;
+use grove_types::NodeId;
 
 use crate::error::ExecError;
 use crate::pushdown::PushdownPlan;
@@ -70,6 +71,7 @@ pub struct EvalCtx<'a> {
     pub(crate) storage: &'a dyn Storage,
     pub(crate) schema: &'a ValidatedSchema,
     pub(crate) plan: &'a PushdownPlan,
+    pub(crate) applied_triggers: HashSet<NodeId>,
 }
 
 impl<'a> EvalCtx<'a> {
@@ -87,6 +89,7 @@ impl<'a> EvalCtx<'a> {
             storage,
             schema,
             plan,
+            applied_triggers: HashSet::new(),
         }
     }
 }

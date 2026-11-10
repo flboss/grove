@@ -42,8 +42,10 @@ pub(super) fn eval_method(
         (true, Val::Some(v)) => *v,
         (_, v) => v,
     };
-    if let Some(rewrite) = ctx.plan.cap_rewrite(node) {
-        match (rewrite, name) {
+    if let Some(cap) = ctx.plan.cap_plan(node)
+        && ctx.applied_triggers.contains(&cap.trigger)
+    {
+        match (cap.rewrite, name) {
             (CapRewrite::Skip, "take" | "skip") => return Ok(base),
             (CapRewrite::First, "nth") => return eval_slice("first", base, optional, &[], span),
             _ => {}
