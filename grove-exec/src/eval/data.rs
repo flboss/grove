@@ -1260,6 +1260,11 @@ mod tests {
 
     struct RecordingBackend<'a, 's> {
         inner: &'a SqliteBackend<'s>,
+        recording: Recording,
+    }
+
+    #[derive(Default)]
+    struct Recording {
         fetches: RefCell<Vec<(StructId, Vec<FieldId>)>>,
         constraints: RefCell<Vec<FetchConstraints>>,
         related_fetches: RefCell<Vec<(RelationId, bool, Vec<FieldId>)>>,
@@ -1271,11 +1276,7 @@ mod tests {
         pub fn new(backend: &'a SqliteBackend<'s>) -> RecordingBackend<'a, 's> {
             RecordingBackend {
                 inner: backend,
-                fetches: RefCell::new(Vec::new()),
-                constraints: RefCell::new(Vec::new()),
-                related_fetches: RefCell::new(Vec::new()),
-                related_constraints: RefCell::new(Vec::new()),
-                related_parent_counts: RefCell::new(Vec::new()),
+                recording: Default::default(),
             }
         }
     }
@@ -1287,8 +1288,14 @@ mod tests {
             fields: &[FieldId],
             constraints: &FetchConstraints,
         ) -> Result<Vec<Row>, ExecError> {
-            self.fetches.borrow_mut().push((struct_id, fields.to_vec()));
-            self.constraints.borrow_mut().push(constraints.clone());
+            self.recording
+                .fetches
+                .borrow_mut()
+                .push((struct_id, fields.to_vec()));
+            self.recording
+                .constraints
+                .borrow_mut()
+                .push(constraints.clone());
             self.inner.fetch(struct_id, fields, constraints)
         }
 
@@ -1300,32 +1307,40 @@ mod tests {
             fields: &[FieldId],
             constraints: &FetchConstraints,
         ) -> Result<Vec<Vec<Row>>, ExecError> {
-            self.related_fetches
-                .borrow_mut()
-                .push((rel, fetch_from_first, fields.to_vec()));
-            self.related_constraints
+            self.recording.related_fetches.borrow_mut().push((
+                rel,
+                fetch_from_first,
+                fields.to_vec(),
+            ));
+            self.recording
+                .related_constraints
                 .borrow_mut()
                 .push(constraints.clone());
-            self.related_parent_counts.borrow_mut().push(parents.len());
+            self.recording
+                .related_parent_counts
+                .borrow_mut()
+                .push(parents.len());
             self.inner
                 .fetch_related(rel, fetch_from_first, parents, fields, constraints)
         }
     }
 
-    #[test]
-    fn field_pushdown_projection_fields_pruned() {
+    fn run_seeded_recording(src: &str) -> Result<(Val, Recording), ExecError> {
         let schema = testdata::schema();
         let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory database");
         testdata::seed(&mut conn).expect("testdata initialization");
         let backend = SqliteBackend::new(conn, &schema).expect("backend");
         let recording = RecordingBackend::new(&backend);
-        run_with_storage_opts(
-            "users { name }",
-            &schema,
-            &recording,
-            ExecOptions::default(),
-        )
-        .expect("query");
+        let result = run_with_storage_opts(src, &schema, &recording, ExecOptions::default())?;
+        // run without recording for differential tests
+        run_with_storage(src, &schema, &backend)?;
+        Ok((result, recording.recording))
+    }
+
+    #[test]
+    fn field_pushdown_projection_fields_pruned() {
+        let schema = testdata::schema();
+        let (_, recording) = run_seeded_recording("users { name }").expect("query");
         let user = testdata::struct_id(&schema, "User");
         let name = testdata::field_id(&schema, user, "name");
         assert_eq!(*recording.fetches.borrow(), vec![(user, vec![name])]);
@@ -1336,11 +1351,7 @@ mod tests {
     #[test]
     fn field_pushdown_whole_record_fields_kept() {
         let schema = testdata::schema();
-        let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory database");
-        testdata::seed(&mut conn).expect("testdata initialization");
-        let backend = SqliteBackend::new(conn, &schema).expect("backend");
-        let recording = RecordingBackend::new(&backend);
-        run_with_storage_opts("users", &schema, &recording, ExecOptions::default()).expect("query");
+        let (_, recording) = run_seeded_recording("users").expect("query");
         let user = testdata::struct_id(&schema, "User");
         assert_eq!(
             *recording.fetches.borrow(),
@@ -1375,17 +1386,8 @@ mod tests {
     #[test]
     fn root_fetch_constraints_reach_storage() {
         let schema = testdata::schema();
-        let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory database");
-        testdata::seed(&mut conn).expect("testdata initialization");
-        let backend = SqliteBackend::new(conn, &schema).expect("backend");
-        let recording = RecordingBackend::new(&backend);
-        run_with_storage_opts(
-            "users[id > 2].sort_over(name).take(2)",
-            &schema,
-            &recording,
-            ExecOptions::default(),
-        )
-        .expect("query");
+        let (_, recording) =
+            run_seeded_recording("users[id > 2].sort_over(name).take(2)").expect("query");
         let constraints = recording.constraints.borrow();
         let first = constraints.first().expect("root fetch");
         assert_eq!(first.filters.len(), 1);
@@ -1584,17 +1586,8 @@ mod tests {
     #[test]
     fn filter_prefetch_batched_owning_refs() {
         let schema = testdata::schema();
-        let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory database");
-        testdata::seed(&mut conn).expect("testdata initialization");
-        let backend = SqliteBackend::new(conn, &schema).expect("backend");
-        let recording = RecordingBackend::new(&backend);
-        run_with_storage_opts(
-            "users[orders.len() > 1] { name }",
-            &schema,
-            &recording,
-            ExecOptions::default(),
-        )
-        .expect("query");
+        let (_, recording) =
+            run_seeded_recording("users[orders.len() > 1] { name }").expect("query");
         let orders = testdata::field_id(&schema, testdata::struct_id(&schema, "User"), "orders");
         let related = recording.related_fetches.borrow();
         assert_eq!(related.len(), 1, "expected one batched fetch: {related:?}");
@@ -1607,18 +1600,9 @@ mod tests {
 
     #[test]
     fn prefetch_refs_behind_non_owning_refs_skipped() {
-        let schema = testdata::schema();
-        let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory database");
-        testdata::seed(&mut conn).expect("testdata initialization");
-        let backend = SqliteBackend::new(conn, &schema).expect("backend");
-        let recording = RecordingBackend::new(&backend);
-        let result = run_with_storage_opts(
-            "users[manager?.orders?.len() == some(1)] { name }",
-            &schema,
-            &recording,
-            ExecOptions::default(),
-        )
-        .expect("query");
+        let (result, recording) =
+            run_seeded_recording("users[manager?.orders?.len() == some(1)] { name }")
+                .expect("query");
         let counts = recording.related_parent_counts.borrow();
         assert!(!counts.is_empty(), "manager chain resolves lazily");
         assert!(
@@ -1638,17 +1622,8 @@ mod tests {
     #[test]
     fn projection_prefetch_batched_owning_refs() {
         let schema = testdata::schema();
-        let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory database");
-        testdata::seed(&mut conn).expect("testdata initialization");
-        let backend = SqliteBackend::new(conn, &schema).expect("backend");
-        let recording = RecordingBackend::new(&backend);
-        run_with_storage_opts(
-            "users { o = orders.len(), p = profile?.bio }",
-            &schema,
-            &recording,
-            ExecOptions::default(),
-        )
-        .expect("query");
+        let (_, recording) =
+            run_seeded_recording("users { o = orders.len(), p = profile?.bio }").expect("query");
         let user = testdata::struct_id(&schema, "User");
         let profile = testdata::field_id(&schema, user, "profile");
         let orders = testdata::field_id(&schema, user, "orders");
@@ -1672,17 +1647,7 @@ mod tests {
     #[test]
     fn map_prefetch_batched_record_field_refs() {
         let schema = testdata::schema();
-        let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory database");
-        testdata::seed(&mut conn).expect("testdata initialization");
-        let backend = SqliteBackend::new(conn, &schema).expect("backend");
-        let recording = RecordingBackend::new(&backend);
-        run_with_storage_opts(
-            "users.map($.orders.len())",
-            &schema,
-            &recording,
-            ExecOptions::default(),
-        )
-        .expect("query");
+        let (_, recording) = run_seeded_recording("users.map($.orders.len())").expect("query");
         let orders = testdata::field_id(&schema, testdata::struct_id(&schema, "User"), "orders");
         let related = recording.related_fetches.borrow();
         assert_eq!(related.len(), 1, "expected one batched fetch: {related:?}");
@@ -1719,15 +1684,8 @@ mod tests {
     #[test]
     fn owning_ident_chain_pushes_into_fetch_related() {
         let schema = testdata::schema();
-        let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory database");
-        testdata::seed(&mut conn).expect("testdata initialization");
-        let backend = SqliteBackend::new(conn, &schema).expect("backend");
-        let recording = RecordingBackend::new(&backend);
-        let result = run_with_storage_opts(
+        let (result, recording) = run_seeded_recording(
             "users[id <= 2] { o = orders[amount > 150].sort_desc_over(amount).take(1) { amount } }",
-            &schema,
-            &recording,
-            ExecOptions::default(),
         )
         .expect("query");
 
@@ -1770,16 +1728,8 @@ mod tests {
 
     #[test]
     fn non_owning_ident_chain_pushes_into_fetch_related() {
-        let schema = testdata::schema();
-        let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory database");
-        testdata::seed(&mut conn).expect("testdata initialization");
-        let backend = SqliteBackend::new(conn, &schema).expect("backend");
-        let recording = RecordingBackend::new(&backend);
-        let result = run_with_storage_opts(
+        let (result, recording) = run_seeded_recording(
             "users[id <= 2] { r = roles[name.contains(\"\")].take(1) { name } }",
-            &schema,
-            &recording,
-            ExecOptions::default(),
         )
         .expect("query");
 
@@ -1813,16 +1763,8 @@ mod tests {
 
     #[test]
     fn related_fetch_first_nth() {
-        let schema = testdata::schema();
-        let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory database");
-        testdata::seed(&mut conn).expect("testdata initialization");
-        let backend = SqliteBackend::new(conn, &schema).expect("backend");
-        let recording = RecordingBackend::new(&backend);
-        let result = run_with_storage_opts(
+        let (result, recording) = run_seeded_recording(
             "users[id <= 2] { a = orders.first()?.amount, b = orders.nth(1)?.amount }",
-            &schema,
-            &recording,
-            ExecOptions::default(),
         )
         .expect("query");
 
@@ -1855,16 +1797,8 @@ mod tests {
 
     #[test]
     fn mixed_constrained_and_plain_refs() {
-        let schema = testdata::schema();
-        let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory database");
-        testdata::seed(&mut conn).expect("testdata initialization");
-        let backend = SqliteBackend::new(conn, &schema).expect("backend");
-        let recording = RecordingBackend::new(&backend);
-        let result = run_with_storage_opts(
+        let (result, recording) = run_seeded_recording(
             "users[id <= 1] { a = orders.take(1) { amount }, b = orders.len() }",
-            &schema,
-            &recording,
-            ExecOptions::default(),
         )
         .expect("query");
 
@@ -1886,18 +1820,9 @@ mod tests {
 
     #[test]
     fn prefetch_nested_owned_scopes() {
-        let schema = testdata::schema();
-        let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory database");
-        testdata::seed(&mut conn).expect("testdata initialization");
-        let backend = SqliteBackend::new(conn, &schema).expect("backend");
-        let recording = RecordingBackend::new(&backend);
-        let result = run_with_storage_opts(
-            "users[orders[items.len() > 0].len() > 0] { name }",
-            &schema,
-            &recording,
-            ExecOptions::default(),
-        )
-        .expect("query");
+        let (result, recording) =
+            run_seeded_recording("users[orders[items.len() > 0].len() > 0] { name }")
+                .expect("query");
 
         let counts = recording.related_parent_counts.borrow();
         assert_eq!(
@@ -1910,35 +1835,14 @@ mod tests {
 
     #[test]
     fn first_record_projection_no_owning_refs_fetched() {
-        let schema = testdata::schema();
-        let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory database");
-        testdata::seed(&mut conn).expect("testdata initialization");
-        let backend = SqliteBackend::new(conn, &schema).expect("backend");
-        let recording = RecordingBackend::new(&backend);
-        run_with_storage_opts(
-            "users.first()?.name",
-            &schema,
-            &recording,
-            ExecOptions::default(),
-        )
-        .expect("query");
+        let (_, recording) = run_seeded_recording("users.first()?.name").expect("query");
         assert!(recording.related_fetches.borrow().is_empty(),);
     }
 
     #[test]
     fn projection_prefetch_only_needed_owning_ref() {
         let schema = testdata::schema();
-        let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory database");
-        testdata::seed(&mut conn).expect("testdata initialization");
-        let backend = SqliteBackend::new(conn, &schema).expect("backend");
-        let recording = RecordingBackend::new(&backend);
-        run_with_storage_opts(
-            "users { o = orders.len() }",
-            &schema,
-            &recording,
-            ExecOptions::default(),
-        )
-        .expect("query");
+        let (_, recording) = run_seeded_recording("users { o = orders.len() }").expect("query");
         let user = testdata::struct_id(&schema, "User");
         let orders = testdata::field_id(&schema, user, "orders");
         let profile = testdata::field_id(&schema, user, "profile");
@@ -1954,18 +1858,9 @@ mod tests {
 
     #[test]
     fn field_trigger_owning_pushes_into_fetch_related() {
-        let schema = testdata::schema();
-        let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory database");
-        testdata::seed(&mut conn).expect("testdata initialization");
-        let backend = SqliteBackend::new(conn, &schema).expect("backend");
-        let recording = RecordingBackend::new(&backend);
-        let result = run_with_storage_opts(
-            "users[id <= 2].map($.orders[amount > 150].take(1).len())",
-            &schema,
-            &recording,
-            ExecOptions::default(),
-        )
-        .expect("query");
+        let (result, recording) =
+            run_seeded_recording("users[id <= 2].map($.orders[amount > 150].take(1).len())")
+                .expect("query");
 
         let related = recording.related_constraints.borrow();
         assert_eq!(related.len(), 2);
@@ -1980,18 +1875,8 @@ mod tests {
 
     #[test]
     fn field_trigger_non_owning_pushes_into_fetch_related() {
-        let schema = testdata::schema();
-        let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory database");
-        testdata::seed(&mut conn).expect("testdata initialization");
-        let backend = SqliteBackend::new(conn, &schema).expect("backend");
-        let recording = RecordingBackend::new(&backend);
-        let result = run_with_storage_opts(
-            "users[id <= 2].map($.roles.take(1).len())",
-            &schema,
-            &recording,
-            ExecOptions::default(),
-        )
-        .expect("query");
+        let (result, recording) =
+            run_seeded_recording("users[id <= 2].map($.roles.take(1).len())").expect("query");
 
         let related = recording.related_constraints.borrow();
         assert_eq!(related.len(), 2);
@@ -2002,5 +1887,26 @@ mod tests {
             assert_eq!(constraints.limit, Some(1));
         }
         assert_eq!(result, Val::List(vec![int(1), int(0)]));
+    }
+
+    #[test]
+    fn ident_trigger_filter_predicate() {
+        let (result, recording) =
+            run_seeded_recording("users[orders[amount > 150].take(1).len() > 0] { name }")
+                .expect("query");
+
+        let related = recording.related_constraints.borrow();
+        assert_eq!(related.len(), 5);
+        for constraints in related.iter() {
+            assert_eq!(constraints.filters.len(), 1);
+            assert_eq!(constraints.limit, Some(1));
+        }
+        assert_eq!(
+            result,
+            Val::List(vec![
+                rec(vec![("name", str("Ada"))]),
+                rec(vec![("name", str("Bob"))]),
+            ])
+        );
     }
 }
