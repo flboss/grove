@@ -170,6 +170,10 @@ impl PushdownPlan {
     pub fn cap_plan(&self, node: NodeId) -> Option<CapPlan> {
         self.caps.get(&node).copied()
     }
+
+    pub fn prefetch_skip(&self) -> &HashSet<FieldId> {
+        &self.prefetch_skip
+    }
 }
 
 /// Non-Ref fields of every struct in declaration order

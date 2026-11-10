@@ -90,7 +90,7 @@ pub(super) fn eval_sort(
     if kind.is_keyed() {
         let mut fields = HashSet::new();
         for arg in args {
-            collect_owning_refs_in(&arg.expr, ctx.schema, &mut fields);
+            collect_owning_refs_in(&arg.expr, ctx.schema, ctx.plan.prefetch_skip(), &mut fields);
         }
         prefetch_owning(ctx, &mut items, &fields)?;
         sort_by_keys(&mut items, kind, args, ctx, span)?;

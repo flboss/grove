@@ -48,7 +48,12 @@ pub(crate) fn eval_projection(
     let mut base = resolve_base_link(ctx, base)?;
     let mut fields = HashSet::new();
     for item in items {
-        collect_owning_refs_in(&item.value, ctx.schema, &mut fields);
+        collect_owning_refs_in(
+            &item.value,
+            ctx.schema,
+            ctx.plan.prefetch_skip(),
+            &mut fields,
+        );
     }
     prefetch_owning(ctx, std::slice::from_mut(&mut base), &fields)?;
     match base {

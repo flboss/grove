@@ -35,12 +35,12 @@ pub(crate) fn exec_root(
     materialize(ctx, root.struct_id, &fields, rows)
 }
 
-/// Fetch a Ref field for a batch of parents;
-/// recursively resolve contained owning Refs
+/// Fetch a Ref field for a batch of parents
 fn resolve_field(
     ctx: &mut EvalCtx,
     field: FieldId,
     parents: &[Key],
+    constraints: &FetchConstraints,
 ) -> Result<Vec<ResolvedLink>, ExecError> {
     let (target, field_name) =
         match &ctx.schema.structs[field.struct_id().index()].fields[field.local()] {
@@ -59,13 +59,9 @@ fn resolve_field(
         })?;
     let fetch_from_first = ctx.schema.relations[relation.index()].endpoints()[0] == field;
     let fields = ctx.plan.fields_for(target).to_vec();
-    let groups = ctx.storage.fetch_related(
-        relation,
-        fetch_from_first,
-        parents,
-        &fields,
-        &FetchConstraints::EMPTY,
-    )?;
+    let groups =
+        ctx.storage
+            .fetch_related(relation, fetch_from_first, parents, &fields, constraints)?;
     let mut resolved_pairs = Vec::with_capacity(parents.len());
     for (parent, group) in parents.iter().zip(groups) {
         // Recursion terminates: ownership chain ends at a root
@@ -142,7 +138,12 @@ fn batch_fetch(
 ) -> Result<HashMap<(FieldId, Key), Val>, ExecError> {
     let mut resolved = HashMap::with_capacity(by_field.values().map(Vec::len).sum());
     for field in order {
-        resolved.extend(resolve_field(ctx, *field, &by_field[field])?);
+        resolved.extend(resolve_field(
+            ctx,
+            *field,
+            &by_field[field],
+            &FetchConstraints::EMPTY,
+        )?);
     }
     Ok(resolved)
 }
@@ -328,10 +329,47 @@ pub(crate) fn resolve_owning_ident(
     }
 }
 
+/// Resolve a Ref value, honoring a planned constrained fetch
+pub(crate) fn resolve_ident_value(
+    ctx: &mut EvalCtx,
+    node: NodeId,
+    field: FieldId,
+    value: Val,
+) -> Result<Val, ExecError> {
+    let constraints = ctx
+        .plan
+        .constraints_for(node)
+        .filter(|constraints| !constraints.is_empty());
+    if let Some(constraints) = constraints {
+        return match value {
+            Val::Ref {
+                field: linked_field,
+                parent,
+            } => {
+                let mut resolved = resolve_field(ctx, linked_field, &[parent], constraints)?;
+                ctx.applied_triggers.insert(node);
+                match resolved.pop() {
+                    Some((_, value)) => Ok(value),
+                    None => Err(ExecError::Integrity {
+                        message: "constrained Ref resolved to no value (internal error)"
+                            .to_string(),
+                    }),
+                }
+            }
+            other => resolve_owning_ident(ctx, field, other),
+        };
+    }
+    resolve_owning_ident(ctx, field, value)
+}
+
 /// Owning Ref fields referenced by an expression
-pub(crate) fn owning_refs_in(expr: &TypedExpr, schema: &ValidatedSchema) -> HashSet<FieldId> {
+pub(crate) fn owning_refs_in(
+    expr: &TypedExpr,
+    schema: &ValidatedSchema,
+    skip: &HashSet<FieldId>,
+) -> HashSet<FieldId> {
     let mut fields = HashSet::new();
-    collect_owning_refs_in(expr, schema, &mut fields);
+    collect_owning_refs_in(expr, schema, skip, &mut fields);
     fields
 }
 
@@ -351,15 +389,17 @@ pub(crate) fn prefetch_owning(
 pub(crate) fn collect_owning_refs_in(
     expr: &TypedExpr,
     schema: &ValidatedSchema,
+    skip: &HashSet<FieldId>,
     fields: &mut HashSet<FieldId>,
 ) {
     let mut frames = vec![true];
-    collect_owning_refs_at(expr, schema, &mut frames, fields);
+    collect_owning_refs_at(expr, schema, skip, &mut frames, fields);
 }
 
 fn collect_owning_refs_at(
     expr: &TypedExpr,
     schema: &ValidatedSchema,
+    skip: &HashSet<FieldId>,
     // collectability flag per pushed element/projection scope, outermost first
     frames: &mut Vec<bool>,
     fields: &mut HashSet<FieldId>,
@@ -374,6 +414,7 @@ fn collect_owning_refs_at(
             if let Some(frame) = current.checked_sub(*depth)
                 && frames[frame]
                 && schema.field_is_ref_owning(*field) == Some(true)
+                && !skip.contains(field)
             {
                 fields.insert(*field);
             }
@@ -384,63 +425,64 @@ fn collect_owning_refs_at(
                 && let Some(struct_id) = base.ty.schema_record()
                 && let Some((field, _)) = schema.struct_field(struct_id, name)
                 && schema.field_is_ref_owning(field) == Some(true)
+                && !skip.contains(&field)
             {
                 fields.insert(field);
             }
-            collect_owning_refs_at(base, schema, frames, fields);
+            collect_owning_refs_at(base, schema, skip, frames, fields);
         }
         TypedExprKind::Method {
             base, name, args, ..
         } => {
-            collect_owning_refs_at(base, schema, frames, fields);
+            collect_owning_refs_at(base, schema, skip, frames, fields);
             if is_scoped_method(name) {
                 let nested = rooted_frame(base, schema, frames).is_some_and(|frame| frames[frame]);
                 frames.push(nested);
                 for arg in args {
-                    collect_owning_refs_at(&arg.expr, schema, frames, fields);
+                    collect_owning_refs_at(&arg.expr, schema, skip, frames, fields);
                 }
                 frames.pop();
             } else {
                 for arg in args {
-                    collect_owning_refs_at(&arg.expr, schema, frames, fields);
+                    collect_owning_refs_at(&arg.expr, schema, skip, frames, fields);
                 }
             }
         }
         TypedExprKind::TupleAccess { base, .. } => {
-            collect_owning_refs_at(base, schema, frames, fields);
+            collect_owning_refs_at(base, schema, skip, frames, fields);
         }
         TypedExprKind::Binary { lhs, rhs, .. } => {
-            collect_owning_refs_at(lhs, schema, frames, fields);
-            collect_owning_refs_at(rhs, schema, frames, fields);
+            collect_owning_refs_at(lhs, schema, skip, frames, fields);
+            collect_owning_refs_at(rhs, schema, skip, frames, fields);
         }
         TypedExprKind::Unary { expr, .. }
         | TypedExprKind::Cast { expr, .. }
         | TypedExprKind::Some { value: expr } => {
-            collect_owning_refs_at(expr, schema, frames, fields);
+            collect_owning_refs_at(expr, schema, skip, frames, fields);
         }
         TypedExprKind::If { arms, default } => {
             for (condition, value) in arms {
-                collect_owning_refs_at(condition, schema, frames, fields);
-                collect_owning_refs_at(value, schema, frames, fields);
+                collect_owning_refs_at(condition, schema, skip, frames, fields);
+                collect_owning_refs_at(value, schema, skip, frames, fields);
             }
-            collect_owning_refs_at(default, schema, frames, fields);
+            collect_owning_refs_at(default, schema, skip, frames, fields);
         }
         TypedExprKind::Tuple { elements } | TypedExprKind::Array { elements } => {
             for element in elements {
-                collect_owning_refs_at(element, schema, frames, fields);
+                collect_owning_refs_at(element, schema, skip, frames, fields);
             }
         }
         TypedExprKind::Struct { fields: values } => {
             for (_, value) in values {
-                collect_owning_refs_at(value, schema, frames, fields);
+                collect_owning_refs_at(value, schema, skip, frames, fields);
             }
         }
         TypedExprKind::Projection { base, items } => {
-            collect_owning_refs_at(base, schema, frames, fields);
+            collect_owning_refs_at(base, schema, skip, frames, fields);
             let nested = rooted_frame(base, schema, frames).is_some_and(|frame| frames[frame]);
             frames.push(nested);
             for item in items {
-                collect_owning_refs_at(&item.value, schema, frames, fields);
+                collect_owning_refs_at(&item.value, schema, skip, frames, fields);
             }
             frames.pop();
         }
@@ -571,7 +613,7 @@ pub(crate) fn exec_field(
 pub(crate) fn resolve_base_link(ctx: &mut EvalCtx, base: Val) -> Result<Val, ExecError> {
     match base {
         Val::Ref { field, parent } => {
-            let mut resolved = resolve_field(ctx, field, &[parent])?;
+            let mut resolved = resolve_field(ctx, field, &[parent], &FetchConstraints::EMPTY)?;
             match resolved.pop() {
                 Some((_, value)) => Ok(value),
                 None => Err(ExecError::Integrity {
@@ -800,7 +842,7 @@ mod tests {
 
     use crate::{
         eval::{Env, ExecOptions, harness::*},
-        pushdown::PushdownPlan,
+        pushdown::{PushdownPlan, SortKey},
         sqlite::SqliteBackend,
         storage::Storage,
         testdata,
@@ -1193,6 +1235,7 @@ mod tests {
         fetches: RefCell<Vec<(StructId, Vec<FieldId>)>>,
         constraints: RefCell<Vec<FetchConstraints>>,
         related_fetches: RefCell<Vec<(RelationId, bool, Vec<FieldId>)>>,
+        related_constraints: RefCell<Vec<FetchConstraints>>,
         related_parent_counts: RefCell<Vec<usize>>,
     }
 
@@ -1203,6 +1246,7 @@ mod tests {
                 fetches: RefCell::new(Vec::new()),
                 constraints: RefCell::new(Vec::new()),
                 related_fetches: RefCell::new(Vec::new()),
+                related_constraints: RefCell::new(Vec::new()),
                 related_parent_counts: RefCell::new(Vec::new()),
             }
         }
@@ -1231,6 +1275,9 @@ mod tests {
             self.related_fetches
                 .borrow_mut()
                 .push((rel, fetch_from_first, fields.to_vec()));
+            self.related_constraints
+                .borrow_mut()
+                .push(constraints.clone());
             self.related_parent_counts.borrow_mut().push(parents.len());
             self.inner
                 .fetch_related(rel, fetch_from_first, parents, fields, constraints)
@@ -1616,6 +1663,197 @@ mod tests {
             Some([].as_slice())
         );
         assert_eq!(recording.related_parent_counts.borrow().as_slice(), &[5]);
+    }
+
+    fn unpack_nested_i64s(value: &Val, field: &str) -> Vec<i64> {
+        let Val::List(rows) = value else {
+            panic!("expected list, got {value:?}");
+        };
+        rows.iter()
+            .map(|row| match record_field_value(row, field) {
+                Val::Scalar(Scalar::Int(value)) => *value,
+                other => panic!("expected int, got {other:?}"),
+            })
+            .collect()
+    }
+
+    fn unpack_optional_i64(value: &Val) -> Option<i64> {
+        match value {
+            Val::Some(inner) => match inner.as_ref() {
+                Val::Scalar(Scalar::Int(value)) => Some(*value),
+                other => panic!("expected int, got {other:?}"),
+            },
+            Val::None => None,
+            other => panic!("expected optional int, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn owning_ident_chain_pushes_into_fetch_related() {
+        let schema = testdata::schema();
+        let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory database");
+        testdata::seed(&mut conn).expect("testdata initialization");
+        let backend = SqliteBackend::new(conn, &schema).expect("backend");
+        let recording = RecordingBackend::new(&backend);
+        let result = run_with_storage_opts(
+            "users[id <= 2] { o = orders[amount > 150].sort_desc_over(amount).take(1) { amount } }",
+            &schema,
+            &recording,
+            ExecOptions::default(),
+        )
+        .expect("query");
+
+        let related = recording.related_constraints.borrow();
+        assert_eq!(related.len(), 2);
+        assert!(
+            recording
+                .related_parent_counts
+                .borrow()
+                .iter()
+                .all(|count| *count == 1)
+        );
+        let amount = testdata::field_id(&schema, testdata::struct_id(&schema, "Order"), "amount");
+        for constraints in related.iter() {
+            assert_eq!(constraints.filters.len(), 1);
+            assert_eq!(
+                constraints.sort,
+                vec![SortKey {
+                    field: amount,
+                    desc: true,
+                }]
+            );
+            assert_eq!(constraints.offset, 0);
+            assert_eq!(constraints.limit, Some(1));
+        }
+
+        let Val::List(rows) = result else {
+            panic!("expected user rows, got {result:?}");
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            unpack_nested_i64s(record_field_value(&rows[0], "o"), "amount"),
+            [200]
+        );
+        assert_eq!(
+            unpack_nested_i64s(record_field_value(&rows[1], "o"), "amount"),
+            [400]
+        );
+    }
+
+    #[test]
+    fn non_owning_ident_chain_pushes_into_fetch_related() {
+        let schema = testdata::schema();
+        let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory database");
+        testdata::seed(&mut conn).expect("testdata initialization");
+        let backend = SqliteBackend::new(conn, &schema).expect("backend");
+        let recording = RecordingBackend::new(&backend);
+        let result = run_with_storage_opts(
+            "users[id <= 2] { r = roles[name.contains(\"\")].take(1) { name } }",
+            &schema,
+            &recording,
+            ExecOptions::default(),
+        )
+        .expect("query");
+
+        let related = recording.related_constraints.borrow();
+        assert_eq!(related.len(), 2);
+        for constraints in related.iter() {
+            assert_eq!(constraints.filters.len(), 1);
+            assert!(constraints.sort.is_empty());
+            assert_eq!(constraints.offset, 0);
+            assert_eq!(constraints.limit, Some(1));
+        }
+
+        let Val::List(rows) = result else {
+            panic!("expected user rows, got {result:?}");
+        };
+        let first = record_field_value(&rows[0], "r");
+        let second = record_field_value(&rows[1], "r");
+        let first_names: Vec<&str> = match first {
+            Val::List(roles) => roles
+                .iter()
+                .map(|role| match record_field_value(role, "name") {
+                    Val::Scalar(Scalar::String(name)) => name.as_str(),
+                    other => panic!("expected name, got {other:?}"),
+                })
+                .collect(),
+            other => panic!("expected role list, got {other:?}"),
+        };
+        assert_eq!(first_names, ["admin"]);
+        assert!(matches!(second, Val::List(roles) if roles.is_empty()));
+    }
+
+    #[test]
+    fn related_fetch_first_nth() {
+        let schema = testdata::schema();
+        let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory database");
+        testdata::seed(&mut conn).expect("testdata initialization");
+        let backend = SqliteBackend::new(conn, &schema).expect("backend");
+        let recording = RecordingBackend::new(&backend);
+        let result = run_with_storage_opts(
+            "users[id <= 2] { a = orders.first()?.amount, b = orders.nth(1)?.amount }",
+            &schema,
+            &recording,
+            ExecOptions::default(),
+        )
+        .expect("query");
+
+        let related = recording.related_constraints.borrow();
+        assert_eq!(related.len(), 4);
+        for pair in related.chunks(2) {
+            assert_eq!(pair[0].offset, 0);
+            assert_eq!(pair[0].limit, Some(1));
+            assert_eq!(pair[1].offset, 1);
+            assert_eq!(pair[1].limit, Some(1));
+        }
+
+        let Val::List(rows) = result else {
+            panic!("expected user rows, got {result:?}");
+        };
+        assert_eq!(
+            unpack_optional_i64(record_field_value(&rows[0], "a")),
+            Some(100)
+        );
+        assert_eq!(
+            unpack_optional_i64(record_field_value(&rows[0], "b")),
+            Some(200)
+        );
+        assert_eq!(
+            unpack_optional_i64(record_field_value(&rows[1], "a")),
+            Some(400)
+        );
+        assert_eq!(unpack_optional_i64(record_field_value(&rows[1], "b")), None);
+    }
+
+    #[test]
+    fn mixed_constrained_and_plain_refs() {
+        let schema = testdata::schema();
+        let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory database");
+        testdata::seed(&mut conn).expect("testdata initialization");
+        let backend = SqliteBackend::new(conn, &schema).expect("backend");
+        let recording = RecordingBackend::new(&backend);
+        let result = run_with_storage_opts(
+            "users[id <= 1] { a = orders.take(1) { amount }, b = orders.len() }",
+            &schema,
+            &recording,
+            ExecOptions::default(),
+        )
+        .expect("query");
+
+        let related = recording.related_constraints.borrow();
+        assert_eq!(related.len(), 2);
+        assert_eq!(related[0].limit, Some(1));
+        assert!(related[1].is_empty());
+
+        let Val::List(rows) = result else {
+            panic!("expected user rows, got {result:?}");
+        };
+        let first = &rows[0];
+        assert_eq!(
+            unpack_nested_i64s(record_field_value(first, "a"), "amount"),
+            [100]
+        );
+        assert_eq!(record_field_value(first, "b"), &int(2));
     }
 
     #[test]

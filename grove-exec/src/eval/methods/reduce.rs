@@ -165,7 +165,7 @@ pub(super) fn eval_reduce_over(
             message: format!("`{kind}()` expects one key argument (internal error)"),
         });
     };
-    let fields = owning_refs_in(&arg.expr, ctx.schema);
+    let fields = owning_refs_in(&arg.expr, ctx.schema, ctx.plan.prefetch_skip());
     prefetch_owning(ctx, &mut items, &fields)?;
     let config = &ctx.schema.config;
     let reduced = if items.is_empty() {

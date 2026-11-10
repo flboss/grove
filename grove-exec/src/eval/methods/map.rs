@@ -36,7 +36,7 @@ pub(super) fn eval_map(
             message: "`map()` expects one argument (internal error)".to_string(),
         });
     };
-    let fields = owning_refs_in(&arg.expr, ctx.schema);
+    let fields = owning_refs_in(&arg.expr, ctx.schema, ctx.plan.prefetch_skip());
     prefetch_owning(ctx, &mut items, &fields)?;
     let mut mapped = Vec::with_capacity(items.len());
     for item in items {

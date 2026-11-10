@@ -36,7 +36,7 @@ pub(super) fn eval_filter(
             message: "`filter()` expects one argument (internal error)".to_string(),
         });
     };
-    let fields = owning_refs_in(&arg.expr, ctx.schema);
+    let fields = owning_refs_in(&arg.expr, ctx.schema, ctx.plan.prefetch_skip());
     prefetch_owning(ctx, &mut items, &fields)?;
     let mut kept = Vec::with_capacity(items.len());
     for item in items {

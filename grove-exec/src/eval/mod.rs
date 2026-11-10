@@ -21,7 +21,7 @@ mod methods;
 mod operators;
 
 use composite::{eval_array, eval_projection, eval_struct, eval_tuple};
-use data::{exec_field, exec_root, resolve_base_link, resolve_owning_ident, resolve_owning_values};
+use data::{exec_field, exec_root, resolve_base_link, resolve_ident_value, resolve_owning_values};
 use literals::{decode_literal, eval_type_constant};
 use methods::eval_method;
 use operators::{eval_binary, eval_cast, eval_unary};
@@ -120,7 +120,7 @@ pub fn eval(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
                         .ok_or_else(|| ExecError::Integrity {
                             message: format!("unbound field `{}` (internal error)", name.value),
                         })?;
-                    resolve_owning_ident(ctx, *field, value)
+                    resolve_ident_value(ctx, expr.id, *field, value)
                 }
                 IdentBinding::ProjectedField { .. } => {
                     ctx.env.lookup(&name.value, *depth).cloned().ok_or_else(|| {
