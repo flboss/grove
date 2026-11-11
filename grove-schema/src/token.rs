@@ -8,6 +8,7 @@ pub enum TokenKind {
     Config,
     Root,
     Struct,
+    Enum,
     Rel,
     Via,
     List,
@@ -23,6 +24,7 @@ pub enum TokenKind {
     // Literals
     Ident(String),
     StringLit(String),
+    IntLit(i64),
 
     // Punctuation
     LBrace,
@@ -36,6 +38,7 @@ pub enum TokenKind {
     Colon,
     Semicolon,
     Equals,
+    FatArrow,
     Comma,
     Dot,
     At,

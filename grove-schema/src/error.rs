@@ -6,6 +6,7 @@ pub enum SchemaParseError {
     UnexpectedChar { span: Span, ch: char },
     UnclosedString { span: Span },
     UnclosedBacktickIdent { span: Span },
+    IntLiteralOverflow { span: Span },
 
     ExpectedTopLevelStmt { span: Span },
     DuplicateConfigBlock { span: Span, previous: Span },
@@ -104,11 +105,18 @@ impl From<SchemaParseError> for Diagnostic {
                 span,
                 "missing closing '`'",
             ),
+            IntLiteralOverflow { span } => error_simple(
+                "SL0004",
+                "integer literal is out of range for `i64`",
+                span,
+                "literal does not fit in `i64`",
+            )
+            .with_help(format!("valid values are {}..{}", i64::MIN, i64::MAX)),
             ExpectedTopLevelStmt { span } => error_simple(
                 "SP0001",
                 "expected a top-level statement",
                 span,
-                "expected one of `config`, `root`, `struct`, or `rel`",
+                "expected one of `config`, `root`, `struct`, `enum`, or `rel`",
             ),
             ExpectedConfigLBrace { span } => error_simple(
                 "SP0002",

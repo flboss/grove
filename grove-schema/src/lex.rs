@@ -60,7 +60,7 @@ impl<'src> Lexer<'src> {
                 ')' => self.make_token(start, TokenKind::RParen),
                 ':' => self.make_token(start, TokenKind::Colon),
                 ';' => self.make_token(start, TokenKind::Semicolon),
-                '=' => self.make_token(start, TokenKind::Equals),
+                '=' => self.scan_equals_or_fat_arrow(start),
                 ',' => self.make_token(start, TokenKind::Comma),
                 '.' => self.make_token(start, TokenKind::Dot),
                 '@' => self.make_token(start, TokenKind::At),
@@ -68,7 +68,8 @@ impl<'src> Lexer<'src> {
                 '&' => self.make_token(start, TokenKind::Ampersand),
                 '>' => self.make_token(start, TokenKind::RAngle),
                 '<' => self.scan_arrow_or_langle(start),
-                '-' => self.scan_arrow_or_minus(start),
+                '-' => self.scan_arrow_or_int(start),
+                '0'..='9' => self.scan_int(start),
                 '"' => self.scan_string(start),
                 '`' => self.scan_backtick_ident(start),
                 _ => {
@@ -101,6 +102,7 @@ impl<'src> Lexer<'src> {
             "config" => TokenKind::Config,
             "root" => TokenKind::Root,
             "struct" => TokenKind::Struct,
+            "enum" => TokenKind::Enum,
             "rel" => TokenKind::Rel,
             "via" => TokenKind::Via,
             "List" => TokenKind::List,
@@ -134,10 +136,26 @@ impl<'src> Lexer<'src> {
         self.make_token(start, TokenKind::LAngle)
     }
 
-    fn scan_arrow_or_minus(&mut self, start: usize) -> Token {
+    fn scan_equals_or_fat_arrow(&mut self, start: usize) -> Token {
+        if self.source[self.pos..].starts_with('>') {
+            self.pos += '>'.len_utf8();
+            self.make_token(start, TokenKind::FatArrow)
+        } else {
+            self.make_token(start, TokenKind::Equals)
+        }
+    }
+
+    fn scan_arrow_or_int(&mut self, start: usize) -> Token {
         if self.source[self.pos..].starts_with('>') {
             self.pos += '>'.len_utf8();
             return self.make_token(start, TokenKind::Arrow);
+        }
+
+        if matches!(
+            self.source[self.pos..].chars().next(),
+            Some(ch) if ch.is_ascii_digit()
+        ) {
+            return self.scan_int(start);
         }
 
         // Lone '-' is an error
@@ -149,6 +167,29 @@ impl<'src> Lexer<'src> {
             ch: '-',
         });
         self.advance()
+    }
+
+    fn scan_int(&mut self, start: usize) -> Token {
+        while let Some(ch) = self.source[self.pos..].chars().next() {
+            if ch.is_ascii_digit() {
+                self.pos += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+
+        match self.source[start..self.pos].parse::<i64>() {
+            Ok(value) => self.make_token(start, TokenKind::IntLit(value)),
+            Err(_) => {
+                self.emit_error(SchemaParseError::IntLiteralOverflow {
+                    span: Span {
+                        start,
+                        end: self.pos,
+                    },
+                });
+                self.advance()
+            }
+        }
     }
 
     fn scan_string(&mut self, start: usize) -> Token {
@@ -306,10 +347,11 @@ mod tests {
 
     #[test]
     fn keywords() {
-        let mut lex = Lexer::new("config root struct rel via");
+        let mut lex = Lexer::new("config root struct enum rel via");
         assert_token!(lex, TokenKind::Config);
         assert_token!(lex, TokenKind::Root);
         assert_token!(lex, TokenKind::Struct);
+        assert_token!(lex, TokenKind::Enum);
         assert_token!(lex, TokenKind::Rel);
         assert_token!(lex, TokenKind::Via);
         assert_eof!(lex);
@@ -404,6 +446,44 @@ mod tests {
         let mut lex = Lexer::new("->");
         assert_token!(lex, TokenKind::Arrow);
         assert_eof!(lex);
+    }
+
+    #[test]
+    fn fat_arrow() {
+        let mut lex = Lexer::new("= =>");
+        assert_token!(lex, TokenKind::Equals);
+        assert_token!(lex, TokenKind::FatArrow);
+        assert_eof!(lex);
+    }
+
+    #[test]
+    fn int_literals() {
+        let mut lex = Lexer::new("0 42 -1 -9223372036854775808 9223372036854775807");
+        assert_eq!(lex.next_token().value, TokenKind::IntLit(0));
+        assert_eq!(lex.next_token().value, TokenKind::IntLit(42));
+        assert_eq!(lex.next_token().value, TokenKind::IntLit(-1));
+        assert_eq!(lex.next_token().value, TokenKind::IntLit(i64::MIN));
+        assert_eq!(lex.next_token().value, TokenKind::IntLit(i64::MAX));
+        assert_eof!(lex);
+        assert!(lex.take_diagnostics().is_empty());
+    }
+
+    #[test]
+    fn int_literal_overflow() {
+        let mut lex = Lexer::new("9223372036854775808");
+        assert_eof!(lex);
+        let diags = lex.take_diagnostics();
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code.as_ref(), "SL0004");
+    }
+
+    #[test]
+    fn negative_int_literal_overflow() {
+        let mut lex = Lexer::new("-9223372036854775809");
+        assert_eof!(lex);
+        let diags = lex.take_diagnostics();
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code.as_ref(), "SL0004");
     }
 
     #[test]
