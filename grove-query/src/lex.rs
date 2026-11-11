@@ -157,6 +157,7 @@ impl<'src> Lexer<'src> {
             "Int" => TokenKind::Int,
             "Float" => TokenKind::Float,
             "Dec" => TokenKind::Dec,
+            "String" => TokenKind::String,
             _ => TokenKind::Ident(word.to_string()),
         };
 
@@ -1389,10 +1390,11 @@ mod tests {
 
     #[test]
     fn type_keywords() {
-        let mut lex = Lexer::new("Int Float Dec");
+        let mut lex = Lexer::new("Int Float Dec String");
         assert_token!(lex, TokenKind::Int);
         assert_token!(lex, TokenKind::Float);
         assert_token!(lex, TokenKind::Dec);
+        assert_token!(lex, TokenKind::String);
         assert_eof!(lex);
     }
 

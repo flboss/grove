@@ -601,7 +601,28 @@ impl<'src> Parser<'src> {
             }
             TokenKind::Ident(_) => {
                 let name = self.expect_ident()?;
-                Ok(Expr::Ident(name))
+                if matches!(self.current.value, TokenKind::DoubleColon) {
+                    self.bump();
+                    let variant = match self.current.value {
+                        TokenKind::Ident(_) => self.expect_ident()?,
+                        _ => {
+                            let span = self.current.span;
+                            self.emit_error(QueryParseError::ExpectedEnumVariantName { span });
+                            return Err(());
+                        }
+                    };
+                    let span = Span {
+                        start: name.span.start,
+                        end: variant.span.end,
+                    };
+                    Ok(Expr::EnumVariant {
+                        enum_name: name,
+                        variant,
+                        span,
+                    })
+                } else {
+                    Ok(Expr::Ident(name))
+                }
             }
             TokenKind::Prev => {
                 self.bump();
@@ -727,6 +748,7 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_type_constant(&mut self) -> Result<Expr, ()> {
+        // TokenKind::String isn't dispatched here
         let ty = self
             .parse_type_name()
             .expect("only type keywords dispatch here");
@@ -911,6 +933,7 @@ impl<'src> Parser<'src> {
             TokenKind::Int => TypeName::Int,
             TokenKind::Float => TypeName::Float,
             TokenKind::Dec => TypeName::Dec,
+            TokenKind::String => TypeName::String,
             _ => {
                 return Err(tok);
             }
@@ -1416,6 +1439,53 @@ mod tests {
                 },
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn enum_variant_expr() {
+        let expr = parse_ok("Priority::High");
+        match expr {
+            Expr::EnumVariant {
+                enum_name,
+                variant,
+                span,
+            } => {
+                assert_eq!(enum_name.value, "Priority");
+                assert_eq!(variant.value, "High");
+                assert_eq!(span.start, 0);
+                assert_eq!(span.end, "Priority::High".len());
+            }
+            other => panic!("expected enum variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bare_ident_not_enum_variant() {
+        let expr = parse_ok("Priority");
+        assert!(matches!(expr, Expr::Ident(name) if name.value == "Priority"));
+    }
+
+    #[test]
+    fn enum_variant_missing_name() {
+        let (file, diags) = parse_query("Priority::");
+        assert!(file.is_none());
+        assert_eq!(codes(&diags), vec!["QP0030"]);
+    }
+
+    #[test]
+    fn enum_variant_cast_to_string() {
+        let expr = parse_ok("Priority::High as String");
+        assert!(matches!(
+            expr,
+            Expr::Cast {
+                expr,
+                ty: Spanned {
+                    value: TypeName::String,
+                    ..
+                },
+                ..
+            } if matches!(expr.as_ref(), Expr::EnumVariant { .. })
         ));
     }
 

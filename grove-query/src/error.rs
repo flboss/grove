@@ -368,6 +368,7 @@ pub enum QueryParseError {
     ExpectedFilterRBracket { span: Span },
     ExpectedProjectionRBrace { span: Span },
     ExpectedCastTypeName { span: Span },
+    ExpectedEnumVariantName { span: Span },
     ProjectionItemAliasRequired { span: Span },
     EmptyStatement { span: Span },
     DiscardedQuery { span: Span },
@@ -475,7 +476,13 @@ impl From<QueryParseError> for Diagnostic {
                 span,
                 "expected a type name",
             )
-            .with_help("valid cast targets are `Int`, `Float`, and `Dec`"),
+            .with_help("possible cast targets are `Int`, `Float`, `Dec`, and `String`"),
+            ExpectedEnumVariantName { span } => error_simple(
+                "QP0030",
+                "expected an enum variant name after `::`",
+                span,
+                "expected an identifier",
+            ),
             ProjectionItemAliasRequired { span } => error_simple(
                 "QP0022",
                 "expected explicit alias for complex projection item",

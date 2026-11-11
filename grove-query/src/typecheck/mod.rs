@@ -216,6 +216,7 @@ fn infer(expr: &Expr, env: &mut TypeEnv) -> Result<TypedExpr, TypeError> {
                 name.span,
             ))
         }
+        Expr::EnumVariant { .. } => todo!("enums"),
         Expr::Field {
             base,
             name,
@@ -410,6 +411,7 @@ fn infer_type_constant(
         TypeName::Int => ScalarType::Int,
         TypeName::Float => ScalarType::Float,
         TypeName::Dec => ScalarType::Dec,
+        TypeName::String => unreachable!("String has no type constants"),
     };
 
     let result_ty = QueryType::Scalar(scalar_ty);

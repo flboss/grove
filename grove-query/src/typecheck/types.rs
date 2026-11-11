@@ -257,6 +257,7 @@ impl From<TypeName> for QueryType {
             TypeName::Int => QueryType::Scalar(ScalarType::Int),
             TypeName::Float => QueryType::Scalar(ScalarType::Float),
             TypeName::Dec => QueryType::Scalar(ScalarType::Dec),
+            TypeName::String => QueryType::Scalar(ScalarType::String),
         }
     }
 }

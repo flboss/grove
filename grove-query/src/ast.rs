@@ -51,6 +51,11 @@ impl fmt::Display for MutationKind {
 pub enum Expr {
     Literal(Spanned<Literal>),
     Ident(Spanned<String>),
+    EnumVariant {
+        enum_name: Spanned<String>,
+        variant: Spanned<String>,
+        span: Span,
+    },
     Array {
         elements: Vec<Expr>,
         span: Span,
@@ -123,6 +128,7 @@ impl Expr {
         match self {
             Expr::Literal(lit) => lit.span,
             Expr::Ident(name) => name.span,
+            Expr::EnumVariant { span, .. } => *span,
             Expr::TypeConstant { ty, name } => Span {
                 start: ty.span.start,
                 end: name.span.end,
@@ -162,6 +168,7 @@ pub enum TypeName {
     Int,
     Float,
     Dec,
+    String,
 }
 
 impl fmt::Display for TypeName {
@@ -170,6 +177,7 @@ impl fmt::Display for TypeName {
             TypeName::Int => write!(f, "Int"),
             TypeName::Float => write!(f, "Float"),
             TypeName::Dec => write!(f, "Dec"),
+            TypeName::String => write!(f, "String"),
         }
     }
 }
