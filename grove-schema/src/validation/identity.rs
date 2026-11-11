@@ -12,14 +12,17 @@ impl<'s> Builder<'s> {
             .extend(self.schema.structs.iter().map(|s| s.name.as_str()));
 
         let mut unknown_refs: HashMap<&'s str, Vec<Span>> = HashMap::new();
+        let mut enum_as_struct: HashMap<&'s str, Vec<Span>> = HashMap::new();
 
         for root in &self.schema.roots {
             let name = root.struct_name.as_str();
             if !self.declared_structs.contains(name) {
-                unknown_refs
-                    .entry(name)
-                    .or_default()
-                    .push(root.struct_name.span);
+                let spans = if self.enum_index.contains_key(name) {
+                    &mut enum_as_struct
+                } else {
+                    &mut unknown_refs
+                };
+                spans.entry(name).or_default().push(root.struct_name.span);
             }
         }
 
@@ -27,7 +30,12 @@ impl<'s> Builder<'s> {
             for endpoint in [&relation.child, &relation.parent] {
                 let name = endpoint.struct_name.as_str();
                 if !self.declared_structs.contains(name) {
-                    unknown_refs
+                    let spans = if self.enum_index.contains_key(name) {
+                        &mut enum_as_struct
+                    } else {
+                        &mut unknown_refs
+                    };
+                    spans
                         .entry(name)
                         .or_default()
                         .push(endpoint.struct_name.span);
@@ -42,18 +50,26 @@ impl<'s> Builder<'s> {
         let mut targets = Vec::new();
         for def in &self.schema.structs {
             for field in &def.fields {
-                collect_struct_types(&field.exposed_type, &mut targets);
+                collect_named_types(&field.exposed_type, &mut targets);
             }
         }
         for (name, span) in targets {
-            if !self.declared_structs.contains(name) {
+            if !self.declared_structs.contains(name) && !self.enum_index.contains_key(name) {
                 unknown_refs.entry(name).or_default().push(span);
             }
         }
 
         for (name, mut spans) in unknown_refs {
             spans.sort_unstable();
-            self.emit_error(SchemaValidationError::UnknownStructRef {
+            self.emit_error(SchemaValidationError::UnknownTypeRef {
+                name: name.to_string(),
+                occurrences: spans,
+            });
+        }
+
+        for (name, mut spans) in enum_as_struct {
+            spans.sort_unstable();
+            self.emit_error(SchemaValidationError::EnumAsStruct {
                 name: name.to_string(),
                 occurrences: spans,
             });
@@ -61,16 +77,16 @@ impl<'s> Builder<'s> {
     }
 }
 
-fn collect_struct_types<'a>(ty: &'a TypeExpr, out: &mut Vec<(&'a str, Span)>) {
+fn collect_named_types<'a>(ty: &'a TypeExpr, out: &mut Vec<(&'a str, Span)>) {
     match ty {
         TypeExpr::Primitive(_) => {}
         TypeExpr::Named(ident) => out.push((ident.as_str(), ident.span)),
         TypeExpr::Optional { inner, .. } | TypeExpr::List { element: inner, .. } => {
-            collect_struct_types(inner, out)
+            collect_named_types(inner, out)
         }
         TypeExpr::Tuple { elements, .. } => {
             for element in elements {
-                collect_struct_types(element, out);
+                collect_named_types(element, out);
             }
         }
     }
@@ -94,8 +110,40 @@ mod tests {
         );
         let schema = schema.expect("source should parse");
         let mut builder = Builder::new(&schema);
+        builder.stage_enums();
         builder.stage_identity();
         f(&builder);
+    }
+
+    #[test]
+    fn enum_field_type() {
+        stage_identity(
+            r#"enum Priority { Low => "low" } struct User { priority: Priority }"#,
+            |b| {
+                assert!(b.diags.is_empty());
+            },
+        );
+    }
+
+    #[test]
+    fn enum_as_root_rejected() {
+        stage_identity(
+            r#"enum Priority { Low => "low" } root priorities: Priority;"#,
+            |b| {
+                assert_eq!(codes(&b.diags), vec!["SV0025"]);
+                assert_eq!(b.diags[0].labels.len(), 1);
+            },
+        );
+    }
+
+    #[test]
+    fn enum_as_relation_endpoint_rejected() {
+        stage_identity(
+            "enum P { A => 1 } struct S {} rel P.x <-> S.y (a.a -> b.b);",
+            |b| {
+                assert_eq!(codes(&b.diags), vec!["SV0025"]);
+            },
+        );
     }
 
     #[test]
@@ -128,7 +176,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_struct_in_field_type() {
+    fn unknown_type_in_field_type() {
         stage_identity("struct User { manager: Missing }", |b| {
             assert_eq!(codes(&b.diags), vec!["SV0001"]);
             assert_eq!(b.diags[0].labels.len(), 1);
@@ -136,7 +184,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_struct_labels_all_occurrences() {
+    fn unknown_type_labels_all_occurrences() {
         stage_identity(
             "root users: Missing; \
              struct User { manager: Missing, orders: List<Missing> } \

@@ -5,8 +5,8 @@ use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 use grove_schema::validated::{
-    Field, FieldId, Relation, RelationId, ScalarType, StorageTable, StructId, ValidatedSchema,
-    ValueType,
+    EnumId, Field, FieldId, Relation, RelationId, ScalarType, StorageTable, StructId,
+    ValidatedSchema, ValueType,
 };
 use rusqlite::Connection;
 use rusqlite::Statement;
@@ -336,7 +336,7 @@ impl LinkKey {
 /// the validated `columns` order
 fn leaf_count(ty: &ValueType) -> usize {
     match ty {
-        ValueType::Scalar(_) => 1,
+        ValueType::Scalar(_) | ValueType::Enum(_) => 1,
         ValueType::Tuple(elements) => elements.iter().map(leaf_count).sum(),
         ValueType::Optional(inner) => leaf_count(inner),
         ValueType::Array { .. } => 0,
@@ -353,6 +353,7 @@ fn decode_node(
         ValueType::Scalar(scalar) => {
             decode_scalar(*scalar, vals[0], false, float_checks).map(|v| (v, 1))
         }
+        ValueType::Enum(_) => todo!("enums"),
         ValueType::Optional(inner) => {
             let len = leaf_count(inner);
             if vals[..len].iter().all(|v| matches!(v, ValueRef::Null)) {
@@ -417,6 +418,8 @@ struct ArrayNode {
 #[derive(Debug, Clone)]
 enum ElemPlan {
     Scalar(ScalarType),
+    #[allow(dead_code)] // TODO: enums
+    Enum(EnumId),
     Tuple(Vec<ElemPlan>),
     Optional(Box<ElemPlan>),
     Link(usize),
@@ -441,6 +444,10 @@ fn walk_element<'a>(
         ValueType::Scalar(scalar) => {
             *counter += 1;
             ElemPlan::Scalar(*scalar)
+        }
+        ValueType::Enum(id) => {
+            *counter += 1;
+            ElemPlan::Enum(*id)
         }
         ValueType::Tuple(elements) => ElemPlan::Tuple(
             elements
@@ -470,7 +477,7 @@ fn walk_element<'a>(
 
 fn plan_width(plan: &ElemPlan) -> usize {
     match plan {
-        ElemPlan::Scalar(_) | ElemPlan::Link(_) => 1,
+        ElemPlan::Scalar(_) | ElemPlan::Enum(_) | ElemPlan::Link(_) => 1,
         ElemPlan::Tuple(elements) => elements.iter().map(plan_width).sum(),
         ElemPlan::Optional(inner) => plan_width(inner),
     }
@@ -549,6 +556,7 @@ fn semi(
         ElemPlan::Scalar(scalar) => {
             decode_scalar(*scalar, cells[0], false, float_checks).map(|v| (SemiVal::Done(v), 1))
         }
+        ElemPlan::Enum(_) => todo!("enums"),
         ElemPlan::Tuple(plans) => {
             let mut items = Vec::with_capacity(plans.len());
             let mut used = 0;

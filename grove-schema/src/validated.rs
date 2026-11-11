@@ -45,6 +45,9 @@ pub struct TableId(u16);
 pub struct StructId(u16);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EnumId(u16);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RelationId(u16);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -66,6 +69,16 @@ impl TableId {
 impl StructId {
     pub fn new(index: usize) -> Self {
         StructId(index as u16)
+    }
+
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+impl EnumId {
+    pub fn new(index: usize) -> Self {
+        EnumId(index as u16)
     }
 
     pub fn index(self) -> usize {
@@ -117,6 +130,7 @@ pub struct ValidatedSchema {
     pub roots: Vec<Root>,
     pub tables: Vec<Table>,
     pub structs: Vec<Struct>,
+    pub enums: Vec<Enum>,
     pub relations: Vec<Relation>,
 }
 
@@ -126,6 +140,13 @@ impl ValidatedSchema {
             .iter()
             .position(|r| r.endpoints().contains(&field))
             .map(RelationId::new)
+    }
+
+    pub fn enum_by_name(&self, name: &str) -> Option<(EnumId, &Enum)> {
+        self.enums
+            .iter()
+            .position(|e| e.name == name)
+            .map(|index| (EnumId::new(index), &self.enums[index]))
     }
 
     pub fn struct_field(&self, struct_id: StructId, name: &str) -> Option<(FieldId, &Field)> {
@@ -199,6 +220,50 @@ pub struct Struct {
     pub fields: Vec<Field>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EnumUnderlying {
+    Int,
+    String,
+}
+
+impl EnumUnderlying {
+    pub fn scalar_type(self) -> ScalarType {
+        match self {
+            EnumUnderlying::Int => ScalarType::Int,
+            EnumUnderlying::String => ScalarType::String,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Enum {
+    pub name: String,
+    pub underlying: EnumUnderlying,
+    pub variants: Vec<EnumVariant>,
+}
+
+impl Enum {
+    pub fn variant_index(&self, name: &str) -> Option<usize> {
+        self.variants.iter().position(|v| v.name == name)
+    }
+
+    pub fn variant_index_by_value(&self, value: &EnumValue) -> Option<usize> {
+        self.variants.iter().position(|v| &v.value == value)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumVariant {
+    pub name: String,
+    pub value: EnumValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum EnumValue {
+    Int(i64),
+    String(String),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Field {
     Value {
@@ -232,6 +297,7 @@ impl Field {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValueType {
     Scalar(ScalarType),
+    Enum(EnumId),
     Tuple(Vec<ValueType>),
     Optional(Box<ValueType>),
     Array {
@@ -243,7 +309,7 @@ pub enum ValueType {
 impl ValueType {
     pub fn has_array(&self) -> bool {
         match self {
-            ValueType::Scalar(_) => false,
+            ValueType::Scalar(_) | ValueType::Enum(_) => false,
             ValueType::Tuple(elements) => elements.iter().any(Self::has_array),
             ValueType::Optional(inner) => inner.has_array(),
             ValueType::Array { .. } => true,

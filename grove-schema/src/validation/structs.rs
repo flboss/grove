@@ -42,7 +42,7 @@ impl<'s> Builder<'s> {
         let name = field.name.value.clone();
         let struct_name = def.name.value.clone();
 
-        if let Some(nested) = nested_struct_ref(&field.exposed_type) {
+        if let Some(nested) = self.nested_struct_ref(&field.exposed_type) {
             self.emit_error(SchemaValidationError::NestedStructRef {
                 span: field.exposed_type.span(),
                 struct_name,
@@ -52,7 +52,8 @@ impl<'s> Builder<'s> {
             return None;
         }
 
-        match super::field_kind(&field.exposed_type) {
+        let kind = self.field_kind(&field.exposed_type)?;
+        match kind {
             FieldKind::Value | FieldKind::Array { .. } | FieldKind::ListNoVia
                 if field.non_owning =>
             {
@@ -65,7 +66,7 @@ impl<'s> Builder<'s> {
             }
             FieldKind::Value => {
                 let declared = super::value_column_refs(field).len();
-                let expected = super::value_column_types(&field.exposed_type).len();
+                let expected = self.field_column_types(&field.exposed_type).len();
                 if declared != expected {
                     let columns = field
                         .column
@@ -101,7 +102,7 @@ impl<'s> Builder<'s> {
                     ColumnMapping::Single(_) => 1,
                     ColumnMapping::Multi(cols) => cols.len(),
                 };
-                let expected = super::storage_value_types(element).len();
+                let expected = self.via_value_column_types(element).len();
                 if declared != expected {
                     self.emit_error(SchemaValidationError::ViaArityMismatch {
                         span: field.exposed_type.span(),
@@ -202,8 +203,16 @@ impl<'s> Builder<'s> {
                 element: Box::new(self.value_type(element)),
                 storage: self.storage_table(via),
             },
-            TypeExpr::Named(_) | TypeExpr::List { via: None, .. } => {
-                unreachable!("struct or via-less list reached ValueType conversion")
+            TypeExpr::Named(name) => {
+                let id = self
+                    .enum_index
+                    .get(name.as_str())
+                    .copied()
+                    .expect("non-enum named type reached ValueType conversion");
+                ValueType::Enum(id)
+            }
+            TypeExpr::List { via: None, .. } => {
+                unreachable!("via-less list reached ValueType conversion")
             }
         }
     }
@@ -222,28 +231,37 @@ impl<'s> Builder<'s> {
     }
 }
 
-fn nested_struct_ref(ty: &TypeExpr) -> Option<Span> {
-    match ty {
-        TypeExpr::Primitive(_) | TypeExpr::Named(_) => None,
-        TypeExpr::Optional { inner, .. } => match inner.as_ref() {
-            TypeExpr::Named(_) => None,
-            other => struct_in_value_position(other),
-        },
-        TypeExpr::List { element, .. } => match element.as_ref() {
-            TypeExpr::Named(_) => None,
-            other => struct_in_value_position(other),
-        },
-        TypeExpr::Tuple { elements, .. } => elements.iter().find_map(struct_in_value_position),
+impl<'s> Builder<'s> {
+    fn nested_struct_ref(&self, ty: &TypeExpr) -> Option<Span> {
+        match ty {
+            TypeExpr::Primitive(_) | TypeExpr::Named(_) => None,
+            TypeExpr::Optional { inner, .. } => match inner.as_ref() {
+                TypeExpr::Named(_) => None,
+                other => self.struct_in_value_position(other),
+            },
+            TypeExpr::List { element, .. } => match element.as_ref() {
+                TypeExpr::Named(_) => None,
+                other => self.struct_in_value_position(other),
+            },
+            TypeExpr::Tuple { elements, .. } => elements
+                .iter()
+                .find_map(|e| self.struct_in_value_position(e)),
+        }
     }
-}
 
-fn struct_in_value_position(ty: &TypeExpr) -> Option<Span> {
-    match ty {
-        TypeExpr::Primitive(_) => None,
-        TypeExpr::Named(spanned) => Some(spanned.span),
-        TypeExpr::Optional { inner, .. } => struct_in_value_position(inner),
-        TypeExpr::List { element, .. } => struct_in_value_position(element),
-        TypeExpr::Tuple { elements, .. } => elements.iter().find_map(struct_in_value_position),
+    fn struct_in_value_position(&self, ty: &TypeExpr) -> Option<Span> {
+        match ty {
+            TypeExpr::Primitive(_) => None,
+            TypeExpr::Named(name) => self
+                .declared_structs
+                .contains(name.as_str())
+                .then_some(name.span),
+            TypeExpr::Optional { inner, .. } => self.struct_in_value_position(inner),
+            TypeExpr::List { element, .. } => self.struct_in_value_position(element),
+            TypeExpr::Tuple { elements, .. } => elements
+                .iter()
+                .find_map(|e| self.struct_in_value_position(e)),
+        }
     }
 }
 
@@ -289,6 +307,7 @@ mod tests {
         );
         let schema = schema.expect("source should parse");
         let mut builder = Builder::new(&schema);
+        builder.stage_enums();
         builder.stage_identity();
         builder.stage_physical();
         builder.stage_structs();
@@ -661,6 +680,106 @@ mod tests {
                 assert_eq!(codes(&b.diags), vec!["SV0012"]);
                 assert!(b.structs[0].fields.is_empty());
                 assert_eq!(b.structs[1].fields.len(), 1);
+            },
+        );
+    }
+
+    #[test]
+    fn enum_fields_are_values() {
+        stage_structs(
+            r#"root tickets: Ticket;
+               enum Priority { Low => "low", High => "high" }
+               enum Level { Low => 0, High => 2 }
+               struct Ticket {
+                   priority: Priority,
+                   fallback: ?Priority,
+                   pair: Tuple<Priority, Level>@(p, l),
+                   tags: List<Priority>@tags_ref via ticket_tags[ticket_key, tag],
+               }"#,
+            |b| {
+                assert!(b.diags.is_empty(), "unexpected diagnostics: {:?}", b.diags);
+                let fields = &b.structs[0].fields;
+                assert_eq!(fields.len(), 4);
+                let priority = b.enum_index["Priority"];
+                let level = b.enum_index["Level"];
+                assert!(matches!(
+                    &fields[0],
+                    Field::Value { ty: ValueType::Enum(id), .. } if *id == priority
+                ));
+                assert!(matches!(
+                    &fields[1],
+                    Field::Value { ty: ValueType::Optional(inner), .. }
+                        if matches!(inner.as_ref(), ValueType::Enum(id) if *id == priority)
+                ));
+                assert!(matches!(
+                    &fields[2],
+                    Field::Value { ty: ValueType::Tuple(items), .. }
+                        if items == &vec![ValueType::Enum(priority), ValueType::Enum(level)]
+                ));
+                assert!(matches!(
+                    &fields[3],
+                    Field::Array { element: ValueType::Enum(id), .. } if *id == priority
+                ));
+            },
+        );
+    }
+
+    #[test]
+    fn enum_list_without_via_rejected() {
+        stage_structs(
+            r#"root tickets: Ticket; enum Priority { Low => "low" }
+               struct Ticket { priorities: List<Priority> }"#,
+            |b| {
+                assert_eq!(codes(&b.diags), vec!["SV0011"]);
+            },
+        );
+    }
+
+    #[test]
+    fn non_owning_enum_rejected() {
+        stage_structs(
+            r#"root tickets: Ticket; enum Priority { Low => "low" }
+               struct Ticket { priority: &Priority }"#,
+            |b| {
+                assert_eq!(codes(&b.diags), vec!["SV0021"]);
+            },
+        );
+    }
+
+    #[test]
+    fn enum_column_arity_mismatch_rejected() {
+        stage_structs(
+            r#"root tickets: Ticket; enum Priority { Low => "low" }
+               struct Ticket { priority: Priority@(a, b) }"#,
+            |b| {
+                assert_eq!(codes(&b.diags), vec!["SV0009"]);
+            },
+        );
+    }
+
+    #[test]
+    fn nested_enum_arrays_are_values() {
+        stage_structs(
+            r#"root tickets: Ticket; enum Priority { Low => "low", High => "high" }
+               struct Ticket {
+                   matrix: List<List<Priority> via inner_table[ref, data]>@matrix_ref
+                       via outer_table[ref, inner_ref],
+               }"#,
+            |b| {
+                assert!(b.diags.is_empty(), "unexpected diagnostics: {:?}", b.diags);
+                let priority = b.enum_index["Priority"];
+                match &b.structs[0].fields[0] {
+                    Field::Array {
+                        element: ValueType::Array { element, .. },
+                        ..
+                    } => {
+                        assert!(matches!(
+                            element.as_ref(),
+                            ValueType::Enum(id) if *id == priority
+                        ));
+                    }
+                    other => panic!("expected nested enum array, got {other:?}"),
+                }
             },
         );
     }

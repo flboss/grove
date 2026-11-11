@@ -222,9 +222,12 @@ impl<'s> Builder<'s> {
         first_claims: &mut HashMap<&'s str, Span>,
         declared_columns: &mut HashMap<(TableId, &'s str), Span>,
     ) {
-        match super::field_kind(&field.exposed_type) {
+        let Some(kind) = self.field_kind(&field.exposed_type) else {
+            return;
+        };
+        match kind {
             FieldKind::Value | FieldKind::ListNoVia => {
-                let leaves = super::value_column_types(&field.exposed_type);
+                let leaves = self.field_column_types(&field.exposed_type);
                 for (i, (name, span)) in super::value_column_refs(field).into_iter().enumerate() {
                     match leaves.get(i) {
                         Some(Some(scalar)) => {
@@ -261,7 +264,7 @@ impl<'s> Builder<'s> {
     ) {
         let tid = self.register_table(&via.table, via.table.span, first_claims);
         self.claim_declared(tid, &via.key_col, via.key_col.span, None, declared_columns);
-        let value_types = super::storage_value_types(element);
+        let value_types = self.via_value_column_types(element);
         match &via.value {
             ColumnMapping::Single(col) => {
                 self.claim_declared(
@@ -367,6 +370,7 @@ mod tests {
         );
         let schema = schema.expect("source should parse");
         let mut builder = Builder::new(&schema);
+        builder.stage_enums();
         builder.stage_identity();
         builder.stage_physical();
         f(&builder);
@@ -682,6 +686,60 @@ mod tests {
                         name: "image_id".into(),
                         ty: None,
                     }]
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn enum_columns_use_underlying_scalar_types() {
+        stage_physical(
+            r#"root tickets: Ticket;
+               enum Priority { Low => "low", High => "high" }
+               enum Level { Low => 0, High => 2 }
+               struct Ticket {
+                   priority: Priority,
+                   fallback: ?Priority,
+                   level: Level,
+                   tags: List<Priority>@tags_ref via ticket_tags[ticket_key, tag],
+               }"#,
+            |b| {
+                assert!(b.diags.is_empty(), "unexpected diagnostics: {:?}", b.diags);
+                let ticket = b.struct_index["Ticket"];
+                assert_eq!(
+                    b.tables[ticket.index()].columns,
+                    vec![
+                        Column {
+                            name: "priority".into(),
+                            ty: Some(ScalarType::String),
+                        },
+                        Column {
+                            name: "fallback".into(),
+                            ty: Some(ScalarType::String),
+                        },
+                        Column {
+                            name: "level".into(),
+                            ty: Some(ScalarType::Int),
+                        },
+                        Column {
+                            name: "tags_ref".into(),
+                            ty: None,
+                        },
+                    ]
+                );
+                let tags = b.table_index["ticket_tags"];
+                assert_eq!(
+                    b.tables[tags.index()].columns,
+                    vec![
+                        Column {
+                            name: "ticket_key".into(),
+                            ty: None,
+                        },
+                        Column {
+                            name: "tag".into(),
+                            ty: Some(ScalarType::String),
+                        },
+                    ]
                 );
             },
         );

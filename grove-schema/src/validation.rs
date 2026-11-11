@@ -1,3 +1,4 @@
+mod enums;
 mod identity;
 mod ownership;
 mod physical;
@@ -11,8 +12,8 @@ use crate::ast::{
     ListStorage, Schema, TypeExpr,
 };
 use crate::validated::{
-    ColumnId, Config, FieldId, Relation, Root, ScalarType, Struct, StructId, Table, TableId,
-    ValidatedSchema,
+    ColumnId, Config, Enum, EnumId, FieldId, Relation, Root, ScalarType, Struct, StructId, Table,
+    TableId, ValidatedSchema,
 };
 use crate::validation_error::SchemaValidationError;
 use grove_types::{Diagnostic, Span};
@@ -28,6 +29,8 @@ pub struct Builder<'s> {
     struct_index: HashMap<&'s str, StructId>,
     roots: Vec<Root>,
     structs: Vec<Struct>,
+    enums: Vec<Enum>,
+    enum_index: HashMap<&'s str, EnumId>,
     field_index: HashMap<(&'s str, &'s str), FieldId>,
     relations: Vec<Relation>,
     diags: Vec<Diagnostic>,
@@ -35,6 +38,7 @@ pub struct Builder<'s> {
 
 pub fn validate(schema: Schema) -> (Option<ValidatedSchema>, Vec<Diagnostic>) {
     let mut builder = Builder::new(&schema);
+    builder.stage_enums();
     builder.stage_identity();
     builder.stage_physical();
     builder.stage_structs();
@@ -50,6 +54,7 @@ fn assemble(builder: Builder) -> (Option<ValidatedSchema>, Vec<Diagnostic>) {
         roots: builder.roots,
         tables: builder.tables,
         structs: builder.structs,
+        enums: builder.enums,
         relations: builder.relations,
     });
     (validated, diags)
@@ -82,6 +87,8 @@ impl<'s> Builder<'s> {
             struct_index: HashMap::new(),
             roots: Vec::new(),
             structs: Vec::new(),
+            enums: Vec::new(),
+            enum_index: HashMap::new(),
             field_index: HashMap::new(),
             relations: Vec::new(),
             diags: Vec::new(),
@@ -93,23 +100,104 @@ impl<'s> Builder<'s> {
     }
 }
 
-fn field_kind(ty: &TypeExpr) -> FieldKind<'_> {
-    match ty {
-        TypeExpr::Primitive(_) | TypeExpr::Tuple { .. } => FieldKind::Value,
-        TypeExpr::Named(_) => FieldKind::Ref,
-        TypeExpr::Optional { inner, .. } if matches!(inner.as_ref(), TypeExpr::Named(_)) => {
-            FieldKind::Ref
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NamedKind {
+    Struct,
+    Enum(EnumId),
+    Unknown,
+}
+
+impl<'s> Builder<'s> {
+    fn named_kind(&self, name: &str) -> NamedKind {
+        if let Some(&id) = self.enum_index.get(name) {
+            NamedKind::Enum(id)
+        } else if self.declared_structs.contains(name) {
+            NamedKind::Struct
+        } else {
+            NamedKind::Unknown
         }
-        TypeExpr::Optional { .. } => FieldKind::Value,
-        TypeExpr::List { element, .. } if matches!(element.as_ref(), TypeExpr::Named(_)) => {
-            FieldKind::Ref
+    }
+
+    fn enum_scalar(&self, id: EnumId) -> ScalarType {
+        self.enums[id.index()].underlying.scalar_type()
+    }
+
+    fn contains_unknown_named(&self, ty: &TypeExpr) -> bool {
+        match ty {
+            TypeExpr::Primitive(_) => false,
+            TypeExpr::Named(name) => self.named_kind(name.as_str()) == NamedKind::Unknown,
+            TypeExpr::Optional { inner, .. } | TypeExpr::List { element: inner, .. } => {
+                self.contains_unknown_named(inner)
+            }
+            TypeExpr::Tuple { elements, .. } => {
+                elements.iter().any(|e| self.contains_unknown_named(e))
+            }
         }
-        TypeExpr::List {
-            element,
-            via: Some(via),
-            ..
-        } => FieldKind::Array { element, via },
-        TypeExpr::List { .. } => FieldKind::ListNoVia,
+    }
+
+    fn field_kind<'a>(&self, ty: &'a TypeExpr) -> Option<FieldKind<'a>> {
+        if self.contains_unknown_named(ty) {
+            return None;
+        }
+
+        Some(match ty {
+            TypeExpr::Primitive(_) | TypeExpr::Tuple { .. } => FieldKind::Value,
+            TypeExpr::Named(name) => match self.named_kind(name.as_str()) {
+                NamedKind::Enum(_) => FieldKind::Value,
+                NamedKind::Struct => FieldKind::Ref,
+                NamedKind::Unknown => unreachable!("unknown named type was filtered"),
+            },
+            TypeExpr::Optional { inner, .. } => match inner.as_ref() {
+                TypeExpr::Named(name) if self.named_kind(name.as_str()) == NamedKind::Struct => {
+                    FieldKind::Ref
+                }
+                _ => FieldKind::Value,
+            },
+            TypeExpr::List { element, via, .. } => match element.as_ref() {
+                TypeExpr::Named(name) if self.named_kind(name.as_str()) == NamedKind::Struct => {
+                    FieldKind::Ref
+                }
+                _ => match via {
+                    Some(via) => FieldKind::Array { element, via },
+                    None => FieldKind::ListNoVia,
+                },
+            },
+        })
+    }
+
+    /// columns representing the field in its owning struct's table
+    fn field_column_types(&self, ty: &TypeExpr) -> Vec<Option<ScalarType>> {
+        match ty {
+            TypeExpr::Primitive(spanned) => vec![Some(builtin_scalar(spanned))],
+            TypeExpr::Named(name) => match self.named_kind(name.as_str()) {
+                NamedKind::Enum(id) => vec![Some(self.enum_scalar(id))],
+                NamedKind::Struct | NamedKind::Unknown => Vec::new(),
+            },
+            TypeExpr::Optional { inner, .. } => self.field_column_types(inner),
+            TypeExpr::Tuple { elements, .. } => elements
+                .iter()
+                .flat_map(|e| self.field_column_types(e))
+                .collect(),
+            TypeExpr::List { via: Some(_), .. } => vec![None],
+            TypeExpr::List { element, .. } => self.field_column_types(element),
+        }
+    }
+
+    /// value columns stored in a via table for an array element
+    fn via_value_column_types(&self, ty: &TypeExpr) -> Vec<Option<ScalarType>> {
+        match ty {
+            TypeExpr::Primitive(spanned) => vec![Some(builtin_scalar(spanned))],
+            TypeExpr::Named(name) => match self.named_kind(name.as_str()) {
+                NamedKind::Enum(id) => vec![Some(self.enum_scalar(id))],
+                NamedKind::Struct | NamedKind::Unknown => Vec::new(),
+            },
+            TypeExpr::Optional { inner, .. } => self.via_value_column_types(inner),
+            TypeExpr::Tuple { elements, .. } => elements
+                .iter()
+                .flat_map(|e| self.via_value_column_types(e))
+                .collect(),
+            TypeExpr::List { .. } => vec![None],
+        }
     }
 }
 
@@ -139,27 +227,6 @@ fn array_link_column(field: &FieldDecl) -> (&str, Span) {
     }
 }
 
-fn value_column_types(ty: &TypeExpr) -> Vec<Option<ScalarType>> {
-    match ty {
-        TypeExpr::Primitive(spanned) => vec![Some(builtin_scalar(spanned))],
-        TypeExpr::Optional { inner, .. } => value_column_types(inner),
-        TypeExpr::Tuple { elements, .. } => elements.iter().flat_map(value_column_types).collect(),
-        TypeExpr::List { via: Some(_), .. } => vec![None],
-        TypeExpr::List { element, .. } => value_column_types(element),
-        TypeExpr::Named(_) => Vec::new(),
-    }
-}
-
-fn storage_value_types(ty: &TypeExpr) -> Vec<Option<ScalarType>> {
-    match ty {
-        TypeExpr::Primitive(spanned) => vec![Some(builtin_scalar(spanned))],
-        TypeExpr::Optional { inner, .. } => storage_value_types(inner),
-        TypeExpr::Tuple { elements, .. } => elements.iter().flat_map(storage_value_types).collect(),
-        TypeExpr::List { .. } => vec![None],
-        TypeExpr::Named(_) => Vec::new(),
-    }
-}
-
 fn builtin_scalar(builtin: &BuiltinType) -> ScalarType {
     match builtin {
         BuiltinType::Int => ScalarType::Int,
@@ -176,7 +243,9 @@ fn builtin_scalar(builtin: &BuiltinType) -> ScalarType {
 mod tests {
     use super::*;
     use crate::parse_schema;
-    use crate::validated::{DecArithmetic, Field, IntArithmetic};
+    use crate::validated::{
+        DecArithmetic, EnumId, EnumUnderlying, Field, IntArithmetic, ValueType,
+    };
 
     fn codes(diags: &[Diagnostic]) -> Vec<&str> {
         diags.iter().map(|d| d.code.as_ref()).collect()
@@ -334,6 +403,86 @@ mod tests {
             validated.is_none(),
             "a schema with diagnostics must not assemble"
         );
+    }
+
+    #[test]
+    fn unknown_field_type_no_cascade() {
+        let (schema, parse_diags) = parse_schema("root users: User; struct User { x: Missing }");
+        assert!(
+            parse_diags.is_empty(),
+            "expected no parse errors: {parse_diags:?}"
+        );
+        let (validated, diags) = validate(schema.expect("source should parse"));
+        assert_eq!(codes(&diags), vec!["SV0001"]);
+        assert!(validated.is_none());
+    }
+
+    #[test]
+    fn validate_enums_and_enum_fields() {
+        let (schema, parse_diags) = parse_schema(
+            r#"root tickets: Ticket;
+               enum Priority { Low => "low", High => "high" }
+               enum Level { Low => 0, High => 2 }
+               struct Ticket {
+                   priority: Priority,
+                   fallback: ?Priority,
+                   pair: Tuple<Priority, Level>@(p, l),
+                   tags: List<Priority>@tags_ref via ticket_tags[ticket_key, tag],
+               }"#,
+        );
+        assert!(
+            parse_diags.is_empty(),
+            "expected no parse errors: {parse_diags:?}"
+        );
+        let (validated, diags) = validate(schema.expect("source should parse"));
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let validated = validated.expect("clean schema should assemble");
+
+        assert_eq!(validated.enums.len(), 2);
+        let (priority_id, priority) = validated.enum_by_name("Priority").expect("Priority");
+        assert_eq!(priority_id, EnumId::new(0));
+        assert_eq!(priority.name, "Priority");
+        assert_eq!(priority.underlying, EnumUnderlying::String);
+        let (level_id, level) = validated.enum_by_name("Level").expect("Level");
+        assert_eq!(level_id, EnumId::new(1));
+        assert_eq!(level.underlying, EnumUnderlying::Int);
+
+        let ticket = validated
+            .structs
+            .iter()
+            .find(|s| s.name == "Ticket")
+            .expect("Ticket");
+        assert!(matches!(
+            &ticket.fields[0],
+            Field::Value { ty: ValueType::Enum(id), .. } if *id == priority_id
+        ));
+        assert!(matches!(
+            &ticket.fields[1],
+            Field::Value { ty: ValueType::Optional(inner), .. }
+                if matches!(inner.as_ref(), ValueType::Enum(id) if *id == priority_id)
+        ));
+        assert!(matches!(
+            &ticket.fields[2],
+            Field::Value { ty: ValueType::Tuple(items), .. }
+                if items == &vec![ValueType::Enum(priority_id), ValueType::Enum(level_id)]
+        ));
+        assert!(matches!(
+            &ticket.fields[3],
+            Field::Array { element: ValueType::Enum(id), .. } if *id == priority_id
+        ));
+
+        let column_ty = |name: &str| {
+            validated.tables[ticket.table.index()]
+                .columns
+                .iter()
+                .find(|c| c.name == name)
+                .and_then(|c| c.ty)
+        };
+        assert_eq!(column_ty("priority"), Some(ScalarType::String));
+        assert_eq!(column_ty("fallback"), Some(ScalarType::String));
+        assert_eq!(column_ty("p"), Some(ScalarType::String));
+        assert_eq!(column_ty("l"), Some(ScalarType::Int));
+        assert_eq!(column_ty("tags_ref"), None);
     }
 
     #[test]

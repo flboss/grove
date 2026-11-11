@@ -239,6 +239,7 @@ impl From<&ValueType> for QueryType {
     fn from(value: &ValueType) -> Self {
         match value {
             ValueType::Scalar(s) => QueryType::Scalar(*s),
+            ValueType::Enum(_) => todo!("enums"),
             ValueType::Tuple(types) => {
                 QueryType::Tuple(types.iter().map(QueryType::from).collect())
             }

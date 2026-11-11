@@ -4,7 +4,11 @@ use crate::error::error_simple;
 
 #[derive(Debug, Clone)]
 pub enum SchemaValidationError {
-    UnknownStructRef {
+    UnknownTypeRef {
+        name: String,
+        occurrences: Vec<Span>,
+    },
+    EnumAsStruct {
         name: String,
         occurrences: Vec<Span>,
     },
@@ -123,20 +127,40 @@ impl From<SchemaValidationError> for Diagnostic {
         use SchemaValidationError::*;
 
         match err {
-            UnknownStructRef { name, occurrences } => {
+            UnknownTypeRef { name, occurrences } => {
                 let (first, rest) = occurrences
                     .split_first()
-                    .expect("an unknown struct reference always has at least one occurrence");
+                    .expect("an unknown type reference always has at least one occurrence");
                 let mut diag = error_simple(
                     "SV0001",
-                    format!("unknown struct reference `{name}`"),
+                    format!("unknown type reference `{name}`"),
                     *first,
-                    "unknown struct",
+                    "unknown type",
                 );
                 for span in rest {
                     diag = diag.with_label(Label {
                         span: *span,
                         message: "also referenced here".into(),
+                        style: LabelStyle::Secondary,
+                    });
+                }
+                diag
+            }
+            EnumAsStruct { name, occurrences } => {
+                let (first, rest) = occurrences
+                    .split_first()
+                    .expect("an invalid reference always has at least one occurrence");
+                let mut diag = error_simple(
+                    "SV0025",
+                    format!("enum `{name}` cannot be used as a struct"),
+                    *first,
+                    "expected a struct type",
+                )
+                .with_help("roots and relation endpoints must name structs, not enums");
+                for span in rest {
+                    diag = diag.with_label(Label {
+                        span: *span,
+                        message: "also used as a struct here".into(),
                         style: LabelStyle::Secondary,
                     });
                 }

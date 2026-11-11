@@ -159,6 +159,7 @@ mod tests {
         );
         let schema = schema.expect("source should parse");
         let mut builder = Builder::new(&schema);
+        builder.stage_enums();
         builder.stage_identity();
         builder.stage_physical();
         builder.stage_structs();
