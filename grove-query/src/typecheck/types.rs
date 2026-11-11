@@ -1,7 +1,7 @@
 use std::fmt;
 
 use crate::ast::{BinaryOp, ConstantName, Literal, SortDir, TypeName, UnaryOp};
-use grove_schema::validated::{FieldId, ScalarType, StructId, ValueType};
+use grove_schema::validated::{EnumId, FieldId, ScalarType, StructId, ValueType};
 use grove_types::{NodeId, Span, Spanned};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -57,6 +57,10 @@ pub enum TypedExprKind {
         name: Spanned<String>,
         binding: IdentBinding,
         depth: usize,
+    },
+    EnumVariant {
+        enum_id: EnumId,
+        variant: usize,
     },
     Field {
         base: Box<TypedExpr>,
@@ -150,6 +154,7 @@ pub enum RecordSource {
 #[derive(Debug, Clone, PartialEq)]
 pub enum QueryType {
     Scalar(ScalarType),
+    Enum(EnumId),
     Optional(Box<QueryType>),
     List(Box<QueryType>),
     Tuple(Vec<QueryType>),
@@ -199,7 +204,7 @@ impl QueryType {
 
     pub fn is_unknown(&self) -> bool {
         match self {
-            QueryType::Scalar(_) | QueryType::Void => false,
+            QueryType::Scalar(_) | QueryType::Enum(_) | QueryType::Void => false,
             QueryType::Optional(inner) | QueryType::List(inner) => inner.is_unknown(),
             QueryType::Tuple(elements) => elements.iter().any(QueryType::is_unknown),
             QueryType::Record(source) => match source {
@@ -239,7 +244,7 @@ impl From<&ValueType> for QueryType {
     fn from(value: &ValueType) -> Self {
         match value {
             ValueType::Scalar(s) => QueryType::Scalar(*s),
-            ValueType::Enum(_) => todo!("enums"),
+            ValueType::Enum(id) => QueryType::Enum(*id),
             ValueType::Tuple(types) => {
                 QueryType::Tuple(types.iter().map(QueryType::from).collect())
             }
@@ -297,8 +302,9 @@ impl fmt::Display for QueryType {
                 write!(f, " }}")
             }
             QueryType::Record(RecordSource::Schema(struct_id)) => {
-                write!(f, "Record#{}", struct_id.index())
+                write!(f, "Struct#{}", struct_id.index())
             }
+            QueryType::Enum(enum_id) => write!(f, "Enum#{}", enum_id.index()),
             QueryType::Void => write!(f, "Void"),
             QueryType::Unknown => write!(f, "_"),
         }

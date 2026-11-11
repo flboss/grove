@@ -32,6 +32,8 @@ pub enum TypeError {
     UnexpectedType { expected: String, got: String, span: Span },
     TupleAccessOnNonTuple { base_ty: String, span: Span },
     TupleIndexOutOfRange { index: usize, len: usize, span: Span },
+    UnknownEnum { name: String, span: Span },
+    UnknownEnumVariant { enum_name: String, variant: String, span: Span },
 }
 
 impl From<TypeError> for Diagnostic {
@@ -271,6 +273,22 @@ impl From<TypeError> for Diagnostic {
                 format!("tuple index `.{index}` out of range for tuple of length {len}"),
                 span,
                 format!("valid indices are .0 through .{}", len - 1),
+            ),
+            TypeError::UnknownEnum { name, span } => error_simple(
+                "QT0030",
+                format!("unknown enum `{name}`"),
+                span,
+                "no such enum",
+            ),
+            TypeError::UnknownEnumVariant {
+                enum_name,
+                variant,
+                span,
+            } => error_simple(
+                "QT0031",
+                format!("enum `{enum_name}` has no variant `{variant}`"),
+                span,
+                "no such variant",
             ),
         }
     }

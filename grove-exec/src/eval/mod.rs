@@ -139,6 +139,7 @@ pub fn eval(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
                 IdentBinding::Prev { .. } => todo!("prev with mutations"),
             }
         }
+        TypedExprKind::EnumVariant { .. } => todo!("enums"),
         TypedExprKind::Some { value } => eval(value, ctx).map(|v| Val::Some(Box::new(v))),
         TypedExprKind::TypeConstant { ty, name } => Ok(eval_type_constant(ty.value, name.value)),
         TypedExprKind::If { arms, default } => {

@@ -216,7 +216,30 @@ fn infer(expr: &Expr, env: &mut TypeEnv) -> Result<TypedExpr, TypeError> {
                 name.span,
             ))
         }
-        Expr::EnumVariant { .. } => todo!("enums"),
+        Expr::EnumVariant {
+            enum_name,
+            variant,
+            span,
+        } => {
+            let Some((enum_id, enum_def)) = env.schema().enum_by_name(enum_name) else {
+                return Err(TypeError::UnknownEnum {
+                    name: enum_name.value.clone(),
+                    span: enum_name.span,
+                });
+            };
+            let Some(variant) = enum_def.variant_index(variant) else {
+                return Err(TypeError::UnknownEnumVariant {
+                    enum_name: enum_name.value.clone(),
+                    variant: variant.value.clone(),
+                    span: variant.span,
+                });
+            };
+            Ok(env.typed(
+                TypedExprKind::EnumVariant { enum_id, variant },
+                QueryType::Enum(enum_id),
+                *span,
+            ))
+        }
         Expr::Field {
             base,
             name,
@@ -375,7 +398,7 @@ fn infer_cast(
 
     let target_ty = target.value.into();
 
-    if !cast_allowed(&typed_expr.ty, &target_ty) {
+    if !cast_allowed(&typed_expr.ty, &target_ty, env.schema()) {
         return Err(TypeError::InvalidCast {
             from: typed_expr.ty.to_string(),
             to: target_ty.to_string(),
@@ -393,12 +416,21 @@ fn infer_cast(
     ))
 }
 
-fn cast_allowed(from: &QueryType, to: &QueryType) -> bool {
-    use ScalarType::*;
+fn cast_allowed(from: &QueryType, to: &QueryType, schema: &ValidatedSchema) -> bool {
     from.is_numeric() && to.is_numeric()
         || matches!(
             (from, to),
-            (QueryType::Scalar(Bool), QueryType::Scalar(Int))
+            (
+                QueryType::Scalar(ScalarType::Bool),
+                QueryType::Scalar(ScalarType::Int)
+            )
+        )
+        || matches!(
+            (from, to),
+            (QueryType::Enum(id), QueryType::Scalar(target))
+                if schema
+                    .enums.get(id.index())
+                    .is_some_and(|def| def.underlying.scalar_type() == *target)
         )
 }
 
@@ -1089,6 +1121,7 @@ fn types_compatible(a: &mut QueryType, b: &mut QueryType, schema: &ValidatedSche
         (QueryType::Optional(a), QueryType::Optional(b)) => types_compatible(a, b, schema),
         (QueryType::List(a), QueryType::List(b)) => types_compatible(a, b, schema),
         (QueryType::Scalar(a), QueryType::Scalar(b)) => a == b,
+        (QueryType::Enum(a), QueryType::Enum(b)) => a == b,
         (QueryType::Tuple(a), QueryType::Tuple(b)) => {
             a.len() == b.len()
                 && a.iter_mut()
@@ -1359,7 +1392,9 @@ fn check(
     }
 
     match &mut expr.kind {
-        TypedExprKind::Literal(_) | TypedExprKind::Ident { .. } => {}
+        TypedExprKind::Literal(_)
+        | TypedExprKind::Ident { .. }
+        | TypedExprKind::EnumVariant { .. } => {}
         // no propagation
         TypedExprKind::Field { base, .. } => {
             let mut base_ty = base.ty.clone();
@@ -1851,6 +1886,189 @@ mod tests {
         .expect("invalid test schema")
     }
 
+    const ENUM_SCHEMA_SRC: &str = r#"
+        root tickets: Ticket;
+        enum Priority { Low => "low", Medium => "medium", High => "high" }
+        enum Level { Low => 0, High => 2 }
+        struct Ticket {
+            id: Int,
+            priority: Priority,
+            level: Level,
+            maybe_priority: ?Priority,
+            priorities: List<Priority>@priorities_ref via ticket_priorities[ticket_key, priority],
+            pair: Tuple<Priority, Level>@(pair_priority, pair_level),
+        }
+    "#;
+
+    fn enum_schema() -> ValidatedSchema {
+        grove_schema::validate(
+            grove_schema::parse_schema(ENUM_SCHEMA_SRC)
+                .0
+                .expect("invalid enum test schema"),
+        )
+        .0
+        .expect("invalid enum test schema")
+    }
+
+    fn error_codes(source: &str, schema: &ValidatedSchema) -> Vec<String> {
+        let (file, parse_diags) = crate::parse_query(source);
+        assert!(parse_diags.is_empty(), "parse diagnostics: {parse_diags:?}");
+        let (typed, diags) = typecheck(file.unwrap(), schema);
+        assert!(typed.is_none(), "expected type error for `{source}`");
+        diags.iter().map(|d| d.code.to_string()).collect()
+    }
+
+    #[test]
+    fn infer_enum_variant() {
+        let schema = enum_schema();
+        let priority_id = schema.enum_by_name("Priority").unwrap().0;
+        let mut env = TypeEnv::new(&schema);
+        let (file, diags) = crate::parse_query("Priority::Medium");
+        assert!(diags.is_empty(), "parse diagnostics: {diags:?}");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Enum(priority_id));
+        assert!(matches!(
+            result.kind,
+            TypedExprKind::EnumVariant {
+                enum_id,
+                variant: 1
+            } if enum_id == priority_id
+        ));
+    }
+
+    #[test]
+    fn enum_field_type() {
+        let schema = enum_schema();
+        let priority_id = schema.enum_by_name("Priority").unwrap().0;
+        let mut env = TypeEnv::new(&schema);
+        let (file, diags) = crate::parse_query("tickets.first().unwrap().priority");
+        assert!(diags.is_empty(), "parse diagnostics: {diags:?}");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Enum(priority_id));
+    }
+
+    #[test]
+    fn unknown_enum_rejected() {
+        let schema = enum_schema();
+        assert_eq!(error_codes("Missing::High", &schema), vec!["QT0030"]);
+    }
+
+    #[test]
+    fn unknown_enum_variant_rejected() {
+        let schema = enum_schema();
+        assert_eq!(error_codes("Priority::Urgent", &schema), vec!["QT0031"]);
+    }
+
+    #[test]
+    fn enum_equality_and_membership() {
+        let schema = enum_schema();
+        let mut env = TypeEnv::new(&schema);
+        for source in [
+            "Priority::High == Priority::Low",
+            "Priority::High != Priority::Low",
+            "Priority::High in (Priority::Low, Priority::High)",
+            "[Priority::Low, Priority::High].contains(Priority::High)",
+        ] {
+            let (file, diags) = crate::parse_query(source);
+            assert!(diags.is_empty(), "parse diagnostics: {diags:?}");
+            let result = infer(&file.unwrap().result, &mut env).unwrap();
+            assert_eq!(
+                result.ty,
+                QueryType::Scalar(ScalarType::Bool),
+                "source: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn enum_raw_value_comparison_rejected() {
+        let schema = enum_schema();
+        assert_eq!(
+            error_codes(r#"Priority::High == "high""#, &schema),
+            vec!["QT0007"]
+        );
+    }
+
+    #[test]
+    fn different_enum_comparison_rejected() {
+        let schema = enum_schema();
+        assert_eq!(
+            error_codes("Priority::Low == Level::Low", &schema),
+            vec!["QT0007"]
+        );
+    }
+
+    #[test]
+    fn enum_ordering_rejected() {
+        let schema = enum_schema();
+        assert_eq!(
+            error_codes("Priority::High > Priority::Low", &schema),
+            vec!["QT0007"]
+        );
+        assert_eq!(
+            error_codes("[Priority::Low, Priority::High].sort()", &schema),
+            vec!["QT0003"]
+        );
+    }
+
+    #[test]
+    fn enum_cast_to_underlying_value() {
+        let schema = enum_schema();
+        let mut env = TypeEnv::new(&schema);
+
+        let (file, diags) = crate::parse_query("Priority::High as String");
+        assert!(diags.is_empty(), "parse diagnostics: {diags:?}");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::String));
+        assert!(matches!(result.kind, TypedExprKind::Cast { .. }));
+
+        let (file, diags) = crate::parse_query("Level::High as Int");
+        assert!(diags.is_empty(), "parse diagnostics: {diags:?}");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Int));
+    }
+
+    #[test]
+    fn enum_cast_to_wrong_underlying_type_rejected() {
+        let schema = enum_schema();
+        assert_eq!(
+            error_codes("Priority::High as Int", &schema),
+            vec!["QT0013"]
+        );
+        assert_eq!(
+            error_codes("Level::High as String", &schema),
+            vec!["QT0013"]
+        );
+    }
+
+    #[test]
+    fn enum_optional_and_projection() {
+        let schema = enum_schema();
+        let priority_id = schema.enum_by_name("Priority").unwrap().0;
+        let mut env = TypeEnv::new(&schema);
+
+        let (file, diags) = crate::parse_query("some(Priority::High)");
+        assert!(diags.is_empty(), "parse diagnostics: {diags:?}");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(
+            result.ty,
+            QueryType::Optional(Box::new(QueryType::Enum(priority_id)))
+        );
+
+        let (file, diags) = crate::parse_query("tickets { priority }");
+        assert!(diags.is_empty(), "parse diagnostics: {diags:?}");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        match result.ty {
+            QueryType::List(inner) => match *inner {
+                QueryType::Record(RecordSource::Projection(fields)) => {
+                    assert_eq!(fields[0].ty, QueryType::Enum(priority_id));
+                }
+                other => panic!("expected projection record, got {other:?}"),
+            },
+            other => panic!("expected list projection, got {other:?}"),
+        }
+    }
+
     #[test]
     fn infer_int_literal() {
         let schema = test_schema();
@@ -2261,6 +2479,7 @@ mod tests {
         match &expr.kind {
             TypedExprKind::Literal(_)
             | TypedExprKind::Ident { .. }
+            | TypedExprKind::EnumVariant { .. }
             | TypedExprKind::TypeConstant { .. } => {}
             TypedExprKind::Some { value } => collect_node_ids(value, ids),
             TypedExprKind::Tuple { elements } | TypedExprKind::Array { elements } => {

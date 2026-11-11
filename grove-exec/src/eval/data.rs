@@ -488,6 +488,7 @@ fn collect_owning_refs_at(
         }
         TypedExprKind::Literal(_)
         | TypedExprKind::TypeConstant { .. }
+        | TypedExprKind::EnumVariant { .. }
         | TypedExprKind::Ident { .. } => {}
     }
 }

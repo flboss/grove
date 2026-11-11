@@ -303,7 +303,9 @@ impl<'a> PlanBuilder<'a> {
             self.mark_used_whole(&expr.ty);
         }
         match &expr.kind {
-            TypedExprKind::Literal(_) | TypedExprKind::TypeConstant { .. } => None,
+            TypedExprKind::Literal(_)
+            | TypedExprKind::TypeConstant { .. }
+            | TypedExprKind::EnumVariant { .. } => None,
             TypedExprKind::Ident { binding, .. } => self.visit_ident(expr, binding),
             TypedExprKind::Field { base, name, .. } => {
                 self.visit_field_access(base, &name.value);
@@ -456,7 +458,7 @@ impl<'a> PlanBuilder<'a> {
                     self.mark_used_whole(&field.ty);
                 }
             }
-            QueryType::Scalar(_) | QueryType::Void | QueryType::Unknown => {}
+            QueryType::Scalar(_) | QueryType::Enum(_) | QueryType::Void | QueryType::Unknown => {}
         }
     }
 
@@ -852,7 +854,9 @@ mod tests {
     fn walk(expr: &TypedExpr, f: &mut dyn FnMut(&TypedExpr)) {
         f(expr);
         match &expr.kind {
-            TypedExprKind::Literal(_) | TypedExprKind::TypeConstant { .. } => {}
+            TypedExprKind::Literal(_)
+            | TypedExprKind::TypeConstant { .. }
+            | TypedExprKind::EnumVariant { .. } => {}
             TypedExprKind::Ident { .. } => {}
             TypedExprKind::Field { base, .. } | TypedExprKind::TupleAccess { base, .. } => {
                 walk(base, f);
