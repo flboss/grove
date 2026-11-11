@@ -250,6 +250,7 @@ impl<'src> Parser<'src> {
             TokenKind::Config,
             TokenKind::Root,
             TokenKind::Struct,
+            TokenKind::Enum,
             TokenKind::Rel,
             TokenKind::Eof,
         ]);

@@ -1,3 +1,5 @@
+use std::fmt;
+
 use grove_types::{Span, Spanned};
 
 pub use crate::validated::{DecArithmetic, IntArithmetic};
@@ -6,6 +8,7 @@ pub use crate::validated::{DecArithmetic, IntArithmetic};
 pub struct Schema {
     pub roots: Vec<RootCollection>,
     pub structs: Vec<StructDef>,
+    pub enums: Vec<EnumDef>,
     pub config: Option<Spanned<ConfigBlock>>,
     pub relations: Vec<Relation>,
 }
@@ -39,9 +42,36 @@ pub struct Field {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct EnumDef {
+    pub name: Spanned<String>,
+    pub variants: Vec<EnumVariantDef>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumVariantDef {
+    pub name: Spanned<String>,
+    pub value: Spanned<EnumValue>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum EnumValue {
+    Int(i64),
+    String(String),
+}
+
+impl fmt::Display for EnumValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EnumValue::Int(n) => write!(f, "{n}"),
+            EnumValue::String(s) => write!(f, "{s:?}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum TypeExpr {
     Primitive(Spanned<BuiltinType>),
-    Struct(Spanned<String>),
+    Named(Spanned<String>),
     Optional {
         inner: Box<TypeExpr>,
         span: Span,
@@ -61,7 +91,7 @@ impl TypeExpr {
     pub fn span(&self) -> Span {
         match self {
             TypeExpr::Primitive(spanned) => spanned.span,
-            TypeExpr::Struct(spanned) => spanned.span,
+            TypeExpr::Named(spanned) => spanned.span,
             TypeExpr::Optional { span, .. } => *span,
             TypeExpr::List { span, .. } => *span,
             TypeExpr::Tuple { span, .. } => *span,

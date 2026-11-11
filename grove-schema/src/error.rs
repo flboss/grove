@@ -58,6 +58,51 @@ pub enum SchemaParseError {
     ExpectedListViaRBracket { span: Span },
     ExpectedListForVia { span: Span },
 
+    ExpectedEnumName { span: Span },
+    ExpectedEnumLBrace { span: Span, name: String },
+    ExpectedEnumVariantName { span: Span, enum_name: String },
+    ExpectedEnumArrow {
+        span: Span,
+        enum_name: String,
+        variant: String,
+    },
+    ExpectedEnumValue {
+        span: Span,
+        enum_name: String,
+        variant: String,
+    },
+    ExpectedEnumCommaOrRBrace { span: Span, enum_name: String },
+    UnclosedEnum { span: Span },
+    DuplicateEnum {
+        span: Span,
+        name: String,
+        previous: Span,
+    },
+    DuplicateEnumVariant {
+        span: Span,
+        enum_name: String,
+        variant: String,
+        previous: Span,
+    },
+    DuplicateEnumValue {
+        span: Span,
+        enum_name: String,
+        value: String,
+        previous: Span,
+    },
+    MixedEnumValueTypes {
+        span: Span,
+        enum_name: String,
+        expected: String,
+        found: String,
+    },
+    DuplicateTypeName {
+        span: Span,
+        name: String,
+        previous: Span,
+    },
+    EmptyEnum { span: Span, name: String },
+
     ExpectedRelEndpointStruct { span: Span },
     ExpectedRelEndpointDot { span: Span },
     ExpectedRelEndpointField { span: Span },
@@ -173,7 +218,7 @@ impl From<SchemaParseError> for Diagnostic {
             )
             .with_label(Label {
                 span: previous,
-                message: "first defined here".into(),
+                message: "first declared here".into(),
                 style: LabelStyle::Secondary,
             }),
             ExpectedConfigCommaOrRBrace { span, key } => error_simple(
@@ -192,7 +237,7 @@ impl From<SchemaParseError> for Diagnostic {
                 "SP0011",
                 "duplicate `config` block",
                 span,
-                "redundant `config` block",
+                "config already defined",
             )
             .with_label(Label {
                 span: previous,
@@ -237,11 +282,11 @@ impl From<SchemaParseError> for Diagnostic {
                 "SP0017",
                 format!("duplicate root `{name}`"),
                 span,
-                "redundant root",
+                "duplicate root",
             )
             .with_label(Label {
                 span: previous,
-                message: "first defined here".into(),
+                message: "first declared here".into(),
                 style: LabelStyle::Secondary,
             }),
             ExpectedStructName { span } => error_simple(
@@ -324,7 +369,7 @@ impl From<SchemaParseError> for Diagnostic {
             )
             .with_label(Label {
                 span: previous,
-                message: "first defined here".into(),
+                message: "first declared here".into(),
                 style: LabelStyle::Secondary,
             }),
             UnclosedStruct { span } => error_simple(
@@ -341,11 +386,11 @@ impl From<SchemaParseError> for Diagnostic {
                 "SP0032",
                 format!("duplicate struct `{name}`"),
                 span,
-                "redundant struct",
+                "duplicate struct",
             )
             .with_label(Label {
                 span: previous,
-                message: "first defined here".into(),
+                message: "first declared here".into(),
                 style: LabelStyle::Secondary,
             }),
             ExpectedColumn { span } => error_simple(
@@ -396,6 +441,143 @@ impl From<SchemaParseError> for Diagnostic {
                 span,
                 "expected a `List` type",
             ),
+            ExpectedEnumName { span } => error_simple(
+                "SP0063",
+                "expected an enum name",
+                span,
+                "expected an identifier",
+            ),
+            ExpectedEnumLBrace { span, name } => error_simple(
+                "SP0064",
+                format!("expected `{{` after enum name `{name}`"),
+                span,
+                "expected `{`",
+            ),
+            ExpectedEnumVariantName { span, enum_name } => error_simple(
+                "SP0065",
+                format!("expected a variant name in enum `{enum_name}`"),
+                span,
+                "expected an identifier",
+            ),
+            ExpectedEnumArrow {
+                span,
+                enum_name,
+                variant,
+            } => error_simple(
+                "SP0066",
+                format!("expected `=>` after variant `{variant}` in enum `{enum_name}`"),
+                span,
+                "expected `=>`",
+            ),
+            ExpectedEnumValue {
+                span,
+                enum_name,
+                variant,
+            } => error_simple(
+                "SP0067",
+                format!(
+                    "expected a string or integer value \
+                    for variant `{variant}` in enum `{enum_name}`"
+                ),
+                span,
+                "expected a string or integer literal",
+            )
+            .with_help("enum underlying values must be string or integer literals"),
+            ExpectedEnumCommaOrRBrace { span, enum_name } => error_simple(
+                "SP0068",
+                format!("expected `,` or `}}` after variant in enum `{enum_name}`"),
+                span,
+                "expected `,` or `}`",
+            ),
+            UnclosedEnum { span } => error_simple(
+                "SP0069",
+                "unclosed `enum` block",
+                span,
+                "missing closing `}`",
+            ),
+            DuplicateEnum {
+                span,
+                name,
+                previous,
+            } => error_simple(
+                "SP0073",
+                format!("duplicate enum `{name}`"),
+                span,
+                "duplicate enum",
+            )
+            .with_label(Label {
+                span: previous,
+                message: "first declared here".into(),
+                style: LabelStyle::Secondary,
+            }),
+            DuplicateEnumVariant {
+                span,
+                enum_name,
+                variant,
+                previous,
+            } => error_simple(
+                "SP0070",
+                format!("duplicate variant `{variant}` in enum `{enum_name}`"),
+                span,
+                "duplicate variant",
+            )
+            .with_label(Label {
+                span: previous,
+                message: "first declared here".into(),
+                style: LabelStyle::Secondary,
+            }),
+            DuplicateEnumValue {
+                span,
+                enum_name,
+                value,
+                previous,
+            } => error_simple(
+                "SP0071",
+                format!("duplicate underlying value {value} in enum `{enum_name}`"),
+                span,
+                "duplicate value",
+            )
+            .with_label(Label {
+                span: previous,
+                message: "first used here".into(),
+                style: LabelStyle::Secondary,
+            })
+            .with_help("variants must have unique underlying values within each enum"),
+            MixedEnumValueTypes {
+                span,
+                enum_name,
+                expected,
+                found,
+            } => error_simple(
+                "SP0072",
+                format!("enum `{enum_name}` mixes underlying value types"),
+                span,
+                format!("this value is `{found}`"),
+            )
+            .with_note(format!("the first variant uses `{expected}` values"))
+            .with_help("all variants in an enum must use either String or Int values"),
+            DuplicateTypeName {
+                span,
+                name,
+                previous,
+            } => error_simple(
+                "SP0074",
+                format!("duplicate type name `{name}`"),
+                span,
+                "type name already declared",
+            )
+            .with_label(Label {
+                span: previous,
+                message: "first declared here".into(),
+                style: LabelStyle::Secondary,
+            }),
+            EmptyEnum { span, name } => error_simple(
+                "SP0075",
+                format!("enum `{name}` has no variants"),
+                span,
+                "empty enum",
+            )
+            .with_help("add at least one variant to the enum"),
             ExpectedRelEndpointStruct { span } => error_simple(
                 "SP0041",
                 "expected a struct name for the relation endpoint",

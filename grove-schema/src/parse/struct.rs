@@ -243,7 +243,7 @@ impl<'src> Parser<'src> {
                 let TokenKind::Ident(s) = tok.value else {
                     unreachable!()
                 };
-                Ok(TypeExpr::Struct(Spanned {
+                Ok(TypeExpr::Named(Spanned {
                     span: tok.span,
                     value: s,
                 }))
@@ -400,6 +400,7 @@ impl<'src> Parser<'src> {
             TokenKind::Config,
             TokenKind::Root,
             TokenKind::Struct,
+            TokenKind::Enum,
             TokenKind::Rel,
             TokenKind::Eof,
         ]);
@@ -475,7 +476,7 @@ mod tests {
         let fields = schema.unwrap().structs[0].fields.clone();
         assert_eq!(fields.len(), 4);
         assert!(fields[0].non_owning);
-        assert!(matches!(fields[0].exposed_type, TypeExpr::Struct(_)));
+        assert!(matches!(fields[0].exposed_type, TypeExpr::Named(_)));
         assert!(fields[1].non_owning);
         assert!(matches!(fields[1].exposed_type, TypeExpr::Optional { .. }));
         assert!(fields[2].non_owning);

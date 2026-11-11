@@ -202,7 +202,7 @@ impl<'s> Builder<'s> {
                 element: Box::new(self.value_type(element)),
                 storage: self.storage_table(via),
             },
-            TypeExpr::Struct(_) | TypeExpr::List { via: None, .. } => {
+            TypeExpr::Named(_) | TypeExpr::List { via: None, .. } => {
                 unreachable!("struct or via-less list reached ValueType conversion")
             }
         }
@@ -224,13 +224,13 @@ impl<'s> Builder<'s> {
 
 fn nested_struct_ref(ty: &TypeExpr) -> Option<Span> {
     match ty {
-        TypeExpr::Primitive(_) | TypeExpr::Struct(_) => None,
+        TypeExpr::Primitive(_) | TypeExpr::Named(_) => None,
         TypeExpr::Optional { inner, .. } => match inner.as_ref() {
-            TypeExpr::Struct(_) => None,
+            TypeExpr::Named(_) => None,
             other => struct_in_value_position(other),
         },
         TypeExpr::List { element, .. } => match element.as_ref() {
-            TypeExpr::Struct(_) => None,
+            TypeExpr::Named(_) => None,
             other => struct_in_value_position(other),
         },
         TypeExpr::Tuple { elements, .. } => elements.iter().find_map(struct_in_value_position),
@@ -240,7 +240,7 @@ fn nested_struct_ref(ty: &TypeExpr) -> Option<Span> {
 fn struct_in_value_position(ty: &TypeExpr) -> Option<Span> {
     match ty {
         TypeExpr::Primitive(_) => None,
-        TypeExpr::Struct(spanned) => Some(spanned.span),
+        TypeExpr::Named(spanned) => Some(spanned.span),
         TypeExpr::Optional { inner, .. } => struct_in_value_position(inner),
         TypeExpr::List { element, .. } => struct_in_value_position(element),
         TypeExpr::Tuple { elements, .. } => elements.iter().find_map(struct_in_value_position),
@@ -249,7 +249,7 @@ fn struct_in_value_position(ty: &TypeExpr) -> Option<Span> {
 
 fn value_list_without_via(ty: &TypeExpr) -> Option<Span> {
     match ty {
-        TypeExpr::Primitive(_) | TypeExpr::Struct(_) => None,
+        TypeExpr::Primitive(_) | TypeExpr::Named(_) => None,
         TypeExpr::Optional { inner, .. } => value_list_without_via(inner),
         TypeExpr::Tuple { elements, .. } => elements.iter().find_map(value_list_without_via),
         TypeExpr::List {
@@ -261,7 +261,7 @@ fn value_list_without_via(ty: &TypeExpr) -> Option<Span> {
 
 fn ref_struct_name(ty: &TypeExpr) -> &str {
     match ty {
-        TypeExpr::Struct(spanned) => spanned.as_str(),
+        TypeExpr::Named(spanned) => spanned.as_str(),
         TypeExpr::Optional { inner, .. } => ref_struct_name(inner),
         TypeExpr::List { element, .. } => ref_struct_name(element),
         _ => unreachable!("only called on reference-shaped types"),

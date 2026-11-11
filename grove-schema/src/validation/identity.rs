@@ -64,7 +64,7 @@ impl<'s> Builder<'s> {
 fn collect_struct_types<'a>(ty: &'a TypeExpr, out: &mut Vec<(&'a str, Span)>) {
     match ty {
         TypeExpr::Primitive(_) => {}
-        TypeExpr::Struct(ident) => out.push((ident.as_str(), ident.span)),
+        TypeExpr::Named(ident) => out.push((ident.as_str(), ident.span)),
         TypeExpr::Optional { inner, .. } | TypeExpr::List { element: inner, .. } => {
             collect_struct_types(inner, out)
         }

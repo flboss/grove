@@ -1,4 +1,5 @@
 mod config;
+mod r#enum;
 mod rel;
 mod root;
 mod r#struct;
@@ -28,12 +29,14 @@ impl<'src> Parser<'src> {
         let mut schema = Schema {
             roots: Vec::new(),
             structs: Vec::new(),
+            enums: Vec::new(),
             config: None,
             relations: Vec::new(),
         };
         let mut config_span = None;
         let mut root_spans: Vec<(String, Span)> = Vec::new();
         let mut struct_spans: Vec<(String, Span)> = Vec::new();
+        let mut enum_spans: Vec<(String, Span)> = Vec::new();
 
         loop {
             let Spanned { span, value: token } = self.advance();
@@ -93,10 +96,50 @@ impl<'src> Parser<'src> {
                                 previous: *previous,
                             });
                         }
-                        None => {
-                            struct_spans.push((name, struct_def.span));
-                            schema.structs.push(struct_def.value);
+                        None => match enum_spans.iter().find(|(n, _)| n == &name) {
+                            Some((_, previous)) => {
+                                self.emit_error(SchemaParseError::DuplicateTypeName {
+                                    span: struct_def.span,
+                                    name,
+                                    previous: *previous,
+                                });
+                            }
+                            None => {
+                                struct_spans.push((name, struct_def.span));
+                                schema.structs.push(struct_def.value);
+                            }
+                        },
+                    }
+                }
+                TokenKind::Enum => {
+                    let Ok(mut enum_def) = self.parse_enum() else {
+                        continue;
+                    };
+
+                    enum_def.span.start = span.start;
+
+                    let name = enum_def.name.value.clone();
+                    match enum_spans.iter().find(|(n, _)| n == &name) {
+                        Some((_, previous)) => {
+                            self.emit_error(SchemaParseError::DuplicateEnum {
+                                span: enum_def.span,
+                                name,
+                                previous: *previous,
+                            });
                         }
+                        None => match struct_spans.iter().find(|(n, _)| n == &name) {
+                            Some((_, previous)) => {
+                                self.emit_error(SchemaParseError::DuplicateTypeName {
+                                    span: enum_def.span,
+                                    name,
+                                    previous: *previous,
+                                });
+                            }
+                            None => {
+                                enum_spans.push((name, enum_def.span));
+                                schema.enums.push(enum_def.value);
+                            }
+                        },
                     }
                 }
                 TokenKind::Rel => {
@@ -137,6 +180,7 @@ impl<'src> Parser<'src> {
             TokenKind::Config,
             TokenKind::Root,
             TokenKind::Struct,
+            TokenKind::Enum,
             TokenKind::Rel,
             TokenKind::Eof,
         ]);

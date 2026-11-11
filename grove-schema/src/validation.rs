@@ -96,12 +96,12 @@ impl<'s> Builder<'s> {
 fn field_kind(ty: &TypeExpr) -> FieldKind<'_> {
     match ty {
         TypeExpr::Primitive(_) | TypeExpr::Tuple { .. } => FieldKind::Value,
-        TypeExpr::Struct(_) => FieldKind::Ref,
-        TypeExpr::Optional { inner, .. } if matches!(inner.as_ref(), TypeExpr::Struct(_)) => {
+        TypeExpr::Named(_) => FieldKind::Ref,
+        TypeExpr::Optional { inner, .. } if matches!(inner.as_ref(), TypeExpr::Named(_)) => {
             FieldKind::Ref
         }
         TypeExpr::Optional { .. } => FieldKind::Value,
-        TypeExpr::List { element, .. } if matches!(element.as_ref(), TypeExpr::Struct(_)) => {
+        TypeExpr::List { element, .. } if matches!(element.as_ref(), TypeExpr::Named(_)) => {
             FieldKind::Ref
         }
         TypeExpr::List {
@@ -146,7 +146,7 @@ fn value_column_types(ty: &TypeExpr) -> Vec<Option<ScalarType>> {
         TypeExpr::Tuple { elements, .. } => elements.iter().flat_map(value_column_types).collect(),
         TypeExpr::List { via: Some(_), .. } => vec![None],
         TypeExpr::List { element, .. } => value_column_types(element),
-        TypeExpr::Struct(_) => Vec::new(),
+        TypeExpr::Named(_) => Vec::new(),
     }
 }
 
@@ -156,7 +156,7 @@ fn storage_value_types(ty: &TypeExpr) -> Vec<Option<ScalarType>> {
         TypeExpr::Optional { inner, .. } => storage_value_types(inner),
         TypeExpr::Tuple { elements, .. } => elements.iter().flat_map(storage_value_types).collect(),
         TypeExpr::List { .. } => vec![None],
-        TypeExpr::Struct(_) => Vec::new(),
+        TypeExpr::Named(_) => Vec::new(),
     }
 }
 
