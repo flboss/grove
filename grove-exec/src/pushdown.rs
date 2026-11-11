@@ -10,7 +10,7 @@ use grove_schema::validated::{Field, FieldId, ScalarType, StructId, ValidatedSch
 use grove_types::NodeId;
 
 use crate::eval::literals::{decode_literal, eval_type_constant};
-use crate::value::{Scalar, Val};
+use crate::value::{Scalar, Val, enum_variant_scalar};
 
 /// Backend-agnostic constraint set attached to a storage read
 #[derive(Debug, Clone, PartialEq, Default, Hash)]
@@ -634,6 +634,27 @@ impl<'a> PlanBuilder<'a> {
                 columns,
                 ..
             } if columns.len() == 1 => Some(*scalar),
+            Field::Value {
+                ty: ValueType::Enum(id),
+                columns,
+                ..
+            } if columns.len() == 1 => self
+                .schema
+                .enums
+                .get(id.index())
+                .map(|enum_def| enum_def.underlying.scalar_type()),
+            _ => None,
+        }
+    }
+
+    fn push_scalar_type(&self, ty: &QueryType) -> Option<ScalarType> {
+        match ty {
+            QueryType::Scalar(scalar) => Some(*scalar),
+            QueryType::Enum(id) => self
+                .schema
+                .enums
+                .get(id.index())
+                .map(|enum_def| enum_def.underlying.scalar_type()),
             _ => None,
         }
     }
@@ -650,6 +671,10 @@ impl<'a> PlanBuilder<'a> {
                     Val::Scalar(scalar) => Some(PushExpr::Literal(scalar)),
                     _ => None,
                 }
+            }
+            TypedExprKind::EnumVariant { enum_id, variant } => {
+                let enum_def = self.schema.enums.get(enum_id.index())?;
+                enum_variant_scalar(enum_def, *variant).map(PushExpr::Literal)
             }
             TypedExprKind::Ident {
                 binding: IdentBinding::Field(field),
@@ -691,9 +716,7 @@ impl<'a> PlanBuilder<'a> {
                 )),
                 BinaryOp::In => {
                     let translated_lhs = self.translate_expr(lhs, source)?;
-                    let QueryType::Scalar(scalar) = &lhs.ty else {
-                        return None;
-                    };
+                    let scalar = self.push_scalar_type(&lhs.ty)?;
                     let TypedExprKind::Tuple { elements } = &rhs.kind else {
                         return None;
                     };
@@ -702,17 +725,13 @@ impl<'a> PlanBuilder<'a> {
                     }
                     let mut items = Vec::with_capacity(elements.len());
                     for element in elements {
-                        match &element.ty {
-                            QueryType::Scalar(element_ty) if element_ty == scalar => {}
-                            _ => return None,
+                        if self.push_scalar_type(&element.ty)? != scalar {
+                            return None;
                         }
-                        let TypedExprKind::Literal(literal) = &element.kind else {
+                        let PushExpr::Literal(value) = self.translate_expr(element, source)? else {
                             return None;
                         };
-                        match decode_literal(literal, self.now) {
-                            Val::Scalar(value) => items.push(PushExpr::Literal(value)),
-                            _ => return None,
-                        }
+                        items.push(PushExpr::Literal(value));
                     }
                     Some(PushExpr::In {
                         lhs: Box::new(translated_lhs),
@@ -1062,6 +1081,35 @@ mod tests {
                 needle: Box::new(PushExpr::Literal(Scalar::String("A".to_string()))),
             }]
         );
+    }
+
+    #[test]
+    fn matcher_enum_predicates() {
+        let (file, plan, schema) = typed_and_plan("settings[priority == Priority::High]");
+        assert_eq!(
+            root_constraints(&plan, &file).filters,
+            vec![PushExpr::Cmp {
+                op: CmpOp::Eq,
+                lhs: Box::new(PushExpr::Field(field(&schema, "Setting", "priority"))),
+                rhs: Box::new(PushExpr::Literal(Scalar::String("high".to_string()))),
+            }]
+        );
+
+        let (file, plan, schema) = typed_and_plan("settings[level in (Level::High, Level::Low)]");
+        assert_eq!(
+            root_constraints(&plan, &file).filters,
+            vec![PushExpr::In {
+                lhs: Box::new(PushExpr::Field(field(&schema, "Setting", "level"))),
+                items: vec![
+                    PushExpr::Literal(Scalar::Int(2)),
+                    PushExpr::Literal(Scalar::Int(-1)),
+                ],
+            }]
+        );
+
+        let (file, plan, schema) = typed_and_plan("settings[priority == Priority::High] { name }");
+        assert_eq!(root_constraints(&plan, &file).filters.len(), 1);
+        assert_fields(&plan, &schema, "Setting", &["name", "priority"]);
     }
 
     #[test]

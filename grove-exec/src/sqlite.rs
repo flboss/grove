@@ -841,6 +841,23 @@ impl SqliteBackend<'_> {
                 columns,
                 ..
             }) if columns.len() == 1 => Ok((quote(self.schema.column_name(columns[0])), *scalar)),
+            Some(Field::Value {
+                ty: ValueType::Enum(id),
+                columns,
+                ..
+            }) if columns.len() == 1 => {
+                let enum_def =
+                    self.schema
+                        .enums
+                        .get(id.index())
+                        .ok_or_else(|| ExecError::Integrity {
+                            message: format!("unknown enum id {} (internal error)", id.index()),
+                        })?;
+                Ok((
+                    quote(self.schema.column_name(columns[0])),
+                    enum_def.underlying.scalar_type(),
+                ))
+            }
             Some(other) => Err(ExecError::Integrity {
                 message: format!(
                     "pushdown field `{}.{}` is not a single-column scalar (internal error)",
@@ -2448,6 +2465,52 @@ mod tests {
             .fetch(sid, &[user_field(&schema, sid, "id")], &constraints)
             .unwrap();
         assert_eq!(backend.sql_cache.borrow().len(), 3);
+    }
+
+    #[test]
+    fn fetch_enum_filter_and_cache() {
+        let schema = testdata::schema();
+        let backend = test_backend(&schema);
+        let sid = testdata::struct_id(&schema, "Setting");
+        let name = testdata::field_id(&schema, sid, "name");
+        let priority = FetchConstraints {
+            filters: vec![push_cmp(
+                CmpOp::Eq,
+                target_field(&schema, "Setting", "priority"),
+                push_str("high"),
+            )],
+            sort: vec![],
+            offset: 0,
+            limit: None,
+        };
+        let rows = backend.fetch(sid, &[name], &priority).unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.values[0].clone())
+                .collect::<Vec<_>>(),
+            vec![str("alpha")]
+        );
+        assert_eq!(backend.sql_cache.borrow().len(), 1);
+        backend.fetch(sid, &[name], &priority).unwrap();
+        assert_eq!(backend.sql_cache.borrow().len(), 1);
+
+        let level = FetchConstraints {
+            filters: vec![PushExpr::In {
+                lhs: Box::new(target_field(&schema, "Setting", "level")),
+                items: vec![push_int(2), push_int(-1)],
+            }],
+            sort: vec![],
+            offset: 0,
+            limit: None,
+        };
+        let rows = backend.fetch(sid, &[name], &level).unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.values[0].clone())
+                .collect::<Vec<_>>(),
+            vec![str("alpha"), str("beta")]
+        );
+        assert_eq!(backend.sql_cache.borrow().len(), 2);
     }
 
     #[test]
