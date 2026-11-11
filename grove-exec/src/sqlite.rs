@@ -18,7 +18,7 @@ use crate::codec;
 use crate::error::ExecError;
 use crate::pushdown::{CmpOp, FetchConstraints, PushExpr, StringOp};
 use crate::storage::{Key, Row, Storage};
-use crate::value::{Scalar, Val};
+use crate::value::{Scalar, Val, enum_variant_index};
 
 pub struct SqliteBackend<'a> {
     conn: Connection,
@@ -348,25 +348,27 @@ fn decode_node(
     ty: &ValueType,
     vals: &[ValueRef<'_>],
     float_checks: bool,
+    schema: &ValidatedSchema,
 ) -> Result<(Val, usize), ExecError> {
     match ty {
         ValueType::Scalar(scalar) => {
             decode_scalar(*scalar, vals[0], false, float_checks).map(|v| (v, 1))
         }
-        ValueType::Enum(_) => todo!("enums"),
+        ValueType::Enum(id) => decode_enum(*id, vals[0], float_checks, schema).map(|v| (v, 1)),
         ValueType::Optional(inner) => {
             let len = leaf_count(inner);
             if vals[..len].iter().all(|v| matches!(v, ValueRef::Null)) {
                 Ok((Val::None, len))
             } else {
-                decode_node(inner, vals, float_checks).map(|(v, n)| (Val::Some(Box::new(v)), n))
+                decode_node(inner, vals, float_checks, schema)
+                    .map(|(v, n)| (Val::Some(Box::new(v)), n))
             }
         }
         ValueType::Tuple(elements) => {
             let mut items = Vec::with_capacity(elements.len());
             let mut used = 0;
             for element in elements {
-                let (v, n) = decode_node(element, &vals[used..], float_checks)?;
+                let (v, n) = decode_node(element, &vals[used..], float_checks, schema)?;
                 items.push(v);
                 used += n;
             }
@@ -374,6 +376,35 @@ fn decode_node(
         }
         ValueType::Array { .. } => unreachable!("array reached scalar decode"),
     }
+}
+
+fn decode_enum(
+    enum_id: EnumId,
+    value: ValueRef<'_>,
+    float_checks: bool,
+    schema: &ValidatedSchema,
+) -> Result<Val, ExecError> {
+    let enum_def = schema
+        .enums
+        .get(enum_id.index())
+        .ok_or_else(|| ExecError::Integrity {
+            message: format!("unknown enum id {} (internal error)", enum_id.index()),
+        })?;
+    let scalar = match decode_scalar(
+        enum_def.underlying.scalar_type(),
+        value,
+        false,
+        float_checks,
+    )? {
+        Val::Scalar(scalar) => scalar,
+        _ => unreachable!("scalar decode returned a non-scalar"),
+    };
+    let Some(index) = enum_variant_index(enum_def, &scalar) else {
+        return Err(ExecError::Integrity {
+            message: format!("invalid value {scalar} for enum `{}`", enum_def.name),
+        });
+    };
+    Ok(Val::Enum(enum_id, index))
 }
 
 struct ValueSlot<'a> {
@@ -551,17 +582,20 @@ fn semi(
     plan: &ElemPlan,
     cells: &[ValueRef<'_>],
     float_checks: bool,
+    schema: &ValidatedSchema,
 ) -> Result<(SemiVal, usize), ExecError> {
     match plan {
         ElemPlan::Scalar(scalar) => {
             decode_scalar(*scalar, cells[0], false, float_checks).map(|v| (SemiVal::Done(v), 1))
         }
-        ElemPlan::Enum(_) => todo!("enums"),
+        ElemPlan::Enum(id) => {
+            decode_enum(*id, cells[0], float_checks, schema).map(|v| (SemiVal::Done(v), 1))
+        }
         ElemPlan::Tuple(plans) => {
             let mut items = Vec::with_capacity(plans.len());
             let mut used = 0;
             for plan in plans {
-                let (v, n) = semi(plan, &cells[used..], float_checks)?;
+                let (v, n) = semi(plan, &cells[used..], float_checks, schema)?;
                 items.push(v);
                 used += n;
             }
@@ -572,7 +606,7 @@ fn semi(
             if cells[..width].iter().all(|v| matches!(v, ValueRef::Null)) {
                 Ok((SemiVal::Done(Val::None), width))
             } else {
-                semi(inner, cells, float_checks).map(|(s, n)| match s {
+                semi(inner, cells, float_checks, schema).map(|(s, n)| match s {
                     SemiVal::Done(v) => (SemiVal::Done(Val::Some(Box::new(v))), n),
                     other => (SemiVal::Some(Box::new(other)), n),
                 })
@@ -756,8 +790,13 @@ impl SqliteBackend<'_> {
                             .map_err(|err| Self::storage_error(ctx, err))?,
                     );
                 }
-                let (semival, _) = semi(&nodes[n].plan, &cells, self.schema.config.float_checks)
-                    .map_err(|err| err.context(label))?;
+                let (semival, _) = semi(
+                    &nodes[n].plan,
+                    &cells,
+                    self.schema.config.float_checks,
+                    self.schema,
+                )
+                .map_err(|err| err.context(label))?;
                 let val = finalize(semival, &groups);
                 if n == root {
                     items.push(val);
@@ -1028,7 +1067,7 @@ impl SqliteBackend<'_> {
                                 .map_err(|err| Self::storage_error(ctx, err))?,
                         );
                     }
-                    let (val, _) = decode_node(slot.ty, &cells, float_checks)
+                    let (val, _) = decode_node(slot.ty, &cells, float_checks, self.schema)
                         .map_err(|err| err.context(&slot.label))?;
                     values.push(val);
                 }
@@ -1058,7 +1097,7 @@ impl SqliteBackend<'_> {
                                 .map_err(|err| Self::storage_error(ctx, err))?,
                         );
                     }
-                    let (tree, _) = semi(&slot.plan, &cells, float_checks)
+                    let (tree, _) = semi(&slot.plan, &cells, float_checks, self.schema)
                         .map_err(|err| err.context(&slot.label))?;
                     let mut resolved: HashMap<usize, Val> = HashMap::new();
                     for (root, sub) in &slot.subtrees {
@@ -2002,7 +2041,7 @@ mod tests {
             ValueRef::Text(b"a"),
             ValueRef::Integer(1),
         ];
-        let (v, used) = decode_node(&ty, &vals, true).unwrap();
+        let (v, used) = decode_node(&ty, &vals, true, &ValidatedSchema::default()).unwrap();
         assert_eq!(used, 3);
         assert_eq!(
             v,
@@ -2961,6 +3000,132 @@ mod tests {
             user_names(&backend, &schema, vec![], sort, 0, Some(2)),
             names(&["Eli", "Dan"])
         );
+    }
+
+    #[test]
+    fn fetch_enums_optional_array_tuple() {
+        let schema = testdata::schema();
+        let sid = testdata::struct_id(&schema, "Setting");
+        let priority = testdata::enum_id(&schema, "Priority");
+        let level = testdata::enum_id(&schema, "Level");
+        let fields = [
+            testdata::field_id(&schema, sid, "name"),
+            testdata::field_id(&schema, sid, "priority"),
+            testdata::field_id(&schema, sid, "level"),
+            testdata::field_id(&schema, sid, "fallback"),
+            testdata::field_id(&schema, sid, "history"),
+            testdata::field_id(&schema, sid, "pair"),
+        ];
+        let rows = test_backend(&schema)
+            .fetch(sid, &fields, &FetchConstraints::EMPTY)
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[0].values,
+            vec![
+                str("alpha"),
+                Val::Enum(priority, 2),
+                Val::Enum(level, 2),
+                some(Val::Enum(priority, 0)),
+                Val::List(vec![Val::Enum(priority, 0), Val::Enum(priority, 2)]),
+                Val::Tuple(vec![Val::Enum(priority, 2), Val::Enum(level, 2)]),
+            ]
+        );
+        assert_eq!(
+            rows[1].values,
+            vec![
+                str("beta"),
+                Val::Enum(priority, 0),
+                Val::Enum(level, 0),
+                Val::None,
+                Val::List(vec![Val::Enum(priority, 2)]),
+                Val::Tuple(vec![Val::Enum(priority, 0), Val::Enum(level, 0)]),
+            ]
+        );
+        assert_eq!(
+            rows[2].values,
+            vec![
+                str("gamma"),
+                Val::Enum(priority, 1),
+                Val::Enum(level, 1),
+                some(Val::Enum(priority, 1)),
+                Val::List(vec![]),
+                Val::Tuple(vec![Val::Enum(priority, 1), Val::Enum(level, 1)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn fetch_invalid_enum_value() {
+        let schema = testdata::schema();
+        let sid = testdata::struct_id(&schema, "Setting");
+        let priority = testdata::field_id(&schema, sid, "priority");
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        testdata::seed(&mut conn).unwrap();
+        conn.execute(
+            "UPDATE settings SET priority = 'urgent' WHERE name = 'alpha'",
+            [],
+        )
+        .unwrap();
+        let backend = SqliteBackend::new(conn, &schema).unwrap();
+        let err = backend
+            .fetch(sid, &[priority], &FetchConstraints::EMPTY)
+            .unwrap_err();
+        match err {
+            ExecError::Integrity { message } => {
+                assert!(message.contains("Priority"), "{message}");
+                assert!(message.contains("urgent"), "{message}");
+            }
+            other => panic!("expected integrity error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fetch_enum_mismatched_storage_class() {
+        let schema = testdata::schema();
+        let sid = testdata::struct_id(&schema, "Setting");
+        let level = testdata::field_id(&schema, sid, "level");
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        testdata::seed(&mut conn).unwrap();
+        conn.execute(
+            "UPDATE settings SET level = 'high' WHERE name = 'alpha'",
+            [],
+        )
+        .unwrap();
+        let backend = SqliteBackend::new(conn, &schema).unwrap();
+        let err = backend
+            .fetch(sid, &[level], &FetchConstraints::EMPTY)
+            .unwrap_err();
+        assert!(matches!(err, ExecError::Integrity { .. }), "{err:?}");
+        assert!(err.to_string().contains("expected Int"), "{err}");
+    }
+
+    #[test]
+    fn fetch_invalid_enum_array_value() {
+        let schema = testdata::schema();
+        let sid = testdata::struct_id(&schema, "Setting");
+        let history = testdata::field_id(&schema, sid, "history");
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        testdata::seed(&mut conn).unwrap();
+        conn.execute(
+            "UPDATE setting_history SET priority = 'urgent' WHERE setting_key = 700",
+            [],
+        )
+        .unwrap();
+        let backend = SqliteBackend::new(conn, &schema).unwrap();
+        let err = backend
+            .fetch(sid, &[history], &FetchConstraints::EMPTY)
+            .unwrap_err();
+        match err {
+            ExecError::Integrity { message } => {
+                assert!(message.contains("Priority"), "{message}");
+                assert!(message.contains("urgent"), "{message}");
+            }
+            other => panic!("expected integrity error, got {other:?}"),
+        }
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Central test dataset for backend tests (test-only)
 
 use chrono::{DateTime, TimeDelta};
-use grove_schema::validated::{FieldId, RelationId, StructId, ValidatedSchema};
+use grove_schema::validated::{EnumId, FieldId, RelationId, StructId, ValidatedSchema};
 use rusqlite::{Connection, params};
 use rust_decimal::Decimal;
 
@@ -10,6 +10,7 @@ root users: User;
 root roles: Role;
 root images: Image;
 root messages: Message;
+root settings: Setting;
 struct User {
   id: Int,
   name: String,
@@ -60,6 +61,24 @@ struct Role {
   name: String,
   users: &List<User>,
 }
+enum Priority {
+  Low => "low",
+  Medium => "medium",
+  High => "high",
+}
+enum Level {
+  Low => -1,
+  Medium => 0,
+  High => 2,
+}
+struct Setting {
+  name: String,
+  priority: Priority,
+  level: Level,
+  fallback: ?Priority,
+  history: List<Priority>@history_ref via setting_history[setting_key, priority],
+  pair: (Priority, Level)@(pair_priority, pair_level),
+}
 rel Profile.user <-> User.profile (profiles.user_id -> users.id);
 rel Order.user <<-> User.orders (orders.user_id -> users.id);
 rel Item.order <<-> Order.items (items.order_id -> orders.oid);
@@ -74,6 +93,10 @@ pub fn schema() -> ValidatedSchema {
     let (valid, diags) = grove_schema::validate(schema.expect("fixture parses"));
     assert!(diags.is_empty(), "validation diagnostics: {diags:?}");
     valid.expect("fixture validates")
+}
+
+pub fn enum_id(schema: &ValidatedSchema, name: &str) -> EnumId {
+    schema.enum_by_name(name).unwrap().0
 }
 
 pub fn struct_id(schema: &ValidatedSchema, name: &str) -> StructId {
@@ -136,6 +159,9 @@ pub fn seed(conn: &mut Connection) -> rusqlite::Result<()> {
          CREATE TABLE messages(body TEXT, image_id INTEGER);
          CREATE TABLE roles(id INTEGER, name TEXT);
          CREATE TABLE user_roles(role_id INTEGER, user_id INTEGER);
+         CREATE TABLE settings(name TEXT, priority TEXT, level INTEGER, fallback TEXT,
+           history_ref INTEGER, pair_priority TEXT, pair_level INTEGER);
+         CREATE TABLE setting_history(setting_key INTEGER, priority TEXT);
          INSERT INTO profiles(bio, user_id, notes_ref) VALUES
            ('AdaBio', 1, 501), ('CydBio', 3, NULL);
          INSERT INTO profile_notes(profile_key, note) VALUES (501, 'a-note');
@@ -146,7 +172,13 @@ pub fn seed(conn: &mut Connection) -> rusqlite::Result<()> {
          INSERT INTO messages(body, image_id) VALUES
            ('nice', 1), ('wow', 1), ('meh', 2), ('lost', NULL);
          INSERT INTO roles(id, name) VALUES (1, 'admin'), (2, 'editor');
-         INSERT INTO user_roles(role_id, user_id) VALUES (1, 1), (2, 1), (2, 3), (2, 1);",
+         INSERT INTO user_roles(role_id, user_id) VALUES (1, 1), (2, 1), (2, 3), (2, 1);
+         INSERT INTO settings(name, priority, level, fallback, history_ref, pair_priority, pair_level)
+           VALUES ('alpha', 'high', 2, 'low', 700, 'high', 2),
+                  ('beta', 'low', -1, NULL, 701, 'low', -1),
+                  ('gamma', 'medium', 0, 'medium', NULL, 'medium', 0);
+         INSERT INTO setting_history(setting_key, priority) VALUES
+           (700, 'low'), (700, 'high'), (701, 'high');",
     )?;
     let insert = "INSERT INTO users(id, name, nickname, x, y, hx, hy, balance, created, \
                   elapsed, active, tags_ref, scores_ref, lucky_ref, matrix_ref, deep_ref, \

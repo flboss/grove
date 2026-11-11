@@ -253,7 +253,7 @@ fn collect_owning_refs(
             }
             Ok(())
         }
-        Val::None | Val::Scalar(_) => Ok(()),
+        Val::None | Val::Scalar(_) | Val::Enum(_, _) => Ok(()),
     }
 }
 
@@ -285,7 +285,7 @@ fn splice_owning_refs(
             }
             Ok(())
         }
-        Val::None | Val::Scalar(_) => Ok(()),
+        Val::None | Val::Scalar(_) | Val::Enum(_, _) => Ok(()),
     }
 }
 
@@ -657,7 +657,12 @@ pub(crate) fn resolve_base_link(ctx: &mut EvalCtx, base: Val) -> Result<Val, Exe
             }
             Ok(Val::List(resolved_items))
         }
-        Val::Record(_) | Val::Some(_) | Val::None | Val::Scalar(_) | Val::Tuple(_) => Ok(base),
+        Val::Record(_)
+        | Val::Some(_)
+        | Val::None
+        | Val::Scalar(_)
+        | Val::Enum(_, _)
+        | Val::Tuple(_) => Ok(base),
     }
 }
 
@@ -705,7 +710,12 @@ fn collect_refs(
             }
             Ok(())
         }
-        Val::Record(_) | Val::Some(_) | Val::None | Val::Scalar(_) | Val::Tuple(_) => Ok(()),
+        Val::Record(_)
+        | Val::Some(_)
+        | Val::None
+        | Val::Scalar(_)
+        | Val::Enum(_, _)
+        | Val::Tuple(_) => Ok(()),
     }
 }
 
@@ -784,7 +794,12 @@ fn collect_projection_refs(
                 }
             }
         }
-        Val::Ref { .. } | Val::Some(_) | Val::None | Val::Scalar(_) | Val::Tuple(_) => {}
+        Val::Ref { .. }
+        | Val::Some(_)
+        | Val::None
+        | Val::Scalar(_)
+        | Val::Enum(_, _)
+        | Val::Tuple(_) => {}
     }
 }
 
@@ -803,7 +818,12 @@ fn collect_item_refs(
                 }
             }
         }
-        Val::Record(_) | Val::Some(_) | Val::None | Val::Scalar(_) | Val::Tuple(_) => {}
+        Val::Record(_)
+        | Val::Some(_)
+        | Val::None
+        | Val::Scalar(_)
+        | Val::Enum(_, _)
+        | Val::Tuple(_) => {}
     }
 }
 

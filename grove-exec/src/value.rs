@@ -5,7 +5,7 @@ use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 use chrono::{DateTime, TimeDelta, Utc};
-use grove_schema::validated::FieldId;
+use grove_schema::validated::{Enum, EnumId, EnumValue, FieldId};
 use grove_types::Span;
 use rust_decimal::Decimal;
 
@@ -86,6 +86,7 @@ pub enum Val {
     None,
     Some(Box<Val>),
     Scalar(Scalar),
+    Enum(EnumId, usize),
     List(Vec<Val>),
     Tuple(Vec<Val>),
     Record(Vec<(Rc<str>, Val)>),
@@ -126,6 +127,13 @@ impl Val {
             (Val::Some(x), Val::Some(y)) => Some(x.as_ref().eq(y)?),
             (Val::None, Val::Some(_)) | (Val::Some(_), Val::None) => Some(false),
             (Val::Scalar(x), Val::Scalar(y)) => x.eq(y),
+            (Val::Enum(a, ai), Val::Enum(b, bi)) => {
+                if a == b {
+                    Some(ai == bi)
+                } else {
+                    None
+                }
+            }
             (Val::List(xs), Val::List(ys)) => {
                 if xs.len() != ys.len() {
                     return Some(false);
@@ -164,6 +172,35 @@ impl Val {
             Val::Ref { .. } => true,
             _ => false,
         }
+    }
+}
+
+pub(crate) fn enum_value_scalar(value: EnumValue) -> Scalar {
+    match value {
+        EnumValue::Int(n) => Scalar::Int(n),
+        EnumValue::String(s) => Scalar::String(s),
+    }
+}
+
+pub(crate) fn enum_variant_scalar(enum_def: &Enum, index: usize) -> Option<Scalar> {
+    enum_def
+        .variants
+        .get(index)
+        .map(|variant| enum_value_scalar(variant.value.clone()))
+}
+
+pub(crate) fn enum_variant_index(enum_def: &Enum, scalar: &Scalar) -> Option<usize> {
+    enum_def
+        .variants
+        .iter()
+        .position(|variant| enum_value_matches_scalar(&variant.value, scalar))
+}
+
+fn enum_value_matches_scalar(value: &EnumValue, scalar: &Scalar) -> bool {
+    match (value, scalar) {
+        (EnumValue::Int(a), Scalar::Int(b)) => a == b,
+        (EnumValue::String(a), Scalar::String(b)) => a == b,
+        _ => false,
     }
 }
 
@@ -302,6 +339,7 @@ impl fmt::Display for Val {
             Val::None => write!(f, "none"),
             Val::Some(inner) => write!(f, "some({inner})"),
             Val::Scalar(s) => write!(f, "{s}"),
+            Val::Enum(id, variant) => write!(f, "enum({}:{})", id.index(), variant),
             Val::List(items) => {
                 write!(f, "[")?;
                 for (i, item) in items.iter().enumerate() {
@@ -432,6 +470,16 @@ mod tests {
             ])),
             Some(true)
         );
+    }
+
+    #[test]
+    fn enum_display_and_equality() {
+        let high = Val::Enum(EnumId::new(0), 1);
+        assert_eq!(high.to_string(), "enum(0:1)");
+        assert_eq!(high.eq(&Val::Enum(EnumId::new(0), 1)), Some(true));
+        assert_eq!(high.eq(&Val::Enum(EnumId::new(0), 0)), Some(false));
+        assert_eq!(high.eq(&Val::Enum(EnumId::new(1), 1)), None);
+        assert!(!high.contains_ref());
     }
 
     #[test]
