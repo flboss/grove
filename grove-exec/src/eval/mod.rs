@@ -139,7 +139,7 @@ pub fn eval(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
                 IdentBinding::Prev { .. } => todo!("prev with mutations"),
             }
         }
-        TypedExprKind::EnumVariant { .. } => todo!("enums"),
+        TypedExprKind::EnumVariant { enum_id, variant } => Ok(Val::Enum(*enum_id, *variant)),
         TypedExprKind::Some { value } => eval(value, ctx).map(|v| Val::Some(Box::new(v))),
         TypedExprKind::TypeConstant { ty, name } => Ok(eval_type_constant(ty.value, name.value)),
         TypedExprKind::If { arms, default } => {
@@ -176,7 +176,7 @@ pub fn eval(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
         } => eval_method(base, &name.value, args, *optional, expr.id, ctx, expr.span),
         TypedExprKind::Cast { expr: inner, ty } => {
             let value = eval(inner, ctx)?;
-            eval_cast(value, ty.value, expr.span)
+            eval_cast(value, ty.value, expr.span, ctx.schema)
         }
         TypedExprKind::Tuple { elements } => eval_tuple(elements, ctx),
         TypedExprKind::Array { elements } => eval_array(elements, ctx),
@@ -458,6 +458,7 @@ mod tests {
     use super::harness::*;
     use super::{Env, EvalCtx, eval};
     use crate::pushdown::PushdownPlan;
+    use crate::testdata;
     use crate::value::Val;
     use grove_query::typecheck::types::{IdentBinding, QueryType, TypedExpr, TypedExprKind};
     use grove_schema::validated::{ScalarType, ValidatedSchema};
@@ -617,6 +618,71 @@ mod tests {
         assert_eq!(
             eval(&expr, &mut ctx),
             Ok(Val::List(vec![int(1), Val::None]))
+        );
+    }
+
+    #[test]
+    fn enum_construction_and_casts() {
+        let schema = testdata::schema();
+        let priority = testdata::enum_id(&schema, "Priority");
+
+        assert_eq!(
+            run_with("Priority::High", schema.clone()),
+            Ok(Val::Enum(priority, 2))
+        );
+        assert_eq!(
+            run_with("Priority::High as String", schema.clone()),
+            Ok(str("high"))
+        );
+        assert_eq!(run_with("Level::High as Int", schema), Ok(int(2)));
+    }
+
+    #[test]
+    fn enum_fields_decode_cast_and_filter() {
+        let schema = testdata::schema();
+        let priority = testdata::enum_id(&schema, "Priority");
+        let level = testdata::enum_id(&schema, "Level");
+
+        assert_eq!(
+            run_seeded("settings.first().unwrap().priority as String"),
+            Ok(str("high"))
+        );
+        assert_eq!(
+            run_seeded("settings.first().unwrap().level as Int"),
+            Ok(int(2))
+        );
+        assert_eq!(
+            run_seeded("settings.first().unwrap().fallback"),
+            Ok(some(Val::Enum(priority, 0)))
+        );
+        assert_eq!(
+            run_seeded("settings.nth(1).unwrap().fallback"),
+            Ok(Val::None)
+        );
+        assert_eq!(
+            run_seeded("settings.first().unwrap().history"),
+            Ok(Val::List(vec![
+                Val::Enum(priority, 0),
+                Val::Enum(priority, 2)
+            ]))
+        );
+        assert_eq!(
+            run_seeded("settings.first().unwrap().pair"),
+            Ok(Val::Tuple(vec![
+                Val::Enum(priority, 2),
+                Val::Enum(level, 2)
+            ]))
+        );
+        assert_eq!(
+            run_seeded("settings[priority == Priority::High] { name }"),
+            Ok(Val::List(vec![rec(vec![("name", str("alpha"))])]))
+        );
+        assert_eq!(
+            run_seeded("settings[level in (Level::High, Level::Low)] { name }"),
+            Ok(Val::List(vec![
+                rec(vec![("name", str("alpha"))]),
+                rec(vec![("name", str("beta"))]),
+            ]))
         );
     }
 

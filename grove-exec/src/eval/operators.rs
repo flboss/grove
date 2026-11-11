@@ -1,6 +1,6 @@
 use grove_query::ast::{BinaryOp, TypeName, UnaryOp};
 use grove_query::typecheck::types::TypedExpr;
-use grove_schema::validated::IntArithmetic;
+use grove_schema::validated::{EnumUnderlying, IntArithmetic, ValidatedSchema};
 use grove_types::{Span, Spanned};
 use num_traits::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
@@ -9,7 +9,7 @@ use super::arithmetic::{dec_arith, duration_from_nanos, float_arith, int_arith, 
 use super::data::resolve_owning_values;
 use super::{EvalCtx, eval};
 use crate::error::ExecError;
-use crate::value::{Scalar, Val, total_nanos};
+use crate::value::{Scalar, Val, enum_variant_scalar, total_nanos};
 
 pub(super) fn eval_binary(
     op: &Spanned<BinaryOp>,
@@ -314,7 +314,12 @@ fn eval_logic(
     Ok(Val::Scalar(Scalar::Bool(r)))
 }
 
-pub(super) fn eval_cast(value: Val, target: TypeName, span: Span) -> Result<Val, ExecError> {
+pub(super) fn eval_cast(
+    value: Val,
+    target: TypeName,
+    span: Span,
+    schema: &ValidatedSchema,
+) -> Result<Val, ExecError> {
     let scalar = match (value, target) {
         (Val::Scalar(Scalar::Int(n)), TypeName::Int) => Scalar::Int(n),
         (Val::Scalar(Scalar::Int(n)), TypeName::Float) => Scalar::Float(n as f64),
@@ -350,6 +355,32 @@ pub(super) fn eval_cast(value: Val, target: TypeName, span: Span) -> Result<Val,
         }
         (Val::Scalar(Scalar::Dec(d)), TypeName::Dec) => Scalar::Dec(d),
         (Val::Scalar(Scalar::Bool(b)), TypeName::Int) => Scalar::Int(i64::from(b)),
+        (Val::Enum(id, index), target) => {
+            let enum_def = schema
+                .enums
+                .get(id.index())
+                .ok_or_else(|| ExecError::Integrity {
+                    message: format!("unknown enum id {} (internal error)", id.index()),
+                })?;
+            let expected = match enum_def.underlying {
+                EnumUnderlying::Int => TypeName::Int,
+                EnumUnderlying::String => TypeName::String,
+            };
+            if target != expected {
+                return Err(ExecError::Integrity {
+                    message: format!(
+                        "enum cast target {target} does not match enum `{}` (internal error)",
+                        enum_def.name
+                    ),
+                });
+            }
+            enum_variant_scalar(enum_def, index).ok_or_else(|| ExecError::Integrity {
+                message: format!(
+                    "unknown variant {index} for enum `{}` (internal error)",
+                    enum_def.name
+                ),
+            })?
+        }
         (value, target) => {
             return Err(ExecError::Integrity {
                 message: format!("mismatched cast operands: {value} as {target} (internal error)"),
