@@ -23,7 +23,7 @@ use super::data::resolve_base_link;
 use super::{EvalCtx, eval};
 use crate::error::ExecError;
 use crate::pushdown::CapRewrite;
-use crate::value::{Scalar, Val};
+use crate::value::{Scalar, Val, rewrap_optional};
 
 pub(super) fn eval_method(
     base: &TypedExpr,
@@ -46,7 +46,9 @@ pub(super) fn eval_method(
         && ctx.applied_triggers.contains(&cap.trigger)
     {
         match (cap.rewrite, name) {
-            (CapRewrite::Skip, "take" | "skip") => return Ok(base),
+            (CapRewrite::Skip, "take" | "skip") => {
+                return Ok(rewrap_optional(optional, base));
+            }
             (CapRewrite::First, "nth") => return eval_slice("first", base, optional, &[], span),
             _ => {}
         }

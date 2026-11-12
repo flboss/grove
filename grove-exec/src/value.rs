@@ -175,6 +175,14 @@ impl Val {
     }
 }
 
+pub(crate) fn rewrap_optional(optional: bool, value: Val) -> Val {
+    if optional {
+        Val::Some(Box::new(value))
+    } else {
+        value
+    }
+}
+
 pub(crate) fn enum_value_scalar(value: EnumValue) -> Scalar {
     match value {
         EnumValue::Int(n) => Scalar::Int(n),

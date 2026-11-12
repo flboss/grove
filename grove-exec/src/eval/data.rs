@@ -9,7 +9,7 @@ use crate::error::ExecError;
 use crate::eval::{EvalCtx, eval};
 use crate::pushdown::FetchConstraints;
 use crate::storage::{Key, Row};
-use crate::value::Val;
+use crate::value::{Val, rewrap_optional};
 
 /// Read root table into a List<Record> (owning Refs resolved)
 pub(crate) fn exec_root(
@@ -603,11 +603,7 @@ pub(crate) fn exec_field(
                             });
                         }
                     };
-                    return Ok(if optional && !matches!(value, Val::None) {
-                        Val::Some(Box::new(value))
-                    } else {
-                        value
-                    });
+                    return Ok(rewrap_optional(optional, value));
                 }
                 (_, value) => value,
             }
@@ -686,11 +682,7 @@ fn resolve_refs(ctx: &mut EvalCtx, optional: bool, value: Val) -> Result<Val, Ex
     collect_refs(&value, &mut by_field, &mut order)?;
     let resolved = batch_fetch(ctx, &by_field, &order)?;
     let resolved_value = splice_refs(value, &resolved)?;
-    if optional && !matches!(resolved_value, Val::None) {
-        Ok(Val::Some(Box::new(resolved_value)))
-    } else {
-        Ok(resolved_value)
-    }
+    Ok(rewrap_optional(optional, resolved_value))
 }
 
 /// Gather parent rowids from bare (non-owning) Ref fields
@@ -1032,6 +1024,25 @@ mod tests {
             }
             got => panic!("expected manager list, got {got:?}"),
         }
+    }
+
+    #[test]
+    fn optional_field_access_nested_optional_preserved() {
+        assert_eq!(
+            run_src("some({a=if true {none} else {some(1)}})?.a"),
+            Ok(some(Val::None))
+        );
+        assert_eq!(run_src("some({a=some(1)})?.a"), Ok(some(some(int(1)))));
+    }
+
+    #[test]
+    fn optional_tuple_and_method_preserve_nested_optional() {
+        assert_eq!(
+            run_src("some((if true {none} else {some(1)}, 2))?.0"),
+            Ok(some(Val::None))
+        );
+        assert_eq!(run_src("some([1, 2])?.nth(5)"), Ok(some(Val::None)));
+        assert_eq!(run_src("some([1, 2])?.nth(0)"), Ok(some(some(int(1)))));
     }
 
     #[test]

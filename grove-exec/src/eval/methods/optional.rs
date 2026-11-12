@@ -180,6 +180,10 @@ mod tests {
         assert_eq!(run_src("some(some(1))?.unwrap_or(1 / 0)"), Ok(some(int(1))));
         assert_eq!(
             run_seeded("users.skip(1).first()?.nickname.unwrap_or(some(\"anon\"))"),
+            Ok(Val::None)
+        );
+        assert_eq!(
+            run_seeded("users.skip(1).first()?.nickname?.unwrap_or(\"anon\")"),
             Ok(some(str("anon")))
         );
         assert_eq!(
