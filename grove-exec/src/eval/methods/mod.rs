@@ -47,7 +47,7 @@ pub(super) fn eval_method(
     {
         match (cap.rewrite, name) {
             (CapRewrite::Skip, "take" | "skip") => {
-                return Ok(rewrap_optional(optional, base));
+                return Ok(rewrap_optional(usize::from(optional), base));
             }
             (CapRewrite::First, "nth") => return eval_slice("first", base, optional, &[], span),
             _ => {}

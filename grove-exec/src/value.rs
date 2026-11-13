@@ -175,12 +175,35 @@ impl Val {
     }
 }
 
-pub(crate) fn rewrap_optional(optional: bool, value: Val) -> Val {
-    if optional {
-        Val::Some(Box::new(value))
-    } else {
-        value
+pub(crate) fn rewrap_optional(depth: usize, mut value: Val) -> Val {
+    for _ in 0..depth {
+        value = Val::Some(Box::new(value));
     }
+    value
+}
+
+pub(crate) fn unwrap_optional_depth(
+    mut value: Val,
+    depth: usize,
+) -> Result<(Val, usize), ExecError> {
+    let mut peeled = 0;
+    while peeled < depth {
+        match value {
+            Val::Some(inner) => {
+                value = *inner;
+                peeled += 1;
+            }
+            Val::None => return Ok((Val::None, peeled)),
+            other => {
+                return Err(ExecError::Integrity {
+                    message: format!(
+                        "optional access expected {depth} layer(s), found {other} (internal error)"
+                    ),
+                });
+            }
+        }
+    }
+    Ok((value, peeled))
 }
 
 pub(crate) fn enum_value_scalar(value: EnumValue) -> Scalar {
@@ -463,6 +486,18 @@ mod tests {
             ])),
             Some(true)
         );
+    }
+
+    #[test]
+    fn optional_depth_helpers() {
+        let value = some(some(int(1)));
+        assert_eq!(unwrap_optional_depth(value, 2).unwrap(), (int(1), 2));
+        assert_eq!(
+            unwrap_optional_depth(some(Val::None), 2).unwrap(),
+            (Val::None, 1)
+        );
+        assert_eq!(rewrap_optional(2, int(1)), some(some(int(1))));
+        assert_eq!(rewrap_optional(1, Val::None), some(Val::None));
     }
 
     #[test]

@@ -11,7 +11,7 @@ use grove_types::NodeId;
 use crate::error::ExecError;
 use crate::pushdown::PushdownPlan;
 use crate::storage::Storage;
-use crate::value::{Interner, Scalar, Val};
+use crate::value::{Interner, Scalar, Val, rewrap_optional, unwrap_optional_depth};
 
 mod arithmetic;
 pub mod composite;
@@ -162,12 +162,12 @@ pub fn eval(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
             base,
             name,
             opt_depth,
-        } => exec_field(base, name, *opt_depth > 0, expr.id, ctx),
+        } => exec_field(base, name, *opt_depth, expr.id, ctx),
         TypedExprKind::TupleAccess {
             base,
             index,
             opt_depth,
-        } => eval_tuple_access(base, *index, *opt_depth > 0, ctx),
+        } => eval_tuple_access(base, *index, *opt_depth, ctx),
         TypedExprKind::Method {
             base,
             name,
@@ -189,35 +189,31 @@ pub fn eval(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
 pub fn eval_tuple_access(
     base: &TypedExpr,
     index: usize,
-    optional: bool,
+    opt_depth: usize,
     ctx: &mut EvalCtx<'_>,
 ) -> Result<Val, ExecError> {
     let base = eval(base, ctx)?;
     let base = resolve_base_link(ctx, base)?;
-    let base = match (optional, base) {
-        (true, Val::None) => return Ok(Val::None),
-        (true, Val::Some(v)) => *v,
-        (_, v) => v,
-    };
-    match base {
-        Val::Tuple(elements) => elements.into_iter().nth(index).map_or_else(
-            || {
-                Err(ExecError::Integrity {
-                    message: format!("tuple index {index} out of range (internal error)"),
-                })
-            },
-            |element| {
-                Ok(if optional {
-                    Val::Some(Box::new(element))
-                } else {
-                    element
-                })
-            },
-        ),
-        other => Err(ExecError::Integrity {
-            message: format!("tuple access on non-tuple value: {other} (internal error)"),
-        }),
+    let (base, peeled) = unwrap_optional_depth(base, opt_depth)?;
+    if peeled < opt_depth {
+        return Ok(rewrap_optional(peeled, Val::None));
     }
+    let element = match base {
+        Val::Tuple(elements) => {
+            elements
+                .into_iter()
+                .nth(index)
+                .ok_or_else(|| ExecError::Integrity {
+                    message: format!("tuple index {index} out of range (internal error)"),
+                })?
+        }
+        other => {
+            return Err(ExecError::Integrity {
+                message: format!("tuple access on non-tuple value: {other} (internal error)"),
+            });
+        }
+    };
+    Ok(rewrap_optional(opt_depth, element))
 }
 
 /// Evaluate a `let` and bind its value
@@ -580,6 +576,15 @@ mod tests {
             }
             got => panic!("expected projected users, got {got:?}"),
         }
+    }
+
+    #[test]
+    fn eval_deep_optional_tuple_access() {
+        assert_eq!(run_src("some(some((1, 2)))??.1"), Ok(some(some(int(2)))));
+        assert_eq!(
+            run_src("some(if true {none} else {some((1, 2))})??.0"),
+            Ok(some(Val::None))
+        );
     }
 
     #[test]

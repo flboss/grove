@@ -9,7 +9,7 @@ use crate::error::ExecError;
 use crate::eval::{EvalCtx, eval};
 use crate::pushdown::FetchConstraints;
 use crate::storage::{Key, Row};
-use crate::value::{Val, rewrap_optional};
+use crate::value::{Val, rewrap_optional, unwrap_optional_depth};
 
 /// Read root table into a List<Record> (owning Refs resolved)
 pub(crate) fn exec_root(
@@ -572,17 +572,16 @@ fn rooted_frame(expr: &TypedExpr, schema: &ValidatedSchema, frames: &[bool]) -> 
 pub(crate) fn exec_field(
     base: &TypedExpr,
     name: &str,
-    optional: bool,
+    opt_depth: usize,
     node: NodeId,
     ctx: &mut EvalCtx,
 ) -> Result<Val, ExecError> {
     let base = eval(base, ctx)?;
     let base = resolve_base_link(ctx, base)?;
-    let base = match (optional, base) {
-        (true, Val::None) => return Ok(Val::None),
-        (true, Val::Some(v)) => *v,
-        (_, v) => v,
-    };
+    let (base, peeled) = unwrap_optional_depth(base, opt_depth)?;
+    if peeled < opt_depth {
+        return Ok(rewrap_optional(peeled, Val::None));
+    }
     let result = match base {
         Val::Record(fields) => {
             let value = record_field(fields, name)?;
@@ -603,7 +602,7 @@ pub(crate) fn exec_field(
                             });
                         }
                     };
-                    return Ok(rewrap_optional(optional, value));
+                    return Ok(rewrap_optional(opt_depth, value));
                 }
                 (_, value) => value,
             }
@@ -631,7 +630,8 @@ pub(crate) fn exec_field(
             });
         }
     };
-    resolve_refs(ctx, optional, result)
+    let resolved = resolve_refs(ctx, result)?;
+    Ok(rewrap_optional(opt_depth, resolved))
 }
 
 /// Resolve a bare Ref base before navigation
@@ -676,13 +676,12 @@ fn record_field(
 }
 
 /// Resolve bare top-level (non-owning) Refs in a field access result
-fn resolve_refs(ctx: &mut EvalCtx, optional: bool, value: Val) -> Result<Val, ExecError> {
+fn resolve_refs(ctx: &mut EvalCtx, value: Val) -> Result<Val, ExecError> {
     let mut by_field: HashMap<FieldId, Vec<Key>> = HashMap::new();
     let mut order: Vec<FieldId> = Vec::new();
     collect_refs(&value, &mut by_field, &mut order)?;
     let resolved = batch_fetch(ctx, &by_field, &order)?;
-    let resolved_value = splice_refs(value, &resolved)?;
-    Ok(rewrap_optional(optional, resolved_value))
+    splice_refs(value, &resolved)
 }
 
 /// Gather parent rowids from bare (non-owning) Ref fields
@@ -1024,6 +1023,19 @@ mod tests {
             }
             got => panic!("expected manager list, got {got:?}"),
         }
+    }
+
+    #[test]
+    fn deep_optional_field_access() {
+        assert_eq!(run_src("some(some({a = 1}))??.a"), Ok(some(some(int(1)))));
+        assert_eq!(
+            run_src("some(some({a = some(1)}))??.a"),
+            Ok(some(some(some(int(1)))))
+        );
+        assert_eq!(
+            run_src("some(if true {none} else {some({a = 1})})??.a"),
+            Ok(some(Val::None))
+        );
     }
 
     #[test]
