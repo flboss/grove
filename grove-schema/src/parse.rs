@@ -167,7 +167,7 @@ impl<'src> Parser<'src> {
     fn sync_to(&mut self, targets: &[TokenKind]) {
         loop {
             let tok = self.peek();
-            if matches!(tok.value, TokenKind::Eof) || targets.contains(&tok.value) {
+            if matches!(tok.value, TokenKind::Eof) || targets.contains(tok) {
                 break;
             }
             self.advance();

@@ -196,16 +196,16 @@ fn infer_literal(literal: &Literal) -> QueryType {
 fn infer(expr: &Expr, env: &mut TypeEnv) -> Result<TypedExpr, TypeError> {
     match expr {
         Expr::Literal(lit) => {
-            let ty = infer_literal(&lit.value);
+            let ty = infer_literal(lit);
             Ok(env.typed(TypedExprKind::Literal(lit.clone()), ty, lit.span))
         }
         Expr::Ident(name) => {
-            let (entry, depth) =
-                env.resolve(&name.value)
-                    .ok_or_else(|| TypeError::UnknownIdentifier {
-                        name: name.to_string(),
-                        span: name.span,
-                    })?;
+            let (entry, depth) = env
+                .resolve(name)
+                .ok_or_else(|| TypeError::UnknownIdentifier {
+                    name: name.to_string(),
+                    span: name.span,
+                })?;
             Ok(env.typed(
                 TypedExprKind::Ident {
                     name: name.clone(),
@@ -591,28 +591,25 @@ fn infer_field(
     env: &mut TypeEnv,
 ) -> Result<TypedExpr, TypeError> {
     let schema = env.schema();
-    let lookup_ty = base
-        .ty
-        .unwrap_optional_depth(opt_depth)
-        .ok_or_else(|| TypeError::OptionalDepthMismatch {
+    let lookup_ty = base.ty.unwrap_optional_depth(opt_depth).ok_or_else(|| {
+        TypeError::OptionalDepthMismatch {
             depth: opt_depth,
             ty: base.ty.to_string(),
             span: name.span,
-        })?
-        .clone();
+        }
+    })?;
 
-    let (inner, was_list) = match &lookup_ty {
-        QueryType::List(inner) => (inner.as_ref().clone(), true),
-        other => (other.clone(), false),
+    let (inner, was_list) = match lookup_ty {
+        QueryType::List(inner) => (inner.as_ref(), true),
+        other => (other, false),
     };
 
-    let mut field_ty = record_field_by_name(&inner, &name.value, schema).ok_or_else(|| {
-        TypeError::UnknownField {
+    let mut field_ty =
+        record_field_by_name(inner, name, schema).ok_or_else(|| TypeError::UnknownField {
             field: name.value.clone(),
             base_ty: base.ty.to_string(),
             span: name.span,
-        }
-    })?;
+        })?;
 
     if was_list {
         field_ty = QueryType::List(Box::new(field_ty));
@@ -637,16 +634,14 @@ fn infer_tuple_access(
     opt_depth: usize,
     env: &mut TypeEnv,
 ) -> Result<TypedExpr, TypeError> {
-    let lookup_ty = base
-        .ty
-        .unwrap_optional_depth(opt_depth)
-        .ok_or_else(|| TypeError::OptionalDepthMismatch {
+    let lookup_ty = base.ty.unwrap_optional_depth(opt_depth).ok_or_else(|| {
+        TypeError::OptionalDepthMismatch {
             depth: opt_depth,
             ty: base.ty.to_string(),
             span: index.span,
-        })?
-        .clone();
-    let QueryType::Tuple(elems) = &lookup_ty else {
+        }
+    })?;
+    let QueryType::Tuple(elems) = lookup_ty else {
         return Err(TypeError::TupleAccessOnNonTuple {
             base_ty: base.ty.to_string(),
             span: index.span,
@@ -691,18 +686,16 @@ fn infer_method(
     opt_depth: usize,
     env: &mut TypeEnv,
 ) -> Result<TypedExpr, TypeError> {
-    let resolve_ty = base
-        .ty
-        .unwrap_optional_depth(opt_depth)
-        .ok_or_else(|| TypeError::OptionalDepthMismatch {
+    let resolve_ty = base.ty.unwrap_optional_depth(opt_depth).ok_or_else(|| {
+        TypeError::OptionalDepthMismatch {
             depth: opt_depth,
             ty: base.ty.to_string(),
             span: name.span,
-        })?
-        .clone();
+        }
+    })?;
 
     let mut signature =
-        method_signature(&resolve_ty, &name.value).ok_or_else(|| TypeError::UnknownMethod {
+        method_signature(resolve_ty, name).ok_or_else(|| TypeError::UnknownMethod {
             method: name.value.clone(),
             base_ty: base.ty.to_string(),
             span: name.span,
@@ -746,18 +739,18 @@ fn infer_method(
     let (pushed_scope, pushed_element) = match (&signature.args, name.value.as_str()) {
         (ArgCheck::Scoped { .. }, "map") => {
             env.push_scope();
-            env.push_element(list_element_ty(&resolve_ty));
+            env.push_element(list_element_ty(resolve_ty));
             (true, true)
         }
         (ArgCheck::Scoped { .. }, _) => {
-            let pushed = env.push_record_fields(&resolve_ty);
-            if element_is_record(&resolve_ty) {
+            let pushed = env.push_record_fields(resolve_ty);
+            if element_is_record(resolve_ty) {
                 (pushed, false)
             } else {
                 if !pushed {
                     env.push_scope();
                 }
-                env.push_element(list_element_ty(&resolve_ty));
+                env.push_element(list_element_ty(resolve_ty));
                 (true, true)
             }
         }
@@ -864,21 +857,13 @@ fn infer_binary(
             }
             QueryType::Scalar(ScalarType::Bool)
         }
-        BinaryOp::Eq | BinaryOp::Ne => infer_equality_op(
-            &mut typed_lhs.ty,
-            &op.value,
-            &mut typed_rhs.ty,
-            span,
-            env.schema(),
-        )?,
-        BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Ge => infer_comparison_op(
-            &mut typed_lhs.ty,
-            &op.value,
-            &mut typed_rhs.ty,
-            span,
-            env.schema(),
-        )?,
-        _ => infer_arithmetic_op(&mut typed_lhs.ty, &op.value, &mut typed_rhs.ty, span)?,
+        BinaryOp::Eq | BinaryOp::Ne => {
+            infer_equality_op(&mut typed_lhs.ty, op, &mut typed_rhs.ty, span, env.schema())?
+        }
+        BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Ge => {
+            infer_comparison_op(&mut typed_lhs.ty, op, &mut typed_rhs.ty, span, env.schema())?
+        }
+        _ => infer_arithmetic_op(&mut typed_lhs.ty, op, &mut typed_rhs.ty, span)?,
     };
 
     Ok(env.typed(
@@ -1587,12 +1572,12 @@ fn check_insert_base(base: &Expr, env: &mut TypeEnv) -> Result<(TypedExpr, Struc
             span: base_ident.span,
         });
     };
-    let (entry, depth) =
-        env.resolve(&base_ident.value)
-            .ok_or_else(|| TypeError::UnknownIdentifier {
-                name: base_ident.to_string(),
-                span: base_ident.span,
-            })?;
+    let (entry, depth) = env
+        .resolve(base_ident)
+        .ok_or_else(|| TypeError::UnknownIdentifier {
+            name: base_ident.to_string(),
+            span: base_ident.span,
+        })?;
     let struct_id = match &entry.ty {
         QueryType::List(inner)
             if let QueryType::Record(RecordSource::Schema(id)) = inner.as_ref() =>

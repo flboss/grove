@@ -308,11 +308,11 @@ impl<'a> PlanBuilder<'a> {
             | TypedExprKind::EnumVariant { .. } => None,
             TypedExprKind::Ident { binding, .. } => self.visit_ident(expr, binding),
             TypedExprKind::Field { base, name, .. } => {
-                self.visit_field_access(base, &name.value);
+                self.visit_field_access(base, name);
                 let trigger = base
                     .ty
                     .single_schema_record()
-                    .and_then(|struct_id| self.schema.struct_field(struct_id, &name.value))
+                    .and_then(|struct_id| self.schema.struct_field(struct_id, name))
                     .and_then(|(field, _)| {
                         self.list_ref_target(field).map(|target| (field, target))
                     });
@@ -328,12 +328,12 @@ impl<'a> PlanBuilder<'a> {
                 args,
                 opt_depth,
             } => {
-                let base_need = method_base_need(&name.value, need);
+                let base_need = method_base_need(name, need);
                 let summary = self.visit(base, base_need);
                 for arg in args {
                     self.visit(&arg.expr, Need::Whole);
                 }
-                self.extend_chain(expr.id, &name.value, *opt_depth > 0, args, summary)
+                self.extend_chain(expr.id, name, *opt_depth > 0, args, summary)
             }
             TypedExprKind::Binary { lhs, rhs, .. } => {
                 self.visit(lhs, Need::Whole);

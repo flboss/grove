@@ -105,36 +105,36 @@ pub fn eval(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
         } => {
             match binding {
                 IdentBinding::Let => {
-                    ctx.env.lookup(&name.value, *depth).cloned().ok_or_else(|| {
-                        ExecError::Integrity {
+                    ctx.env
+                        .lookup(name, *depth)
+                        .cloned()
+                        .ok_or_else(|| ExecError::Integrity {
                             message: format!("unbound variable `{}` (internal error)", name.value),
-                        }
-                    })
+                        })
                 }
                 IdentBinding::Root { root_idx } => exec_root(ctx, *root_idx, expr.id),
                 IdentBinding::Field(field) => {
-                    let value = ctx
-                        .env
-                        .lookup(&name.value, *depth)
-                        .cloned()
-                        .ok_or_else(|| ExecError::Integrity {
+                    let value = ctx.env.lookup(name, *depth).cloned().ok_or_else(|| {
+                        ExecError::Integrity {
                             message: format!("unbound field `{}` (internal error)", name.value),
-                        })?;
+                        }
+                    })?;
                     resolve_ident_value(ctx, expr.id, *field, value)
                 }
-                IdentBinding::ProjectedField { .. } => {
-                    ctx.env.lookup(&name.value, *depth).cloned().ok_or_else(|| {
-                        ExecError::Integrity {
-                            message: format!("unbound field `{}` (internal error)", name.value),
-                        }
-                    })
-                }
+                IdentBinding::ProjectedField { .. } => ctx
+                    .env
+                    .lookup(name, *depth)
+                    .cloned()
+                    .ok_or_else(|| ExecError::Integrity {
+                        message: format!("unbound field `{}` (internal error)", name.value),
+                    }),
                 IdentBinding::ListElement => {
-                    ctx.env.lookup(&name.value, *depth).cloned().ok_or_else(|| {
-                        ExecError::Integrity {
+                    ctx.env
+                        .lookup(name, *depth)
+                        .cloned()
+                        .ok_or_else(|| ExecError::Integrity {
                             message: format!("unbound element `{}` (internal error)", name.value),
-                        }
-                    })
+                        })
                 }
                 IdentBinding::Prev { .. } => todo!("prev with mutations"),
             }
@@ -162,7 +162,7 @@ pub fn eval(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
             base,
             name,
             opt_depth,
-        } => exec_field(base, &name.value, *opt_depth > 0, expr.id, ctx),
+        } => exec_field(base, name, *opt_depth > 0, expr.id, ctx),
         TypedExprKind::TupleAccess {
             base,
             index,
@@ -173,15 +173,7 @@ pub fn eval(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
             name,
             args,
             opt_depth,
-        } => eval_method(
-            base,
-            &name.value,
-            args,
-            *opt_depth > 0,
-            expr.id,
-            ctx,
-            expr.span,
-        ),
+        } => eval_method(base, name, args, *opt_depth > 0, expr.id, ctx, expr.span),
         TypedExprKind::Cast { expr: inner, ty } => {
             let value = eval(inner, ctx)?;
             eval_cast(value, ty.value, expr.span, ctx.schema)
