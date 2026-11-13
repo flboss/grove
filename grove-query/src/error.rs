@@ -8,6 +8,12 @@ pub enum QueryLexError {
     UnclosedString { span: Span },
     UnclosedBacktickIdent { span: Span },
     UnclosedBlockComment { span: Span },
+    UnclosedBytesLiteral { span: Span },
+    BytesHexInvalidDigit { span: Span, ch: char },
+    BytesHexOddDigitCount { span: Span },
+    BytesBase64InvalidChar { span: Span, ch: char },
+    BytesBase64InvalidPadding { span: Span },
+    BytesBase64NonZeroTrailingBits { span: Span },
 
     HexEscapeInvalid { span: Span },
     HexEscapeNonAscii { span: Span, value: u8 },
@@ -78,6 +84,51 @@ impl From<QueryLexError> for Diagnostic {
                 "unclosed block comment",
                 span,
                 "missing closing `*/`",
+            ),
+            UnclosedBytesLiteral { span } => error_simple(
+                "QL0040",
+                "unclosed bytes literal",
+                span,
+                "missing closing `\"`",
+            ),
+            BytesHexInvalidDigit { span, ch } => error_simple(
+                "QL0041",
+                format!("invalid hex digit `{ch}` in bytes literal"),
+                span,
+                "expected hex digit",
+            )
+            .with_help(
+                "valid hex digits are `0-9`, `a-f`, or `A-F`; \
+                    spaces, tabs, and `_` are allowed as separators",
+            ),
+            BytesHexOddDigitCount { span } => error_simple(
+                "QL0042",
+                "hex bytes literal has an odd number of digits",
+                span,
+                "expected even number of hex digits",
+            ),
+            BytesBase64InvalidChar { span, ch } => error_simple(
+                "QL0043",
+                format!("invalid base64 character `{ch}` in bytes literal"),
+                span,
+                "expected standard base64 character",
+            )
+            .with_help("valid base64 digits are `A-Z`, `a-z`, `0-9`, `+`, and `/`"),
+            BytesBase64InvalidPadding { span } => error_simple(
+                "QL0044",
+                "invalid base64 padding in bytes literal",
+                span,
+                "invalid padding",
+            )
+            .with_help(
+                "padding must complete the final 3-byte group:
+                `==` for 2 digits, `=` for 3 digits, no padding for 4 digits",
+            ),
+            BytesBase64NonZeroTrailingBits { span } => error_simple(
+                "QL0045",
+                "base64 bytes literal has nonzero unused trailing bits",
+                span,
+                "non-canonical base64 encoding",
             ),
             HexEscapeInvalid { span } => error_simple(
                 "QL0005",

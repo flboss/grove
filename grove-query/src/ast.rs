@@ -155,6 +155,7 @@ pub enum Literal {
     Float(f64),
     Dec(Decimal),
     String(String),
+    Bytes(Vec<u8>),
     Bool(bool),
     Instant(DateTime<Utc>),
     Now,

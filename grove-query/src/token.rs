@@ -24,10 +24,12 @@ pub enum TokenKind {
     Float,
     Dec,
     String,
+    Bytes,
 
     // Literals
     Ident(String),
     StringLit(String),
+    BytesLit(Vec<u8>),
     IntLit(i64),
     FloatLit(f64),
     DecLit(Decimal),

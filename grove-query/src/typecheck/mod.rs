@@ -184,6 +184,7 @@ fn infer_literal(literal: &Literal) -> QueryType {
         Literal::Float(_) => QueryType::Scalar(ScalarType::Float),
         Literal::Dec(_) => QueryType::Scalar(ScalarType::Dec),
         Literal::String(_) => QueryType::Scalar(ScalarType::String),
+        Literal::Bytes(_) => QueryType::Scalar(ScalarType::Bytes),
         Literal::Bool(_) => QueryType::Scalar(ScalarType::Bool),
         Literal::Instant(_) | Literal::Now | Literal::Today(_) => {
             QueryType::Scalar(ScalarType::Instant)

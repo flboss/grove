@@ -561,6 +561,15 @@ impl<'src> Parser<'src> {
                     value: Literal::String(s),
                 }))
             }
+            TokenKind::BytesLit(_) => {
+                let TokenKind::BytesLit(bytes) = self.bump().value else {
+                    unreachable!()
+                };
+                Ok(Expr::Literal(Spanned {
+                    span,
+                    value: Literal::Bytes(bytes),
+                }))
+            }
             TokenKind::True => {
                 self.bump();
                 Ok(Expr::Literal(Spanned {
@@ -1092,6 +1101,24 @@ mod tests {
                     panic!("expected Instant literal");
                 };
             }
+            other => panic!("expected literal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bytes_literal_expr() {
+        let src = r#"hex"DEAD_be ef""#;
+        match parse_ok(src) {
+            Expr::Literal(lit) => {
+                assert_eq!(lit.value, Literal::Bytes(vec![0xde, 0xad, 0xbe, 0xef]));
+                assert_eq!(lit.span.start, 0);
+                assert_eq!(lit.span.end, src.len());
+            }
+            other => panic!("expected literal, got {other:?}"),
+        }
+
+        match parse_ok(r#"b64"Zm9v""#) {
+            Expr::Literal(lit) => assert_eq!(lit.value, Literal::Bytes(b"foo".to_vec())),
             other => panic!("expected literal, got {other:?}"),
         }
     }

@@ -15,6 +15,7 @@ pub(crate) fn decode_literal(lit: &Spanned<Literal>, now: DateTime<Utc>) -> Val 
         Literal::Float(x) => Val::Scalar(Scalar::Float(*x)),
         Literal::Dec(d) => Val::Scalar(Scalar::Dec(*d)),
         Literal::String(s) => Val::Scalar(Scalar::String(s.clone())),
+        Literal::Bytes(_) => todo!("bytes literal runtime support"),
         Literal::Bool(b) => Val::Scalar(Scalar::Bool(*b)),
         Literal::Instant(t) => Val::Scalar(Scalar::Instant(*t)),
         Literal::Duration(d) => Val::Scalar(Scalar::Duration(*d)),
