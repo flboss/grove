@@ -418,21 +418,20 @@ fn infer_cast(
 }
 
 fn cast_allowed(from: &QueryType, to: &QueryType, schema: &ValidatedSchema) -> bool {
-    from.is_numeric() && to.is_numeric()
-        || matches!(
-            (from, to),
-            (
-                QueryType::Scalar(ScalarType::Bool),
-                QueryType::Scalar(ScalarType::Int)
-            )
-        )
-        || matches!(
-            (from, to),
-            (QueryType::Enum(id), QueryType::Scalar(target))
-                if schema
-                    .enums.get(id.index())
-                    .is_some_and(|def| def.underlying.scalar_type() == *target)
-        )
+    match (from, to) {
+        _ if from.is_numeric() && to.is_numeric() => true,
+        (QueryType::Scalar(ScalarType::Bool), QueryType::Scalar(ScalarType::Int)) => true,
+        (QueryType::Scalar(ScalarType::String), QueryType::Scalar(ScalarType::Bytes)) => true,
+        (QueryType::Enum(id), QueryType::Scalar(target))
+            if schema
+                .enums
+                .get(id.index())
+                .is_some_and(|def| def.underlying.scalar_type() == *target) =>
+        {
+            true
+        }
+        _ => false,
+    }
 }
 
 fn infer_type_constant(
@@ -445,6 +444,7 @@ fn infer_type_constant(
         TypeName::Float => ScalarType::Float,
         TypeName::Dec => ScalarType::Dec,
         TypeName::String => unreachable!("String has no type constants"),
+        TypeName::Bytes => unreachable!("Bytes has no type constants"),
     };
 
     let result_ty = QueryType::Scalar(scalar_ty);
@@ -1326,7 +1326,10 @@ fn scalar_method(s: &ScalarType, method: &str) -> Option<MethodSig> {
             "to_string" => Some(MethodSig::no_args(QueryType::Scalar(String))),
             _ => None,
         },
-        Bytes => None,
+        Bytes => match method {
+            "len" => Some(MethodSig::no_args(QueryType::Scalar(Int))),
+            _ => None,
+        },
     }
 }
 
@@ -1878,6 +1881,13 @@ mod tests {
         diags.iter().map(|d| d.code.to_string()).collect()
     }
 
+    fn infer_ok(source: &str, schema: &ValidatedSchema) -> TypedExpr {
+        let mut env = TypeEnv::new(schema);
+        let (file, parse_diags) = crate::parse_query(source);
+        assert!(parse_diags.is_empty(), "parse diagnostics: {parse_diags:?}");
+        infer(&file.unwrap().result, &mut env).unwrap()
+    }
+
     #[test]
     fn infer_enum_variant() {
         let schema = enum_schema();
@@ -2063,6 +2073,71 @@ mod tests {
         let (file, _diags) = crate::parse_query("\"hello\"");
         let result = infer(&file.unwrap().result, &mut env).unwrap();
         assert_eq!(result.ty, QueryType::Scalar(ScalarType::String));
+    }
+
+    #[test]
+    fn infer_bytes_literal() {
+        let schema = test_schema();
+        for source in [r#"hex"deadbeef""#, r#"b64"3q2+7w==""#] {
+            assert_eq!(
+                infer_ok(source, &schema).ty,
+                QueryType::Scalar(ScalarType::Bytes),
+                "source: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn bytes_len_method() {
+        let schema = test_schema();
+        for source in [r#"hex"deadbeef".len()"#, r#"b64"3q2+7w==".len()"#] {
+            assert_eq!(
+                infer_ok(source, &schema).ty,
+                QueryType::Scalar(ScalarType::Int),
+                "source: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn bytes_cast_from_string() {
+        let schema = test_schema();
+        assert_eq!(
+            infer_ok(r#""hello" as Bytes"#, &schema).ty,
+            QueryType::Scalar(ScalarType::Bytes)
+        );
+    }
+
+    #[test]
+    fn bytes_comparison() {
+        let schema = test_schema();
+        for source in [
+            r#"hex"00" == hex"01""#,
+            r#"hex"00" != hex"01""#,
+            r#"hex"00" < hex"01""#,
+            r#"hex"00" <= hex"01""#,
+            r#"hex"00" > hex"01""#,
+            r#"hex"00" >= hex"01""#,
+            r#"hex"00" in (hex"00", hex"01")"#,
+        ] {
+            assert_eq!(
+                infer_ok(source, &schema).ty,
+                QueryType::Scalar(ScalarType::Bool),
+                "source: {source}"
+            );
+        }
+        assert_eq!(
+            infer_ok(r#"[hex"02", hex"01"].sort()"#, &schema).ty,
+            QueryType::List(Box::new(QueryType::Scalar(ScalarType::Bytes)))
+        );
+        assert_eq!(
+            infer_ok(r#"[hex"02", hex"01"].min()"#, &schema).ty,
+            QueryType::Scalar(ScalarType::Bytes).wrap_optional()
+        );
+        assert_eq!(
+            infer_ok(r#"[hex"02", hex"01"].max()"#, &schema).ty,
+            QueryType::Scalar(ScalarType::Bytes).wrap_optional()
+        );
     }
 
     #[test]

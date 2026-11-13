@@ -38,6 +38,7 @@ pub(crate) fn eval_type_constant(ty: TypeName, name: ConstantName) -> Val {
         (TypeName::Dec, ConstantName::Min) => Scalar::Dec(Decimal::MIN),
         (TypeName::Dec, ConstantName::Max) => Scalar::Dec(Decimal::MAX),
         (TypeName::String, _) => unreachable!("String has no type constants"),
+        (TypeName::Bytes, _) => unreachable!("Bytes has no type constants"),
     };
     Val::Scalar(scalar)
 }

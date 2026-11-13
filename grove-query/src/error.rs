@@ -527,7 +527,7 @@ impl From<QueryParseError> for Diagnostic {
                 span,
                 "expected a type name",
             )
-            .with_help("possible cast targets are `Int`, `Float`, `Dec`, and `String`"),
+            .with_help("possible cast targets are `Int`, `Float`, `Dec`, `String`, and `Bytes`"),
             ExpectedEnumVariantName { span } => error_simple(
                 "QP0030",
                 "expected an enum variant name after `::`",

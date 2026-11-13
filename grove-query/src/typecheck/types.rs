@@ -282,6 +282,7 @@ impl From<TypeName> for QueryType {
             TypeName::Float => QueryType::Scalar(ScalarType::Float),
             TypeName::Dec => QueryType::Scalar(ScalarType::Dec),
             TypeName::String => QueryType::Scalar(ScalarType::String),
+            TypeName::Bytes => QueryType::Scalar(ScalarType::Bytes),
         }
     }
 }

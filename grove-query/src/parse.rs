@@ -954,6 +954,7 @@ impl<'src> Parser<'src> {
             TokenKind::Float => TypeName::Float,
             TokenKind::Dec => TypeName::Dec,
             TokenKind::String => TypeName::String,
+            TokenKind::Bytes => TypeName::Bytes,
             _ => {
                 return Err(tok);
             }
@@ -1494,6 +1495,21 @@ mod tests {
             Expr::Cast {
                 ty: Spanned {
                     value: TypeName::Int,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn as_cast_bytes() {
+        let expr = parse_ok(r#""abc" as Bytes"#);
+        assert!(matches!(
+            expr,
+            Expr::Cast {
+                ty: Spanned {
+                    value: TypeName::Bytes,
                     ..
                 },
                 ..

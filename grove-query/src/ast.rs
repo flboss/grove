@@ -170,6 +170,7 @@ pub enum TypeName {
     Float,
     Dec,
     String,
+    Bytes,
 }
 
 impl fmt::Display for TypeName {
@@ -179,6 +180,7 @@ impl fmt::Display for TypeName {
             TypeName::Float => write!(f, "Float"),
             TypeName::Dec => write!(f, "Dec"),
             TypeName::String => write!(f, "String"),
+            TypeName::Bytes => write!(f, "Bytes"),
         }
     }
 }

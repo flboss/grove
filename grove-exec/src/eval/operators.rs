@@ -355,6 +355,9 @@ pub(super) fn eval_cast(
         }
         (Val::Scalar(Scalar::Dec(d)), TypeName::Dec) => Scalar::Dec(d),
         (Val::Scalar(Scalar::Bool(b)), TypeName::Int) => Scalar::Int(i64::from(b)),
+        (Val::Scalar(Scalar::String(_)), TypeName::Bytes) => {
+            todo!("bytes cast runtime support")
+        }
         (Val::Enum(id, index), target) => {
             let enum_def = schema
                 .enums
