@@ -294,6 +294,7 @@ impl fmt::Display for QueryType {
                 ScalarType::Float => write!(f, "Float"),
                 ScalarType::Dec => write!(f, "Dec"),
                 ScalarType::String => write!(f, "String"),
+                ScalarType::Bytes => write!(f, "Bytes"),
                 ScalarType::Bool => write!(f, "Bool"),
                 ScalarType::Instant => write!(f, "Instant"),
                 ScalarType::Duration => write!(f, "Duration"),

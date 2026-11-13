@@ -323,6 +323,7 @@ pub enum ScalarType {
     Float,
     Dec,
     String,
+    Bytes,
     Bool,
     Instant,
     Duration,

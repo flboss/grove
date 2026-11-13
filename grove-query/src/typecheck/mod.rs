@@ -1325,6 +1325,7 @@ fn scalar_method(s: &ScalarType, method: &str) -> Option<MethodSig> {
             "to_string" => Some(MethodSig::no_args(QueryType::Scalar(String))),
             _ => None,
         },
+        Bytes => None,
     }
 }
 

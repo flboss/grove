@@ -111,6 +111,7 @@ impl<'src> Lexer<'src> {
             "Float" => TokenKind::Float,
             "Dec" => TokenKind::Dec,
             "String" => TokenKind::String,
+            "Bytes" => TokenKind::Bytes,
             "Bool" => TokenKind::Bool,
             "Instant" => TokenKind::Instant,
             "Duration" => TokenKind::Duration,
@@ -359,11 +360,12 @@ mod tests {
 
     #[test]
     fn type_keywords() {
-        let mut lex = Lexer::new("Int Float Dec String Bool Instant Duration List Tuple");
+        let mut lex = Lexer::new("Int Float Dec String Bytes Bool Instant Duration List Tuple");
         assert_token!(lex, TokenKind::Int);
         assert_token!(lex, TokenKind::Float);
         assert_token!(lex, TokenKind::Dec);
         assert_token!(lex, TokenKind::String);
+        assert_token!(lex, TokenKind::Bytes);
         assert_token!(lex, TokenKind::Bool);
         assert_token!(lex, TokenKind::Instant);
         assert_token!(lex, TokenKind::Duration);

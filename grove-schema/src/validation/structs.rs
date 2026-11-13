@@ -685,6 +685,47 @@ mod tests {
     }
 
     #[test]
+    fn bytes_fields() {
+        stage_structs(
+            "root blobs: Blob; \
+             struct Blob { data: Bytes, maybe: ?Bytes, pair: Tuple<Bytes, Int>@(a, b), \
+             chunks: List<Bytes>@chunks_ref via blob_chunks[k, chunk] }",
+            |b| {
+                assert!(b.diags.is_empty(), "unexpected diagnostics: {:?}", b.diags);
+                let fields = &b.structs[0].fields;
+                assert_eq!(fields.len(), 4);
+                assert!(matches!(
+                    &fields[0],
+                    Field::Value {
+                        ty: ValueType::Scalar(ScalarType::Bytes),
+                        ..
+                    }
+                ));
+                assert!(matches!(
+                    &fields[1],
+                    Field::Value { ty: ValueType::Optional(inner), .. }
+                        if matches!(inner.as_ref(), ValueType::Scalar(ScalarType::Bytes))
+                ));
+                assert!(matches!(
+                    &fields[2],
+                    Field::Value { ty: ValueType::Tuple(items), .. }
+                        if items == &vec![
+                            ValueType::Scalar(ScalarType::Bytes),
+                            ValueType::Scalar(ScalarType::Int),
+                        ]
+                ));
+                assert!(matches!(
+                    &fields[3],
+                    Field::Array {
+                        element: ValueType::Scalar(ScalarType::Bytes),
+                        ..
+                    }
+                ));
+            },
+        );
+    }
+
+    #[test]
     fn enum_fields_are_values() {
         stage_structs(
             r#"root tickets: Ticket;

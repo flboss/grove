@@ -222,6 +222,7 @@ impl<'src> Parser<'src> {
             | TokenKind::Float
             | TokenKind::Dec
             | TokenKind::String
+            | TokenKind::Bytes
             | TokenKind::Bool
             | TokenKind::Instant
             | TokenKind::Duration => {
@@ -231,6 +232,7 @@ impl<'src> Parser<'src> {
                     TokenKind::Float => BuiltinType::Float,
                     TokenKind::Dec => BuiltinType::Dec,
                     TokenKind::String => BuiltinType::String,
+                    TokenKind::Bytes => BuiltinType::Bytes,
                     TokenKind::Bool => BuiltinType::Bool,
                     TokenKind::Instant => BuiltinType::Instant,
                     TokenKind::Duration => BuiltinType::Duration,
@@ -452,6 +454,28 @@ mod tests {
         assert!(matches!(
             structs[0].fields[3].exposed_type,
             TypeExpr::List { via: None, .. }
+        ));
+    }
+
+    #[test]
+    fn bytes_primitive_type() {
+        let (schema, diags) =
+            parse_schema("struct S { data: Bytes, maybe: ?Bytes, pair: Tuple<Bytes, Int> }");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let fields = schema.unwrap().structs[0].fields.clone();
+        assert!(matches!(
+            fields[0].exposed_type,
+            TypeExpr::Primitive(ref ty) if ty.value == BuiltinType::Bytes
+        ));
+        assert!(matches!(
+            fields[1].exposed_type,
+            TypeExpr::Optional { ref inner, .. }
+                if matches!(inner.as_ref(), TypeExpr::Primitive(ty) if ty.value == BuiltinType::Bytes)
+        ));
+        assert!(matches!(
+            fields[2].exposed_type,
+            TypeExpr::Tuple { ref elements, .. }
+                if matches!(&elements[0], TypeExpr::Primitive(ty) if ty.value == BuiltinType::Bytes)
         ));
     }
 

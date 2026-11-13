@@ -233,6 +233,7 @@ fn builtin_scalar(builtin: &BuiltinType) -> ScalarType {
         BuiltinType::Float => ScalarType::Float,
         BuiltinType::Dec => ScalarType::Dec,
         BuiltinType::String => ScalarType::String,
+        BuiltinType::Bytes => ScalarType::Bytes,
         BuiltinType::Bool => ScalarType::Bool,
         BuiltinType::Instant => ScalarType::Instant,
         BuiltinType::Duration => ScalarType::Duration,

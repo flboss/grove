@@ -105,6 +105,7 @@ pub enum BuiltinType {
     Float,
     Dec,
     String,
+    Bytes,
     Bool,
     Instant,
     Duration,

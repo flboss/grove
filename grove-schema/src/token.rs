@@ -17,6 +17,7 @@ pub enum TokenKind {
     Float,
     Dec,
     String,
+    Bytes,
     Bool,
     Instant,
     Duration,
