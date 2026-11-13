@@ -588,6 +588,18 @@ mod tests {
     }
 
     #[test]
+    fn deep_optional_chain_pushdown_parity() {
+        assert_eq!(
+            run_seeded("users.first()?.nickname??.to_upper()"),
+            Ok(some(some(str("A"))))
+        );
+        assert_eq!(
+            run_seeded("users.first()?.manager??.name"),
+            Ok(some(some(str("Bob"))))
+        );
+    }
+
+    #[test]
     fn eval_deep_optional_methods() {
         assert_eq!(
             run_src("some(some([1, 2]))??.map($ + 1)"),

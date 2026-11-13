@@ -333,7 +333,7 @@ impl<'a> PlanBuilder<'a> {
                 for arg in args {
                     self.visit(&arg.expr, Need::Whole);
                 }
-                self.extend_chain(expr.id, name, *opt_depth > 0, args, summary)
+                self.extend_chain(expr.id, name, *opt_depth, args, summary)
             }
             TypedExprKind::Binary { lhs, rhs, .. } => {
                 self.visit(lhs, Need::Whole);
@@ -467,12 +467,12 @@ impl<'a> PlanBuilder<'a> {
         &mut self,
         node: NodeId,
         method: &str,
-        optional: bool,
+        opt_depth: usize,
         args: &[TypedMethodArg],
         base: Option<ChainSummary>,
     ) -> Option<ChainSummary> {
         let chain = base?;
-        if optional {
+        if opt_depth > 0 {
             return None;
         }
         match method {
@@ -1110,6 +1110,14 @@ mod tests {
         let (file, plan, schema) = typed_and_plan("settings[priority == Priority::High] { name }");
         assert_eq!(root_constraints(&plan, &file).filters.len(), 1);
         assert_fields(&plan, &schema, "Setting", &["name", "priority"]);
+    }
+
+    #[test]
+    fn optional_method_chains_are_not_pushed() {
+        let (file, plan, _schema) = typed_and_plan("users.first()?.orders?.take(1)");
+        let takes = method_nodes(&file, "take");
+        assert_eq!(takes.len(), 1);
+        assert_eq!(plan.cap_rewrite(takes[0]), None);
     }
 
     #[test]
