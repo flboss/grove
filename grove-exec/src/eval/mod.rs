@@ -173,7 +173,7 @@ pub fn eval(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
             name,
             args,
             opt_depth,
-        } => eval_method(base, name, args, *opt_depth > 0, expr.id, ctx, expr.span),
+        } => eval_method(base, name, args, *opt_depth, expr.id, ctx, expr.span),
         TypedExprKind::Cast { expr: inner, ty } => {
             let value = eval(inner, ctx)?;
             eval_cast(value, ty.value, expr.span, ctx.schema)
@@ -583,6 +583,38 @@ mod tests {
         assert_eq!(run_src("some(some((1, 2)))??.1"), Ok(some(some(int(2)))));
         assert_eq!(
             run_src("some(if true {none} else {some((1, 2))})??.0"),
+            Ok(some(Val::None))
+        );
+    }
+
+    #[test]
+    fn eval_deep_optional_methods() {
+        assert_eq!(
+            run_src("some(some([1, 2]))??.map($ + 1)"),
+            Ok(some(some(Val::List(vec![int(2), int(3)]))))
+        );
+        assert_eq!(
+            run_src("some(some([1, 2]))??.filter($ > 1)"),
+            Ok(some(some(Val::List(vec![int(2)]))))
+        );
+        assert_eq!(
+            run_src("some(some([3, 1]))??.sort()"),
+            Ok(some(some(Val::List(vec![int(1), int(3)]))))
+        );
+        assert_eq!(
+            run_src("some(some(\"hi\"))??.len()"),
+            Ok(some(some(int(2))))
+        );
+        assert_eq!(
+            run_src("some(some([1, 2]))??.nth(0)"),
+            Ok(some(some(some(int(1)))))
+        );
+        assert_eq!(
+            run_src("some(some(some(1)))??.unwrap()"),
+            Ok(some(some(int(1))))
+        );
+        assert_eq!(
+            run_src("some(if true {none} else {some([1])})??.len()"),
             Ok(some(Val::None))
         );
     }

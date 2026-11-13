@@ -79,24 +79,12 @@ impl fmt::Display for KeyedReduceKind {
 pub(super) fn eval_reduce(
     kind: ReduceKind,
     base: Val,
-    optional: bool,
     ctx: &mut EvalCtx<'_>,
     span: Span,
 ) -> Result<Val, ExecError> {
-    let items = match (optional, base) {
-        (true, Val::None) => return Ok(Val::None),
-        (true, Val::Some(v)) => match *v {
-            Val::List(items) => items,
-            other => {
-                return Err(ExecError::Integrity {
-                    message: format!(
-                        "`?.{kind}()` called on non-list value: {other} (internal error)"
-                    ),
-                });
-            }
-        },
-        (_, Val::List(items)) => items,
-        (_, other) => {
+    let items = match base {
+        Val::List(items) => items,
+        other => {
             return Err(ExecError::Integrity {
                 message: format!("`{kind}()` called on non-list value: {other} (internal error)"),
             });
@@ -121,14 +109,9 @@ pub(super) fn eval_reduce(
             ReduceKind::Min => extremum(items, std::cmp::Ordering::Less, span)?,
         }
     };
-    let result = match reduced {
+    Ok(match reduced {
         Val::None => Val::None,
         value => Val::Some(Box::new(value)),
-    };
-    Ok(if optional {
-        Val::Some(Box::new(result))
-    } else {
-        result
     })
 }
 
@@ -136,25 +119,13 @@ pub(super) fn eval_reduce(
 pub(super) fn eval_reduce_over(
     kind: KeyedReduceKind,
     base: Val,
-    optional: bool,
     args: &[TypedMethodArg],
     ctx: &mut EvalCtx<'_>,
     span: Span,
 ) -> Result<Val, ExecError> {
-    let mut items = match (optional, base) {
-        (true, Val::None) => return Ok(Val::None),
-        (true, Val::Some(v)) => match *v {
-            Val::List(items) => items,
-            other => {
-                return Err(ExecError::Integrity {
-                    message: format!(
-                        "`?.{kind}()` called on non-list value: {other} (internal error)"
-                    ),
-                });
-            }
-        },
-        (_, Val::List(items)) => items,
-        (_, other) => {
+    let mut items = match base {
+        Val::List(items) => items,
+        other => {
             return Err(ExecError::Integrity {
                 message: format!("`{kind}()` called on non-list value: {other} (internal error)"),
             });
@@ -222,11 +193,7 @@ pub(super) fn eval_reduce_over(
             }
         }
     };
-    Ok(if optional {
-        Val::Some(Box::new(reduced))
-    } else {
-        reduced
-    })
+    Ok(reduced)
 }
 
 fn collect_reduction_scalars(items: Vec<Val>, kind: ReduceKind) -> Result<Vec<Scalar>, ExecError> {

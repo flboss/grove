@@ -63,25 +63,13 @@ impl fmt::Display for SortKind {
 pub(super) fn eval_sort(
     kind: SortKind,
     base: Val,
-    optional: bool,
     args: &[TypedMethodArg],
     ctx: &mut EvalCtx<'_>,
     span: Span,
 ) -> Result<Val, ExecError> {
-    let mut items = match (optional, base) {
-        (true, Val::None) => return Ok(Val::None),
-        (true, Val::Some(v)) => match *v {
-            Val::List(items) => items,
-            other => {
-                return Err(ExecError::Integrity {
-                    message: format!(
-                        "`?.{kind}()` called on non-list value: {other} (internal error)"
-                    ),
-                });
-            }
-        },
-        (_, Val::List(items)) => items,
-        (_, other) => {
+    let mut items = match base {
+        Val::List(items) => items,
+        other => {
             return Err(ExecError::Integrity {
                 message: format!("`{kind}()` called on non-list value: {other} (internal error)"),
             });
@@ -101,12 +89,7 @@ pub(super) fn eval_sort(
     } else {
         sort_keyless(&mut items, kind, span)?;
     }
-    let sorted = Val::List(items);
-    Ok(if optional {
-        Val::Some(Box::new(sorted))
-    } else {
-        sorted
-    })
+    Ok(Val::List(items))
 }
 
 /// Keyless sort (stable) over values

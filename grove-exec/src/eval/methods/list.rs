@@ -7,22 +7,12 @@ use crate::value::{Scalar, Val};
 pub(super) fn eval_slice(
     name: &str,
     base: Val,
-    optional: bool,
     args: &[Val],
     span: Span,
 ) -> Result<Val, ExecError> {
-    let mut items = match (optional, base) {
-        (true, Val::None) => return Ok(Val::None),
-        (true, Val::Some(v)) => match *v {
-            Val::List(items) => items,
-            other => {
-                return Err(ExecError::Integrity {
-                    message: format!("`?.{name}()` on non-list value: {other} (internal error)"),
-                });
-            }
-        },
-        (_, Val::List(items)) => items,
-        (_, other) => {
+    let mut items = match base {
+        Val::List(items) => items,
+        other => {
             return Err(ExecError::Integrity {
                 message: format!("`{name}()` on non-list value: {other} (internal error)"),
             });
@@ -81,93 +71,43 @@ pub(super) fn eval_slice(
             });
         }
     };
-    Ok(if optional {
-        Val::Some(Box::new(result))
-    } else {
-        result
-    })
+    Ok(result)
 }
 
 /// Element count of a List
-pub(super) fn eval_list_len(base: Val, optional: bool) -> Result<Val, ExecError> {
-    let count = match (optional, base) {
-        (true, Val::None) => return Ok(Val::None),
-        (true, Val::Some(v)) => match *v {
-            Val::List(items) => items.len(),
-            other => {
-                return Err(ExecError::Integrity {
-                    message: format!("`?.len()` on non-list value: {other} (internal error)"),
-                });
-            }
-        },
-        (_, Val::List(items)) => items.len(),
-        (_, other) => {
-            return Err(ExecError::Integrity {
-                message: format!("`.len()` on non-list value: {other} (internal error)"),
-            });
-        }
+pub(super) fn eval_list_len(base: Val) -> Result<Val, ExecError> {
+    let Val::List(items) = base else {
+        return Err(ExecError::Integrity {
+            message: format!("`.len()` on non-list value: {base} (internal error)"),
+        });
     };
-    let len = Val::Scalar(Scalar::Int(count as i64));
-    Ok(if optional {
-        Val::Some(Box::new(len))
-    } else {
-        len
-    })
+    Ok(Val::Scalar(Scalar::Int(items.len() as i64)))
 }
 
 /// List membership by element equality
 pub(super) fn eval_list_contains(
     ctx: &mut EvalCtx<'_>,
     base: Val,
-    optional: bool,
     needle: Val,
 ) -> Result<Val, ExecError> {
     let mut operands = [base, needle];
     resolve_owning_values(ctx, &mut operands, None)?;
     let [base, needle] = operands;
-    let items = match (optional, base) {
-        (true, Val::None) => return Ok(Val::None),
-        (true, Val::Some(v)) => match *v {
-            Val::List(items) => items,
-            other => {
-                return Err(ExecError::Integrity {
-                    message: format!("`?.contains()` on non-list value: {other} (internal error)"),
-                });
-            }
-        },
-        (_, Val::List(items)) => items,
-        (_, other) => {
-            return Err(ExecError::Integrity {
-                message: format!("`.contains()` on non-list value: {other} (internal error)"),
-            });
-        }
+    let Val::List(items) = base else {
+        return Err(ExecError::Integrity {
+            message: format!("`.contains()` on non-list value: {base} (internal error)"),
+        });
     };
-    let found = items.iter().any(|item| item.eq(&needle) == Some(true));
-    let result = Val::Scalar(Scalar::Bool(found));
-    Ok(if optional {
-        Val::Some(Box::new(result))
-    } else {
-        result
-    })
+    Ok(Val::Scalar(Scalar::Bool(
+        items.iter().any(|item| item.eq(&needle) == Some(true)),
+    )))
 }
 
-pub(super) fn eval_flatten(base: Val, optional: bool) -> Result<Val, ExecError> {
-    let items = match (optional, base) {
-        (true, Val::None) => return Ok(Val::None),
-        (true, Val::Some(v)) => match *v {
-            Val::List(items) => items,
-            other => {
-                return Err(ExecError::Integrity {
-                    message: format!("`?.flatten()` on non-list value: {other} (internal error)"),
-                });
-            }
-        },
-        (_, Val::List(items)) => items,
-        (_, other) => {
-            return Err(ExecError::Integrity {
-                message: format!("`flatten()` on non-list value: {other} (internal error)"),
-            });
-        }
+pub(super) fn eval_flatten(base: Val) -> Result<Val, ExecError> {
+    let Val::List(items) = base else {
+        return Err(ExecError::Integrity {
+            message: format!("`flatten()` on non-list value: {base} (internal error)"),
+        });
     };
     let mut flat = Vec::new();
     for item in items {
@@ -180,28 +120,14 @@ pub(super) fn eval_flatten(base: Val, optional: bool) -> Result<Val, ExecError> 
             }
         }
     }
-    let flat = Val::List(flat);
-    Ok(if optional {
-        Val::Some(Box::new(flat))
-    } else {
-        flat
-    })
+    Ok(Val::List(flat))
 }
 
 /// Concatenate two compatible lists
-pub(super) fn eval_extend(base: Val, optional: bool, mut args: Vec<Val>) -> Result<Val, ExecError> {
-    let mut items = match (optional, base) {
-        (true, Val::None) => return Ok(Val::None),
-        (true, Val::Some(v)) => match *v {
-            Val::List(items) => items,
-            other => {
-                return Err(ExecError::Integrity {
-                    message: format!("`?.extend()` on non-list value: {other} (internal error)"),
-                });
-            }
-        },
-        (_, Val::List(items)) => items,
-        (_, other) => {
+pub(super) fn eval_extend(base: Val, mut args: Vec<Val>) -> Result<Val, ExecError> {
+    let mut items = match base {
+        Val::List(items) => items,
+        other => {
             return Err(ExecError::Integrity {
                 message: format!("`extend()` on non-list value: {other} (internal error)"),
             });
@@ -213,12 +139,7 @@ pub(super) fn eval_extend(base: Val, optional: bool, mut args: Vec<Val>) -> Resu
         });
     };
     items.extend(other);
-    let extended = Val::List(items);
-    Ok(if optional {
-        Val::Some(Box::new(extended))
-    } else {
-        extended
-    })
+    Ok(Val::List(items))
 }
 
 #[cfg(test)]

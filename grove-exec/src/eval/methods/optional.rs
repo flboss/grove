@@ -42,7 +42,6 @@ impl fmt::Display for OptMethodKind {
 pub(super) fn eval_optional(
     kind: OptMethodKind,
     base: Val,
-    optional: bool,
     args: &[TypedMethodArg],
     ctx: &mut EvalCtx<'_>,
     span: Span,
@@ -57,23 +56,13 @@ pub(super) fn eval_optional(
             message: "`unwrap_or()` expects one argument (internal error)".to_string(),
         });
     }
-    // dispatch already unwraps outer optional on `?.`
-    let result = match base {
-        Val::None => eval_opt_absent(kind, args, ctx, span)?,
-        Val::Some(v) => eval_opt_present(kind, *v),
-        _ => {
-            return Err(ExecError::Integrity {
-                message: format!(
-                    "`{kind}()` called on non-optional value: {base} (internal error)"
-                ),
-            });
-        }
-    };
-    Ok(if optional {
-        Val::Some(Box::new(result))
-    } else {
-        result
-    })
+    match base {
+        Val::None => eval_opt_absent(kind, args, ctx, span),
+        Val::Some(v) => Ok(eval_opt_present(kind, *v)),
+        _ => Err(ExecError::Integrity {
+            message: format!("`{kind}()` called on non-optional value: {base} (internal error)"),
+        }),
+    }
 }
 
 fn eval_opt_present(kind: OptMethodKind, value: Val) -> Val {

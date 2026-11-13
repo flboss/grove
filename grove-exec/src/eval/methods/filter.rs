@@ -8,24 +8,12 @@ use crate::value::{Scalar, Val};
 
 pub(super) fn eval_filter(
     base: Val,
-    optional: bool,
     args: &[TypedMethodArg],
     ctx: &mut EvalCtx<'_>,
 ) -> Result<Val, ExecError> {
-    let mut items = match (optional, base) {
-        (true, Val::None) => return Ok(Val::None),
-        (true, Val::Some(v)) => match *v {
-            Val::List(items) => items,
-            other => {
-                return Err(ExecError::Integrity {
-                    message: format!(
-                        "`?.filter()` called on non-list value: {other} (internal error)"
-                    ),
-                });
-            }
-        },
-        (_, Val::List(items)) => items,
-        (_, other) => {
+    let mut items = match base {
+        Val::List(items) => items,
+        other => {
             return Err(ExecError::Integrity {
                 message: format!("`filter()` called on non-list value: {other} (internal error)"),
             });
@@ -55,12 +43,7 @@ pub(super) fn eval_filter(
             }
         }
     }
-    let filtered = Val::List(kept);
-    Ok(if optional {
-        Val::Some(Box::new(filtered))
-    } else {
-        filtered
-    })
+    Ok(Val::List(kept))
 }
 
 #[cfg(test)]

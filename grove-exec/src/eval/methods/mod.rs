@@ -23,85 +23,77 @@ use super::data::resolve_base_link;
 use super::{EvalCtx, eval};
 use crate::error::ExecError;
 use crate::pushdown::CapRewrite;
-use crate::value::{Scalar, Val, rewrap_optional};
+use crate::value::{Scalar, Val, rewrap_optional, unwrap_optional_depth};
 
 pub(super) fn eval_method(
     base: &TypedExpr,
     name: &str,
     args: &[TypedMethodArg],
-    optional: bool,
+    opt_depth: usize,
     node: NodeId,
     ctx: &mut EvalCtx<'_>,
     span: Span,
 ) -> Result<Val, ExecError> {
     let base = eval(base, ctx)?;
     let base = resolve_base_link(ctx, base)?;
-    // `?.` on none returns none without evaluating args
-    let base = match (optional, base) {
-        (true, Val::None) => return Ok(Val::None),
-        (true, Val::Some(v)) => *v,
-        (_, v) => v,
-    };
+    let (base, peeled) = unwrap_optional_depth(base, opt_depth)?;
+    if peeled < opt_depth {
+        return Ok(rewrap_optional(peeled, Val::None));
+    }
     if let Some(cap) = ctx.plan.cap_plan(node)
         && ctx.applied_triggers.contains(&cap.trigger)
+        && let (CapRewrite::Skip, "take" | "skip") = (cap.rewrite, name)
     {
-        match (cap.rewrite, name) {
-            (CapRewrite::Skip, "take" | "skip") => {
-                return Ok(rewrap_optional(usize::from(optional), base));
-            }
-            (CapRewrite::First, "nth") => return eval_slice("first", base, optional, &[], span),
-            _ => {}
-        }
+        return Ok(rewrap_optional(opt_depth, base));
     }
-    if let Some(sort_kind) = SortKind::from_str(name) {
-        return eval_sort(sort_kind, base, optional, args, ctx, span);
+    if let Some(cap) = ctx.plan.cap_plan(node)
+        && ctx.applied_triggers.contains(&cap.trigger)
+        && let (CapRewrite::First, "nth") = (cap.rewrite, name)
+    {
+        return Ok(rewrap_optional(
+            opt_depth,
+            eval_slice("first", base, &[], span)?,
+        ));
     }
-    if name == "filter" {
-        return eval_filter(base, optional, args, ctx);
-    }
-    if name == "map" {
-        return eval_map(base, optional, args, ctx);
-    }
-    if let Some(kind) = ReduceKind::from_str(name) {
-        return eval_reduce(kind, base, optional, ctx, span);
-    }
-    if let Some(kind) = KeyedReduceKind::from_str(name) {
-        return eval_reduce_over(kind, base, optional, args, ctx, span);
-    }
-    if let Some(opt_kind) = OptMethodKind::from_str(name) {
-        return eval_optional(opt_kind, base, optional, args, ctx, span);
-    }
-    let mut arg_vals = args
-        .iter()
-        .map(|arg| eval(&arg.expr, ctx))
-        .collect::<Result<Vec<_>, _>>()?;
-    if name == "flatten" {
-        return eval_flatten(base, optional);
-    }
-    if name == "extend" {
-        return eval_extend(base, optional, arg_vals);
-    }
-    if matches!(name, "take" | "skip" | "first" | "nth") {
-        return eval_slice(name, base, optional, &arg_vals, span);
-    }
-    if name == "len" && matches!(base, Val::List(_)) {
-        return eval_list_len(base, optional);
-    }
-    if name == "contains" && matches!(&base, Val::List(_)) {
-        let Some(needle) = arg_vals.pop() else {
-            return Err(ExecError::Integrity {
-                message: "`contains()` expects one argument (internal error)".to_string(),
-            });
-        };
-        return eval_list_contains(ctx, base, optional, needle);
-    }
-    let scalar = eval_scalar_method(&base, name, &arg_vals, span)?;
-    let value = Val::Scalar(scalar);
-    Ok(if optional {
-        Val::Some(Box::new(value))
+
+    let result = if let Some(sort_kind) = SortKind::from_str(name) {
+        eval_sort(sort_kind, base, args, ctx, span)
+    } else if name == "filter" {
+        eval_filter(base, args, ctx)
+    } else if name == "map" {
+        eval_map(base, args, ctx)
+    } else if let Some(kind) = ReduceKind::from_str(name) {
+        eval_reduce(kind, base, ctx, span)
+    } else if let Some(kind) = KeyedReduceKind::from_str(name) {
+        eval_reduce_over(kind, base, args, ctx, span)
+    } else if let Some(opt_kind) = OptMethodKind::from_str(name) {
+        eval_optional(opt_kind, base, args, ctx, span)
     } else {
-        value
-    })
+        let mut arg_vals = args
+            .iter()
+            .map(|arg| eval(&arg.expr, ctx))
+            .collect::<Result<Vec<_>, _>>()?;
+        if name == "flatten" {
+            eval_flatten(base)
+        } else if name == "extend" {
+            eval_extend(base, arg_vals)
+        } else if matches!(name, "take" | "skip" | "first" | "nth") {
+            eval_slice(name, base, &arg_vals, span)
+        } else if name == "len" && matches!(base, Val::List(_)) {
+            eval_list_len(base)
+        } else if name == "contains" && matches!(&base, Val::List(_)) {
+            let Some(needle) = arg_vals.pop() else {
+                return Err(ExecError::Integrity {
+                    message: "`contains()` expects one argument (internal error)".to_string(),
+                });
+            };
+            eval_list_contains(ctx, base, needle)
+        } else {
+            eval_scalar_method(&base, name, &arg_vals, span).map(Val::Scalar)
+        }
+    };
+
+    Ok(rewrap_optional(opt_depth, result?))
 }
 
 fn method_arg<'a>(args: &'a [Val], method: &str, index: usize) -> Result<&'a Val, ExecError> {
