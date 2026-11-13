@@ -1066,14 +1066,7 @@ impl<'src> Lexer<'src> {
             }
             BytesDecodeError::InvalidBase64Padding { offset } => {
                 QueryLexError::BytesBase64InvalidPadding {
-                    span: if offset < content_end - content_start {
-                        char_span(offset)
-                    } else {
-                        Span {
-                            start: content_end,
-                            end: content_end,
-                        }
-                    },
+                    span: Span::new(content_start + offset, content_end),
                 }
             }
             BytesDecodeError::NonZeroTrailingBits { offset } => {
@@ -1361,7 +1354,8 @@ enum BytesDecodeError {
 }
 
 fn decode_hex_literal(content: &str) -> Result<Vec<u8>, BytesDecodeError> {
-    let mut digits: Vec<(u8, usize)> = Vec::new();
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut incomplete_byte = false;
     for (offset, ch) in content.char_indices() {
         let digit = match ch {
             ' ' | '\t' | '_' => continue,
@@ -1370,84 +1364,76 @@ fn decode_hex_literal(content: &str) -> Result<Vec<u8>, BytesDecodeError> {
             'A'..='F' => ch as u8 - b'A' + 10,
             _ => return Err(BytesDecodeError::InvalidHexDigit { offset }),
         };
-        digits.push((digit, offset));
+        if incomplete_byte {
+            *bytes.last_mut().expect("incomplete byte") |= digit;
+        } else {
+            bytes.push(digit << 4);
+        }
+        incomplete_byte = !incomplete_byte;
     }
 
-    if !digits.len().is_multiple_of(2) {
+    if incomplete_byte {
         return Err(BytesDecodeError::OddHexDigits);
-    }
-
-    let mut bytes = Vec::with_capacity(digits.len() / 2);
-    for i in (0..digits.len()).step_by(2) {
-        bytes.push((digits[i].0 << 4) | digits[i + 1].0);
     }
     Ok(bytes)
 }
 
 fn decode_b64_literal(content: &str) -> Result<Vec<u8>, BytesDecodeError> {
-    let mut chars: Vec<(char, usize)> = Vec::new();
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut incomplete_chunk = 0u8;
+    let mut padding: Vec<usize> = Vec::new();
     for (offset, ch) in content.char_indices() {
         match ch {
             ' ' | '\t' | '_' => continue,
-            '=' => chars.push((ch, offset)),
-            _ if base64_value(ch).is_some() => chars.push((ch, offset)),
-            _ => return Err(BytesDecodeError::InvalidBase64Char { offset }),
+            '=' => padding.push(offset),
+            _ => {
+                let Some(value) = base64_value(ch) else {
+                    return Err(BytesDecodeError::InvalidBase64Char { offset });
+                };
+                if !padding.is_empty() {
+                    return Err(BytesDecodeError::InvalidBase64Padding { offset });
+                }
+                match incomplete_chunk {
+                    0 => bytes.push(value << 2),
+                    1 => {
+                        *bytes.last_mut().expect("incomplete byte") |= value >> 4;
+                        bytes.push(value << 4);
+                    }
+                    2 => {
+                        *bytes.last_mut().expect("incomplete byte") |= value >> 2;
+                        bytes.push(value << 6);
+                    }
+                    _ => {
+                        *bytes.last_mut().expect("incomplete byte") |= value;
+                        incomplete_chunk = 0;
+                        continue;
+                    }
+                }
+                incomplete_chunk += 1;
+            }
         }
     }
 
-    if chars.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let padding = chars.iter().rev().take_while(|(ch, _)| *ch == '=').count();
-    let pad_offset = chars
-        .iter()
-        .find(|(ch, _)| *ch == '=')
-        .map_or(content.len(), |(_, offset)| *offset);
-
-    if padding > 2
-        || chars[..chars.len() - padding]
-            .iter()
-            .any(|(ch, _)| *ch == '=')
-        || !chars.len().is_multiple_of(4)
-    {
-        return Err(BytesDecodeError::InvalidBase64Padding { offset: pad_offset });
-    }
-
-    let data_len = chars.len() - padding;
-    match (data_len % 4, padding) {
-        (0, 0) | (2, 2) | (3, 1) => {}
+    match (incomplete_chunk, padding.len()) {
+        (0, 0) => {}
+        (2, 2) => {
+            if bytes.pop().expect("incomplete byte") != 0 {
+                return Err(BytesDecodeError::NonZeroTrailingBits {
+                    offset: padding.first().unwrap() - 1,
+                });
+            }
+        }
+        (3, 1) => {
+            if bytes.pop().expect("incomplete byte") != 0 {
+                return Err(BytesDecodeError::NonZeroTrailingBits {
+                    offset: padding.first().unwrap() - 1,
+                });
+            }
+        }
         _ => {
-            return Err(BytesDecodeError::InvalidBase64Padding { offset: pad_offset });
-        }
-    }
-
-    let mut bytes = Vec::with_capacity((data_len + 2) / 4 * 3);
-    for chunk in chars[..data_len].chunks(4) {
-        let values: Vec<u8> = chunk
-            .iter()
-            .map(|(ch, _)| base64_value(*ch).expect("validated base64 character"))
-            .collect();
-        match values.as_slice() {
-            [a, b, c, d] => {
-                bytes.push((a << 2) | (b >> 4));
-                bytes.push(((b & 0x0F) << 4) | (c >> 2));
-                bytes.push(((c & 0x03) << 6) | d);
-            }
-            [a, b, c] => {
-                if c & 0x03 != 0 {
-                    return Err(BytesDecodeError::NonZeroTrailingBits { offset: chunk[2].1 });
-                }
-                bytes.push((a << 2) | (b >> 4));
-                bytes.push(((b & 0x0F) << 4) | (c >> 2));
-            }
-            [a, b] => {
-                if b & 0x0F != 0 {
-                    return Err(BytesDecodeError::NonZeroTrailingBits { offset: chunk[1].1 });
-                }
-                bytes.push((a << 2) | (b >> 4));
-            }
-            _ => unreachable!("base64 data length was validated"),
+            return Err(BytesDecodeError::InvalidBase64Padding {
+                offset: padding.first().copied().unwrap_or(content.len()),
+            });
         }
     }
     Ok(bytes)

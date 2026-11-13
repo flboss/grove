@@ -121,7 +121,7 @@ impl From<QueryLexError> for Diagnostic {
                 "invalid padding",
             )
             .with_help(
-                "padding must complete the final 3-byte group:
+                "padding must complete the final 3-byte group: \
                 `==` for 2 digits, `=` for 3 digits, no padding for 4 digits",
             ),
             BytesBase64NonZeroTrailingBits { span } => error_simple(
