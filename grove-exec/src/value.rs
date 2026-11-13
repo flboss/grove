@@ -197,21 +197,6 @@ pub(crate) fn enum_variant_scalar(enum_def: &Enum, index: usize) -> Option<Scala
         .map(|variant| enum_value_scalar(variant.value.clone()))
 }
 
-pub(crate) fn enum_variant_index(enum_def: &Enum, scalar: &Scalar) -> Option<usize> {
-    enum_def
-        .variants
-        .iter()
-        .position(|variant| enum_value_matches_scalar(&variant.value, scalar))
-}
-
-fn enum_value_matches_scalar(value: &EnumValue, scalar: &Scalar) -> bool {
-    match (value, scalar) {
-        (EnumValue::Int(a), Scalar::Int(b)) => a == b,
-        (EnumValue::String(a), Scalar::String(b)) => a == b,
-        _ => false,
-    }
-}
-
 impl Scalar {
     pub fn cmp(&self, other: &Scalar, span: Span) -> Result<std::cmp::Ordering, ExecError> {
         match (self, other) {

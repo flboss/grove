@@ -5,8 +5,8 @@ use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 use grove_schema::validated::{
-    EnumId, Field, FieldId, Relation, RelationId, ScalarType, StorageTable, StructId,
-    ValidatedSchema, ValueType,
+    EnumId, EnumUnderlying, EnumValue, Field, FieldId, Relation, RelationId, ScalarType,
+    StorageTable, StructId, ValidatedSchema, ValueType,
 };
 use rusqlite::Connection;
 use rusqlite::Statement;
@@ -18,7 +18,7 @@ use crate::codec;
 use crate::error::ExecError;
 use crate::pushdown::{CmpOp, FetchConstraints, PushExpr, StringOp};
 use crate::storage::{Key, Row, Storage};
-use crate::value::{Scalar, Val, enum_variant_index};
+use crate::value::{Scalar, Val};
 
 pub struct SqliteBackend<'a> {
     conn: Connection,
@@ -354,7 +354,7 @@ fn decode_node(
         ValueType::Scalar(scalar) => {
             decode_scalar(*scalar, vals[0], false, float_checks).map(|v| (v, 1))
         }
-        ValueType::Enum(id) => decode_enum(*id, vals[0], float_checks, schema).map(|v| (v, 1)),
+        ValueType::Enum(id) => decode_enum(*id, vals[0], schema).map(|v| (v, 1)),
         ValueType::Optional(inner) => {
             let len = leaf_count(inner);
             if vals[..len].iter().all(|v| matches!(v, ValueRef::Null)) {
@@ -381,7 +381,6 @@ fn decode_node(
 fn decode_enum(
     enum_id: EnumId,
     value: ValueRef<'_>,
-    float_checks: bool,
     schema: &ValidatedSchema,
 ) -> Result<Val, ExecError> {
     let enum_def = schema
@@ -390,19 +389,34 @@ fn decode_enum(
         .ok_or_else(|| ExecError::Integrity {
             message: format!("unknown enum id {} (internal error)", enum_id.index()),
         })?;
-    let scalar = match decode_scalar(
-        enum_def.underlying.scalar_type(),
-        value,
-        false,
-        float_checks,
-    )? {
-        Val::Scalar(scalar) => scalar,
-        _ => unreachable!("scalar decode returned a non-scalar"),
+    let invalid = |found: &str| ExecError::Integrity {
+        message: format!("invalid value {found} for enum `{}`", enum_def.name),
     };
-    let Some(index) = enum_variant_index(enum_def, &scalar) else {
-        return Err(ExecError::Integrity {
-            message: format!("invalid value {scalar} for enum `{}`", enum_def.name),
-        });
+    let index = match (enum_def.underlying, value) {
+        (EnumUnderlying::Int, ValueRef::Integer(n)) => enum_def
+            .variants
+            .iter()
+            .position(|v| matches!(v.value, EnumValue::Int(m) if m == n))
+            .ok_or_else(|| invalid(&n.to_string()))?,
+        (EnumUnderlying::String, ValueRef::Text(bytes)) => {
+            let text = str::from_utf8(bytes).map_err(|_| ExecError::Integrity {
+                message: "expected String, found non-UTF8 TEXT".to_string(),
+            })?;
+            enum_def
+                .variants
+                .iter()
+                .position(|v| matches!(&v.value, EnumValue::String(s) if s == text))
+                .ok_or_else(|| invalid(&format!("{text:?}")))?
+        }
+        (underlying, other) => {
+            return Err(ExecError::Integrity {
+                message: format!(
+                    "expected {:?}, found {}",
+                    underlying.scalar_type(),
+                    stored_class(&other)
+                ),
+            });
+        }
     };
     Ok(Val::Enum(enum_id, index))
 }
@@ -588,9 +602,7 @@ fn semi(
         ElemPlan::Scalar(scalar) => {
             decode_scalar(*scalar, cells[0], false, float_checks).map(|v| (SemiVal::Done(v), 1))
         }
-        ElemPlan::Enum(id) => {
-            decode_enum(*id, cells[0], float_checks, schema).map(|v| (SemiVal::Done(v), 1))
-        }
+        ElemPlan::Enum(id) => decode_enum(*id, cells[0], schema).map(|v| (SemiVal::Done(v), 1)),
         ElemPlan::Tuple(plans) => {
             let mut items = Vec::with_capacity(plans.len());
             let mut used = 0;
