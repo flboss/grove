@@ -65,18 +65,18 @@ pub enum TypedExprKind {
     Field {
         base: Box<TypedExpr>,
         name: Spanned<String>,
-        optional: bool,
+        opt_depth: usize,
     },
     TupleAccess {
         base: Box<TypedExpr>,
         index: usize,
-        optional: bool,
+        opt_depth: usize,
     },
     Method {
         base: Box<TypedExpr>,
         name: Spanned<String>,
         args: Vec<TypedMethodArg>,
-        optional: bool,
+        opt_depth: usize,
     },
     Binary {
         op: Spanned<BinaryOp>,
@@ -200,6 +200,25 @@ impl QueryType {
 
     pub fn wrap_optional(self) -> QueryType {
         QueryType::Optional(Box::new(self))
+    }
+
+    pub fn unwrap_optional_depth(&self, depth: usize) -> Option<&QueryType> {
+        let mut ty = self;
+        for _ in 0..depth {
+            let QueryType::Optional(inner) = ty else {
+                return None;
+            };
+            ty = inner;
+        }
+        Some(ty)
+    }
+
+    pub fn wrap_optional_depth(self, depth: usize) -> QueryType {
+        let mut ty = self;
+        for _ in 0..depth {
+            ty = ty.wrap_optional();
+        }
+        ty
     }
 
     pub fn is_unknown(&self) -> bool {

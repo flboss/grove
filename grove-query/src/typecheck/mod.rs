@@ -243,30 +243,30 @@ fn infer(expr: &Expr, env: &mut TypeEnv) -> Result<TypedExpr, TypeError> {
         Expr::Field {
             base,
             name,
-            opt_depth: optional,
+            opt_depth,
             ..
         } => {
             let typed_base = infer(base, env)?;
-            infer_field(typed_base, name, *optional, env)
+            infer_field(typed_base, name, *opt_depth, env)
         }
         Expr::TupleAccess {
             base,
             index,
-            opt_depth: optional,
+            opt_depth,
             ..
         } => {
             let typed_base = infer(base, env)?;
-            infer_tuple_access(typed_base, index, *optional, env)
+            infer_tuple_access(typed_base, index, *opt_depth, env)
         }
         Expr::Method {
             base,
             name,
             args,
-            opt_depth: optional,
+            opt_depth,
             ..
         } => {
             let typed_base = infer(base, env)?;
-            infer_method(typed_base, name, args, *optional, env)
+            infer_method(typed_base, name, args, *opt_depth, env)
         }
         Expr::Binary { op, lhs, rhs, .. } => infer_binary(op, lhs, rhs, env),
         Expr::Unary { op, expr, .. } => infer_unary(op, expr, env),
@@ -590,23 +590,16 @@ fn infer_field(
     opt_depth: usize,
     env: &mut TypeEnv,
 ) -> Result<TypedExpr, TypeError> {
-    let optional = opt_depth > 0;
     let schema = env.schema();
-    let lookup_ty = if optional {
-        match &base.ty {
-            QueryType::Optional(inner) => inner.as_ref().clone(),
-            other => {
-                return Err(TypeError::ArgTypeMismatch {
-                    method: name.value.clone(),
-                    expected: "optional type".into(),
-                    got: other.to_string(),
-                    span: name.span,
-                });
-            }
-        }
-    } else {
-        base.ty.clone()
-    };
+    let lookup_ty = base
+        .ty
+        .unwrap_optional_depth(opt_depth)
+        .ok_or_else(|| TypeError::OptionalDepthMismatch {
+            depth: opt_depth,
+            ty: base.ty.to_string(),
+            span: name.span,
+        })?
+        .clone();
 
     let (inner, was_list) = match &lookup_ty {
         QueryType::List(inner) => (inner.as_ref().clone(), true),
@@ -624,16 +617,14 @@ fn infer_field(
     if was_list {
         field_ty = QueryType::List(Box::new(field_ty));
     }
-    if optional {
-        field_ty = field_ty.wrap_optional();
-    }
+    let field_ty = field_ty.wrap_optional_depth(opt_depth);
 
     let span = Span::new(base.span.start, name.span.end);
     Ok(env.typed(
         TypedExprKind::Field {
             base: Box::new(base),
             name: name.clone(),
-            optional,
+            opt_depth,
         },
         field_ty,
         span,
@@ -646,21 +637,15 @@ fn infer_tuple_access(
     opt_depth: usize,
     env: &mut TypeEnv,
 ) -> Result<TypedExpr, TypeError> {
-    let optional = opt_depth > 0;
-        match &base.ty {
-            QueryType::Optional(inner) => inner.as_ref().clone(),
-            other => {
-                return Err(TypeError::ArgTypeMismatch {
-                    method: format!(".{}", index.value),
-                    expected: "optional type".into(),
-                    got: other.to_string(),
-                    span: index.span,
-                });
-            }
-        }
-    } else {
-        base.ty.clone()
-    };
+    let lookup_ty = base
+        .ty
+        .unwrap_optional_depth(opt_depth)
+        .ok_or_else(|| TypeError::OptionalDepthMismatch {
+            depth: opt_depth,
+            ty: base.ty.to_string(),
+            span: index.span,
+        })?
+        .clone();
     let QueryType::Tuple(elems) = &lookup_ty else {
         return Err(TypeError::TupleAccessOnNonTuple {
             base_ty: base.ty.to_string(),
@@ -675,16 +660,13 @@ fn infer_tuple_access(
             span: index.span,
         });
     }
-    let mut elem_ty = elems[pos].clone();
-    if optional {
-        elem_ty = elem_ty.wrap_optional();
-    }
+    let elem_ty = elems[pos].clone().wrap_optional_depth(opt_depth);
     let span = Span::new(base.span.start, index.span.end);
     Ok(env.typed(
         TypedExprKind::TupleAccess {
             base: Box::new(base),
             index: pos,
-            optional,
+            opt_depth,
         },
         elem_ty,
         span,
@@ -709,21 +691,15 @@ fn infer_method(
     opt_depth: usize,
     env: &mut TypeEnv,
 ) -> Result<TypedExpr, TypeError> {
-    let optional = opt_depth > 0;
-        match &base.ty {
-            QueryType::Optional(inner) => inner.as_ref().clone(),
-            other => {
-                return Err(TypeError::ArgTypeMismatch {
-                    method: name.value.clone(),
-                    expected: "optional type".into(),
-                    got: other.to_string(),
-                    span: name.span,
-                });
-            }
-        }
-    } else {
-        base.ty.clone()
-    };
+    let resolve_ty = base
+        .ty
+        .unwrap_optional_depth(opt_depth)
+        .ok_or_else(|| TypeError::OptionalDepthMismatch {
+            depth: opt_depth,
+            ty: base.ty.to_string(),
+            span: name.span,
+        })?
+        .clone();
 
     let mut signature =
         method_signature(&resolve_ty, &name.value).ok_or_else(|| TypeError::UnknownMethod {
@@ -850,11 +826,7 @@ fn infer_method(
         _ => signature.return_type,
     };
 
-    let return_ty = if optional {
-        return_ty.wrap_optional()
-    } else {
-        return_ty
-    };
+    let return_ty = return_ty.wrap_optional_depth(opt_depth);
 
     let span = Span::new(base.span.start, name.span.end);
     Ok(env.typed(
@@ -862,7 +834,7 @@ fn infer_method(
             base: Box::new(base),
             name: name.clone(),
             args: typed_args,
-            optional,
+            opt_depth,
         },
         return_ty,
         span,
@@ -2463,6 +2435,80 @@ mod tests {
         let result = infer(&file.unwrap().result, &mut env).unwrap();
         assert!(
             matches!(result.ty, QueryType::List(inner) if matches!(*inner, QueryType::Optional(_)))
+        );
+    }
+
+    #[test]
+    fn deep_optional_tuple_access() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _diags) = crate::parse_query("some(some((1, 2)))??.1");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(
+            result.ty,
+            QueryType::Scalar(ScalarType::Int)
+                .wrap_optional()
+                .wrap_optional()
+        );
+    }
+
+    #[test]
+    fn deep_optional_field_and_method() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _diags) =
+            crate::parse_query(r#"some(some({name = "Ada"}))??.name??.to_upper()"#);
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(
+            result.ty,
+            QueryType::Scalar(ScalarType::String)
+                .wrap_optional()
+                .wrap_optional()
+        );
+    }
+
+    #[test]
+    fn deep_optional_list_method() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _diags) = crate::parse_query("some(some([1, 2]))??.map($ + 1)");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(
+            result.ty,
+            QueryType::List(Box::new(QueryType::Scalar(ScalarType::Int)))
+                .wrap_optional()
+                .wrap_optional()
+        );
+    }
+
+    #[test]
+    fn optional_depth_mismatch() {
+        let schema = test_schema();
+        let (file, _diags) = crate::parse_query("1?.to_string()");
+        let (typed, diags) = typecheck(file.unwrap(), &schema);
+        assert!(typed.is_none());
+        assert_eq!(diags[0].code.as_ref(), "QT0032");
+        let (file, _diags) = crate::parse_query("some(some(2))???.to_string()");
+        let (typed, diags) = typecheck(file.unwrap(), &schema);
+        assert!(typed.is_none());
+        assert_eq!(diags[0].code.as_ref(), "QT0032");
+        let (file, _diags) = crate::parse_query("some(some(3))?.to_string()");
+        let (typed, diags) = typecheck(file.unwrap(), &schema);
+        assert!(typed.is_none());
+        assert_eq!(diags[0].code.as_ref(), "QT0003");
+    }
+
+    #[test]
+    fn optional_method_inner_base() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _diags) = crate::parse_query("some(some(some(1)))??.unwrap()");
+        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        assert_eq!(
+            result.ty,
+            QueryType::Scalar(ScalarType::Int)
+                .wrap_optional()
+                .wrap_optional()
         );
     }
 

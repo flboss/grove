@@ -161,19 +161,27 @@ pub fn eval(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
         TypedExprKind::Field {
             base,
             name,
-            optional,
-        } => exec_field(base, &name.value, *optional, expr.id, ctx),
+            opt_depth,
+        } => exec_field(base, &name.value, *opt_depth > 0, expr.id, ctx),
         TypedExprKind::TupleAccess {
             base,
             index,
-            optional,
-        } => eval_tuple_access(base, *index, *optional, ctx),
+            opt_depth,
+        } => eval_tuple_access(base, *index, *opt_depth > 0, ctx),
         TypedExprKind::Method {
             base,
             name,
             args,
-            optional,
-        } => eval_method(base, &name.value, args, *optional, expr.id, ctx, expr.span),
+            opt_depth,
+        } => eval_method(
+            base,
+            &name.value,
+            args,
+            *opt_depth > 0,
+            expr.id,
+            ctx,
+            expr.span,
+        ),
         TypedExprKind::Cast { expr: inner, ty } => {
             let value = eval(inner, ctx)?;
             eval_cast(value, ty.value, expr.span, ctx.schema)

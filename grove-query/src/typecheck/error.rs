@@ -34,6 +34,7 @@ pub enum TypeError {
     TupleIndexOutOfRange { index: usize, len: usize, span: Span },
     UnknownEnum { name: String, span: Span },
     UnknownEnumVariant { enum_name: String, variant: String, span: Span },
+    OptionalDepthMismatch { depth: usize, ty: String, span: Span },
 }
 
 impl From<TypeError> for Diagnostic {
@@ -289,6 +290,12 @@ impl From<TypeError> for Diagnostic {
                 format!("enum `{enum_name}` has no variant `{variant}`"),
                 span,
                 "no such variant",
+            ),
+            TypeError::OptionalDepthMismatch { depth, ty, span } => error_simple(
+                "QT0032",
+                format!("optional chaining depth {depth} exceeds the optional layers in `{ty}`"),
+                span,
+                format!("needs {depth} optional layer(s)"),
             ),
         }
     }

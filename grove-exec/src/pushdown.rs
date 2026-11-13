@@ -326,14 +326,14 @@ impl<'a> PlanBuilder<'a> {
                 base,
                 name,
                 args,
-                optional,
+                opt_depth,
             } => {
                 let base_need = method_base_need(&name.value, need);
                 let summary = self.visit(base, base_need);
                 for arg in args {
                     self.visit(&arg.expr, Need::Whole);
                 }
-                self.extend_chain(expr.id, &name.value, *optional, args, summary)
+                self.extend_chain(expr.id, &name.value, *opt_depth > 0, args, summary)
             }
             TypedExprKind::Binary { lhs, rhs, .. } => {
                 self.visit(lhs, Need::Whole);
@@ -747,7 +747,7 @@ impl<'a> PlanBuilder<'a> {
                 base,
                 name,
                 args,
-                optional: false,
+                opt_depth: 0,
             } => {
                 let QueryType::Scalar(ScalarType::String) = &base.ty else {
                     return None;
