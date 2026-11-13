@@ -139,7 +139,7 @@ impl From<QueryLexError> for Diagnostic {
             }
             UnexpectedQuestion { span } => {
                 error_simple("QL0015", "unexpected `?`", span, "unexpected `?`")
-                    .with_help("use `?.` for optional chaining")
+                    .with_help("use `?.`, `??.`, ... for optional chaining")
             }
             UnexpectedColon { span } => {
                 error_simple("QL0016", "unexpected `:`", span, "unexpected `:`")

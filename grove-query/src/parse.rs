@@ -250,8 +250,8 @@ impl<'src> Parser<'src> {
 
         loop {
             match self.current.value {
-                TokenKind::Dot | TokenKind::QuestionDot => {
-                    let optional = matches!(self.current.value, TokenKind::QuestionDot);
+                TokenKind::Dot | TokenKind::QuestionDot(_) => {
+                    let optional = matches!(self.current.value, TokenKind::QuestionDot(_));
                     self.bump();
                     if let TokenKind::IntLit(n) = &self.current.value {
                         let (n, index_span) = (*n, self.current.span);
@@ -477,8 +477,8 @@ impl<'src> Parser<'src> {
         };
         let mut expr = Expr::Ident(first);
 
-        while matches!(self.current.value, TokenKind::Dot | TokenKind::QuestionDot) {
-            let optional = matches!(self.current.value, TokenKind::QuestionDot);
+        while matches!(self.current.value, TokenKind::Dot | TokenKind::QuestionDot(_)) {
+            let optional = matches!(self.current.value, TokenKind::QuestionDot(_));
             self.bump();
             if let TokenKind::IntLit(n) = &self.current.value {
                 let (n, index_span) = (*n, self.current.span);

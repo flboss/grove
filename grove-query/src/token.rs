@@ -46,7 +46,7 @@ pub enum TokenKind {
     Comma,
     Semicolon,
     Dot,
-    QuestionDot,
+    QuestionDot(usize),
     Dollar(usize),
     Equals,
     EqualsEquals,

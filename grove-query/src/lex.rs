@@ -33,7 +33,7 @@ impl<'src> Lexer<'src> {
         } else {
             self.advance_inner()
         };
-        self.after_dot = matches!(tok.value, TokenKind::Dot | TokenKind::QuestionDot);
+        self.after_dot = matches!(tok.value, TokenKind::Dot | TokenKind::QuestionDot(_));
         tok
     }
 
@@ -58,7 +58,7 @@ impl<'src> Lexer<'src> {
 
     fn advance(&mut self) -> Token {
         let tok = self.advance_inner();
-        self.after_dot = matches!(tok.value, TokenKind::Dot | TokenKind::QuestionDot);
+        self.after_dot = matches!(tok.value, TokenKind::Dot | TokenKind::QuestionDot(_));
         tok
     }
 
@@ -202,9 +202,14 @@ impl<'src> Lexer<'src> {
     }
 
     fn scan_question_or_error(&mut self, start: usize) -> Token {
+        let mut depth = 1;
+        while self.peek_char() == Some('?') {
+            self.bump();
+            depth += 1;
+        }
         if self.peek_char() == Some('.') {
             self.bump();
-            return self.make_token(start, TokenKind::QuestionDot);
+            return self.make_token(start, TokenKind::QuestionDot(depth));
         }
         self.emit_error(QueryLexError::UnexpectedQuestion {
             span: self.span_from(start),
@@ -1576,8 +1581,34 @@ mod tests {
         assert_token!(lex, TokenKind::AmpAmp);
         assert_token!(lex, TokenKind::PipePipe);
         assert_token!(lex, TokenKind::DoubleColon);
-        assert_token!(lex, TokenKind::QuestionDot);
+        assert_token!(lex, TokenKind::QuestionDot(1));
         assert_eof!(lex);
+    }
+
+    #[test]
+    fn question_dot_depth() {
+        let mut lex = Lexer::new("?. ??. ????. foo??.1");
+        assert_token!(lex, TokenKind::QuestionDot(1));
+        assert_token!(lex, TokenKind::QuestionDot(2));
+        assert_token!(lex, TokenKind::QuestionDot(4));
+        assert_ident!(lex, "foo");
+        assert_token!(lex, TokenKind::QuestionDot(2));
+        assert_eq!(lex.next_token().value, TokenKind::IntLit(1));
+        assert_eof!(lex);
+        assert!(lex.take_diagnostics().is_empty());
+    }
+
+    #[test]
+    fn question_without_dot_error() {
+        for source in ["??", "??x", "????"] {
+            let mut lex = Lexer::new(source);
+            loop {
+                if matches!(lex.next_token().value, TokenKind::Eof) {
+                    break;
+                }
+            }
+            assert_eq!(lex.take_diagnostics().len(), 1, "{source}");
+        }
     }
 
     #[test]
