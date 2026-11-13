@@ -1892,10 +1892,7 @@ mod tests {
     fn infer_enum_variant() {
         let schema = enum_schema();
         let priority_id = schema.enum_by_name("Priority").unwrap().0;
-        let mut env = TypeEnv::new(&schema);
-        let (file, diags) = crate::parse_query("Priority::Medium");
-        assert!(diags.is_empty(), "parse diagnostics: {diags:?}");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        let result = infer_ok("Priority::Medium", &schema);
         assert_eq!(result.ty, QueryType::Enum(priority_id));
         assert!(matches!(
             result.kind,
@@ -1910,40 +1907,35 @@ mod tests {
     fn enum_field_type() {
         let schema = enum_schema();
         let priority_id = schema.enum_by_name("Priority").unwrap().0;
-        let mut env = TypeEnv::new(&schema);
-        let (file, diags) = crate::parse_query("tickets.first().unwrap().priority");
-        assert!(diags.is_empty(), "parse diagnostics: {diags:?}");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Enum(priority_id));
+        assert_eq!(
+            infer_ok("tickets.first().unwrap().priority", &schema).ty,
+            QueryType::Enum(priority_id)
+        );
     }
 
     #[test]
     fn unknown_enum_rejected() {
-        let schema = enum_schema();
-        assert_eq!(error_codes("Missing::High", &schema), vec!["QT0030"]);
+        assert_eq!(error_codes("Missing::High", &enum_schema()), vec!["QT0030"]);
     }
 
     #[test]
     fn unknown_enum_variant_rejected() {
-        let schema = enum_schema();
-        assert_eq!(error_codes("Priority::Urgent", &schema), vec!["QT0031"]);
+        assert_eq!(
+            error_codes("Priority::Urgent", &enum_schema()),
+            vec!["QT0031"]
+        );
     }
 
     #[test]
     fn enum_equality_and_membership() {
-        let schema = enum_schema();
-        let mut env = TypeEnv::new(&schema);
         for source in [
             "Priority::High == Priority::Low",
             "Priority::High != Priority::Low",
             "Priority::High in (Priority::Low, Priority::High)",
             "[Priority::Low, Priority::High].contains(Priority::High)",
         ] {
-            let (file, diags) = crate::parse_query(source);
-            assert!(diags.is_empty(), "parse diagnostics: {diags:?}");
-            let result = infer(&file.unwrap().result, &mut env).unwrap();
             assert_eq!(
-                result.ty,
+                infer_ok(source, &enum_schema()).ty,
                 QueryType::Scalar(ScalarType::Bool),
                 "source: {source}"
             );
@@ -1952,18 +1944,16 @@ mod tests {
 
     #[test]
     fn enum_raw_value_comparison_rejected() {
-        let schema = enum_schema();
         assert_eq!(
-            error_codes(r#"Priority::High == "high""#, &schema),
+            error_codes(r#"Priority::High == "high""#, &enum_schema()),
             vec!["QT0007"]
         );
     }
 
     #[test]
     fn different_enum_comparison_rejected() {
-        let schema = enum_schema();
         assert_eq!(
-            error_codes("Priority::Low == Level::Low", &schema),
+            error_codes("Priority::Low == Level::Low", &enum_schema()),
             vec!["QT0007"]
         );
     }
@@ -1984,18 +1974,15 @@ mod tests {
     #[test]
     fn enum_cast_to_underlying_value() {
         let schema = enum_schema();
-        let mut env = TypeEnv::new(&schema);
 
-        let (file, diags) = crate::parse_query("Priority::High as String");
-        assert!(diags.is_empty(), "parse diagnostics: {diags:?}");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        let result = infer_ok("Priority::High as String", &schema);
         assert_eq!(result.ty, QueryType::Scalar(ScalarType::String));
         assert!(matches!(result.kind, TypedExprKind::Cast { .. }));
 
-        let (file, diags) = crate::parse_query("Level::High as Int");
-        assert!(diags.is_empty(), "parse diagnostics: {diags:?}");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Int));
+        assert_eq!(
+            infer_ok("Level::High as Int", &schema).ty,
+            QueryType::Scalar(ScalarType::Int)
+        );
     }
 
     #[test]
@@ -2015,19 +2002,13 @@ mod tests {
     fn enum_optional_and_projection() {
         let schema = enum_schema();
         let priority_id = schema.enum_by_name("Priority").unwrap().0;
-        let mut env = TypeEnv::new(&schema);
 
-        let (file, diags) = crate::parse_query("some(Priority::High)");
-        assert!(diags.is_empty(), "parse diagnostics: {diags:?}");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
         assert_eq!(
-            result.ty,
+            infer_ok("some(Priority::High)", &schema).ty,
             QueryType::Optional(Box::new(QueryType::Enum(priority_id)))
         );
 
-        let (file, diags) = crate::parse_query("tickets { priority }");
-        assert!(diags.is_empty(), "parse diagnostics: {diags:?}");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        let result = infer_ok("tickets { priority }", &schema);
         match result.ty {
             QueryType::List(inner) => match *inner {
                 QueryType::Record(RecordSource::Projection(fields)) => {
@@ -2041,46 +2022,41 @@ mod tests {
 
     #[test]
     fn infer_int_literal() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("42");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Int));
+        assert_eq!(
+            infer_ok("42", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Int)
+        );
     }
 
     #[test]
     fn infer_float_literal() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("3.14f");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Float));
+        assert_eq!(
+            infer_ok("3.14f", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Float)
+        );
     }
 
     #[test]
     fn infer_dec_literal() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("3.14");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Dec));
+        assert_eq!(
+            infer_ok("3.14", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Dec)
+        );
     }
 
     #[test]
     fn infer_string_literal() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("\"hello\"");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::String));
+        assert_eq!(
+            infer_ok("\"hello\"", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::String)
+        );
     }
 
     #[test]
     fn infer_bytes_literal() {
-        let schema = test_schema();
         for source in [r#"hex"deadbeef""#, r#"b64"3q2+7w==""#] {
             assert_eq!(
-                infer_ok(source, &schema).ty,
+                infer_ok(source, &test_schema()).ty,
                 QueryType::Scalar(ScalarType::Bytes),
                 "source: {source}"
             );
@@ -2089,10 +2065,9 @@ mod tests {
 
     #[test]
     fn bytes_len_method() {
-        let schema = test_schema();
         for source in [r#"hex"deadbeef".len()"#, r#"b64"3q2+7w==".len()"#] {
             assert_eq!(
-                infer_ok(source, &schema).ty,
+                infer_ok(source, &test_schema()).ty,
                 QueryType::Scalar(ScalarType::Int),
                 "source: {source}"
             );
@@ -2101,9 +2076,8 @@ mod tests {
 
     #[test]
     fn bytes_cast_from_string() {
-        let schema = test_schema();
         assert_eq!(
-            infer_ok(r#""hello" as Bytes"#, &schema).ty,
+            infer_ok(r#""hello" as Bytes"#, &test_schema()).ty,
             QueryType::Scalar(ScalarType::Bytes)
         );
     }
@@ -2142,38 +2116,34 @@ mod tests {
 
     #[test]
     fn infer_bool_literal() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("true");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Bool));
+        assert_eq!(
+            infer_ok("true", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Bool)
+        );
     }
 
     #[test]
     fn infer_instant_literal() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("@now");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Instant));
+        assert_eq!(
+            infer_ok("@now", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Instant)
+        );
     }
 
     #[test]
     fn infer_duration_literal() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("#30d");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Duration));
+        assert_eq!(
+            infer_ok("#30d", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Duration)
+        );
     }
 
     #[test]
     fn none_without_context_unknown() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("none");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Unknown.wrap_optional());
+        assert_eq!(
+            infer_ok("none", &test_schema()).ty,
+            QueryType::Unknown.wrap_optional()
+        );
     }
 
     #[test]
@@ -2213,10 +2183,7 @@ mod tests {
 
     #[test]
     fn ident_binding_root() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("users");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        let result = infer_ok("users", &test_schema());
         let TypedExprKind::Ident {
             name,
             binding,
@@ -2234,9 +2201,7 @@ mod tests {
     fn ident_binding_scoped_field() {
         let schema = test_schema();
         let user = schema.roots[0].struct_id;
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("users[active]");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        let result = infer_ok("users[active]", &schema);
         let TypedExprKind::Method { args, .. } = &result.kind else {
             panic!("expected method, got {:?}", result.kind);
         };
@@ -2257,9 +2222,7 @@ mod tests {
     fn ident_binding_scoped_ref_field() {
         let schema = test_schema();
         let user = schema.roots[0].struct_id;
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("users[profile.is_some()]");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        let result = infer_ok("users[profile.is_some()]", &schema);
         let TypedExprKind::Method { args, .. } = &result.kind else {
             panic!("expected method, got {:?}", result.kind);
         };
@@ -2281,10 +2244,7 @@ mod tests {
 
     #[test]
     fn ident_binding_projected_field() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("users { name } { name }");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        let result = infer_ok("users { name } { name }", &test_schema());
         let TypedExprKind::Projection { items, .. } = &result.kind else {
             panic!("expected projection, got {:?}", result.kind);
         };
@@ -2308,10 +2268,7 @@ mod tests {
 
     #[test]
     fn ident_binding_projected_scoped_field() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query(r#"users { name }[name == "Alice"]"#);
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        let result = infer_ok(r#"users { name }[name == "Alice"]"#, &test_schema());
         let TypedExprKind::Method { args, .. } = &result.kind else {
             panic!("expected method, got {:?}", result.kind);
         };
@@ -2338,9 +2295,8 @@ mod tests {
 
     #[test]
     fn let_statement_binds_value_type() {
-        let schema = test_schema();
         let (file, _) = crate::parse_query("let x = 42; x");
-        let (typed, diags) = typecheck(file.unwrap(), &schema);
+        let (typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(diags.is_empty(), "expected no errors, got {diags:?}");
         let typed = typed.unwrap();
         let TypedStatement::Let(let_stmt) = &typed.statements[0] else {
@@ -2358,18 +2314,16 @@ mod tests {
 
     #[test]
     fn let_chain_scope_visible() {
-        let schema = test_schema();
         let (file, _) = crate::parse_query("let a = 1; let b = a; b");
-        let (typed, diags) = typecheck(file.unwrap(), &schema);
+        let (typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(diags.is_empty(), "expected no errors, got {diags:?}");
         assert_eq!(typed.unwrap().statements.len(), 2);
     }
 
     #[test]
     fn let_collection_type() {
-        let schema = test_schema();
         let (file, _) = crate::parse_query("let names = users { name }; names");
-        let (typed, diags) = typecheck(file.unwrap(), &schema);
+        let (typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(diags.is_empty(), "expected no errors, got {diags:?}");
         let typed = typed.unwrap();
         let TypedStatement::Let(let_stmt) = &typed.statements[0] else {
@@ -2381,25 +2335,22 @@ mod tests {
 
     #[test]
     fn let_use_before_def() {
-        let schema = test_schema();
         let (file, _) = crate::parse_query("let x = y; 0");
-        let (_, diags) = typecheck(file.unwrap(), &schema);
+        let (_, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(diags.iter().any(|d| d.code.as_ref() == "QT0001"));
     }
 
     #[test]
     fn let_self_reference_error() {
-        let schema = test_schema();
         let (file, _) = crate::parse_query("let x = x; 0");
-        let (_, diags) = typecheck(file.unwrap(), &schema);
+        let (_, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(diags.iter().any(|d| d.code.as_ref() == "QT0001"));
     }
 
     #[test]
     fn let_shadows_root() {
-        let schema = test_schema();
         let (file, _) = crate::parse_query("let users = 1; users");
-        let (typed, diags) = typecheck(file.unwrap(), &schema);
+        let (typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(diags.is_empty(), "expected no errors, got {diags:?}");
         let TypedExprKind::Ident { binding, .. } = &typed.unwrap().result.kind else {
             panic!("expected ident result");
@@ -2409,18 +2360,16 @@ mod tests {
 
     #[test]
     fn let_rebind_same_scope() {
-        let schema = test_schema();
         let (file, _) = crate::parse_query("let x = 1; let x = 2; x");
-        let (typed, diags) = typecheck(file.unwrap(), &schema);
+        let (typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(diags.is_empty(), "expected no errors, got {diags:?}");
         assert_eq!(typed.unwrap().result.ty, QueryType::Scalar(ScalarType::Int));
     }
 
     #[test]
     fn let_in_query() {
-        let schema = test_schema();
         let (file, _) = crate::parse_query("let limit = 30; users[age > limit]");
-        let (typed, diags) = typecheck(file.unwrap(), &schema);
+        let (typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(diags.is_empty(), "expected no errors, got {diags:?}");
         assert!(matches!(typed.unwrap().result.ty, QueryType::List(_)));
     }
@@ -2470,12 +2419,8 @@ mod tests {
 
     #[test]
     fn field_access_struct() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("users.name");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
         assert_eq!(
-            result.ty,
+            infer_ok("users.name", &test_schema()).ty,
             QueryType::List(Box::new(QueryType::Scalar(ScalarType::String)))
         );
     }
@@ -2491,23 +2436,15 @@ mod tests {
 
     #[test]
     fn optional_field_access() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("users.profile");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
         assert!(
-            matches!(result.ty, QueryType::List(inner) if matches!(*inner, QueryType::Optional(_)))
+            matches!(infer_ok("users.profile", &test_schema()).ty, QueryType::List(inner) if matches!(*inner, QueryType::Optional(_)))
         );
     }
 
     #[test]
     fn deep_optional_tuple_access() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("some(some((1, 2)))??.1");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
         assert_eq!(
-            result.ty,
+            infer_ok("some(some((1, 2)))??.1", &test_schema()).ty,
             QueryType::Scalar(ScalarType::Int)
                 .wrap_optional()
                 .wrap_optional()
@@ -2516,13 +2453,12 @@ mod tests {
 
     #[test]
     fn deep_optional_field_and_method() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _diags) =
-            crate::parse_query(r#"some(some({name = "Ada"}))??.name??.to_upper()"#);
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
         assert_eq!(
-            result.ty,
+            infer_ok(
+                r#"some(some({name = "Ada"}))??.name??.to_upper()"#,
+                &test_schema()
+            )
+            .ty,
             QueryType::Scalar(ScalarType::String)
                 .wrap_optional()
                 .wrap_optional()
@@ -2531,12 +2467,8 @@ mod tests {
 
     #[test]
     fn deep_optional_list_method() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("some(some([1, 2]))??.map($ + 1)");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
         assert_eq!(
-            result.ty,
+            infer_ok("some(some([1, 2]))??.map($ + 1)", &test_schema()).ty,
             QueryType::List(Box::new(QueryType::Scalar(ScalarType::Int)))
                 .wrap_optional()
                 .wrap_optional()
@@ -2562,12 +2494,8 @@ mod tests {
 
     #[test]
     fn optional_method_inner_base() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("some(some(some(1)))??.unwrap()");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
         assert_eq!(
-            result.ty,
+            infer_ok("some(some(some(1)))??.unwrap()", &test_schema()).ty,
             QueryType::Scalar(ScalarType::Int)
                 .wrap_optional()
                 .wrap_optional()
@@ -2576,11 +2504,10 @@ mod tests {
 
     #[test]
     fn scalar_method() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query(r#""xyz".starts_with("abc")"#);
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Bool));
+        assert_eq!(
+            infer_ok(r#""xyz".starts_with("abc")"#, &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Bool)
+        );
     }
 
     fn collect_node_ids(expr: &TypedExpr, ids: &mut Vec<NodeId>) {
@@ -2635,11 +2562,10 @@ mod tests {
 
     #[test]
     fn node_ids_are_unique() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _diags) =
-            crate::parse_query(r#"users { name, shout = name.to_upper() } { name }"#);
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        let result = infer_ok(
+            r#"users { name, shout = name.to_upper() } { name }"#,
+            &test_schema(),
+        );
         let mut ids = Vec::new();
         collect_node_ids(&result, &mut ids);
         let mut sorted = ids.clone();
@@ -2651,40 +2577,35 @@ mod tests {
 
     #[test]
     fn list_method_len() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("users.len()");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Int));
+        assert_eq!(
+            infer_ok("users.len()", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Int)
+        );
     }
 
     #[test]
     fn list_method_nth() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("users.nth(0)");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert!(matches!(result.ty, QueryType::Optional(inner)
-            if matches!(*inner, QueryType::Record(_))
-        ));
+        assert!(
+            matches!(infer_ok("users.nth(0)", &test_schema()).ty, QueryType::Optional(inner)
+                if matches!(*inner, QueryType::Record(_))
+            )
+        );
     }
 
     #[test]
     fn method_unwrap_access() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("users.first().unwrap().name");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::String));
+        assert_eq!(
+            infer_ok("users.first().unwrap().name", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::String)
+        );
     }
 
     #[test]
     fn optional_method_is_some() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("users.first().is_some()");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Bool));
+        assert_eq!(
+            infer_ok("users.first().is_some()", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Bool)
+        );
     }
 
     #[test]
@@ -2742,11 +2663,8 @@ mod tests {
     #[test]
     fn flatten_nested_collection() {
         let schema = nested_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("users.orders.flatten()");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
         assert_eq!(
-            result.ty,
+            infer_ok("users.orders.flatten()", &schema).ty,
             QueryType::List(Box::new(QueryType::Record(RecordSource::Schema(
                 nested_struct(&schema, "Order")
             ))))
@@ -2756,11 +2674,8 @@ mod tests {
     #[test]
     fn flatten_compose_first() {
         let schema = nested_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("users.orders.flatten().first()");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
         assert_eq!(
-            result.ty,
+            infer_ok("users.orders.flatten().first()", &schema).ty,
             QueryType::Record(RecordSource::Schema(nested_struct(&schema, "Order")))
                 .wrap_optional()
         );
@@ -2769,11 +2684,8 @@ mod tests {
     #[test]
     fn flatten_compose_optional() {
         let schema = nested_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("users.orders.first()?.items?.flatten()");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
         assert_eq!(
-            result.ty,
+            infer_ok("users.orders.first()?.items?.flatten()", &schema).ty,
             QueryType::List(Box::new(QueryType::Record(RecordSource::Schema(
                 nested_struct(&schema, "Item")
             ))))
@@ -2810,11 +2722,7 @@ mod tests {
 
     #[test]
     fn method_arg_constraint_valid() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("users.sum_over(age)");
-        let result = infer(&file.unwrap().result, &mut env);
-        assert!(result.is_ok());
+        infer_ok("users.sum_over(age)", &test_schema());
     }
 
     #[test]
@@ -2828,22 +2736,15 @@ mod tests {
 
     #[test]
     fn sort_no_arg_over_ordered() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("[3, 1, 2].sort()");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
         assert_eq!(
-            result.ty,
+            infer_ok("[3, 1, 2].sort()", &test_schema()).ty,
             QueryType::List(Box::new(QueryType::Scalar(ScalarType::Int)))
         );
     }
 
     #[test]
     fn sort_no_arg_over_tuple() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("[(\"b\", 1), (\"a\", 2)].sort()");
-        assert!(infer(&file.unwrap().result, &mut env).is_ok());
+        infer_ok("[(\"b\", 1), (\"a\", 2)].sort()", &test_schema());
     }
 
     #[test]
@@ -2857,33 +2758,32 @@ mod tests {
     #[test]
     fn sort_over_single_and_multi_key() {
         let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("users.sort_over(age)");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert!(matches!(result.ty, QueryType::List(_)));
-        let (file, _diags) = crate::parse_query("users.sort_desc_over(age, name)");
-        assert!(infer(&file.unwrap().result, &mut env).is_ok());
+        assert!(matches!(
+            infer_ok("users.sort_over(age)", &schema).ty,
+            QueryType::List(_)
+        ));
+        infer_ok("users.sort_desc_over(age, name)", &schema);
     }
 
     #[test]
     fn tuple_access() {
         let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("(\"a\", 1).0");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::String));
-        let (file, _diags) = crate::parse_query("(\"a\", 1).1");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Int));
+        assert_eq!(
+            infer_ok("(\"a\", 1).0", &schema).ty,
+            QueryType::Scalar(ScalarType::String)
+        );
+        assert_eq!(
+            infer_ok("(\"a\", 1).1", &schema).ty,
+            QueryType::Scalar(ScalarType::Int)
+        );
     }
 
     #[test]
     fn tuple_access_chained() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("((\"a\", 1), 2).0.1");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Int));
+        assert_eq!(
+            infer_ok("((\"a\", 1), 2).0.1", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Int)
+        );
     }
 
     #[test]
@@ -2916,12 +2816,8 @@ mod tests {
 
     #[test]
     fn tuple_access_optional_tuple() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("[(\"a\", 1)].first()?.0");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
         assert_eq!(
-            result.ty,
+            infer_ok("[(\"a\", 1)].first()?.0", &test_schema()).ty,
             QueryType::Optional(Box::new(QueryType::Scalar(ScalarType::String)))
         );
     }
@@ -2930,42 +2826,34 @@ mod tests {
     fn tuple_access_optional_schema_field() {
         let schema = test_schema();
         let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("users { x = maybe_pos?.0 }");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert!(matches!(result.ty, QueryType::List(_)));
+        assert!(matches!(
+            infer_ok("users { x = maybe_pos?.0 }", &schema).ty,
+            QueryType::List(_)
+        ));
         let (file, _diags) = crate::parse_query("users { x = maybe_pos.0 }");
         assert!(infer(&file.unwrap().result, &mut env).is_err());
     }
 
     #[test]
     fn tuple_access_over_scope() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("users { x = (\"a\", age).1 }");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert!(matches!(result.ty, QueryType::List(_)));
+        assert!(matches!(
+            infer_ok("users { x = (\"a\", age).1 }", &test_schema()).ty,
+            QueryType::List(_)
+        ));
     }
 
     #[test]
     fn dollar_sum_over() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("[1, 2, 3].sum_over($ + 1)");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
         assert_eq!(
-            result.ty,
+            infer_ok("[1, 2, 3].sum_over($ + 1)", &test_schema()).ty,
             QueryType::Optional(Box::new(QueryType::Scalar(ScalarType::Int)))
         );
     }
 
     #[test]
     fn dollar_filter() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("[-1, -2, 2, 3][$ > 0]");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
         assert_eq!(
-            result.ty,
+            infer_ok("[-1, -2, 2, 3][$ > 0]", &test_schema()).ty,
             QueryType::List(Box::new(QueryType::Scalar(ScalarType::Int)))
         );
     }
@@ -2973,30 +2861,24 @@ mod tests {
     #[test]
     fn dollar_map_transformation() {
         let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("[1, 2, 3].map($ - 1)");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
         assert_eq!(
-            result.ty,
+            infer_ok("[1, 2, 3].map($ - 1)", &schema).ty,
             QueryType::List(Box::new(QueryType::Scalar(ScalarType::Int)))
         );
-        let (file, _diags) = crate::parse_query("[1, 2].map(($, $))");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert!(matches!(result.ty, QueryType::List(inner)
-            if matches!(inner.as_ref(), QueryType::Tuple(_))));
+        assert!(
+            matches!(infer_ok("[1, 2].map(($, $))", &schema).ty, QueryType::List(inner)
+            if matches!(inner.as_ref(), QueryType::Tuple(_)))
+        );
     }
 
     #[test]
     fn dollar_over_family() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
         for (query, is_list) in [
             ("[1, 2, 3].avg_over($ + 3)", false),
             ("[3, 1, 2].max_by($ + 2)", false),
             ("[3, 1, 2].sort_over($ + 1, -$)", true),
         ] {
-            let (file, _diags) = crate::parse_query(query);
-            let result = infer(&file.unwrap().result, &mut env).unwrap();
+            let result = infer_ok(query, &test_schema());
             if is_list {
                 assert!(matches!(result.ty, QueryType::List(_)));
             } else {
@@ -3011,9 +2893,7 @@ mod tests {
     #[test]
     fn dollar_binds_element() {
         let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("[1, 2].map($)");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        let result = infer_ok("[1, 2].map($)", &schema);
         let TypedExprKind::Method { args, .. } = &result.kind else {
             panic!("expected method");
         };
@@ -3022,10 +2902,8 @@ mod tests {
         };
         assert_eq!(name.value, "$");
         assert_eq!(*binding, IdentBinding::ListElement);
-        let (file, _diags) = crate::parse_query("[[1, 2], [3]].map($.map($$ + 1))");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
         assert_eq!(
-            result.ty,
+            infer_ok("[[1, 2], [3]].map($.map($$ + 1))", &schema).ty,
             QueryType::List(Box::new(QueryType::List(Box::new(QueryType::Scalar(
                 ScalarType::Int
             )))))
@@ -3036,29 +2914,30 @@ mod tests {
     fn dollar_outer_access() {
         let schema = test_schema();
         let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("[[1, 2], [3]].map($.map($$ + $.len()))");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
         assert_eq!(
-            result.ty,
+            infer_ok("[[1, 2], [3]].map($.map($$ + $.len()))", &schema).ty,
             QueryType::List(Box::new(QueryType::List(Box::new(QueryType::Scalar(
                 ScalarType::Int
             )))))
         );
-        let (file, _diags) =
-            crate::parse_query("[[[1]], [[2, 3]]].map($.map($$.map($$$ + $$.len() + $.len())))");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert!(matches!(result.ty, QueryType::List(_)));
+        assert!(matches!(
+            infer_ok(
+                "[[[1]], [[2, 3]]].map($.map($$.map($$$ + $$.len() + $.len())))",
+                &schema,
+            )
+            .ty,
+            QueryType::List(_)
+        ));
         let (file, _diags) = crate::parse_query("[[1, 2], [3]].map($ + $$.len())");
         assert!(infer(&file.unwrap().result, &mut env).is_err());
     }
 
     #[test]
     fn dollar_through_record_scope() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _diags) = crate::parse_query("[1, 2].map(users.filter(age > $))");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert!(matches!(result.ty, QueryType::List(_)));
+        assert!(matches!(
+            infer_ok("[1, 2].map(users.filter(age > $))", &test_schema()).ty,
+            QueryType::List(_)
+        ));
     }
 
     #[test]
@@ -3067,12 +2946,10 @@ mod tests {
         let mut env = TypeEnv::new(&schema);
         let (file, _diags) = crate::parse_query("users.filter($)");
         assert!(infer(&file.unwrap().result, &mut env).is_err());
-        let (file, _diags) = crate::parse_query("users.filter(age > 0)");
-        assert!(infer(&file.unwrap().result, &mut env).is_ok());
+        infer_ok("users.filter(age > 0)", &schema);
         let (file, _diags) = crate::parse_query("users.map(name)");
         assert!(infer(&file.unwrap().result, &mut env).is_err());
-        let (file, _diags) = crate::parse_query("users.map($)");
-        assert!(infer(&file.unwrap().result, &mut env).is_ok());
+        infer_ok("users.map($)", &schema);
     }
 
     #[test]
@@ -3088,74 +2965,66 @@ mod tests {
 
     #[test]
     fn binary_int_add() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("1 + 2");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Int));
+        assert_eq!(
+            infer_ok("1 + 2", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Int)
+        );
     }
 
     #[test]
     fn binary_int_sub() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("5 - 3");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Int));
+        assert_eq!(
+            infer_ok("5 - 3", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Int)
+        );
     }
 
     #[test]
     fn binary_int_mul() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("4 * 3");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Int));
+        assert_eq!(
+            infer_ok("4 * 3", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Int)
+        );
     }
 
     #[test]
     fn binary_int_div() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("10 / 2");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Int));
+        assert_eq!(
+            infer_ok("10 / 2", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Int)
+        );
     }
 
     #[test]
     fn binary_int_rem() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("10 % 3");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Int));
+        assert_eq!(
+            infer_ok("10 % 3", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Int)
+        );
     }
 
     #[test]
     fn binary_int_mod() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("10 mod 3");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Int));
+        assert_eq!(
+            infer_ok("10 mod 3", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Int)
+        );
     }
 
     #[test]
     fn binary_float_add() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("1.0f + 2.0f");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Float));
+        assert_eq!(
+            infer_ok("1.0f + 2.0f", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Float)
+        );
     }
 
     #[test]
     fn binary_dec_add() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("1.0 + 2.0");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Dec));
+        assert_eq!(
+            infer_ok("1.0 + 2.0", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Dec)
+        );
     }
 
     #[test]
@@ -3178,65 +3047,58 @@ mod tests {
 
     #[test]
     fn binary_duration_add() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("#30d + #5h");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Duration));
+        assert_eq!(
+            infer_ok("#30d + #5h", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Duration)
+        );
     }
 
     #[test]
     fn binary_duration_sub() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("#30d - #5h");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Duration));
+        assert_eq!(
+            infer_ok("#30d - #5h", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Duration)
+        );
     }
 
     #[test]
     fn binary_duration_mul_int() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("#30d * 3");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Duration));
+        assert_eq!(
+            infer_ok("#30d * 3", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Duration)
+        );
     }
 
     #[test]
     fn binary_int_mul_duration() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("3 * #30d");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Duration));
+        assert_eq!(
+            infer_ok("3 * #30d", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Duration)
+        );
     }
 
     #[test]
     fn binary_duration_mul_float() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("#30d * 1.5f");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Duration));
+        assert_eq!(
+            infer_ok("#30d * 1.5f", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Duration)
+        );
     }
 
     #[test]
     fn binary_duration_mul_dec() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("#30d * 1.5");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Duration));
+        assert_eq!(
+            infer_ok("#30d * 1.5", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Duration)
+        );
     }
 
     #[test]
     fn binary_duration_div_int() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("#30d / 2");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Duration));
+        assert_eq!(
+            infer_ok("#30d / 2", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Duration)
+        );
     }
 
     #[test]
@@ -3259,29 +3121,26 @@ mod tests {
 
     #[test]
     fn binary_duration_div_duration() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("#90s / #30s");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Dec));
+        assert_eq!(
+            infer_ok("#90s / #30s", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Dec)
+        );
     }
 
     #[test]
     fn binary_duration_rem_duration() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("#90s % #7s");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Duration));
+        assert_eq!(
+            infer_ok("#90s % #7s", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Duration)
+        );
     }
 
     #[test]
     fn binary_duration_mod_duration() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("#90s mod #7s");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Duration));
+        assert_eq!(
+            infer_ok("#90s mod #7s", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Duration)
+        );
     }
 
     #[test]
@@ -3304,74 +3163,66 @@ mod tests {
 
     #[test]
     fn binary_comparison_eq() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("1 == 2");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Bool));
+        assert_eq!(
+            infer_ok("1 == 2", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Bool)
+        );
     }
 
     #[test]
     fn binary_comparison_ne() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("1.0f != 2e5f");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Bool));
+        assert_eq!(
+            infer_ok("1.0f != 2e5f", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Bool)
+        );
     }
 
     #[test]
     fn binary_comparison_lt() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("1 < 2");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Bool));
+        assert_eq!(
+            infer_ok("1 < 2", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Bool)
+        );
     }
 
     #[test]
     fn binary_comparison_gt() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("10.5 > 11.0");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Bool));
+        assert_eq!(
+            infer_ok("10.5 > 11.0", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Bool)
+        );
     }
 
     #[test]
     fn binary_comparison_le() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("20 <= 40");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Bool));
+        assert_eq!(
+            infer_ok("20 <= 40", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Bool)
+        );
     }
 
     #[test]
     fn binary_comparison_ge() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("1001 >= 1000");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Bool));
+        assert_eq!(
+            infer_ok("1001 >= 1000", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Bool)
+        );
     }
 
     #[test]
     fn binary_string_eq() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query(r#""a" == "b""#);
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Bool));
+        assert_eq!(
+            infer_ok(r#""a" == "b""#, &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Bool)
+        );
     }
 
     #[test]
     fn binary_string_lt() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query(r#""x" < "y""#);
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Bool));
+        assert_eq!(
+            infer_ok(r#""x" < "y""#, &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Bool)
+        );
     }
 
     #[test]
@@ -3385,20 +3236,18 @@ mod tests {
 
     #[test]
     fn binary_logical_and() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("true && false");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Bool));
+        assert_eq!(
+            infer_ok("true && false", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Bool)
+        );
     }
 
     #[test]
     fn binary_logical_or() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("false || true");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Bool));
+        assert_eq!(
+            infer_ok("false || true", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Bool)
+        );
     }
 
     #[test]
@@ -3412,11 +3261,10 @@ mod tests {
 
     #[test]
     fn binary_in_string_tuple() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query(r#""a" in ("a", "b", "c")"#);
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Bool));
+        assert_eq!(
+            infer_ok(r#""a" in ("a", "b", "c")"#, &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Bool)
+        );
     }
 
     #[test]
@@ -3439,12 +3287,14 @@ mod tests {
 
     #[test]
     fn optional_eq_optional() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) =
-            crate::parse_query("users.first().unwrap().profile == users.first().unwrap().profile");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Bool));
+        assert_eq!(
+            infer_ok(
+                "users.first().unwrap().profile == users.first().unwrap().profile",
+                &test_schema(),
+            )
+            .ty,
+            QueryType::Scalar(ScalarType::Bool)
+        );
     }
 
     #[test]
@@ -3467,38 +3317,34 @@ mod tests {
 
     #[test]
     fn unary_neg_int() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("-1");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Int));
+        assert_eq!(
+            infer_ok("-1", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Int)
+        );
     }
 
     #[test]
     fn unary_neg_float() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("-3e6f");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Float));
+        assert_eq!(
+            infer_ok("-3e6f", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Float)
+        );
     }
 
     #[test]
     fn unary_neg_dec() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("-12.5");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Dec));
+        assert_eq!(
+            infer_ok("-12.5", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Dec)
+        );
     }
 
     #[test]
     fn unary_neg_duration() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("-#30d");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Duration));
+        assert_eq!(
+            infer_ok("-#30d", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Duration)
+        );
     }
 
     #[test]
@@ -3521,11 +3367,10 @@ mod tests {
 
     #[test]
     fn unary_not_bool() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("!true");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Bool));
+        assert_eq!(
+            infer_ok("!true", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Bool)
+        );
     }
 
     #[test]
@@ -3539,65 +3384,58 @@ mod tests {
 
     #[test]
     fn binary_complex_arithmetic() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("1 + 2 * (3 / 2) % (7 - 2)");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Int));
+        assert_eq!(
+            infer_ok("1 + 2 * (3 / 2) % (7 - 2)", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Int)
+        );
     }
 
     #[test]
     fn binary_arithmetic_comparison() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("(1 + 2 - 3) >= 3");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Bool));
+        assert_eq!(
+            infer_ok("(1 + 2 - 3) >= 3", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Bool)
+        );
     }
 
     #[test]
     fn binary_field_arithmetic() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("users.first().unwrap().age + 1");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Int));
+        assert_eq!(
+            infer_ok("users.first().unwrap().age + 1", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Int)
+        );
     }
 
     #[test]
     fn binary_field_comparison() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("users.first().unwrap().age < 18");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Bool));
+        assert_eq!(
+            infer_ok("users.first().unwrap().age < 18", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Bool)
+        );
     }
 
     #[test]
     fn binary_duration_arithmetic() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("#30d + #24h - #7d + #7.8s");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Duration));
+        assert_eq!(
+            infer_ok("#30d + #24h - #7d + #7.8s", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Duration)
+        );
     }
 
     #[test]
     fn if_else_basic() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query(r#"if true { 1 } else { 2 }"#);
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Int));
+        assert_eq!(
+            infer_ok(r#"if true { 1 } else { 2 }"#, &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Int)
+        );
     }
 
     #[test]
     fn if_else_bool_result() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query(r#"if true { false } else { true }"#);
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Bool));
+        assert_eq!(
+            infer_ok(r#"if true { false } else { true }"#, &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Bool)
+        );
     }
 
     #[test]
@@ -3620,85 +3458,82 @@ mod tests {
 
     #[test]
     fn if_else_if_chain() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query(r#"if true { "A" } else if false { "B" } else { "C" }"#);
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::String));
+        assert_eq!(
+            infer_ok(
+                r#"if true { "A" } else if false { "B" } else { "C" }"#,
+                &test_schema(),
+            )
+            .ty,
+            QueryType::Scalar(ScalarType::String)
+        );
     }
 
     #[test]
     fn if_else_with_comparison_condition() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query(
-            r#"if users.first().unwrap().age > 18 { "adult" } else { "minor" }"#,
+        assert_eq!(
+            infer_ok(
+                r#"if users.first().unwrap().age > 18 { "adult" } else { "minor" }"#,
+                &test_schema(),
+            )
+            .ty,
+            QueryType::Scalar(ScalarType::String)
         );
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::String));
     }
 
     #[test]
     fn cast_int_to_float() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("42 as Float");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Float));
+        assert_eq!(
+            infer_ok("42 as Float", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Float)
+        );
     }
 
     #[test]
     fn cast_int_to_dec() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("42 as Dec");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Dec));
+        assert_eq!(
+            infer_ok("42 as Dec", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Dec)
+        );
     }
 
     #[test]
     fn cast_float_to_int() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("1.0f as Int");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Int));
+        assert_eq!(
+            infer_ok("1.0f as Int", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Int)
+        );
     }
 
     #[test]
     fn cast_float_to_dec() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("1.0f as Dec");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Dec));
+        assert_eq!(
+            infer_ok("1.0f as Dec", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Dec)
+        );
     }
 
     #[test]
     fn cast_dec_to_int() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("1.0 as Int");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Int));
+        assert_eq!(
+            infer_ok("1.0 as Int", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Int)
+        );
     }
 
     #[test]
     fn cast_dec_to_float() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("1.0 as Float");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Float));
+        assert_eq!(
+            infer_ok("1.0 as Float", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Float)
+        );
     }
 
     #[test]
     fn cast_bool_to_int() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("true as Int");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Int));
+        assert_eq!(
+            infer_ok("true as Int", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Int)
+        );
     }
 
     #[test]
@@ -3712,54 +3547,40 @@ mod tests {
 
     #[test]
     fn cast_complex_expr() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("users.first().unwrap().age as Float + 1.0f");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Float));
+        assert_eq!(
+            infer_ok("users.first().unwrap().age as Float + 1.0f", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Float)
+        );
     }
 
     #[test]
     fn some_basic() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query(r#"some("hello")"#);
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
         assert_eq!(
-            result.ty,
+            infer_ok(r#"some("hello")"#, &test_schema()).ty,
             QueryType::Scalar(ScalarType::String).wrap_optional()
         );
     }
 
     #[test]
     fn some_complex_expr() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("some(users.first().unwrap().age)");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
         assert_eq!(
-            result.ty,
+            infer_ok("some(users.first().unwrap().age)", &test_schema()).ty,
             QueryType::Scalar(ScalarType::Int).wrap_optional()
         );
     }
 
     #[test]
     fn some_none() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("none");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Unknown.wrap_optional());
+        assert_eq!(
+            infer_ok("none", &test_schema()).ty,
+            QueryType::Unknown.wrap_optional()
+        );
     }
 
     #[test]
     fn some_nested_optional() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query(r#"some(some("a"))"#);
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
         assert_eq!(
-            result.ty,
+            infer_ok(r#"some(some("a"))"#, &test_schema()).ty,
             QueryType::Optional(Box::new(QueryType::Optional(Box::new(QueryType::Scalar(
                 ScalarType::String
             )))))
@@ -3768,36 +3589,24 @@ mod tests {
 
     #[test]
     fn infer_nested_optional() {
-        let schema = test_schema();
-        let (file, _) = crate::parse_query(r#"some(some("a")) != some(none)"#);
-        let (typed, diags) = typecheck(file.unwrap(), &schema);
-        assert!(diags.is_empty(), "expected no errors, got {diags:?}");
         assert_eq!(
-            typed.unwrap().result.ty,
+            infer_ok(r#"some(some("a")) != some(none)"#, &test_schema()).ty,
             QueryType::Scalar(ScalarType::Bool)
         );
     }
 
     #[test]
     fn array_int() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("[1, 2, 3]");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
         assert_eq!(
-            result.ty,
+            infer_ok("[1, 2, 3]", &test_schema()).ty,
             QueryType::List(Box::new(QueryType::Scalar(ScalarType::Int)))
         );
     }
 
     #[test]
     fn array_string() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query(r#"["a", "b", "c"]"#);
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
         assert_eq!(
-            result.ty,
+            infer_ok(r#"["a", "b", "c"]"#, &test_schema()).ty,
             QueryType::List(Box::new(QueryType::Scalar(ScalarType::String)))
         );
     }
@@ -3813,10 +3622,7 @@ mod tests {
 
     #[test]
     fn array_types_inferred() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("[none, some(1), none]");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        let result = infer_ok("[none, some(1), none]", &test_schema());
         assert_eq!(
             result.ty,
             QueryType::List(Box::new(QueryType::Scalar(ScalarType::Int).wrap_optional()))
@@ -3834,21 +3640,16 @@ mod tests {
 
     #[test]
     fn array_empty() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("[]");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::List(Box::new(QueryType::Unknown)));
+        assert_eq!(
+            infer_ok("[]", &test_schema()).ty,
+            QueryType::List(Box::new(QueryType::Unknown))
+        );
     }
 
     #[test]
     fn tuple_mixed_types() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query(r#"(1, "hello", false, @now, 1.7e-5)"#);
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
         assert_eq!(
-            result.ty,
+            infer_ok(r#"(1, "hello", false, @now, 1.7e-5)"#, &test_schema()).ty,
             QueryType::Tuple(vec![
                 QueryType::Scalar(ScalarType::Int),
                 QueryType::Scalar(ScalarType::String),
@@ -3861,21 +3662,16 @@ mod tests {
 
     #[test]
     fn tuple_in_membership() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query(r#"1 in (1, 2, 3)"#);
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Bool));
+        assert_eq!(
+            infer_ok(r#"1 in (1, 2, 3)"#, &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Bool)
+        );
     }
 
     #[test]
     fn projection_basic() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("users { name, age }");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
         assert!(matches!(
-            result.ty,
+            infer_ok("users { name, age }", &test_schema()).ty,
             QueryType::List(inner)
             if matches!(
                 *inner,
@@ -3887,10 +3683,7 @@ mod tests {
 
     #[test]
     fn projection_single_field() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("users { name }");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        let result = infer_ok("users { name }", &test_schema());
         match &result.ty {
             QueryType::List(inner) => match inner.as_ref() {
                 QueryType::Record(RecordSource::Projection(fields)) => {
@@ -3906,11 +3699,10 @@ mod tests {
 
     #[test]
     fn projection_computed_field() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) =
-            crate::parse_query("users { name, adult = users.first().unwrap().age > 18 }");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        let result = infer_ok(
+            "users { name, adult = users.first().unwrap().age > 18 }",
+            &test_schema(),
+        );
         match &result.ty {
             QueryType::List(inner) => match inner.as_ref() {
                 QueryType::Record(RecordSource::Projection(fields)) => {
@@ -3954,10 +3746,7 @@ mod tests {
 
     #[test]
     fn projection_derived_alias() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("users { name, profile?.username }");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
+        let result = infer_ok("users { name, profile?.username }", &test_schema());
         match &result.ty {
             QueryType::List(inner) => match inner.as_ref() {
                 QueryType::Record(RecordSource::Projection(fields)) => {
@@ -3977,190 +3766,166 @@ mod tests {
 
     #[test]
     fn projection_single_record_base() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("users.first().unwrap() { name, age }");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
         assert!(matches!(
-            result.ty,
+            infer_ok("users.first().unwrap() { name, age }", &test_schema()).ty,
             QueryType::Record(RecordSource::Projection(_))
         ));
     }
 
     #[test]
     fn mutation_insert() {
-        let schema = test_schema();
         let (file, _diags) = crate::parse_query(
             r#"users.insert({ name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, created = @now }); 0"#,
         );
-        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(diags.is_empty(), "expected no errors, got {diags:?}");
     }
 
     #[test]
     fn mutation_update() {
-        let schema = test_schema();
         let (file, _diags) = crate::parse_query(r#"users[age == 30].update({ age = 31 }); 0"#);
-        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(diags.is_empty(), "expected no errors, got {diags:?}");
     }
 
     #[test]
     fn mutation_update_with_prev() {
-        let schema = test_schema();
         let (file, _diags) =
             crate::parse_query(r#"users[age == 30].update({ age = prev.age + 1 }); 0"#);
-        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(diags.is_empty(), "expected no errors, got {diags:?}");
     }
 
     #[test]
     fn mutation_delete() {
-        let schema = test_schema();
         let (file, _diags) = crate::parse_query(r#"users[!active].delete(); 0"#);
-        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(diags.is_empty(), "expected no errors, got {diags:?}");
     }
 
     #[test]
     fn mutation_on_projection_error() {
-        let schema = test_schema();
         let (file, _diags) = crate::parse_query(r#"users { name }.insert({ name = "Alice" }); 0"#);
-        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(!diags.is_empty());
     }
 
     #[test]
     fn mutation_on_scalar_error() {
-        let schema = test_schema();
         let (file, _diags) = crate::parse_query(r#"42.insert({ name = "Alice" }); 0"#);
-        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(!diags.is_empty());
     }
 
     #[test]
     fn mutation_delete_arg_error() {
-        let schema = test_schema();
         let (file, _diags) = crate::parse_query(r#"users[!active].delete("abc"); 0"#);
-        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(!diags.is_empty());
     }
 
     #[test]
     fn type_constant_int() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("Int::MAX");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Int));
+        assert_eq!(
+            infer_ok("Int::MAX", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Int)
+        );
     }
 
     #[test]
     fn type_constant_float() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("Float::MIN");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Float));
+        assert_eq!(
+            infer_ok("Float::MIN", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Float)
+        );
     }
 
     #[test]
     fn type_constant_dec() {
-        let schema = test_schema();
-        let mut env = TypeEnv::new(&schema);
-        let (file, _) = crate::parse_query("Dec::MAX");
-        let result = infer(&file.unwrap().result, &mut env).unwrap();
-        assert_eq!(result.ty, QueryType::Scalar(ScalarType::Dec));
+        assert_eq!(
+            infer_ok("Dec::MAX", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Dec)
+        );
     }
 
     #[test]
     fn mutation_insert_missing_required() {
-        let schema = test_schema();
         let (file, _diags) = crate::parse_query(r#"users.insert({ name = "Alice" }); 0"#);
-        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(!diags.is_empty());
     }
 
     #[test]
     fn mutation_insert_unknown_field() {
-        let schema = test_schema();
         let (file, _diags) = crate::parse_query(
             r#"users.insert({ name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, created = @now, bogus = 1 }); 0"#,
         );
-        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(!diags.is_empty());
     }
 
     #[test]
     fn mutation_insert_wrong_type() {
-        let schema = test_schema();
         let (file, _diags) = crate::parse_query(
             r#"users.insert({ name = 42, age = 30, score = 1.0f, balance = 0.0, active = true, created = @now }); 0"#,
         );
-        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(!diags.is_empty());
     }
 
     #[test]
     fn mutation_update_unknown_field() {
-        let schema = test_schema();
         let (file, _diags) = crate::parse_query(r#"users[name == "Bob"].update({ bogus = 2 }); 0"#);
-        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(!diags.is_empty());
     }
 
     #[test]
     fn mutation_update_subset() {
-        let schema = test_schema();
         let (file, _diags) =
             crate::parse_query(r#"users[name == "Bob"].update({ age = 30, score = 2.5f }); 0"#);
-        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(diags.is_empty(), "expected no errors, got {diags:?}");
     }
 
     #[test]
     fn mutation_duplicate_field() {
-        let schema = test_schema();
         let (file, _diags) = crate::parse_query(
             r#"users.insert({ name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, name = "Bob", created = @now }); 0"#,
         );
-        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(!diags.is_empty());
     }
 
     #[test]
     fn mutation_insert_on_non_root() {
-        let schema = test_schema();
         let (file, _diags) = crate::parse_query(
             r#"users[age == 30].insert({ name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, created = @now }); 0"#,
         );
-        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(!diags.is_empty());
     }
 
     #[test]
     fn mutation_insert_optional_field_omitted() {
-        let schema = test_schema();
         let (file, _diags) = crate::parse_query(
             r#"users.insert({ name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, created = @now }); 0"#,
         );
-        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(diags.is_empty(), "expected no errors, got {diags:?}");
     }
 
     #[test]
     fn mutation_insert_with_ref_field() {
-        let schema = test_schema();
         let (file, _diags) = crate::parse_query(
             r#"users.insert({ name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, created = @now, profile = none }); 0"#,
         );
-        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(diags.is_empty());
     }
 
     #[test]
     fn file_with_mutations_result_expr() {
-        let schema = test_schema();
         let (file, _diags) = crate::parse_query(
             r#"
             users.insert({ name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, created = @now });
@@ -4170,183 +3935,153 @@ mod tests {
             users { name, age }
             "#,
         );
-        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(diags.is_empty(), "expected no errors, got {diags:?}");
     }
 
     #[test]
     fn batch_insert() {
-        let schema = test_schema();
         let (file, _diags) = crate::parse_query(
             r#"users.insert([
                 { name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, created = @now },
                 { name = "Bob", age = 25, score = 2.0f, balance = 2.0, active = false, created = @today },
             ]); 0"#,
         );
-        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(diags.is_empty(), "expected no errors, got {diags:?}");
     }
 
     #[test]
     fn batch_insert_element_missing_required() {
-        let schema = test_schema();
         let (file, _diags) = crate::parse_query(
             r#"users.insert([
                 { name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, created = @now },
                 { name = "Bob", score = 2.0f, balance = 0.0, active = true, created = @now },
             ]); 0"#,
         );
-        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(!diags.is_empty());
     }
 
     #[test]
     fn batch_insert_element_mismatched_type() {
-        let schema = test_schema();
         let (file, _diags) = crate::parse_query(
             r#"users.insert([
                 { name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, created = @now },
                 { name = 42, age = 25, score = 2.0f, balance = 0.0, active = true, created = @now },
             ]); 0"#,
         );
-        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(!diags.is_empty());
     }
 
     #[test]
     fn batch_insert_element_unknown_field() {
-        let schema = test_schema();
         let (file, _diags) = crate::parse_query(
             r#"users.insert([
                 { name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, created = @now },
                 { name = "Bob", age = 25, score = 2.0f, balance = 0.0, active = true, created = @now, foo = 1 },
             ]); 0"#,
         );
-        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(!diags.is_empty());
     }
 
     #[test]
     fn typecheck_if_else_optional_list() {
-        let schema = test_schema();
-        let (file, _diags) = crate::parse_query(
-            "
-            if true { none }
-            else {
-                if false { some([]) }
-                else { some([1, 2, 3]) }
-            }
-            ",
-        );
-        let (typed, _diags) = typecheck(file.unwrap(), &schema);
         assert_eq!(
-            typed.unwrap().result.ty,
+            infer_ok(
+                "if true { none }
+                else {
+                    if false { some([]) }
+                    else { some([1, 2, 3]) }
+                }",
+                &test_schema(),
+            )
+            .ty,
             QueryType::List(Box::new(QueryType::Scalar(ScalarType::Int))).wrap_optional()
         );
     }
 
     #[test]
     fn typecheck_if_else_ambiguous() {
-        let schema = test_schema();
         let (file, _) = crate::parse_query("if true { none } else { none }");
-        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(!diags.is_empty());
     }
 
     #[test]
     fn typecheck_array_optional() {
-        let schema = test_schema();
-        let (file, _) = crate::parse_query("[none, some(3), none]");
-        let (typed, _diags) = typecheck(file.unwrap(), &schema);
         assert_eq!(
-            typed.unwrap().result.ty,
+            infer_ok("[none, some(3), none]", &test_schema()).ty,
             QueryType::List(Box::new(QueryType::Scalar(ScalarType::Int).wrap_optional()))
         );
     }
 
     #[test]
     fn typecheck_array_empty() {
-        let schema = test_schema();
         let (file, _) = crate::parse_query("[]");
-        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(!diags.is_empty());
     }
 
     #[test]
     fn typecheck_array_mismatched_types() {
-        let schema = test_schema();
         let (file, _) = crate::parse_query(r#"[1, "two", 3]"#);
-        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(!diags.is_empty());
     }
 
     #[test]
     fn typecheck_some_none_if_else() {
-        let schema = test_schema();
-        let (file, _) = crate::parse_query("if true { some(42) } else { none }");
-        let (typed, _diags) = typecheck(file.unwrap(), &schema);
         assert_eq!(
-            typed.unwrap().result.ty,
+            infer_ok("if true { some(42) } else { none }", &test_schema()).ty,
             QueryType::Scalar(ScalarType::Int).wrap_optional()
         );
     }
 
     #[test]
     fn typecheck_method_chain() {
-        let schema = test_schema();
-        let (file, _) = crate::parse_query("users.first().unwrap().profile?.username");
-        let (typed, _diags) = typecheck(file.unwrap(), &schema);
         assert_eq!(
-            typed.unwrap().result.ty,
+            infer_ok("users.first().unwrap().profile?.username", &test_schema()).ty,
             QueryType::Scalar(ScalarType::String).wrap_optional()
         );
     }
 
     #[test]
     fn typecheck_filter_project() {
-        let schema = test_schema();
-        let (file, _) = crate::parse_query("users[age > 18] { name, profile?.username }");
-        let (typed, _diags) = typecheck(file.unwrap(), &schema);
         assert!(matches!(
-            typed.unwrap().result.ty,
+            infer_ok("users[age > 18] { name, profile?.username }", &test_schema()).ty,
             QueryType::List(inner) if matches!(*inner, QueryType::Record(RecordSource::Projection(_)))
         ));
     }
 
     #[test]
     fn typecheck_optional_comparison_error() {
-        let schema = test_schema();
         let (file, _) = crate::parse_query("none == 1");
-        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(!diags.is_empty());
     }
 
     #[test]
     fn typecheck_optional_ambiguous() {
-        let schema = test_schema();
         let (file, _) = crate::parse_query("none == none");
-        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(!diags.is_empty());
     }
 
     #[test]
     fn typecheck_filter_method_optional() {
-        let schema = test_schema();
-        let (file, _) = crate::parse_query("users[age > 18].first()?.age");
-        let (typed, _diags) = typecheck(file.unwrap(), &schema);
         assert_eq!(
-            typed.unwrap().result.ty,
+            infer_ok("users[age > 18].first()?.age", &test_schema()).ty,
             QueryType::Scalar(ScalarType::Int).wrap_optional()
         );
     }
 
     #[test]
     fn typecheck_tuple() {
-        let schema = test_schema();
-        let (file, _) = crate::parse_query("if true { (1, 2) } else { (3, 4) }");
-        let (typed, _diags) = typecheck(file.unwrap(), &schema);
         assert_eq!(
-            typed.unwrap().result.ty,
+            infer_ok("if true { (1, 2) } else { (3, 4) }", &test_schema()).ty,
             QueryType::Tuple(vec![
                 QueryType::Scalar(ScalarType::Int),
                 QueryType::Scalar(ScalarType::Int),
@@ -4356,9 +4091,8 @@ mod tests {
 
     #[test]
     fn typecheck_tuple_mismatch() {
-        let schema = test_schema();
         let (file, _) = crate::parse_query(r#"if true { (1, 2, 4) } else { (4, "abc") }"#);
-        let (_typed, diags) = typecheck(file.unwrap(), &schema);
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(!diags.is_empty());
     }
 }
