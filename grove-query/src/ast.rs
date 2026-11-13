@@ -100,20 +100,20 @@ pub enum Expr {
     Field {
         base: Box<Expr>,
         name: Spanned<String>,
-        optional: bool,
+        opt_depth: usize,
         span: Span,
     },
     TupleAccess {
         base: Box<Expr>,
         index: Spanned<i64>,
-        optional: bool,
+        opt_depth: usize,
         span: Span,
     },
     Method {
         base: Box<Expr>,
         name: Spanned<String>,
         args: Vec<Arg>,
-        optional: bool,
+        opt_depth: usize,
         span: Span,
     },
     Projection {

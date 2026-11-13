@@ -243,7 +243,7 @@ fn infer(expr: &Expr, env: &mut TypeEnv) -> Result<TypedExpr, TypeError> {
         Expr::Field {
             base,
             name,
-            optional,
+            opt_depth: optional,
             ..
         } => {
             let typed_base = infer(base, env)?;
@@ -252,7 +252,7 @@ fn infer(expr: &Expr, env: &mut TypeEnv) -> Result<TypedExpr, TypeError> {
         Expr::TupleAccess {
             base,
             index,
-            optional,
+            opt_depth: optional,
             ..
         } => {
             let typed_base = infer(base, env)?;
@@ -262,7 +262,7 @@ fn infer(expr: &Expr, env: &mut TypeEnv) -> Result<TypedExpr, TypeError> {
             base,
             name,
             args,
-            optional,
+            opt_depth: optional,
             ..
         } => {
             let typed_base = infer(base, env)?;
@@ -587,9 +587,10 @@ fn infer_projection(
 fn infer_field(
     base: TypedExpr,
     name: &Spanned<String>,
-    optional: bool,
+    opt_depth: usize,
     env: &mut TypeEnv,
 ) -> Result<TypedExpr, TypeError> {
+    let optional = opt_depth > 0;
     let schema = env.schema();
     let lookup_ty = if optional {
         match &base.ty {
@@ -642,10 +643,10 @@ fn infer_field(
 fn infer_tuple_access(
     base: TypedExpr,
     index: &Spanned<i64>,
-    optional: bool,
+    opt_depth: usize,
     env: &mut TypeEnv,
 ) -> Result<TypedExpr, TypeError> {
-    let lookup_ty = if optional {
+    let optional = opt_depth > 0;
         match &base.ty {
             QueryType::Optional(inner) => inner.as_ref().clone(),
             other => {
@@ -705,10 +706,10 @@ fn infer_method(
     base: TypedExpr,
     name: &Spanned<String>,
     args: &[Arg],
-    optional: bool,
+    opt_depth: usize,
     env: &mut TypeEnv,
 ) -> Result<TypedExpr, TypeError> {
-    let resolve_ty = if optional {
+    let optional = opt_depth > 0;
         match &base.ty {
             QueryType::Optional(inner) => inner.as_ref().clone(),
             other => {

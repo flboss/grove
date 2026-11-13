@@ -251,7 +251,11 @@ impl<'src> Parser<'src> {
         loop {
             match self.current.value {
                 TokenKind::Dot | TokenKind::QuestionDot(_) => {
-                    let optional = matches!(self.current.value, TokenKind::QuestionDot(_));
+                    let opt_depth = match self.current.value {
+                        TokenKind::Dot => 0,
+                        TokenKind::QuestionDot(depth) => depth,
+                        _ => unreachable!(),
+                    };
                     self.bump();
                     if let TokenKind::IntLit(n) = &self.current.value {
                         let (n, index_span) = (*n, self.current.span);
@@ -266,7 +270,7 @@ impl<'src> Parser<'src> {
                                 span: index_span,
                                 value: n,
                             },
-                            optional,
+                            opt_depth,
                             span,
                         };
                     } else {
@@ -283,7 +287,7 @@ impl<'src> Parser<'src> {
                                 base: Box::new(expr),
                                 name,
                                 args,
-                                optional,
+                                opt_depth,
                                 span,
                             };
                         } else {
@@ -294,7 +298,7 @@ impl<'src> Parser<'src> {
                             expr = Expr::Field {
                                 base: Box::new(expr),
                                 name,
-                                optional,
+                                opt_depth,
                                 span,
                             };
                         }
@@ -319,7 +323,7 @@ impl<'src> Parser<'src> {
                             direction: None,
                             expr: cond,
                         }],
-                        optional: false,
+                        opt_depth: 0,
                         span,
                     };
                 }
@@ -477,8 +481,15 @@ impl<'src> Parser<'src> {
         };
         let mut expr = Expr::Ident(first);
 
-        while matches!(self.current.value, TokenKind::Dot | TokenKind::QuestionDot(_)) {
-            let optional = matches!(self.current.value, TokenKind::QuestionDot(_));
+        while matches!(
+            self.current.value,
+            TokenKind::Dot | TokenKind::QuestionDot(_)
+        ) {
+            let opt_depth = match self.current.value {
+                TokenKind::Dot => 0,
+                TokenKind::QuestionDot(depth) => depth,
+                _ => unreachable!(),
+            };
             self.bump();
             if let TokenKind::IntLit(n) = &self.current.value {
                 let (n, index_span) = (*n, self.current.span);
@@ -493,7 +504,7 @@ impl<'src> Parser<'src> {
                         span: index_span,
                         value: n,
                     },
-                    optional,
+                    opt_depth,
                     span,
                 };
                 continue;
@@ -508,7 +519,7 @@ impl<'src> Parser<'src> {
             expr = Expr::Field {
                 base: Box::new(expr),
                 name,
-                optional,
+                opt_depth,
                 span,
             };
         }
@@ -1346,7 +1357,7 @@ mod tests {
             expr,
             Expr::TupleAccess {
                 index: Spanned { value: 1, .. },
-                optional: false,
+                opt_depth: 0,
                 ..
             }
         ));
@@ -1372,10 +1383,31 @@ mod tests {
             expr,
             Expr::TupleAccess {
                 index: Spanned { value: 2, .. },
-                optional: true,
+                opt_depth: 1,
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn optional_access_depths() {
+        assert!(matches!(
+            parse_ok("foo??.bar"),
+            Expr::Field { opt_depth: 2, .. }
+        ));
+        assert!(matches!(
+            parse_ok("foo???.0"),
+            Expr::TupleAccess { opt_depth: 3, .. }
+        ));
+        assert!(matches!(
+            parse_ok("foo????.map($ + 1)"),
+            Expr::Method { opt_depth: 4, .. }
+        ));
+
+        let Expr::Projection { items, .. } = parse_ok("users { manager??.name }") else {
+            panic!("expected projection");
+        };
+        assert!(matches!(&items[0].value, Expr::Field { opt_depth: 2, .. }));
     }
 
     #[test]
