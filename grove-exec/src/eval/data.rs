@@ -1479,6 +1479,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bytes_root_pushdown_parity() {
+        assert_eq!(
+            run_seeded(r#"blobs[data == hex"0001"].id"#),
+            Ok(Val::List(vec![int(1)]))
+        );
+        assert_eq!(
+            run_seeded(r#"blobs[data in (hex"0001", hex"00ff")].id"#),
+            Ok(Val::List(vec![int(1), int(3)]))
+        );
+        assert_eq!(
+            run_seeded("blobs.sort_over(data).id"),
+            Ok(Val::List(vec![int(2), int(1), int(3)]))
+        );
+        assert_eq!(
+            run_seeded(r#"blobs.first().unwrap().maybe"#),
+            Ok(some(bytes(&[0xff])))
+        );
+        assert_eq!(
+            run_seeded("blobs.first().unwrap().chunks"),
+            Ok(Val::List(vec![bytes(&[0x01]), bytes(&[0x01, 0x00])]))
+        );
+        assert_eq!(
+            run_seeded("blobs[data.len() > 1].id"),
+            Ok(Val::List(vec![int(1), int(3)]))
+        );
+        assert_eq!(
+            run_seeded(r#"blobs[("x" as Bytes) == data].id"#),
+            Ok(Val::List(Vec::new()))
+        );
+    }
+
     fn record_field_value<'a>(value: &'a Val, name: &str) -> &'a Val {
         let Val::Record(fields) = value else {
             panic!("expected record, got {value:?}");

@@ -11,6 +11,7 @@ root roles: Role;
 root images: Image;
 root messages: Message;
 root settings: Setting;
+root blobs: Blob;
 struct User {
   id: Int,
   name: String,
@@ -78,6 +79,12 @@ struct Setting {
   fallback: ?Priority,
   history: List<Priority>@history_ref via setting_history[setting_key, priority],
   pair: (Priority, Level)@(pair_priority, pair_level),
+}
+struct Blob {
+  id: Int,
+  data: Bytes,
+  maybe: ?Bytes,
+  chunks: List<Bytes>@chunks_ref via blob_chunks[blob_key, chunk],
 }
 rel Profile.user <-> User.profile (profiles.user_id -> users.id);
 rel Order.user <<-> User.orders (orders.user_id -> users.id);
@@ -178,7 +185,15 @@ pub fn seed(conn: &mut Connection) -> rusqlite::Result<()> {
                   ('beta', 'low', -1, NULL, 701, 'low', -1),
                   ('gamma', 'medium', 0, 'medium', NULL, 'medium', 0);
          INSERT INTO setting_history(setting_key, priority) VALUES
-           (700, 'low'), (700, 'high'), (701, 'high');",
+           (700, 'low'), (700, 'high'), (701, 'high');
+         CREATE TABLE blobs(id INTEGER, data BLOB, maybe BLOB, chunks_ref INTEGER);
+         CREATE TABLE blob_chunks(blob_key INTEGER, chunk BLOB);
+         INSERT INTO blobs(id, data, maybe, chunks_ref) VALUES
+           (1, X'0001', X'ff', 800),
+           (2, X'', NULL, NULL),
+           (3, X'00ff', X'00', NULL);
+         INSERT INTO blob_chunks(blob_key, chunk) VALUES
+           (800, X'01'), (800, X'0100');",
     )?;
     let insert = "INSERT INTO users(id, name, nickname, x, y, hx, hy, balance, created, \
                   elapsed, active, tags_ref, scores_ref, lucky_ref, matrix_ref, deep_ref, \

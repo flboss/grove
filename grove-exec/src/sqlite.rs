@@ -1568,47 +1568,21 @@ mod tests {
 
     #[test]
     fn fetch_bytes_blob() {
-        let (schema, parse_diags) = grove_schema::parse_schema(
-            "root blobs: Blob; struct Blob { data: Bytes, maybe: ?Bytes }",
-        );
-        assert!(parse_diags.is_empty(), "parse diagnostics: {parse_diags:?}");
-        let (schema, validation_diags) = grove_schema::validate(schema.unwrap());
-        let schema = schema.unwrap();
-        assert!(
-            validation_diags.is_empty(),
-            "validation diagnostics: {validation_diags:?}"
-        );
-
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE blobs(data BLOB, maybe BLOB);")
-            .unwrap();
-        let data = vec![0x00, 0x01, 0xfe, 0xff];
-        let maybe = vec![0x10, 0x20];
-        conn.execute(
-            "INSERT INTO blobs(data, maybe) VALUES (?1, ?2)",
-            rusqlite::params![&data[..], &maybe[..]],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO blobs(data, maybe) VALUES (?1, ?2)",
-            rusqlite::params![&[], None::<&[u8]>],
-        )
-        .unwrap();
-
-        let backend = SqliteBackend::new(conn, &schema).unwrap();
-        let sid = schema.roots[0].struct_id;
-        let data_fid = schema.struct_field(sid, "data").unwrap().0;
-        let maybe_fid = schema.struct_field(sid, "maybe").unwrap().0;
+        let schema = testdata::schema();
+        let backend = test_backend(&schema);
+        let blobs = testdata::struct_id(&schema, "Blob");
+        let data_fid = schema.struct_field(blobs, "data").unwrap().0;
+        let maybe_fid = schema.struct_field(blobs, "maybe").unwrap().0;
         let rows = backend
-            .fetch(sid, &[data_fid, maybe_fid], &FetchConstraints::EMPTY)
+            .fetch(blobs, &[data_fid, maybe_fid], &FetchConstraints::EMPTY)
             .unwrap();
 
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 3);
         assert_eq!(
             rows[0].values,
             vec![
-                Val::Scalar(Scalar::Bytes(data)),
-                Val::Some(Box::new(Val::Scalar(Scalar::Bytes(maybe)))),
+                Val::Scalar(Scalar::Bytes(vec![0, 1])),
+                Val::Some(Box::new(Val::Scalar(Scalar::Bytes(vec![255])))),
             ]
         );
         assert_eq!(
@@ -3080,6 +3054,63 @@ mod tests {
         assert_eq!(
             user_names(&backend, &schema, filters, vec![], 0, None),
             names(&["Ada", "Dan", "Eli"])
+        );
+    }
+
+    #[test]
+    fn fetch_bytes_filter_sort_and_cache() {
+        let schema = testdata::schema();
+        let backend = test_backend(&schema);
+        let sid = testdata::struct_id(&schema, "Blob");
+        let id = testdata::field_id(&schema, sid, "id");
+        let data = testdata::field_id(&schema, sid, "data");
+        let maybe = testdata::field_id(&schema, sid, "maybe");
+        let chunks = testdata::field_id(&schema, sid, "chunks");
+
+        let constraints = FetchConstraints {
+            filters: vec![push_cmp(
+                CmpOp::Gt,
+                target_field(&schema, "Blob", "data"),
+                PushExpr::Literal(Scalar::Bytes(vec![0x00, 0x00])),
+            )],
+            sort: vec![SortKey {
+                field: data,
+                desc: false,
+            }],
+            offset: 0,
+            limit: None,
+        };
+        let rows = backend.fetch(sid, &[id], &constraints).unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.values[0].clone())
+                .collect::<Vec<_>>(),
+            vec![int(1), int(3)]
+        );
+        assert_eq!(backend.sql_cache.borrow().len(), 1);
+        backend.fetch(sid, &[id], &constraints).unwrap();
+        assert_eq!(backend.sql_cache.borrow().len(), 1);
+
+        let rows = backend
+            .fetch(sid, &[maybe, chunks], &FetchConstraints::EMPTY)
+            .unwrap();
+        assert_eq!(
+            rows[0].values,
+            vec![
+                some(Val::Scalar(Scalar::Bytes(vec![0xff]))),
+                Val::List(vec![
+                    Val::Scalar(Scalar::Bytes(vec![0x01])),
+                    Val::Scalar(Scalar::Bytes(vec![0x01, 0x00])),
+                ]),
+            ]
+        );
+        assert_eq!(rows[1].values, vec![Val::None, Val::List(vec![])]);
+        assert_eq!(
+            rows[2].values,
+            vec![
+                some(Val::Scalar(Scalar::Bytes(vec![0x00]))),
+                Val::List(vec![]),
+            ]
         );
     }
 

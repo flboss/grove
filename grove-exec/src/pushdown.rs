@@ -1015,6 +1015,65 @@ mod tests {
     }
 
     #[test]
+    fn matcher_bytes_predicates() {
+        let (file, plan, schema) = typed_and_plan(r#"blobs[data == hex"0001"]"#);
+        assert_eq!(
+            root_constraints(&plan, &file).filters,
+            vec![PushExpr::Cmp {
+                op: CmpOp::Eq,
+                lhs: Box::new(PushExpr::Field(field(&schema, "Blob", "data"))),
+                rhs: Box::new(PushExpr::Literal(Scalar::Bytes(vec![0x00, 0x01]))),
+            }]
+        );
+
+        let (file, plan, schema) = typed_and_plan(r#"blobs[data > hex"00"]"#);
+        assert_eq!(
+            root_constraints(&plan, &file).filters,
+            vec![PushExpr::Cmp {
+                op: CmpOp::Gt,
+                lhs: Box::new(PushExpr::Field(field(&schema, "Blob", "data"))),
+                rhs: Box::new(PushExpr::Literal(Scalar::Bytes(vec![0x00]))),
+            }]
+        );
+
+        let (file, plan, schema) = typed_and_plan(r#"blobs[data in (hex"0001", hex"00ff")]"#);
+        assert_eq!(
+            root_constraints(&plan, &file).filters,
+            vec![PushExpr::In {
+                lhs: Box::new(PushExpr::Field(field(&schema, "Blob", "data"))),
+                items: vec![
+                    PushExpr::Literal(Scalar::Bytes(vec![0x00, 0x01])),
+                    PushExpr::Literal(Scalar::Bytes(vec![0x00, 0xff])),
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn bytes_sort_and_unpushed() {
+        let (file, plan, schema) = typed_and_plan("blobs.sort_over(data)");
+        assert_eq!(
+            root_constraints(&plan, &file).sort,
+            vec![SortKey {
+                field: field(&schema, "Blob", "data"),
+                desc: false,
+            }]
+        );
+
+        for source in [
+            r#"blobs[data.len() > 1]"#,
+            r#"blobs[("x" as Bytes) == data]"#,
+        ] {
+            let (file, plan, _schema) = typed_and_plan(source);
+            let constraints = root_constraints(&plan, &file);
+            assert!(
+                constraints.filters.is_empty(),
+                "{source} should not push: {constraints:?}"
+            );
+        }
+    }
+
+    #[test]
     fn matcher_simple_predicates() {
         let sources = [
             "users[id > 2]",
