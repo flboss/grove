@@ -1,6 +1,8 @@
+use std::collections::HashMap;
+
 use crate::ast::{
     Arg, BinaryOp, ConstantName, Expr, LetStmt, Literal, MutationKind, MutationStmt,
-    ProjectionItem, QueryFile, SortDir, Statement, TypeName, UnaryOp,
+    ProjectionItem, QueryFile, SortDir, Statement, TypeExpr, TypeName, UnaryOp,
 };
 use crate::error::QueryParseError;
 use crate::lex::Lexer;
@@ -343,15 +345,7 @@ impl<'src> Parser<'src> {
                 }
                 TokenKind::As => {
                     self.bump();
-                    let ty = match self.parse_type_name() {
-                        Ok(ty) => ty,
-                        Err(found) => {
-                            self.emit_error(QueryParseError::ExpectedCastTypeName {
-                                span: found.span,
-                            });
-                            return Err(());
-                        }
-                    };
+                    let ty = self.parse_type_expr()?;
                     let span = Span {
                         start: expr.span().start,
                         end: ty.span.end,
@@ -968,6 +962,183 @@ impl<'src> Parser<'src> {
         })
     }
 
+    fn parse_type_expr(&mut self) -> Result<Spanned<TypeExpr>, ()> {
+        if let &TokenKind::Question(depth) = &self.current.value {
+            let question = self.bump();
+            let mut ty = self.parse_type_expr()?;
+            let span = Span::new(question.span.start, ty.span.end);
+            for _ in 0..depth {
+                ty = Spanned {
+                    span,
+                    value: TypeExpr::Optional {
+                        inner: Box::new(ty),
+                        span,
+                    },
+                };
+            }
+            return Ok(ty);
+        }
+        self.parse_type_primary()
+    }
+
+    fn parse_type_primary(&mut self) -> Result<Spanned<TypeExpr>, ()> {
+        match &self.current.value {
+            TokenKind::Int => Ok(self.scalar_type(TypeName::Int)),
+            TokenKind::Float => Ok(self.scalar_type(TypeName::Float)),
+            TokenKind::Dec => Ok(self.scalar_type(TypeName::Dec)),
+            TokenKind::String => Ok(self.scalar_type(TypeName::String)),
+            TokenKind::Bytes => Ok(self.scalar_type(TypeName::Bytes)),
+            TokenKind::Bool => Ok(self.scalar_type(TypeName::Bool)),
+            TokenKind::Instant => Ok(self.scalar_type(TypeName::Instant)),
+            TokenKind::Duration => Ok(self.scalar_type(TypeName::Duration)),
+            TokenKind::List => self.parse_list_type(),
+            TokenKind::LParen => self.parse_tuple_type(),
+            TokenKind::LBrace => self.parse_record_type(),
+            TokenKind::Ident(_) => {
+                let tok = self.bump();
+                let TokenKind::Ident(name) = tok.value else {
+                    unreachable!()
+                };
+                Ok(Spanned {
+                    span: tok.span,
+                    value: TypeExpr::Named(name),
+                })
+            }
+            _ => {
+                let span = self.current.span;
+                self.emit_error(QueryParseError::ExpectedType { span });
+                Err(())
+            }
+        }
+    }
+
+    fn scalar_type(&mut self, ty: TypeName) -> Spanned<TypeExpr> {
+        let tok = self.bump();
+        Spanned {
+            span: tok.span,
+            value: TypeExpr::Scalar(ty),
+        }
+    }
+
+    fn parse_list_type(&mut self) -> Result<Spanned<TypeExpr>, ()> {
+        let list = self.bump();
+        if !matches!(self.current.value, TokenKind::Less) {
+            let span = self.current.span;
+            self.emit_error(QueryParseError::ExpectedListTypeLAngle { span });
+            return Err(());
+        }
+        self.bump();
+
+        let element = self.parse_type_expr()?;
+        if !matches!(self.current.value, TokenKind::Greater) {
+            let span = self.current.span;
+            self.emit_error(QueryParseError::ExpectedListTypeRAngle { span });
+            return Err(());
+        }
+        let rangle = self.bump();
+        let span = Span::new(list.span.start, rangle.span.end);
+        Ok(Spanned {
+            span,
+            value: TypeExpr::List {
+                element: Box::new(element),
+                span,
+            },
+        })
+    }
+
+    fn parse_tuple_type(&mut self) -> Result<Spanned<TypeExpr>, ()> {
+        let lparen = self.bump();
+        if matches!(self.current.value, TokenKind::RParen) {
+            let span = self.span_from(lparen.span.start);
+            self.emit_error(QueryParseError::EmptyTupleType { span });
+            return Err(());
+        }
+
+        let mut elements = vec![self.parse_type_expr()?];
+        let rparen = loop {
+            if matches!(self.current.value, TokenKind::RParen) {
+                break self.bump();
+            }
+            if !matches!(self.current.value, TokenKind::Comma) {
+                let span = self.current.span;
+                self.emit_error(QueryParseError::TupleCommaOrRParenExpected { span });
+                return Err(());
+            }
+            self.bump();
+            elements.push(self.parse_type_expr()?);
+        };
+
+        let span = Span {
+            start: lparen.span.start,
+            end: rparen.span.end,
+        };
+        Ok(Spanned {
+            span,
+            value: TypeExpr::Tuple { elements, span },
+        })
+    }
+
+    fn parse_record_type(&mut self) -> Result<Spanned<TypeExpr>, ()> {
+        let lbrace = self.bump();
+        let mut fields = Vec::new();
+        let mut field_spans: HashMap<String, Span> = HashMap::new();
+        let rbrace = loop {
+            if matches!(self.current.value, TokenKind::RBrace) {
+                break self.bump();
+            }
+
+            let Ok(name) = self.expect_ident() else {
+                let span = self.current.span;
+                self.emit_error(QueryParseError::ExpectedTypeFieldName { span });
+                return Err(());
+            };
+            if !matches!(self.current.value, TokenKind::Colon) {
+                let span = self.current.span;
+                self.emit_error(QueryParseError::ExpectedTypeFieldColon { span });
+                return Err(());
+            }
+            self.bump();
+
+            let ty = self.parse_type_expr()?;
+            if let Some(previous) = field_spans.get(&name.value) {
+                self.emit_error(QueryParseError::DuplicateTypeField {
+                    span: name.span,
+                    field: name.value.clone(),
+                    previous: *previous,
+                });
+                return Err(());
+            }
+            field_spans.insert(name.value.clone(), name.span);
+            fields.push((name, ty));
+
+            match self.current.value {
+                TokenKind::Comma => {
+                    self.bump();
+                }
+                TokenKind::RBrace => {}
+                _ => {
+                    let span = self.current.span;
+                    self.emit_error(QueryParseError::ExpectedTypeFieldCommaOrRBrace { span });
+                    return Err(());
+                }
+            }
+        };
+
+        let span = Span {
+            start: lbrace.span.start,
+            end: rbrace.span.end,
+        };
+        if fields.is_empty() {
+            let span = Span::new(lbrace.span.start, rbrace.span.end);
+            self.emit_error(QueryParseError::EmptyRecordType { span });
+            return Err(());
+        }
+        Ok(Spanned {
+            span,
+            value: TypeExpr::Record { fields, span },
+        })
+    }
+
     fn emit_error(&mut self, err: QueryParseError) {
         self.diagnostics.push(err.into());
     }
@@ -1497,7 +1668,7 @@ mod tests {
             expr,
             Expr::Cast {
                 ty: Spanned {
-                    value: TypeName::Int,
+                    value: TypeExpr::Scalar(TypeName::Int),
                     ..
                 },
                 ..
@@ -1512,7 +1683,7 @@ mod tests {
             expr,
             Expr::Cast {
                 ty: Spanned {
-                    value: TypeName::Bytes,
+                    value: TypeExpr::Scalar(TypeName::Bytes),
                     ..
                 },
                 ..
@@ -1559,7 +1730,7 @@ mod tests {
             Expr::Cast {
                 expr,
                 ty: Spanned {
-                    value: TypeName::String,
+                    value: TypeExpr::Scalar(TypeName::String),
                     ..
                 },
                 ..
@@ -1567,10 +1738,144 @@ mod tests {
         ));
     }
 
+    fn cast_type(src: &str) -> TypeExpr {
+        match parse_ok(src) {
+            Expr::Cast { ty, .. } => ty.value,
+            other => panic!("expected cast, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn as_cast_unknown_type() {
-        let (_, diags) = parse_query("1 as Something");
-        assert_eq!(codes(&diags), vec!["QP0021"]);
+    fn as_cast_named_type() {
+        let expr = parse_ok("1 as Something");
+        assert!(matches!(
+            expr,
+            Expr::Cast {
+                ty: Spanned {
+                    value: TypeExpr::Named(name),
+                    ..
+                },
+                ..
+            } if name == "Something"
+        ));
+    }
+
+    #[test]
+    fn as_cast_scalars_and_named() {
+        for (source, name) in [
+            ("1 as Int", TypeName::Int),
+            ("1 as Float", TypeName::Float),
+            ("1 as Dec", TypeName::Dec),
+            ("1 as String", TypeName::String),
+            ("1 as Bytes", TypeName::Bytes),
+            ("1 as Bool", TypeName::Bool),
+            ("1 as Instant", TypeName::Instant),
+            ("1 as Duration", TypeName::Duration),
+        ] {
+            assert_eq!(
+                cast_type(source),
+                TypeExpr::Scalar(name),
+                "source: {source}"
+            );
+        }
+        assert_eq!(cast_type("1 as User"), TypeExpr::Named("User".to_string()));
+    }
+
+    #[test]
+    fn type_annotation_optional_list_tuple_record() {
+        assert!(matches!(
+            cast_type("none as ?String"),
+            TypeExpr::Optional { inner, .. }
+                if inner.value == TypeExpr::Scalar(TypeName::String)
+        ));
+        assert!(matches!(
+            cast_type("some(none) as ??String"),
+            TypeExpr::Optional { inner, .. }
+                if matches!(
+                    &inner.value,
+                    TypeExpr::Optional { inner, .. }
+                        if inner.value == TypeExpr::Scalar(TypeName::String)
+                )
+        ));
+        assert!(matches!(
+            cast_type("[] as List<Int>"),
+            TypeExpr::List { element, .. }
+                if element.value == TypeExpr::Scalar(TypeName::Int)
+        ));
+        assert!(matches!(
+            cast_type("(1,) as (Int)"),
+            TypeExpr::Tuple { ref elements, .. } if elements.len() == 1
+        ));
+        assert!(matches!(
+            cast_type("(1, \"\") as (Int, String)"),
+            TypeExpr::Tuple { ref elements, .. } if elements.len() == 2
+        ));
+
+        let record = cast_type("1 as {a: Int, b: List<String>,}");
+        let TypeExpr::Record { fields, .. } = record else {
+            panic!("expected record type");
+        };
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].0.value, "a");
+        assert_eq!(fields[0].1.value, TypeExpr::Scalar(TypeName::Int));
+        assert_eq!(fields[1].0.value, "b");
+        assert!(matches!(
+            fields[1].1.value,
+            TypeExpr::List { ref element, .. }
+                if element.value == TypeExpr::Scalar(TypeName::String)
+        ));
+    }
+
+    #[test]
+    fn type_annotation_complex() {
+        let ty = cast_type("[] as List<(?Int, List<Duration>, ??String, {a: Instant, d: Dec})>");
+        let TypeExpr::List { element, .. } = ty else {
+            panic!("expected list type");
+        };
+        let TypeExpr::Tuple { elements, .. } = element.value else {
+            panic!("expected tuple type");
+        };
+        assert_eq!(elements.len(), 4);
+        assert!(matches!(
+            elements[0].value,
+            TypeExpr::Optional { ref inner, .. }
+                if inner.value == TypeExpr::Scalar(TypeName::Int)
+        ));
+        assert!(matches!(
+            elements[1].value,
+            TypeExpr::List { ref element, .. }
+                if element.value == TypeExpr::Scalar(TypeName::Duration)
+        ));
+        assert!(matches!(
+            elements[2].value,
+            TypeExpr::Optional { ref inner, .. }
+                if matches!(&inner.value, TypeExpr::Optional { inner, .. }
+                    if inner.value == TypeExpr::Scalar(TypeName::String))
+        ));
+        assert!(matches!(
+            elements[3].value,
+            TypeExpr::Record { ref fields, .. } if fields.len() == 2
+        ));
+    }
+
+    #[test]
+    fn type_annotation_errors() {
+        for (source, code) in [
+            ("1 as", "QP0021"),
+            ("1 as ()", "QP0031"),
+            ("1 as {}", "QP0032"),
+            ("1 as {,}", "QP0033"),
+            ("1 as {a Int}", "QP0034"),
+            ("1 as {a: Int b: String}", "QP0035"),
+            ("1 as List Int", "QP0036"),
+            ("1 as List<Int", "QP0037"),
+            ("1 as {a: Int, a: String}", "QP0038"),
+            ("1 as (Int String)", "QP0003"),
+        ] {
+            let (file, diags) = parse_query(source);
+            assert!(file.is_none(), "source: {source}");
+            assert_eq!(codes(&diags), vec![code], "source: {source}");
+        }
     }
 
     #[test]
@@ -1930,7 +2235,9 @@ mod tests {
                     Expr::Binary { op, lhs, rhs, .. } => {
                         assert_eq!(op.value, BinaryOp::Sub);
                         match *lhs {
-                            Expr::Cast { ty, .. } => assert_eq!(ty.value, TypeName::Int),
+                            Expr::Cast { ty, .. } => {
+                                assert_eq!(ty.value, TypeExpr::Scalar(TypeName::Int))
+                            }
                             other => panic!("expected cast, got {other:?}"),
                         }
                         match *rhs {

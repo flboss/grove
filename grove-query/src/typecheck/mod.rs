@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
     Arg, BinaryOp, Expr, Literal, MutationKind, MutationStmt, ProjectionItem, QueryFile, Statement,
-    TypeName, UnaryOp,
+    TypeExpr, TypeName, UnaryOp,
 };
 use crate::typecheck::error::TypeError;
 use crate::typecheck::types::*;
@@ -391,13 +391,20 @@ fn infer_if(
 
 fn infer_cast(
     expr: &Expr,
-    target: &Spanned<TypeName>,
+    target: &Spanned<TypeExpr>,
     env: &mut TypeEnv,
 ) -> Result<TypedExpr, TypeError> {
     let typed_expr = infer(expr, env)?;
     let span = Span::new(typed_expr.span.start, target.span.end);
 
-    let target_ty = target.value.into();
+    let TypeExpr::Scalar(target_name) = &target.value else {
+        todo!("type annotation semantics");
+    };
+    let target_name = Spanned {
+        span: target.span,
+        value: *target_name,
+    };
+    let target_ty = target_name.value.into();
 
     if !cast_allowed(&typed_expr.ty, &target_ty, env.schema()) {
         return Err(TypeError::InvalidCast {
@@ -410,7 +417,7 @@ fn infer_cast(
     Ok(env.typed(
         TypedExprKind::Cast {
             expr: Box::new(typed_expr),
-            ty: target.clone(),
+            ty: target_name,
         },
         target_ty,
         span,

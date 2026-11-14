@@ -94,7 +94,7 @@ pub enum Expr {
     },
     Cast {
         expr: Box<Expr>,
-        ty: Spanned<TypeName>,
+        ty: Spanned<TypeExpr>,
         span: Span,
     },
     Field {
@@ -187,6 +187,59 @@ impl fmt::Display for TypeName {
             TypeName::Bool => write!(f, "Bool"),
             TypeName::Instant => write!(f, "Instant"),
             TypeName::Duration => write!(f, "Duration"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TypeExpr {
+    Scalar(TypeName),
+    Named(String),
+    Optional {
+        inner: Box<Spanned<TypeExpr>>,
+        span: Span,
+    },
+    List {
+        element: Box<Spanned<TypeExpr>>,
+        span: Span,
+    },
+    Tuple {
+        elements: Vec<Spanned<TypeExpr>>,
+        span: Span,
+    },
+    Record {
+        fields: Vec<(Spanned<String>, Spanned<TypeExpr>)>,
+        span: Span,
+    },
+}
+
+impl fmt::Display for TypeExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TypeExpr::Scalar(ty) => write!(f, "{ty}"),
+            TypeExpr::Named(name) => write!(f, "{name}"),
+            TypeExpr::Optional { inner, .. } => write!(f, "?{}", inner.value),
+            TypeExpr::List { element, .. } => write!(f, "List<{}>", element.value),
+            TypeExpr::Tuple { elements, .. } => {
+                write!(f, "(")?;
+                for (i, element) in elements.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", element.value)?;
+                }
+                write!(f, ")")
+            }
+            TypeExpr::Record { fields, .. } => {
+                write!(f, "{{")?;
+                for (i, (name, ty)) in fields.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}: {}", name.value, ty.value)?;
+                }
+                write!(f, "}}")
+            }
         }
     }
 }

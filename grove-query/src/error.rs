@@ -408,7 +408,19 @@ pub enum QueryParseError {
     UnclosedMethodArgs { span: Span },
     ExpectedFilterRBracket { span: Span },
     ExpectedProjectionRBrace { span: Span },
-    ExpectedCastTypeName { span: Span },
+    ExpectedType { span: Span },
+    EmptyTupleType { span: Span },
+    EmptyRecordType { span: Span },
+    ExpectedTypeFieldName { span: Span },
+    ExpectedTypeFieldColon { span: Span },
+    ExpectedTypeFieldCommaOrRBrace { span: Span },
+    ExpectedListTypeLAngle { span: Span },
+    ExpectedListTypeRAngle { span: Span },
+    DuplicateTypeField {
+        span: Span,
+        field: String,
+        previous: Span,
+    },
     ExpectedEnumVariantName { span: Span },
     ProjectionItemAliasRequired { span: Span },
     EmptyStatement { span: Span },
@@ -511,13 +523,60 @@ impl From<QueryParseError> for Diagnostic {
             ExpectedProjectionRBrace { span } => {
                 error_simple("QP0020", "unclosed projection", span, "expected `}`")
             }
-            ExpectedCastTypeName { span } => error_simple(
-                "QP0021",
-                "expected a type name after `as`",
+            ExpectedType { span } => {
+                error_simple("QP0021", "expected a type", span, "expected a type")
+            }
+            EmptyTupleType { span } => error_simple(
+                "QP0031",
+                "expected one or more tuple elements",
                 span,
-                "expected a type name",
+                "empty tuple",
+            ),
+            EmptyRecordType { span } => error_simple(
+                "QP0032",
+                "expected one or more record fields",
+                span,
+                "empty record",
+            ),
+            ExpectedTypeFieldName { span } => error_simple(
+                "QP0033",
+                "expected a field name in record type",
+                span,
+                "expected an identifier",
+            ),
+            ExpectedTypeFieldColon { span } => error_simple(
+                "QP0034",
+                "expected `:` after record type field name",
+                span,
+                "expected `:`",
+            ),
+            ExpectedTypeFieldCommaOrRBrace { span } => error_simple(
+                "QP0035",
+                "unclosed record type",
+                span,
+                "expected `,` or `}`",
+            ),
+            ExpectedListTypeLAngle { span } => {
+                error_simple("QP0036", "expected `<` after `List`", span, "expected `<`")
+            }
+            ExpectedListTypeRAngle { span } => {
+                error_simple("QP0037", "unclosed `List<...>` type", span, "expected `>`")
+            }
+            DuplicateTypeField {
+                span,
+                field,
+                previous,
+            } => error_simple(
+                "QP0038",
+                format!("duplicate field `{field}` in record type"),
+                span,
+                "duplicate field",
             )
-            .with_help("possible cast targets are `Int`, `Float`, `Dec`, `String`, and `Bytes`"),
+            .with_label(Label {
+                span: previous,
+                message: "first declared here".into(),
+                style: LabelStyle::Secondary,
+            }),
             ExpectedEnumVariantName { span } => error_simple(
                 "QP0030",
                 "expected an enum variant name after `::`",
