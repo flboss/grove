@@ -35,9 +35,7 @@ pub enum SchemaParseError {
     ExpectedType { span: Span },
     ExpectedColumns { span: Span },
     ExpectedListLAngle { span: Span },
-    ExpectedTupleLAngle { span: Span },
     ExpectedListRAngle { span: Span },
-    ExpectedTupleCommaOrRAngle { span: Span },
     ExpectedTupleCommaOrRParen { span: Span },
     ExpectedStructCommaOrRBrace { span: Span, struct_name: String },
     UnclosedStruct { span: Span },
@@ -329,20 +327,11 @@ impl From<SchemaParseError> for Diagnostic {
             ExpectedListLAngle { span } => {
                 error_simple("SP0024", "expected `<` after `List`", span, "expected `<`")
             }
-            ExpectedTupleLAngle { span } => {
-                error_simple("SP0025", "expected `<` after `Tuple`", span, "expected `<`")
-            }
             ExpectedListRAngle { span } => error_simple(
                 "SP0026",
                 "expected `>` to close the type arguments",
                 span,
                 "expected `>`",
-            ),
-            ExpectedTupleCommaOrRAngle { span } => error_simple(
-                "SP0027",
-                "expected `,` or `>` after tuple element",
-                span,
-                "expected `,` or `>`",
             ),
             ExpectedTupleCommaOrRParen { span } => error_simple(
                 "SP0028",

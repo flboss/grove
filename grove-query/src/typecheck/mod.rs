@@ -1830,7 +1830,7 @@ mod tests {
             active: Bool,
             created: Instant,
             profile: ?Profile,
-            maybe_pos: ?Tuple<Float, Float>@(mlat, mlng),
+            maybe_pos: ?(Float, Float)@(mlat, mlng),
         }
         struct Profile {
             user: &User,
@@ -1859,7 +1859,7 @@ mod tests {
             level: Level,
             maybe_priority: ?Priority,
             priorities: List<Priority>@priorities_ref via ticket_priorities[ticket_key, priority],
-            pair: Tuple<Priority, Level>@(pair_priority, pair_level),
+            pair: (Priority, Level)@(pair_priority, pair_level),
         }
     "#;
 

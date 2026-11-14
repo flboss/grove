@@ -427,7 +427,7 @@ mod tests {
                struct Ticket {
                    priority: Priority,
                    fallback: ?Priority,
-                   pair: Tuple<Priority, Level>@(p, l),
+                   pair: (Priority, Level)@(p, l),
                    tags: List<Priority>@tags_ref via ticket_tags[ticket_key, tag],
                }"#,
         );

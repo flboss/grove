@@ -251,7 +251,6 @@ impl<'src> Parser<'src> {
                 }))
             }
             TokenKind::List => self.parse_list_type(skip_via),
-            TokenKind::Tuple => self.parse_tuple_type(),
             TokenKind::LParen => self.parse_paren_tuple(),
             _ => {
                 let span = self.peek().span;
@@ -324,42 +323,6 @@ impl<'src> Parser<'src> {
             table,
             key_col,
             value,
-        })
-    }
-
-    fn parse_tuple_type(&mut self) -> PResult<TypeExpr> {
-        let kw_tok = self.advance();
-        if let Err(found) = self.expect(TokenKind::LAngle) {
-            self.emit_error(SchemaParseError::ExpectedTupleLAngle { span: found.span });
-            return Err(());
-        }
-        let mut elements = vec![self.parse_type_expr(false)?];
-        let rangle = loop {
-            match self.peek().value {
-                TokenKind::RAngle => break self.advance(),
-
-                TokenKind::Eof => {
-                    let span = self.peek().span;
-                    self.emit_error(SchemaParseError::ExpectedTupleCommaOrRAngle { span });
-                    return Err(());
-                }
-                _ => {
-                    if let Err(found) = self.expect(TokenKind::Comma) {
-                        self.emit_error(SchemaParseError::ExpectedTupleCommaOrRAngle {
-                            span: found.span,
-                        });
-                        return Err(());
-                    }
-                    elements.push(self.parse_type_expr(false)?);
-                }
-            }
-        };
-        Ok(TypeExpr::Tuple {
-            elements,
-            span: Span {
-                start: kw_tok.span.start,
-                end: rangle.span.end,
-            },
         })
     }
 
@@ -460,7 +423,7 @@ mod tests {
     #[test]
     fn bytes_primitive_type() {
         let (schema, diags) =
-            parse_schema("struct S { data: Bytes, maybe: ?Bytes, pair: Tuple<Bytes, Int> }");
+            parse_schema("struct S { data: Bytes, maybe: ?Bytes, pair: (Bytes, Int) }");
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
         let fields = schema.unwrap().structs[0].fields.clone();
         assert!(matches!(
@@ -518,9 +481,9 @@ mod tests {
     }
 
     #[test]
-    fn struct_with_tuple_and_paren_tuple_types() {
+    fn struct_with_tuple_types() {
         let (schema, diags) =
-            parse_schema("struct P { a: Tuple<Float, Float>, b: List<(Int, String)> }");
+            parse_schema("struct P { a: (Float, Float), b: List<(Int, String)> }");
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
         let fields = schema.unwrap().structs[0].fields.clone();
         assert!(matches!(fields[0].exposed_type, TypeExpr::Tuple { .. }));
@@ -592,8 +555,7 @@ mod tests {
 
     #[test]
     fn struct_with_multi_column_mapping() {
-        let (schema, diags) =
-            parse_schema("struct S { rgb: Tuple<Int, Int, Int>@(red, green, blue) }");
+        let (schema, diags) = parse_schema("struct S { rgb: (Int, Int, Int)@(red, green, blue) }");
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
         match &schema.unwrap().structs[0].fields[0].column {
             Some(ColumnMapping::Multi(cols)) => {
@@ -606,13 +568,13 @@ mod tests {
 
     #[test]
     fn multi_column_empty_parens() {
-        let (_, diags) = parse_schema("struct S { rgb: Tuple<Int, Int, Int>@() }");
+        let (_, diags) = parse_schema("struct S { rgb: (Int, Int, Int)@() }");
         assert_eq!(codes(&diags), vec!["SP0033"]);
     }
 
     #[test]
     fn multi_column_trailing_comma() {
-        let (_, diags) = parse_schema("struct S { rgb: Tuple<Int, Int, Int>@(red, ) }");
+        let (_, diags) = parse_schema("struct S { rgb: (Int, Int, Int)@(red, ) }");
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
 
@@ -749,13 +711,13 @@ mod tests {
 
     #[test]
     fn multi_column_unclosed() {
-        let (_, diags) = parse_schema("struct S { rgb: Tuple<Int, Int, Int>@(red, green");
+        let (_, diags) = parse_schema("struct S { rgb: (Int, Int, Int)@(red, green");
         assert_eq!(codes(&diags), vec!["SP0034"]);
     }
 
     #[test]
     fn multi_column_missing_comma() {
-        let (_, diags) = parse_schema("struct S { rgb: Tuple<Int, Int, Int>@(red green) }");
+        let (_, diags) = parse_schema("struct S { rgb: (Int, Int, Int)@(red green) }");
         assert_eq!(codes(&diags), vec!["SP0034"]);
     }
 

@@ -486,7 +486,7 @@ mod tests {
     #[test]
     fn value_optional_fields() {
         stage_structs(
-            "root users: User; struct User { nickname: ?String, pos: ?Tuple<Float, Float>@(x, y) }",
+            "root users: User; struct User { nickname: ?String, pos: ?(Float, Float)@(x, y) }",
             |b| {
                 assert!(b.diags.is_empty());
                 let nickname = b.field_index[&("User", "nickname")];
@@ -503,7 +503,7 @@ mod tests {
                     panic!("pos should be a Value field");
                 };
                 let ValueType::Optional(inner) = ty else {
-                    panic!("pos should be Optional<Tuple<Float, Float>>");
+                    panic!("pos should be Optional<(Float, Float)>");
                 };
                 let ValueType::Tuple(ts) = inner.as_ref() else {
                     panic!("pos should wrap a Tuple");
@@ -517,7 +517,7 @@ mod tests {
     #[test]
     fn value_tuple_holding_via_list() {
         stage_structs(
-            "root ss: S; struct S { t: Tuple<Int, List<String> via tt[k, v]>@(a, b) }",
+            "root ss: S; struct S { t: (Int, List<String> via tt[k, v])@(a, b) }",
             |b| {
                 assert!(b.diags.is_empty(), "{:?}", codes(&b.diags));
                 let t = b.field_index[&("S", "t")];
@@ -547,7 +547,7 @@ mod tests {
     #[test]
     fn value_optional_tuple_holding_via_list() {
         stage_structs(
-            "root ss: S; struct S { u: ?Tuple<Int, List<String> via tt[k, v]>@(a, b) }",
+            "root ss: S; struct S { u: ?(Int, List<String> via tt[k, v])@(a, b) }",
             |b| {
                 assert!(b.diags.is_empty(), "{:?}", codes(&b.diags));
                 let u = b.field_index[&("S", "u")];
@@ -570,7 +570,7 @@ mod tests {
     #[test]
     fn value_tuple_via_list_arity() {
         stage_structs(
-            "root ss: S; struct S { t: Tuple<Int, List<String> via tt[k, v]>@(a, b, c) }",
+            "root ss: S; struct S { t: (Int, List<String> via tt[k, v])@(a, b, c) }",
             |b| {
                 assert_eq!(codes(&b.diags), vec!["SV0009"]);
             },
@@ -580,7 +580,7 @@ mod tests {
     #[test]
     fn value_tuple_holding_via_tuple_list() {
         stage_structs(
-            "root ss: S; struct S { t: Tuple<Int, List<Tuple<Int, String>> via tt[k, (x, y)]>@(a, b) }",
+            "root ss: S; struct S { t: (Int, List<(Int, String)> via tt[k, (x, y)])@(a, b) }",
             |b| {
                 assert!(b.diags.is_empty(), "{:?}", codes(&b.diags));
                 let t = b.field_index[&("S", "t")];
@@ -614,7 +614,7 @@ mod tests {
     #[test]
     fn nested_value_list_without_via() {
         stage_structs(
-            "root users: User; struct User { data: Tuple<List<Int>, String>@(a, b) }",
+            "root users: User; struct User { data: (List<Int>, String)@(a, b) }",
             |b| {
                 assert_eq!(codes(&b.diags), vec!["SV0011"]);
                 assert!(b.structs[0].fields.is_empty());
@@ -639,8 +639,8 @@ mod tests {
     fn nested_struct_ref_excluded() {
         stage_structs(
             "root users: User; root orders: Order; \
-             struct User { a: Tuple<Int, ?List<Order>>, b: List<List<Order>>, \
-             c: List<Tuple<Order, Int>>@id via t[k, v] } struct Order { x: Int }",
+             struct User { a: (Int, ?List<Order>), b: List<List<Order>>, \
+             c: List<(Order, Int)>@id via t[k, v] } struct Order { x: Int }",
             |b| {
                 assert_eq!(codes(&b.diags), vec!["SV0007", "SV0007", "SV0007"]);
                 assert!(b.structs[0].fields.is_empty());
@@ -652,7 +652,7 @@ mod tests {
     #[test]
     fn value_arity_mismatch() {
         stage_structs(
-            "root users: User; struct User { pos: Tuple<Float, Float>@(x) }",
+            "root users: User; struct User { pos: (Float, Float)@(x) }",
             |b| {
                 assert_eq!(codes(&b.diags), vec!["SV0009"]);
                 assert!(b.structs[0].fields.is_empty());
@@ -688,7 +688,7 @@ mod tests {
     fn bytes_fields() {
         stage_structs(
             "root blobs: Blob; \
-             struct Blob { data: Bytes, maybe: ?Bytes, pair: Tuple<Bytes, Int>@(a, b), \
+             struct Blob { data: Bytes, maybe: ?Bytes, pair: (Bytes, Int)@(a, b), \
              chunks: List<Bytes>@chunks_ref via blob_chunks[k, chunk] }",
             |b| {
                 assert!(b.diags.is_empty(), "unexpected diagnostics: {:?}", b.diags);
@@ -734,7 +734,7 @@ mod tests {
                struct Ticket {
                    priority: Priority,
                    fallback: ?Priority,
-                   pair: Tuple<Priority, Level>@(p, l),
+                   pair: (Priority, Level)@(p, l),
                    tags: List<Priority>@tags_ref via ticket_tags[ticket_key, tag],
                }"#,
             |b| {
@@ -829,7 +829,7 @@ mod tests {
     fn non_owning_on_value_shape_excluded() {
         stage_structs(
             "root users: User; struct User { \
-             a: &Int, b: &List<Int>, c: &Tuple<Int, Int>, d: &List<String>@id via t[k, v] }",
+             a: &Int, b: &List<Int>, c: &(Int, Int), d: &List<String>@id via t[k, v] }",
             |b| {
                 assert_eq!(
                     codes(&b.diags),

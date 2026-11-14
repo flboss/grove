@@ -555,7 +555,7 @@ mod tests {
     fn tuple_via_list_link_inventory() {
         stage_physical(
             "root ss: S; \
-             struct S { t: Tuple<Int, List<String> via tt[k, v]>@(a, b) }",
+             struct S { t: (Int, List<String> via tt[k, v])@(a, b) }",
             |b| {
                 assert!(b.diags.is_empty());
                 let names: Vec<&str> = b.tables.iter().map(|t| t.name.as_str()).collect();

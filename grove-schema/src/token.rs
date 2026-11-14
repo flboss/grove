@@ -12,7 +12,6 @@ pub enum TokenKind {
     Rel,
     Via,
     List,
-    Tuple,
     Int,
     Float,
     Dec,
