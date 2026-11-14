@@ -283,6 +283,9 @@ impl From<TypeName> for QueryType {
             TypeName::Dec => QueryType::Scalar(ScalarType::Dec),
             TypeName::String => QueryType::Scalar(ScalarType::String),
             TypeName::Bytes => QueryType::Scalar(ScalarType::Bytes),
+            TypeName::Bool => QueryType::Scalar(ScalarType::Bool),
+            TypeName::Instant => QueryType::Scalar(ScalarType::Instant),
+            TypeName::Duration => QueryType::Scalar(ScalarType::Duration),
         }
     }
 }

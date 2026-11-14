@@ -445,6 +445,9 @@ fn infer_type_constant(
         TypeName::Dec => ScalarType::Dec,
         TypeName::String => unreachable!("String has no type constants"),
         TypeName::Bytes => unreachable!("Bytes has no type constants"),
+        TypeName::Bool => unreachable!("Bool has no type constants"),
+        TypeName::Instant => unreachable!("Instant has no type constants"),
+        TypeName::Duration => unreachable!("Duration has no type constants"),
     };
 
     let result_ty = QueryType::Scalar(scalar_ty);

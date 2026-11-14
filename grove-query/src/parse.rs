@@ -955,6 +955,9 @@ impl<'src> Parser<'src> {
             TokenKind::Dec => TypeName::Dec,
             TokenKind::String => TypeName::String,
             TokenKind::Bytes => TypeName::Bytes,
+            TokenKind::Bool => TypeName::Bool,
+            TokenKind::Instant => TypeName::Instant,
+            TokenKind::Duration => TypeName::Duration,
             _ => {
                 return Err(tok);
             }

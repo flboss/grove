@@ -171,6 +171,9 @@ pub enum TypeName {
     Dec,
     String,
     Bytes,
+    Bool,
+    Instant,
+    Duration,
 }
 
 impl fmt::Display for TypeName {
@@ -181,6 +184,9 @@ impl fmt::Display for TypeName {
             TypeName::Dec => write!(f, "Dec"),
             TypeName::String => write!(f, "String"),
             TypeName::Bytes => write!(f, "Bytes"),
+            TypeName::Bool => write!(f, "Bool"),
+            TypeName::Instant => write!(f, "Instant"),
+            TypeName::Duration => write!(f, "Duration"),
         }
     }
 }
