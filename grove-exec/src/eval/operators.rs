@@ -627,6 +627,23 @@ mod tests {
     }
 
     #[test]
+    fn eval_type_annotations() {
+        assert_eq!(
+            run_src("([] as List<Int>).extend([1, 2, 3])"),
+            Ok(Val::List(vec![int(1), int(2), int(3)]))
+        );
+        assert_eq!(run_src("none as ?String"), Ok(Val::None));
+        assert_eq!(
+            run_src("some(none) as ??Int"),
+            Ok(Val::Some(Box::new(Val::None)))
+        );
+        assert_eq!(
+            run_src("[] as List<(?Int, List<Duration>, ??String, {a: Instant, d: Dec})>"),
+            Ok(Val::List(Vec::new()))
+        );
+    }
+
+    #[test]
     fn eval_bytes_sort_filter_extrema() {
         assert_eq!(
             run_src(r#"[hex"02", hex"01"].sort()"#),
