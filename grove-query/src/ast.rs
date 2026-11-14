@@ -1,6 +1,7 @@
 use std::fmt;
 
 use chrono::{DateTime, NaiveTime, TimeDelta, Utc};
+use grove_schema::validated::ScalarType;
 use grove_types::{Span, Spanned};
 use rust_decimal::Decimal;
 
@@ -187,6 +188,21 @@ impl fmt::Display for TypeName {
             TypeName::Bool => write!(f, "Bool"),
             TypeName::Instant => write!(f, "Instant"),
             TypeName::Duration => write!(f, "Duration"),
+        }
+    }
+}
+
+impl From<ScalarType> for TypeName {
+    fn from(value: ScalarType) -> Self {
+        match value {
+            ScalarType::Int => TypeName::Int,
+            ScalarType::Float => TypeName::Float,
+            ScalarType::Dec => TypeName::Dec,
+            ScalarType::String => TypeName::String,
+            ScalarType::Bytes => TypeName::Bytes,
+            ScalarType::Bool => TypeName::Bool,
+            ScalarType::Instant => TypeName::Instant,
+            ScalarType::Duration => TypeName::Duration,
         }
     }
 }

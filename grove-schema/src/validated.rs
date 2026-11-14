@@ -149,6 +149,13 @@ impl ValidatedSchema {
             .map(|index| (EnumId::new(index), &self.enums[index]))
     }
 
+    pub fn struct_by_name(&self, name: &str) -> Option<(StructId, &Struct)> {
+        self.structs
+            .iter()
+            .position(|e| e.name == name)
+            .map(|index| (StructId::new(index), &self.structs[index]))
+    }
+
     pub fn struct_field(&self, struct_id: StructId, name: &str) -> Option<(FieldId, &Field)> {
         let struct_ = &self.structs[struct_id.index()];
         let local = struct_.fields.iter().position(|f| match f {

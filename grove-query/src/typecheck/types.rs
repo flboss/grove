@@ -1,7 +1,9 @@
 use std::fmt;
 
 use crate::ast::{BinaryOp, ConstantName, Literal, SortDir, TypeName, UnaryOp};
-use grove_schema::validated::{EnumId, FieldId, ScalarType, StructId, ValueType};
+use grove_schema::validated::{
+    EnumId, Field, FieldId, ScalarType, StructId, ValidatedSchema, ValueType,
+};
 use grove_types::{NodeId, Span, Spanned};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -151,6 +153,34 @@ pub enum RecordSource {
     Projection(Vec<ProjectionField>),
 }
 
+impl RecordSource {
+    fn eq(&self, other: &RecordSource, schema: &ValidatedSchema) -> bool {
+        match (self, other) {
+            (RecordSource::Schema(left), RecordSource::Schema(right)) => left == right,
+            (RecordSource::Projection(left), RecordSource::Projection(right)) => {
+                left.len() == right.len()
+                    && left.iter().all(|left_field| {
+                        right.iter().any(|right_field| {
+                            left_field.name == right_field.name
+                                && left_field.ty.eq(&right_field.ty, schema)
+                        })
+                    })
+            }
+            (RecordSource::Schema(struct_id), RecordSource::Projection(fields))
+            | (RecordSource::Projection(fields), RecordSource::Schema(struct_id)) => {
+                let struct_ = &schema.structs[struct_id.index()];
+                struct_.fields.len() == fields.len()
+                    && struct_.fields.iter().all(|schema_field| {
+                        fields.iter().any(|field| {
+                            field.name == schema_field.name()
+                                && QueryType::from(schema_field).eq(&field.ty, schema)
+                        })
+                    })
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum QueryType {
     Scalar(ScalarType),
@@ -255,6 +285,51 @@ impl QueryType {
             QueryType::Record(RecordSource::Schema(struct_id)) => Some(*struct_id),
             QueryType::Optional(inner) => inner.single_schema_record(),
             _ => None,
+        }
+    }
+
+    pub fn eq(&self, other: &QueryType, schema: &ValidatedSchema) -> bool {
+        match (self, other) {
+            (QueryType::Scalar(left), QueryType::Scalar(right)) => left == right,
+            (QueryType::Enum(left), QueryType::Enum(right)) => left == right,
+            (QueryType::Optional(left), QueryType::Optional(right)) => {
+                left.as_ref().eq(right, schema)
+            }
+            (QueryType::List(left), QueryType::List(right)) => left.as_ref().eq(right, schema),
+            (QueryType::Tuple(left), QueryType::Tuple(right)) => {
+                left.len() == right.len()
+                    && left
+                        .iter()
+                        .zip(right)
+                        .all(|(left, right)| left.eq(right, schema))
+            }
+            (QueryType::Record(left), QueryType::Record(right)) => left.eq(right, schema),
+            (QueryType::Void, QueryType::Void) | (QueryType::Unknown, QueryType::Unknown) => true,
+            _ => false,
+        }
+    }
+}
+
+impl From<&Field> for QueryType {
+    fn from(value: &Field) -> Self {
+        match value {
+            Field::Value { ty, .. } => ty.into(),
+            Field::Array { element, .. } => QueryType::List(Box::new(element.into())),
+            Field::Ref {
+                target,
+                optional,
+                is_list,
+                ..
+            } => {
+                let inner = QueryType::Record(RecordSource::Schema(*target));
+                if *is_list {
+                    QueryType::List(Box::new(inner))
+                } else if *optional {
+                    inner.wrap_optional()
+                } else {
+                    inner
+                }
+            }
         }
     }
 }

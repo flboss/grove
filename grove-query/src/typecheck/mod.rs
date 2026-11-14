@@ -140,28 +140,6 @@ impl<'s> TypeEnv<'s> {
     }
 }
 
-fn field_query_type(field: &Field) -> QueryType {
-    match field {
-        Field::Value { ty, .. } => ty.into(),
-        Field::Array { element, .. } => QueryType::List(Box::new(element.into())),
-        Field::Ref {
-            target,
-            optional,
-            is_list,
-            ..
-        } => {
-            let inner = QueryType::Record(RecordSource::Schema(*target));
-            if *is_list {
-                QueryType::List(Box::new(inner))
-            } else if *optional {
-                inner.wrap_optional()
-            } else {
-                inner
-            }
-        }
-    }
-}
-
 fn record_field_by_name(
     record: &QueryType,
     name: &str,
@@ -170,7 +148,7 @@ fn record_field_by_name(
     match record {
         QueryType::Record(RecordSource::Schema(struct_id)) => schema
             .struct_field(*struct_id, name)
-            .map(|(_, field)| field_query_type(field)),
+            .map(|(_, field)| QueryType::from(field)),
         QueryType::Record(RecordSource::Projection(fields)) => {
             fields.iter().find(|f| f.name == name).map(|f| f.ty.clone())
         }
@@ -389,22 +367,82 @@ fn infer_if(
     ))
 }
 
+fn resolve_type_expr(
+    ty: &Spanned<TypeExpr>,
+    schema: &ValidatedSchema,
+) -> Result<QueryType, TypeError> {
+    match &ty.value {
+        &TypeExpr::Scalar(scalar) => Ok(scalar.into()),
+        TypeExpr::Named(name) => {
+            if let Some((enum_id, _)) = schema.enum_by_name(name) {
+                return Ok(QueryType::Enum(enum_id));
+            }
+            if let Some((struct_id, _)) = schema.struct_by_name(name) {
+                return Ok(QueryType::Record(RecordSource::Schema(struct_id)));
+            }
+            Err(TypeError::UnknownTypeName {
+                name: name.clone(),
+                span: ty.span,
+            })
+        }
+        TypeExpr::Optional { inner, .. } => Ok(resolve_type_expr(inner, schema)?.wrap_optional()),
+        TypeExpr::List { element, .. } => Ok(QueryType::List(Box::new(resolve_type_expr(
+            element, schema,
+        )?))),
+        TypeExpr::Tuple { elements, .. } => elements
+            .iter()
+            .map(|element| resolve_type_expr(element, schema))
+            .collect::<Result<Vec<_>, _>>()
+            .map(QueryType::Tuple),
+        TypeExpr::Record { fields, .. } => {
+            let mut projection = Vec::with_capacity(fields.len());
+            for (name, field_ty) in fields {
+                projection.push(ProjectionField {
+                    name: name.value.clone(),
+                    ty: resolve_type_expr(field_ty, schema)?,
+                });
+            }
+            Ok(QueryType::Record(RecordSource::Projection(projection)))
+        }
+    }
+}
+
 fn infer_cast(
     expr: &Expr,
     target: &Spanned<TypeExpr>,
     env: &mut TypeEnv,
 ) -> Result<TypedExpr, TypeError> {
-    let typed_expr = infer(expr, env)?;
+    let mut typed_expr = infer(expr, env)?;
     let span = Span::new(typed_expr.span.start, target.span.end);
+    let mut target_ty = resolve_type_expr(target, env.schema())?;
+    // target_ty can never contain QueryType::Unknown, so it won't get
+    // mutated in types_compatible() or check(); no clone necessary
+    debug_assert!(!target_ty.is_unknown());
 
-    let TypeExpr::Scalar(target_name) = &target.value else {
-        todo!("type annotation semantics");
-    };
-    let target_name = Spanned {
-        span: target.span,
-        value: *target_name,
-    };
-    let target_ty = target_name.value.into();
+    if typed_expr.ty.is_unknown() {
+        let mut refined = typed_expr.ty.clone();
+        if !types_compatible(&mut refined, &mut target_ty, env.schema()) {
+            return Err(TypeError::AmbiguousCast {
+                from: typed_expr.ty.to_string(),
+                to: target_ty.to_string(),
+                span,
+            });
+        }
+        typed_expr.ty = refined;
+        check(&mut typed_expr, &mut target_ty, env)?;
+        if typed_expr.ty.eq(&target_ty, env.schema()) {
+            return Ok(typed_expr);
+        }
+        return Err(TypeError::AmbiguousCast {
+            from: typed_expr.ty.to_string(),
+            to: target_ty.to_string(),
+            span,
+        });
+    }
+
+    if typed_expr.ty.eq(&target_ty, env.schema()) {
+        return Ok(typed_expr);
+    }
 
     if !cast_allowed(&typed_expr.ty, &target_ty, env.schema()) {
         return Err(TypeError::InvalidCast {
@@ -414,10 +452,18 @@ fn infer_cast(
         });
     }
 
+    let target_name = if let QueryType::Scalar(scalar) = target_ty {
+        scalar.into()
+    } else {
+        unreachable!("allowed cast target must be scalar");
+    };
     Ok(env.typed(
         TypedExprKind::Cast {
             expr: Box::new(typed_expr),
-            ty: target_name,
+            ty: Spanned {
+                span: target.span,
+                value: target_name,
+            },
         },
         target_ty,
         span,
@@ -1137,7 +1183,7 @@ fn record_schema_matches_projection(
         let Some(schema_field) = struct_.fields.iter().find(|f| f.name() == proj_field.name) else {
             return false;
         };
-        let mut schema_ty = field_query_type(schema_field);
+        let mut schema_ty = QueryType::from(schema_field);
         if !types_compatible(&mut schema_ty, &mut proj_field.ty, schema) {
             return false;
         }
@@ -1678,7 +1724,7 @@ fn validate_insert(
         }
 
         if is_optional {
-            let schema_ty = field_query_type(schema_field);
+            let schema_ty = QueryType::from(schema_field);
             let none_expr = env.typed(
                 TypedExprKind::Literal(Spanned {
                     span: typed_arg.span,
@@ -1724,7 +1770,7 @@ fn validate_insert(
                 name == &proj_field.name
             }
         });
-        let Some(mut schema_ty) = schema_field.map(field_query_type) else {
+        let Some(mut schema_ty) = schema_field.map(QueryType::from) else {
             return Err(TypeError::StructFieldNotInSchema {
                 field: proj_field.name.clone(),
                 struct_name: struct_name.clone(),
@@ -1774,7 +1820,7 @@ fn validate_update(
                 span: typed_arg.span,
             });
         }
-        let mut schema_ty = field_query_type(schema_field);
+        let mut schema_ty = QueryType::from(schema_field);
 
         if !types_compatible(&mut schema_ty, &mut proj_field.ty, schema) {
             return Err(TypeError::StructFieldTypeMismatch {
@@ -1896,6 +1942,24 @@ mod tests {
         let (file, parse_diags) = crate::parse_query(source);
         assert!(parse_diags.is_empty(), "parse diagnostics: {parse_diags:?}");
         infer(&file.unwrap().result, &mut env).unwrap()
+    }
+
+    const ANNOTATION_SCHEMA_SRC: &str = r#"
+        root items: Item;
+        struct Item {
+            a: ?String,
+            b: (Int, Int)@(bx, by),
+        }
+    "#;
+
+    fn annotation_schema() -> ValidatedSchema {
+        grove_schema::validate(
+            grove_schema::parse_schema(ANNOTATION_SCHEMA_SRC)
+                .0
+                .expect("invalid annotation test schema"),
+        )
+        .0
+        .expect("invalid annotation test schema")
     }
 
     #[test]
@@ -2090,6 +2154,105 @@ mod tests {
             infer_ok(r#""hello" as Bytes"#, &test_schema()).ty,
             QueryType::Scalar(ScalarType::Bytes)
         );
+    }
+
+    #[test]
+    fn annotations_disambiguation_only() {
+        for (source, expected) in [
+            (
+                "[] as List<Int>",
+                QueryType::List(Box::new(QueryType::Scalar(ScalarType::Int))),
+            ),
+            (
+                "none as ?String",
+                QueryType::Scalar(ScalarType::String).wrap_optional(),
+            ),
+            (
+                "some(none) as ??Int",
+                QueryType::Scalar(ScalarType::Int)
+                    .wrap_optional()
+                    .wrap_optional(),
+            ),
+            ("1 as Int", QueryType::Scalar(ScalarType::Int)),
+        ] {
+            let result = infer_ok(source, &test_schema());
+            assert_eq!(result.ty, expected, "source: {source}");
+            assert!(
+                !matches!(&result.kind, TypedExprKind::Cast { .. }),
+                "source should be a no-op: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn annotations_complex_and_named() {
+        let schema = test_schema();
+        let result = infer_ok(
+            "[] as List<(?Int, List<Duration>, ??String, {a: Instant, d: Dec})>",
+            &schema,
+        );
+        assert!(!result.ty.is_unknown());
+        assert!(matches!(result.ty, QueryType::List(_)));
+        assert!(!matches!(&result.kind, TypedExprKind::Cast { .. }));
+
+        let user_id = schema.roots[0].struct_id;
+        assert_eq!(
+            infer_ok("none as ?User", &schema).ty,
+            QueryType::Record(RecordSource::Schema(user_id)).wrap_optional()
+        );
+
+        let schema = enum_schema();
+        let priority_id = schema.enum_by_name("Priority").unwrap().0;
+        assert_eq!(
+            infer_ok("none as ?Priority", &schema).ty,
+            QueryType::Enum(priority_id).wrap_optional()
+        );
+    }
+
+    #[test]
+    fn annotations_record_equality() {
+        let schema = annotation_schema();
+        for source in [
+            "{a = none, b = (1, 2)} as Item",
+            "{b = (1, 2), a = none} as {b: (Int, Int), a: ?String}",
+            "items.first().unwrap() as {a: ?String, b: (Int, Int)}",
+        ] {
+            let result = infer_ok(source, &schema);
+            assert!(!result.ty.is_unknown(), "source: {source}");
+            assert!(
+                !matches!(&result.kind, TypedExprKind::Cast { .. }),
+                "source should be a no-op: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn annotations_ambiguous_and_invalid_casts() {
+        let schema = test_schema();
+        for source in ["none as Int", "[] as Int", "[none] as List<Int>"] {
+            assert_eq!(
+                error_codes(source, &schema),
+                vec!["QT0034"],
+                "source: {source}"
+            );
+        }
+        assert_eq!(
+            error_codes("{a = none} as Item", &annotation_schema()),
+            vec!["QT0034"]
+        );
+
+        for source in [
+            "none as ?String as Int",
+            "[] as List<Int> as List<Float>",
+            "1 as Bool",
+            "1 as User",
+        ] {
+            assert_eq!(
+                error_codes(source, &schema),
+                vec!["QT0013"],
+                "source: {source}"
+            );
+        }
     }
 
     #[test]

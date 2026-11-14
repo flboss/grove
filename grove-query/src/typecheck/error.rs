@@ -35,6 +35,8 @@ pub enum TypeError {
     UnknownEnum { name: String, span: Span },
     UnknownEnumVariant { enum_name: String, variant: String, span: Span },
     OptionalDepthMismatch { depth: usize, ty: String, span: Span },
+    UnknownTypeName { name: String, span: Span },
+    AmbiguousCast { from: String, to: String, span: Span },
 }
 
 impl From<TypeError> for Diagnostic {
@@ -296,6 +298,21 @@ impl From<TypeError> for Diagnostic {
                 format!("optional chaining depth {depth} exceeds the optional layers in `{ty}`"),
                 span,
                 format!("needs {depth} optional layer(s)"),
+            ),
+            TypeError::UnknownTypeName { name, span } => error_simple(
+                "QT0033",
+                format!("unknown type `{name}`"),
+                span,
+                "no such type",
+            ),
+            TypeError::AmbiguousCast { from, to, span } => error_simple(
+                "QT0034",
+                format!("cannot disambiguate `{from}` as `{to}`"),
+                span,
+                "ambiguous cast",
+            )
+            .with_help(
+                "the target type cannot be reconciled with information already known about the value's type",
             ),
         }
     }
