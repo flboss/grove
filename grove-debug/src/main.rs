@@ -93,6 +93,10 @@ enum Command {
         #[arg(long)]
         raw: bool,
 
+        /// Print the result without schema context (raw numeric ids)
+        #[arg(long)]
+        raw_output: bool,
+
         /// Disable operation pushdown and always evaluate in Rust
         #[arg(long)]
         no_pushdown: bool,
@@ -113,8 +117,9 @@ fn main() {
             schema,
             db,
             raw,
+            raw_output,
             no_pushdown,
-        } => exec_run(&query, &schema, &db, raw, no_pushdown),
+        } => exec_run(&query, &schema, &db, raw, raw_output, no_pushdown),
     }
 }
 
@@ -363,6 +368,7 @@ fn exec_run(
     schema_path: &PathBuf,
     db_path: &PathBuf,
     raw: bool,
+    raw_output: bool,
     no_pushdown: bool,
 ) {
     let (query_name, query_source) = read_input(query_path, "query");
@@ -447,7 +453,13 @@ fn exec_run(
         chrono::Utc::now(),
         options,
     ) {
-        Ok(value) => println!("{value}"),
+        Ok(value) => {
+            if raw_output {
+                println!("{value}");
+            } else {
+                println!("{}", value.formatter(&validated_schema));
+            }
+        }
         Err(e) => println!("No result. (execution failed: {e})"),
     }
     print_diagnostics(&query_source, &query_name, &typecheck_diagnostics, raw, "");
