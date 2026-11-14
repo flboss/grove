@@ -57,6 +57,7 @@ pub(super) fn eval_scalar_method(
         (Scalar::String(s), "to_upper") => Ok(Scalar::String(s.to_uppercase())),
         (Scalar::String(s), "to_lower") => Ok(Scalar::String(s.to_lowercase())),
         (Scalar::String(s), "len") => Ok(Scalar::Int(s.chars().count() as i64)),
+        (Scalar::Bytes(bytes), "len") => Ok(Scalar::Int(bytes.len() as i64)),
         (Scalar::Instant(t), "year") => Ok(Scalar::Int(t.year() as i64)),
         (Scalar::Instant(t), "month") => Ok(Scalar::Int(t.month() as i64)),
         (Scalar::Instant(t), "day") => Ok(Scalar::Int(t.day() as i64)),
@@ -148,6 +149,17 @@ mod tests {
             (r#""".len()"#, int(0)),
             (r#""héllo".len()"#, int(5)),
             (r#""😀".len()"#, int(1)),
+        ] {
+            assert_eq!(run_src(src), Ok(expected), "{src}");
+        }
+    }
+
+    #[test]
+    fn eval_bytes_methods() {
+        for (src, expected) in [
+            (r#"hex"deadbeef_0011 23 45".len()"#, int(8)),
+            (r#"b64"3q2+7w==".len()"#, int(4)),
+            (r#"hex"".len()"#, int(0)),
         ] {
             assert_eq!(run_src(src), Ok(expected), "{src}");
         }

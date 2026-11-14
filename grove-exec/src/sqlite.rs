@@ -290,6 +290,7 @@ fn scalar_value(value: &Scalar) -> Value {
         Scalar::Float(x) => Value::Real(*x),
         Scalar::Dec(d) => Value::Blob(Vec::from(codec::encode_dec(*d))),
         Scalar::String(s) => Value::Text(s.clone()),
+        Scalar::Bytes(bytes) => Value::Blob(bytes.clone()),
         Scalar::Bool(b) => Value::Integer(if *b { 1 } else { 0 }),
         Scalar::Instant(t) => Value::Blob(Vec::from(codec::encode_instant(*t))),
         Scalar::Duration(d) => Value::Blob(Vec::from(codec::encode_duration(*d))),
@@ -728,6 +729,7 @@ fn decode_scalar(
         (ScalarType::String, ValueRef::Text(bytes)) => String::from_utf8(bytes.to_vec())
             .map(|s| Val::Scalar(Scalar::String(s)))
             .map_err(|_| mismatch("non-UTF8 TEXT")),
+        (ScalarType::Bytes, ValueRef::Blob(blob)) => Ok(Val::Scalar(Scalar::Bytes(blob.to_vec()))),
         (ScalarType::Bool, ValueRef::Integer(0)) => Ok(Val::Scalar(Scalar::Bool(false))),
         (ScalarType::Bool, ValueRef::Integer(1)) => Ok(Val::Scalar(Scalar::Bool(true))),
         (ScalarType::Dec, ValueRef::Blob(blob)) => {
@@ -1539,6 +1541,80 @@ mod tests {
         }
         let err = fetch_null_float(true).unwrap_err();
         assert!(matches!(err, ExecError::Integrity { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn decode_bytes_blob() {
+        let raw = [0x00, 0x01, 0xfe, 0xff];
+        assert_eq!(
+            decode_scalar(ScalarType::Bytes, ValueRef::Blob(&raw), false, true),
+            Ok(Val::Scalar(Scalar::Bytes(raw.to_vec())))
+        );
+        assert_eq!(
+            decode_scalar(ScalarType::Bytes, ValueRef::Blob(&[]), false, true),
+            Ok(Val::Scalar(Scalar::Bytes(Vec::new())))
+        );
+        assert_eq!(
+            scalar_value(&Scalar::Bytes(raw.to_vec())),
+            Value::Blob(raw.to_vec())
+        );
+        assert!(decode_scalar(ScalarType::Bytes, ValueRef::Text(b"x"), false, true).is_err());
+        assert_eq!(
+            decode_scalar(ScalarType::Bytes, ValueRef::Null, true, true),
+            Ok(Val::None)
+        );
+        assert!(decode_scalar(ScalarType::Bytes, ValueRef::Null, false, true).is_err());
+    }
+
+    #[test]
+    fn fetch_bytes_blob() {
+        let (schema, parse_diags) = grove_schema::parse_schema(
+            "root blobs: Blob; struct Blob { data: Bytes, maybe: ?Bytes }",
+        );
+        assert!(parse_diags.is_empty(), "parse diagnostics: {parse_diags:?}");
+        let (schema, validation_diags) = grove_schema::validate(schema.unwrap());
+        let schema = schema.unwrap();
+        assert!(
+            validation_diags.is_empty(),
+            "validation diagnostics: {validation_diags:?}"
+        );
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE blobs(data BLOB, maybe BLOB);")
+            .unwrap();
+        let data = vec![0x00, 0x01, 0xfe, 0xff];
+        let maybe = vec![0x10, 0x20];
+        conn.execute(
+            "INSERT INTO blobs(data, maybe) VALUES (?1, ?2)",
+            rusqlite::params![&data[..], &maybe[..]],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blobs(data, maybe) VALUES (?1, ?2)",
+            rusqlite::params![&[], None::<&[u8]>],
+        )
+        .unwrap();
+
+        let backend = SqliteBackend::new(conn, &schema).unwrap();
+        let sid = schema.roots[0].struct_id;
+        let data_fid = schema.struct_field(sid, "data").unwrap().0;
+        let maybe_fid = schema.struct_field(sid, "maybe").unwrap().0;
+        let rows = backend
+            .fetch(sid, &[data_fid, maybe_fid], &FetchConstraints::EMPTY)
+            .unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].values,
+            vec![
+                Val::Scalar(Scalar::Bytes(data)),
+                Val::Some(Box::new(Val::Scalar(Scalar::Bytes(maybe)))),
+            ]
+        );
+        assert_eq!(
+            rows[1].values,
+            vec![Val::Scalar(Scalar::Bytes(Vec::new())), Val::None]
+        );
     }
 
     #[test]

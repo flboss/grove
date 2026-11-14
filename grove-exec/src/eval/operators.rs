@@ -355,9 +355,7 @@ pub(super) fn eval_cast(
         }
         (Val::Scalar(Scalar::Dec(d)), TypeName::Dec) => Scalar::Dec(d),
         (Val::Scalar(Scalar::Bool(b)), TypeName::Int) => Scalar::Int(i64::from(b)),
-        (Val::Scalar(Scalar::String(_)), TypeName::Bytes) => {
-            todo!("bytes cast runtime support")
-        }
+        (Val::Scalar(Scalar::String(s)), TypeName::Bytes) => Scalar::Bytes(s.into_bytes()),
         (Val::Enum(id, index), target) => {
             let enum_def = schema
                 .enums
@@ -416,6 +414,10 @@ mod tests {
             ("\"a\" < \"b\"", true),
             ("\"b\" <= \"b\"", true),
             ("\"abc\" > \"abd\"", false),
+            (r#"hex"00" < hex"0100""#, true),
+            (r#"hex"00" <= hex"00""#, true),
+            (r#"hex"0000" > hex"00""#, true),
+            (r#"hex"ff" > hex"0100""#, true),
             ("false < true", true),
             ("true <= true", true),
             ("@now < @3000-01-02", true),
@@ -470,6 +472,9 @@ mod tests {
             ("30.00 == 30.0", true),
             ("@now == @now", true),
             ("#30s == #30s", true),
+            (r#"hex"00" == hex"00""#, true),
+            (r#"hex"00" != hex"01""#, true),
+            (r#"hex"0000" == hex"00""#, false),
             ("some(1) == some(1)", true),
             ("some(1) != some(2)", true),
             ("none == some(2)", false),
@@ -516,6 +521,8 @@ mod tests {
             ("9 in (1, 2, 3)", false),
             ("\"a\" in ([true], 1.0, \"a\")", true),
             ("\"z\" in (\"a\", 0.0f)", false),
+            (r#"hex"00" in (hex"00", hex"01")"#, true),
+            (r#"hex"02" in (hex"00", hex"01")"#, false),
             ("2 in (1, \"a\")", false),
             ("\"b\" in (1, \"a\")", false),
             ("some(1) in (some(1), 2)", true),
@@ -612,9 +619,35 @@ mod tests {
             ("5.5 as Float", float(5.5)),
             ("true as Int", int(1)),
             ("false as Int", int(0)),
+            (r#""hello" as Bytes"#, bytes(b"hello")),
+            ("\"é\" as Bytes", bytes(&[0xc3, 0xa9])),
         ] {
             assert_eq!(run_src(src), Ok(expected), "{src}");
         }
+    }
+
+    #[test]
+    fn eval_bytes_sort_filter_extrema() {
+        assert_eq!(
+            run_src(r#"[hex"02", hex"01"].sort()"#),
+            Ok(Val::List(vec![bytes(&[0x01]), bytes(&[0x02])]))
+        );
+        assert_eq!(
+            run_src(r#"[hex"02", hex"01"].sort_desc()"#),
+            Ok(Val::List(vec![bytes(&[0x02]), bytes(&[0x01])]))
+        );
+        assert_eq!(
+            run_src(r#"[hex"02", hex"01"].min()"#),
+            Ok(some(bytes(&[0x01])))
+        );
+        assert_eq!(
+            run_src(r#"[hex"02", hex"01"].max()"#),
+            Ok(some(bytes(&[0x02])))
+        );
+        assert_eq!(
+            run_src(r#"[hex"00", hex"01"][$ >= hex"01"]"#),
+            Ok(Val::List(vec![bytes(&[0x01])]))
+        );
     }
 
     #[test]

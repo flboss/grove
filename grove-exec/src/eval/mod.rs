@@ -431,6 +431,10 @@ pub(crate) mod harness {
         Val::Scalar(crate::value::Scalar::String(s.to_string()))
     }
 
+    pub(crate) fn bytes(v: &[u8]) -> Val {
+        Val::Scalar(crate::value::Scalar::Bytes(v.to_vec()))
+    }
+
     pub(crate) fn bool(b: bool) -> Val {
         Val::Scalar(crate::value::Scalar::Bool(b))
     }

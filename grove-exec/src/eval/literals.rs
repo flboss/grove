@@ -15,7 +15,7 @@ pub(crate) fn decode_literal(lit: &Spanned<Literal>, now: DateTime<Utc>) -> Val 
         Literal::Float(x) => Val::Scalar(Scalar::Float(*x)),
         Literal::Dec(d) => Val::Scalar(Scalar::Dec(*d)),
         Literal::String(s) => Val::Scalar(Scalar::String(s.clone())),
-        Literal::Bytes(_) => todo!("bytes literal runtime support"),
+        Literal::Bytes(bytes) => Val::Scalar(Scalar::Bytes(bytes.clone())),
         Literal::Bool(b) => Val::Scalar(Scalar::Bool(*b)),
         Literal::Instant(t) => Val::Scalar(Scalar::Instant(*t)),
         Literal::Duration(d) => Val::Scalar(Scalar::Duration(*d)),
@@ -59,6 +59,19 @@ mod tests {
         assert_eq!(run_src("\"hi\""), Ok(str("hi")));
         assert_eq!(run_src("true"), Ok(bool(true)));
         assert_eq!(run_src("some(1)"), Ok(Val::Some(Box::new(int(1)))),);
+    }
+
+    #[test]
+    fn eval_bytes_literals() {
+        assert_eq!(
+            run_src(r#"hex"deadbeef""#),
+            Ok(bytes(&[0xde, 0xad, 0xbe, 0xef]))
+        );
+        assert_eq!(
+            run_src(r#"b64"3q2+7w==""#),
+            Ok(bytes(&[0xde, 0xad, 0xbe, 0xef]))
+        );
+        assert_eq!(run_src(r#"hex"""#), Ok(bytes(&[])));
     }
 
     #[test]
