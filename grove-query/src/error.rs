@@ -26,7 +26,6 @@ pub enum QueryLexError {
 
     UnexpectedAmpersand { span: Span },
     UnexpectedPipe { span: Span },
-    UnexpectedColon { span: Span },
 
     IncompleteExponent { span: Span },
     IntLiteralOverflow { span: Span },
@@ -186,10 +185,6 @@ impl From<QueryLexError> for Diagnostic {
             UnexpectedPipe { span } => {
                 error_simple("QL0014", "unexpected `|`", span, "unexpected `|`")
                     .with_help("use `||` for logical OR")
-            }
-            UnexpectedColon { span } => {
-                error_simple("QL0016", "unexpected `:`", span, "unexpected `:`")
-                    .with_help("use `::` for type paths")
             }
             IncompleteExponent { span } => error_simple(
                 "QL0017",

@@ -50,6 +50,7 @@ pub enum TokenKind {
     LParen,
     RParen,
     Comma,
+    Colon,
     Semicolon,
     Dot,
     Question(usize),

@@ -106,7 +106,7 @@ impl<'src> Lexer<'src> {
                 '&' => self.scan_amp_or_error(start),
                 '|' => self.scan_pipe_or_error(start),
                 '?' => self.scan_question(start),
-                ':' => self.scan_colon_or_error(start),
+                ':' => self.scan_colon(start),
                 '"' => self.scan_string(start),
                 '`' => self.scan_backtick_ident(start),
                 '0'..='9' => {
@@ -226,15 +226,12 @@ impl<'src> Lexer<'src> {
         self.make_token(start, TokenKind::Question(depth))
     }
 
-    fn scan_colon_or_error(&mut self, start: usize) -> Token {
+    fn scan_colon(&mut self, start: usize) -> Token {
         if self.peek_char() == Some(':') {
             self.bump();
             return self.make_token(start, TokenKind::DoubleColon);
         }
-        self.emit_error(QueryLexError::UnexpectedColon {
-            span: self.span_from(start),
-        });
-        self.advance()
+        self.make_token(start, TokenKind::Colon)
     }
 
     fn scan_postdot_int(&mut self, start: usize) -> Token {
@@ -1954,11 +1951,13 @@ mod tests {
     }
 
     #[test]
-    fn lone_colon_is_error() {
+    fn lone_colon() {
         let mut lex = Lexer::new("a : b");
         assert_ident!(lex, "a");
+        assert_token!(lex, TokenKind::Colon);
         assert_ident!(lex, "b");
-        assert_eq!(lex.take_diagnostics().len(), 1);
+        assert_eof!(lex);
+        assert!(lex.take_diagnostics().is_empty());
     }
 
     #[test]
@@ -2475,7 +2474,7 @@ mod tests {
     fn instant_invalid_hour() {
         let mut lex = Lexer::new("@2026-10-20_25:00");
         drain(&mut lex);
-        assert_eq!(lex.take_diagnostics().len(), 2);
+        assert_eq!(lex.take_diagnostics().len(), 1);
     }
 
     #[test]
