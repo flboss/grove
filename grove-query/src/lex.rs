@@ -105,7 +105,7 @@ impl<'src> Lexer<'src> {
                 '>' => self.scan_pair(start, '=', TokenKind::GreaterEquals, TokenKind::Greater),
                 '&' => self.scan_amp_or_error(start),
                 '|' => self.scan_pipe_or_error(start),
-                '?' => self.scan_question_or_error(start),
+                '?' => self.scan_question(start),
                 ':' => self.scan_colon_or_error(start),
                 '"' => self.scan_string(start),
                 '`' => self.scan_backtick_ident(start),
@@ -166,6 +166,10 @@ impl<'src> Lexer<'src> {
             "Dec" => TokenKind::Dec,
             "String" => TokenKind::String,
             "Bytes" => TokenKind::Bytes,
+            "List" => TokenKind::List,
+            "Bool" => TokenKind::Bool,
+            "Instant" => TokenKind::Instant,
+            "Duration" => TokenKind::Duration,
             _ => TokenKind::Ident(word.to_string()),
         };
 
@@ -209,7 +213,7 @@ impl<'src> Lexer<'src> {
         self.advance()
     }
 
-    fn scan_question_or_error(&mut self, start: usize) -> Token {
+    fn scan_question(&mut self, start: usize) -> Token {
         let mut depth = 1;
         while self.peek_char() == Some('?') {
             self.bump();
@@ -219,10 +223,7 @@ impl<'src> Lexer<'src> {
             self.bump();
             return self.make_token(start, TokenKind::QuestionDot(depth));
         }
-        self.emit_error(QueryLexError::UnexpectedQuestion {
-            span: self.span_from(start),
-        });
-        self.advance()
+        self.make_token(start, TokenKind::Question(depth))
     }
 
     fn scan_colon_or_error(&mut self, start: usize) -> Token {
@@ -1620,12 +1621,16 @@ mod tests {
 
     #[test]
     fn type_keywords() {
-        let mut lex = Lexer::new("Int Float Dec String Bytes");
+        let mut lex = Lexer::new("Int Float Dec String Bytes List Bool Instant Duration");
         assert_token!(lex, TokenKind::Int);
         assert_token!(lex, TokenKind::Float);
         assert_token!(lex, TokenKind::Dec);
         assert_token!(lex, TokenKind::String);
         assert_token!(lex, TokenKind::Bytes);
+        assert_token!(lex, TokenKind::List);
+        assert_token!(lex, TokenKind::Bool);
+        assert_token!(lex, TokenKind::Instant);
+        assert_token!(lex, TokenKind::Duration);
         assert_eof!(lex);
     }
 
@@ -1640,12 +1645,12 @@ mod tests {
 
     #[test]
     fn ident_does_not_match_keyword() {
-        let mut lex = Lexer::new("incoming truex Intx letter outlet");
+        let mut lex = Lexer::new("incoming truex Intx outlet Listx");
         assert_ident!(lex, "incoming");
         assert_ident!(lex, "truex");
         assert_ident!(lex, "Intx");
-        assert_ident!(lex, "letter");
         assert_ident!(lex, "outlet");
+        assert_ident!(lex, "Listx");
         assert_eof!(lex);
     }
 
@@ -1908,16 +1913,18 @@ mod tests {
     }
 
     #[test]
-    fn question_without_dot_error() {
-        for source in ["??", "??x", "????"] {
+    fn question_depth() {
+        for (source, depth) in [("?", 1), ("??", 2), ("????", 4)] {
             let mut lex = Lexer::new(source);
-            loop {
-                if matches!(lex.next_token().value, TokenKind::Eof) {
-                    break;
-                }
-            }
-            assert_eq!(lex.take_diagnostics().len(), 1, "{source}");
+            assert_eq!(lex.next_token().value, TokenKind::Question(depth));
+            assert_eof!(lex);
+            assert!(lex.take_diagnostics().is_empty(), "{source}");
         }
+        let mut lex = Lexer::new("??x");
+        assert_token!(lex, TokenKind::Question(2));
+        assert_ident!(lex, "x");
+        assert_eof!(lex);
+        assert!(lex.take_diagnostics().is_empty());
     }
 
     #[test]
@@ -1941,14 +1948,6 @@ mod tests {
     #[test]
     fn lone_pipe_is_error() {
         let mut lex = Lexer::new("a | b");
-        assert_ident!(lex, "a");
-        assert_ident!(lex, "b");
-        assert_eq!(lex.take_diagnostics().len(), 1);
-    }
-
-    #[test]
-    fn lone_question_is_error() {
-        let mut lex = Lexer::new("a ? b");
         assert_ident!(lex, "a");
         assert_ident!(lex, "b");
         assert_eq!(lex.take_diagnostics().len(), 1);

@@ -25,6 +25,10 @@ pub enum TokenKind {
     Dec,
     String,
     Bytes,
+    List,
+    Bool,
+    Instant,
+    Duration,
 
     // Literals
     Ident(String),
@@ -48,6 +52,7 @@ pub enum TokenKind {
     Comma,
     Semicolon,
     Dot,
+    Question(usize),
     QuestionDot(usize),
     Dollar(usize),
     Equals,
