@@ -146,7 +146,7 @@ struct RenderCtx<'a> {
     options: &'a RenderOptions,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct Styled {
     plain: String,
     styled: String,
@@ -263,7 +263,7 @@ fn block_lines(ctx: &RenderCtx<'_>, value: &Val, depth: usize) -> Vec<String> {
             _ => {}
         }
     }
-    vec![inline_cell(ctx, value, depth).styled]
+    vec![cell_styled(ctx, value, depth).styled]
 }
 
 fn record_lines(ctx: &RenderCtx<'_>, fields: &[(Rc<str>, Val)], depth: usize) -> Vec<String> {
@@ -309,7 +309,7 @@ fn named_lines(ctx: &RenderCtx<'_>, entries: &[(String, &Val)], depth: usize) ->
             }
         } else {
             key.push_str(": ");
-            key.push_str(&inline_cell(ctx, value, depth + 1).styled);
+            key.push_str(&cell_styled(ctx, value, depth + 1).styled);
             lines.push(key);
         }
     }
@@ -342,7 +342,7 @@ fn list_lines(ctx: &RenderCtx<'_>, items: &[Val], depth: usize) -> Vec<String> {
                 lines.push(line);
             }
         } else {
-            lines.push(format!("- {}", inline_cell(ctx, item, depth + 1).styled));
+            lines.push(format!("- {}", cell_styled(ctx, item, depth + 1).styled));
         }
     }
 
@@ -353,27 +353,29 @@ fn list_lines(ctx: &RenderCtx<'_>, items: &[Val], depth: usize) -> Vec<String> {
     lines
 }
 
-fn inline_cell(ctx: &RenderCtx<'_>, value: &Val, depth: usize) -> Styled {
-    let text = cell_text(ctx, value, depth);
-    Styled {
-        styled: paint(&text, value_style(value), ctx.options.color),
-        plain: text,
-    }
-}
-
-fn cell_text(ctx: &RenderCtx<'_>, value: &Val, depth: usize) -> String {
-    let plain = compact(ctx, value, depth).plain;
+fn cell_styled(ctx: &RenderCtx<'_>, value: &Val, depth: usize) -> Styled {
+    let compact = compact(ctx, value, depth);
     let cap = ctx.options.max_cell_width;
-    if cap == 0 || display_width(&plain) <= cap {
-        return plain;
+    if cap == 0 || display_width(&compact.plain) <= cap {
+        return compact;
     }
 
-    match value {
-        Val::List(items) if !items.is_empty() => {
-            truncate_display(format!("[{} items]", items.len()), cap)
+    let abbreviated = match value {
+        Val::List(items) if !items.is_empty() => Styled::painted(
+            format!("[{} items]", items.len()),
+            STYLE_DIM,
+            ctx.options.color,
+        ),
+        Val::Record(fields) if !fields.is_empty() => {
+            Styled::painted("{…}", STYLE_DIM, ctx.options.color)
         }
-        Val::Record(fields) if !fields.is_empty() => truncate_display("{…}", cap),
-        _ => truncate_display(plain, cap),
+        _ => truncate_styled(compact, cap),
+    };
+
+    if display_width(&abbreviated.plain) <= cap {
+        abbreviated
+    } else {
+        truncate_styled(abbreviated, cap)
     }
 }
 
@@ -416,16 +418,14 @@ enum Align {
 }
 
 struct TableCell {
-    text: String,
-    style: Option<&'static str>,
+    content: Styled,
     align: Align,
 }
 
 impl TableCell {
     fn empty() -> Self {
         TableCell {
-            text: String::new(),
-            style: None,
+            content: Styled::default(),
             align: Align::Left,
         }
     }
@@ -545,7 +545,7 @@ fn finish_table(
     for row in &rows {
         for (index, cell) in row.iter().enumerate() {
             if let Some(width) = widths.get_mut(index) {
-                *width = (*width).max(display_width(&cell.text));
+                *width = (*width).max(display_width(&cell.content.plain));
             }
         }
     }
@@ -565,8 +565,7 @@ fn finish_table(
 
 fn table_cell(ctx: &RenderCtx<'_>, value: &Val) -> TableCell {
     TableCell {
-        text: cell_text(ctx, value, 0),
-        style: value_style(value),
+        content: cell_styled(ctx, value, 0),
         align: if is_numeric(value) {
             Align::Right
         } else {
@@ -588,10 +587,9 @@ fn render_table(ctx: &RenderCtx<'_>, data: TableData) -> String {
     if ctx.options.headers {
         let header_cells: Vec<TableCell> = data
             .headers
-            .into_iter()
+            .iter()
             .map(|header| TableCell {
-                text: header,
-                style: Some(STYLE_BOLD),
+                content: Styled::painted(header.as_str(), STYLE_BOLD, ctx.options.color),
                 align: Align::Left,
             })
             .collect();
@@ -653,18 +651,35 @@ fn border_line(
 }
 
 fn table_row(cells: &[TableCell], separator: char, widths: &[usize], color: bool) -> String {
-    let mut row = String::from(separator);
+    let border = paint(&separator.to_string(), Some(STYLE_DIM), color);
+    let empty = Styled::default();
+    let mut row = border.clone();
     for (index, width) in widths.iter().enumerate() {
         let cell = cells.get(index);
-        let text = cell.map(|cell| cell.text.as_str()).unwrap_or("");
+        let content = cell.map(|cell| &cell.content).unwrap_or(&empty);
         let align = cell.map(|cell| cell.align).unwrap_or(Align::Left);
-        let style = cell.and_then(|cell| cell.style);
         row.push(' ');
-        row.push_str(&paint(&pad(text, *width, align), style, color));
+        row.push_str(&pad_styled(content, *width, align));
         row.push(' ');
-        row.push(separator);
+        row.push_str(&border);
     }
     row
+}
+
+fn pad_styled(content: &Styled, width: usize, align: Align) -> String {
+    let padding = width.saturating_sub(display_width(&content.plain));
+    let mut out = String::with_capacity(padding + content.styled.len());
+    match align {
+        Align::Left => {
+            out.push_str(&content.styled);
+            out.extend(std::iter::repeat_n(' ', padding));
+        }
+        Align::Right => {
+            out.extend(std::iter::repeat_n(' ', padding));
+            out.push_str(&content.styled);
+        }
+    }
+    out
 }
 
 fn pad<'a>(text: impl Into<Cow<'a, str>>, width: usize, align: Align) -> String {
@@ -677,10 +692,10 @@ fn pad<'a>(text: impl Into<Cow<'a, str>>, width: usize, align: Align) -> String 
             text
         }
         Align::Right => {
-            let mut spacer = String::with_capacity(padding + text.len());
-            spacer.extend(std::iter::repeat_n(' ', padding));
-            spacer.push_str(&text);
-            spacer
+            let mut spaces = String::with_capacity(padding + text.len());
+            spaces.extend(std::iter::repeat_n(' ', padding));
+            spaces.push_str(&text);
+            spaces
         }
     }
 }
@@ -747,20 +762,58 @@ fn truncate_display<'a>(text: impl Into<Cow<'a, str>>, max_width: usize) -> Stri
     out
 }
 
+fn truncate_styled(styled: Styled, max_width: usize) -> Styled {
+    if max_width == 0 || display_width(&styled.plain) <= max_width {
+        return styled;
+    }
+    let combined = |trunc: String| Styled {
+        plain: truncate_display(styled.plain, max_width),
+        styled: trunc,
+    };
+    if max_width == 1 {
+        return if styled.styled.contains('\x1b') {
+            combined(format!("…{RESET}"))
+        } else {
+            combined("…".to_string())
+        };
+    }
+
+    let mut out = String::new();
+    let mut width = 0;
+    let mut index = 0;
+    let bytes = styled.styled.as_bytes();
+    while index < bytes.len() {
+        if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'[') {
+            let start = index;
+            index += 2;
+            while index < bytes.len() && bytes[index - 1] != b'm' {
+                index += 1;
+            }
+            out.push_str(&styled.styled[start..index]);
+            continue;
+        }
+
+        let ch = styled.styled[index..].chars().next().expect("index < len");
+        let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + char_width > max_width - 1 {
+            break;
+        }
+        out.push(ch);
+        width += char_width;
+        index += ch.len_utf8();
+    }
+
+    out.push('…');
+    if styled.styled.contains('\x1b') {
+        out.push_str(RESET);
+    }
+    combined(out)
+}
+
 fn paint(text: &str, style: Option<&str>, color: bool) -> String {
     match (color, style) {
         (true, Some(style)) => format!("\x1b[{style}m{text}{RESET}"),
         _ => text.to_string(),
-    }
-}
-
-fn value_style(value: &Val) -> Option<&'static str> {
-    match value {
-        Val::Scalar(scalar) => Some(scalar_style(scalar)),
-        Val::Enum(_, _) => Some(STYLE_ENUM),
-        Val::None | Val::Ref { .. } => Some(STYLE_DIM),
-        Val::Some(inner) => value_style(inner),
-        _ => None,
     }
 }
 
@@ -971,6 +1024,18 @@ mod tests {
         options.color = true;
         let output = render_value(&int(7), &int_ty, &options);
         assert!(output.contains("\x1b[36m7\x1b[0m"), "{output}");
+    }
+
+    #[test]
+    fn table_cells_keep_part_styles() {
+        let value = Val::List(vec![Val::Tuple(vec![Val::Some(Box::new(int(3)))])]);
+        let ty = QueryType::List(Box::new(QueryType::Tuple(vec![QueryType::Optional(
+            Box::new(QueryType::Scalar(ScalarType::Int)),
+        )])));
+        let mut options = options(Format::Table);
+        options.color = true;
+        let output = render_value(&value, &ty, &options);
+        assert!(output.contains("some(\x1b[36m3\x1b[0m)"), "{output}");
     }
 
     #[test]
