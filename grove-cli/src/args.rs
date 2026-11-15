@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -178,6 +179,20 @@ pub struct OutputArgs {
     pub stats: bool,
 }
 
+impl OutputArgs {
+    pub fn color_enabled(&self) -> bool {
+        match self.color {
+            ColorChoice::Always => true,
+            ColorChoice::Never => false,
+            ColorChoice::Auto => {
+                self.output.is_none()
+                    && std::io::stdout().is_terminal()
+                    && std::env::var_os("NO_COLOR").is_none()
+            }
+        }
+    }
+}
+
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
     Auto,
@@ -185,18 +200,6 @@ pub enum Format {
     Raw,
     Table,
     Vertical,
-}
-
-impl Format {
-    pub fn name(self) -> &'static str {
-        match self {
-            Format::Auto => "auto",
-            Format::Inline => "inline",
-            Format::Raw => "raw",
-            Format::Table => "table",
-            Format::Vertical => "vertical",
-        }
-    }
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]

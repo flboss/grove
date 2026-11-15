@@ -301,6 +301,7 @@ dependencies = [
  "grove-schema",
  "grove-types",
  "rusqlite",
+ "unicode-width",
 ]
 
 [[package]]

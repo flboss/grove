@@ -58,10 +58,12 @@ fn run_query(args: QueryArgs) -> CliResult<()> {
     let options = grove_exec::ExecOptions {
         pushdown: !args.no_pushdown,
     };
+    let render_options =
+        render::RenderOptions::from_args(&args.output, args.output.color_enabled());
     let execute_start = Instant::now();
     match grove_exec::exec_file_with_options(&typed, &backend, &validated, Utc::now(), options) {
         Ok(Some(value)) => {
-            let text = render::render(&value, &validated, args.output.format)?;
+            let text = render::render(&value, typed.output_type(), &validated, &render_options)?;
             write_output(args.output.output.as_deref(), &text)?;
         }
         Ok(None) => {}

@@ -175,6 +175,39 @@ fn query_write_output_file() {
 }
 
 #[test]
+fn query_format_flag() {
+    let dir = fixture("format");
+    let schema = write_schema(&dir);
+    let db = write_db(&dir);
+
+    let table = grove()
+        .arg("query")
+        .arg(&schema)
+        .arg("users { name, id }")
+        .arg("--file")
+        .arg(&db)
+        .arg("--format")
+        .arg("table")
+        .output()
+        .expect("run grove");
+    assert_eq!(status(&table), 0, "stderr: {}", stderr(&table));
+    assert!(stdout(&table).contains('┌'), "{}", stdout(&table));
+
+    let vertical = grove()
+        .arg("query")
+        .arg(&schema)
+        .arg("users { name, id }")
+        .arg("--file")
+        .arg(&db)
+        .arg("--format")
+        .arg("vertical")
+        .output()
+        .expect("run grove");
+    assert_eq!(status(&vertical), 0, "stderr: {}", stderr(&vertical));
+    assert!(stdout(&vertical).contains("name"), "{}", stdout(&vertical));
+}
+
+#[test]
 fn query_readonly_database() {
     let dir = fixture("readonly");
     let schema = write_schema(&dir);
