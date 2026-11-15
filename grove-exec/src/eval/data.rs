@@ -1529,7 +1529,8 @@ mod tests {
         testdata::seed(&mut conn).expect("testdata initialization");
         let backend = SqliteBackend::new(conn, &schema).expect("backend");
         let plan = PushdownPlan::disabled(&schema);
-        let mut ctx = EvalCtx::new(Env::new(), FIXED_NOW, &backend, &schema, &plan);
+        let mut env = Env::new();
+        let mut ctx = EvalCtx::new(&mut env, FIXED_NOW, &backend, &schema, &plan);
 
         let user = testdata::struct_id(&schema, "User");
         let order = testdata::struct_id(&schema, "Order");
@@ -1606,7 +1607,8 @@ mod tests {
         testdata::seed(&mut conn).expect("testdata initialization");
         let backend = SqliteBackend::new(conn, &schema).expect("backend");
         let plan = PushdownPlan::disabled(&schema);
-        let mut ctx = EvalCtx::new(Env::new(), FIXED_NOW, &backend, &schema, &plan);
+        let mut env = Env::new();
+        let mut ctx = EvalCtx::new(&mut env, FIXED_NOW, &backend, &schema, &plan);
 
         let user = testdata::struct_id(&schema, "User");
         let profile_field = testdata::field_id(&schema, user, "profile");

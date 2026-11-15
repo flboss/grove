@@ -106,7 +106,6 @@ pub struct PushdownPlan {
     fetches: HashMap<NodeId, FetchConstraints>,
     fields: HashMap<StructId, Vec<FieldId>>,
     caps: HashMap<NodeId, CapPlan>,
-    #[allow(dead_code)] // prefetch does not yet consider this
     prefetch_skip: HashSet<FieldId>,
     enabled: bool,
 }

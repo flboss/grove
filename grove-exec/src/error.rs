@@ -9,8 +9,10 @@ pub enum ExecError {
     /// Upstream correctness issue: data violating its schema, or a broken
     /// pipeline invariant
     Integrity { message: String },
-    /// Backend or environment failure (SQLite errors, DB/shape mismatch).
+    /// Backend or environment failure (SQLite errors, DB/shape mismatch)
     Storage { message: String },
+    /// A feature that the executor does not yet implement
+    Unsupported { message: String },
 }
 
 impl fmt::Display for ExecError {
@@ -19,6 +21,7 @@ impl fmt::Display for ExecError {
             ExecError::Abort { message, .. } => write!(f, "query aborted: {message}"),
             ExecError::Integrity { message } => write!(f, "data integrity error: {message}"),
             ExecError::Storage { message } => write!(f, "storage error: {message}"),
+            ExecError::Unsupported { message } => write!(f, "unsupported: {message}"),
         }
     }
 }
@@ -37,6 +40,9 @@ impl ExecError {
                 message: prefixed(message),
             },
             ExecError::Storage { message } => ExecError::Storage {
+                message: prefixed(message),
+            },
+            ExecError::Unsupported { message } => ExecError::Unsupported {
                 message: prefixed(message),
             },
         }

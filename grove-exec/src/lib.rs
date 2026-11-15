@@ -6,5 +6,7 @@ pub mod sqlite;
 pub mod storage;
 pub mod value;
 
+pub use eval::ExecSession;
+
 #[cfg(test)]
 mod testdata;

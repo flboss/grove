@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use chrono::{DateTime, Utc};
 use grove_query::typecheck::types::{
-    IdentBinding, TypedExpr, TypedExprKind, TypedLetStmt, TypedQueryFile, TypedStatement,
+    IdentBinding, TypedExpr, TypedExprKind, TypedLetStmt, TypedQueryFile,
 };
 use grove_schema::validated::ValidatedSchema;
 use grove_types::NodeId;
@@ -19,6 +19,9 @@ pub mod data;
 pub(crate) mod literals;
 mod methods;
 mod operators;
+mod session;
+
+pub use session::ExecSession;
 
 use composite::{eval_array, eval_projection, eval_struct, eval_tuple};
 use data::{exec_field, exec_root, resolve_base_link, resolve_ident_value, resolve_owning_values};
@@ -41,11 +44,36 @@ impl Env {
         }
     }
 
-    pub fn define(&mut self, name: Rc<str>, value: Val) {
+    pub fn define(&mut self, name: impl Into<Rc<str>>, value: Val) {
         self.scopes
             .last_mut()
             .expect("env always has a scope")
-            .insert(name, value);
+            .insert(name.into(), value);
+    }
+
+    pub fn get(&self, name: &str) -> Option<&Val> {
+        self.scopes.iter().rev().find_map(|scope| scope.get(name))
+    }
+
+    pub fn remove(&mut self, name: &str) -> Option<Val> {
+        self.scopes
+            .iter_mut()
+            .rev()
+            .find_map(|scope| scope.remove(name))
+    }
+
+    pub fn clear(&mut self) {
+        self.scopes.clear();
+        self.scopes.push(HashMap::new());
+        self.element_depth = 0;
+    }
+
+    /// Committed bindings in the base scope
+    pub fn bindings(&self) -> impl Iterator<Item = (&str, &Val)> {
+        self.scopes
+            .first()
+            .into_iter()
+            .flat_map(|scope| scope.iter().map(|(name, value)| (name.as_ref(), value)))
     }
 
     /// `depth` counts scopes skipped to reach the identifier
@@ -62,10 +90,36 @@ impl Env {
             self.scopes.pop();
         }
     }
+
+    pub(crate) fn begin_turn(&mut self) {
+        debug_assert_eq!(self.scopes.len(), 1, "turn must start at the base scope");
+        debug_assert_eq!(self.element_depth, 0, "turn leaked an element scope");
+        self.push_scope(HashMap::new());
+    }
+
+    pub(crate) fn commit_turn(&mut self) {
+        debug_assert_eq!(
+            self.scopes.len(),
+            2,
+            "successful turn left temporary scopes behind"
+        );
+        if self.scopes.len() > 1 {
+            let turn = self.scopes.pop().expect("turn scope exists");
+            if let Some(base) = self.scopes.last_mut() {
+                base.extend(turn);
+            }
+        }
+        self.element_depth = 0;
+    }
+
+    pub(crate) fn rollback_turn(&mut self) {
+        self.scopes.truncate(1);
+        self.element_depth = 0;
+    }
 }
 
 pub struct EvalCtx<'a> {
-    env: Env,
+    env: &'a mut Env,
     now: DateTime<Utc>,
     pub(crate) interner: Interner,
     pub(crate) storage: &'a dyn Storage,
@@ -76,7 +130,7 @@ pub struct EvalCtx<'a> {
 
 impl<'a> EvalCtx<'a> {
     pub fn new(
-        env: Env,
+        env: &'a mut Env,
         now: DateTime<Utc>,
         storage: &'a dyn Storage,
         schema: &'a ValidatedSchema,
@@ -136,7 +190,9 @@ pub fn eval(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
                             message: format!("unbound element `{}` (internal error)", name.value),
                         })
                 }
-                IdentBinding::Prev { .. } => todo!("prev with mutations"),
+                IdentBinding::Prev { .. } => Err(ExecError::Unsupported {
+                    message: "`prev` with mutations is not implemented yet".to_string(),
+                }),
             }
         }
         TypedExprKind::EnumVariant { enum_id, variant } => Ok(Val::Enum(*enum_id, *variant)),
@@ -218,7 +274,8 @@ pub fn eval_tuple_access(
 
 /// Evaluate a `let` and bind its value
 pub fn eval_let(stmt: &TypedLetStmt, ctx: &mut EvalCtx<'_>) -> Result<(), ExecError> {
-    let value = eval(&stmt.value, ctx)?;
+    let mut value = eval(&stmt.value, ctx)?;
+    resolve_owning_values(ctx, std::slice::from_mut(&mut value), None)?;
     ctx.env.define(ctx.interner.intern(&stmt.name.value), value);
     Ok(())
 }
@@ -254,29 +311,7 @@ pub fn exec_file_with_options(
     now: DateTime<Utc>,
     options: ExecOptions,
 ) -> Result<Option<Val>, ExecError> {
-    let plan = if options.pushdown {
-        PushdownPlan::analyze(file, schema, now)
-    } else {
-        PushdownPlan::disabled(schema)
-    };
-    let mut ctx = EvalCtx::new(Env::new(), now, storage, schema, &plan);
-    for stmt in &file.statements {
-        match stmt {
-            TypedStatement::Let(let_stmt) => eval_let(let_stmt, &mut ctx)?,
-            // discarded `;`-terminated expressions
-            TypedStatement::Expr(_) => {}
-            TypedStatement::Mutation(_) => todo!("mutations"),
-        }
-    }
-
-    let result = if let Some(expr) = &file.result {
-        let mut result = eval(expr, &mut ctx)?;
-        resolve_owning_values(&mut ctx, std::slice::from_mut(&mut result), None)?;
-        Some(result)
-    } else {
-        None
-    };
-    Ok(result)
+    ExecSession::new(storage, schema).execute(file, now, options)
 }
 
 #[cfg(test)]
@@ -473,15 +508,44 @@ pub(crate) mod harness {
 #[cfg(test)]
 mod tests {
     use super::harness::*;
-    use super::{Env, EvalCtx, eval};
+    use super::{Env, EvalCtx, ExecOptions, ExecSession, eval};
+    use crate::error::ExecError;
     use crate::pushdown::PushdownPlan;
     use crate::testdata;
     use crate::value::Val;
-    use grove_query::typecheck::types::{IdentBinding, QueryType, TypedExpr, TypedExprKind};
+    use grove_query::TypeBindings;
+    use grove_query::typecheck::types::{
+        IdentBinding, QueryType, TypedExpr, TypedExprKind, TypedQueryFile,
+    };
     use grove_schema::validated::{ScalarType, ValidatedSchema};
     use grove_types::{Span, Spanned};
     use rust_decimal::dec;
     use std::rc::Rc;
+
+    fn typed_session(src: &str, schema: &ValidatedSchema, types: &TypeBindings) -> TypedQueryFile {
+        let (file, parse_diags) = grove_query::parse_query(src);
+        assert!(
+            parse_diags
+                .iter()
+                .all(|d| d.severity == grove_types::Severity::Warning),
+            "{parse_diags:?}"
+        );
+        let (typed, diags) =
+            grove_query::typecheck::typecheck_with_bindings(file.unwrap(), schema, types);
+        assert!(diags.is_empty(), "{diags:?}");
+        typed.unwrap()
+    }
+
+    fn record_field<'a>(value: &'a Val, name: &str) -> &'a Val {
+        let Val::Record(fields) = value else {
+            panic!("expected record, got {value:?}");
+        };
+        fields
+            .iter()
+            .find(|(field_name, _)| field_name.as_ref() == name)
+            .map(|(_, value)| value)
+            .expect("expected record field")
+    }
 
     #[test]
     fn eval_let_binding() {
@@ -668,7 +732,7 @@ mod tests {
         env.define(Rc::from("xs"), Val::List(vec![int(1), Val::None]));
         let schema = ValidatedSchema::default();
         let plan = PushdownPlan::disabled(&schema);
-        let mut ctx = EvalCtx::new(env, FIXED_NOW, &NoStorage, &schema, &plan);
+        let mut ctx = EvalCtx::new(&mut env, FIXED_NOW, &NoStorage, &schema, &plan);
         let span = Span::new(0, 0);
         let expr = TypedExpr {
             kind: TypedExprKind::Ident {
@@ -782,5 +846,147 @@ mod tests {
             Ok(Some(int(1)))
         );
         assert_eq!(run_src("42;"), Ok(int(42)));
+    }
+
+    #[test]
+    fn session_bindings_persistence_alignment() {
+        let schema = ValidatedSchema::default();
+        let mut session = ExecSession::new(&NoStorage, &schema);
+        let mut types = TypeBindings::new();
+
+        let first = typed_session("let x = 41;", &schema, &types);
+        assert_eq!(
+            session.execute(&first, FIXED_NOW, ExecOptions::default()),
+            Ok(None)
+        );
+        for (name, ty) in first.let_bindings() {
+            types.define(name, ty.clone());
+        }
+        assert_eq!(session.binding("x"), Some(&int(41)));
+
+        let second = typed_session("x + 1", &schema, &types);
+        assert_eq!(
+            session.execute(&second, FIXED_NOW, ExecOptions::default()),
+            Ok(Some(int(42)))
+        );
+        assert_eq!(session.bindings().count(), 1);
+    }
+
+    #[test]
+    fn session_rollback_failed_turn() {
+        let schema = ValidatedSchema::default();
+        let mut session = ExecSession::new(&NoStorage, &schema);
+        let mut types = TypeBindings::new();
+
+        let first = typed_session("let x = 1;", &schema, &types);
+        assert_eq!(
+            session.execute(&first, FIXED_NOW, ExecOptions::default()),
+            Ok(None)
+        );
+        for (name, ty) in first.let_bindings() {
+            types.define(name, ty.clone());
+        }
+
+        let failed = typed_session("let y = 2; 1 / 0", &schema, &types);
+        let err = session
+            .execute(&failed, FIXED_NOW, ExecOptions::default())
+            .unwrap_err();
+        assert!(matches!(err, ExecError::Abort { .. }));
+        assert!(session.binding("y").is_none());
+        assert_eq!(session.binding("x"), Some(&int(1)));
+
+        let third = typed_session("x", &schema, &types);
+        assert_eq!(
+            session.execute(&third, FIXED_NOW, ExecOptions::default()),
+            Ok(Some(int(1)))
+        );
+    }
+
+    #[test]
+    fn session_binding_depth_matches_scoped_methods() {
+        let schema = ValidatedSchema::default();
+        let mut session = ExecSession::new(&NoStorage, &schema);
+        let mut types = TypeBindings::new();
+
+        let first = typed_session("let min = 1;", &schema, &types);
+        session
+            .execute(&first, FIXED_NOW, ExecOptions::default())
+            .unwrap();
+        for (name, ty) in first.let_bindings() {
+            types.define(name, ty.clone());
+        }
+
+        let second = typed_session("[1, 2, 3].filter($ > min)", &schema, &types);
+        assert_eq!(
+            session.execute(&second, FIXED_NOW, ExecOptions::default()),
+            Ok(Some(Val::List(vec![int(2), int(3)])))
+        );
+    }
+
+    #[test]
+    fn mutations_unsupported() {
+        let schema = testdata::schema();
+        let mut session = ExecSession::new(&NoStorage, &schema);
+        let typed = typed_session("users.delete();", &schema, &TypeBindings::new());
+
+        let err = session
+            .execute(&typed, FIXED_NOW, ExecOptions::default())
+            .unwrap_err();
+        assert!(matches!(err, ExecError::Unsupported { .. }));
+        assert_eq!(session.bindings().count(), 0);
+    }
+
+    #[test]
+    fn let_owning_refs_resolved() {
+        let schema = testdata::schema();
+        let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory database");
+        testdata::seed(&mut conn).expect("testdata initialization");
+        let backend = crate::sqlite::SqliteBackend::new(conn, &schema).expect("backend");
+        let mut session = ExecSession::new(&backend, &schema);
+
+        let typed = typed_session(
+            "let u = users.first().unwrap();",
+            &schema,
+            &TypeBindings::new(),
+        );
+        assert_eq!(
+            session.execute(&typed, FIXED_NOW, ExecOptions::default()),
+            Ok(None)
+        );
+        assert!(matches!(
+            record_field(session.binding("u").expect("u binding"), "profile"),
+            Val::Some(inner) if matches!(inner.as_ref(), Val::Record(_))
+        ));
+    }
+
+    #[test]
+    fn session_remove_and_clear() {
+        let schema = ValidatedSchema::default();
+        let mut session = ExecSession::new(&NoStorage, &schema);
+        let mut types = TypeBindings::new();
+
+        for (src, name) in [("let x = 1;", "x"), ("let y = 2;", "y")] {
+            let typed = typed_session(src, &schema, &types);
+            session
+                .execute(&typed, FIXED_NOW, ExecOptions::default())
+                .unwrap();
+            for (name, ty) in typed.let_bindings() {
+                types.define(name, ty.clone());
+            }
+            assert!(session.binding(name).is_some());
+        }
+
+        assert_eq!(session.remove("x"), Some(int(1)));
+        assert!(session.binding("x").is_none());
+        assert!(session.binding("y").is_some());
+
+        session.clear();
+        assert_eq!(session.bindings().count(), 0);
+
+        let typed = typed_session("1", &schema, &TypeBindings::new());
+        assert_eq!(
+            session.execute(&typed, FIXED_NOW, ExecOptions::default()),
+            Ok(Some(int(1)))
+        );
     }
 }

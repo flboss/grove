@@ -464,7 +464,6 @@ struct ArrayNode {
 #[derive(Debug, Clone)]
 enum ElemPlan {
     Scalar(ScalarType),
-    #[allow(dead_code)] // TODO: enums
     Enum(EnumId),
     Tuple(Vec<ElemPlan>),
     Optional(Box<ElemPlan>),
