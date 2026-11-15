@@ -612,6 +612,9 @@ fn render_table(ctx: &RenderCtx<'_>, data: TableData) -> String {
     for row in &data.rows {
         lines.push(table_row(row, '│', &data.widths, ctx.options.color));
     }
+    if let Some(note) = &data.note {
+        lines.push(note_row(note, &data.widths, ctx.options.color));
+    }
     lines.push(border_line(
         '└',
         '┴',
@@ -620,10 +623,6 @@ fn render_table(ctx: &RenderCtx<'_>, data: TableData) -> String {
         &data.widths,
         ctx.options.color,
     ));
-
-    if let Some(note) = &data.note {
-        lines.push(paint(note, Some(STYLE_DIM), ctx.options.color));
-    }
 
     lines.join("\n")
 }
@@ -664,6 +663,23 @@ fn table_row(cells: &[TableCell], separator: char, widths: &[usize], color: bool
         row.push_str(&border);
     }
     row
+}
+
+fn note_row(note: &str, widths: &[usize], color: bool) -> String {
+    let total = widths.iter().sum::<usize>() + widths.len() * 3 + 1;
+    let text_area = total.saturating_sub(4);
+    let text = if text_area == 0 {
+        String::new()
+    } else {
+        truncate_display(note, text_area)
+    };
+    let padding = text_area.saturating_sub(display_width(&text));
+    let border = paint("│", Some(STYLE_DIM), color);
+    format!(
+        "{border} {}{} {border}",
+        paint(&text, Some(STYLE_DIM), color),
+        " ".repeat(padding)
+    )
 }
 
 fn pad_styled(content: &Styled, width: usize, align: Align) -> String {
@@ -997,6 +1013,12 @@ mod tests {
         let output = render_value(&value, &list_record_ty(), &options);
         assert!(output.contains("1 more row"), "{output}");
         assert!(!output.contains("Cara"), "{output}");
+        let note_line = output
+            .lines()
+            .find(|line| line.contains("1 more row"))
+            .expect("note line");
+        assert!(note_line.starts_with('│'), "{note_line}");
+        assert!(note_line.ends_with('│'), "{note_line}");
     }
 
     #[test]
