@@ -300,6 +300,7 @@ dependencies = [
  "grove-query",
  "grove-schema",
  "grove-types",
+ "libc",
  "rusqlite",
  "unicode-width",
 ]

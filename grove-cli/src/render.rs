@@ -32,11 +32,8 @@ impl RenderOptions {
     pub fn from_args(args: &OutputArgs, color: bool) -> Self {
         let width = args
             .width
-            .or_else(|| {
-                std::env::var("COLUMNS")
-                    .ok()
-                    .and_then(|value| value.parse().ok())
-            })
+            .or_else(terminal_width)
+            .or_else(columns_env)
             .unwrap_or(80)
             .max(20);
         let (max_depth, max_cell_width) = if args.full {
@@ -55,6 +52,28 @@ impl RenderOptions {
             headers: !args.no_headers,
         }
     }
+}
+
+fn columns_env() -> Option<usize> {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+}
+
+#[cfg(unix)]
+fn terminal_width() -> Option<usize> {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: winsize is plain data that ioctl initializes on success
+    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+    // SAFETY: the stdout descriptor is valid for the call and ioctl writes only size
+    let result = unsafe { libc::ioctl(std::io::stdout().as_raw_fd(), libc::TIOCGWINSZ, &mut size) };
+    (result == 0 && size.ws_col > 0).then_some(size.ws_col as usize)
+}
+
+#[cfg(not(unix))]
+fn terminal_width() -> Option<usize> {
+    None
 }
 
 pub fn render(

@@ -16,5 +16,6 @@ grove-exec.workspace = true
 ariadne.workspace = true
 chrono.workspace = true
 clap.workspace = true
+libc.workspace = true
 rusqlite.workspace = true
 unicode-width.workspace = true
