@@ -1,5 +1,6 @@
 use std::fs;
 use std::io::Write as _;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -19,16 +20,34 @@ INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob');
 
 static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
 
+struct TempDir {
+    path: PathBuf,
+}
+
+impl Deref for TempDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
 fn grove() -> Command {
     Command::new(env!("CARGO_BIN_EXE_grove"))
 }
 
-fn fixture(name: &str) -> PathBuf {
+fn fixture(name: &str) -> TempDir {
     let id = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("grove-cli-{name}-{}-{id}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).expect("create fixture directory");
-    dir
+    let path = std::env::temp_dir().join(format!("grove-cli-{name}-{}-{id}", std::process::id()));
+    let _ = fs::remove_dir_all(&path);
+    fs::create_dir_all(&path).expect("create fixture directory");
+    TempDir { path }
 }
 
 fn write_schema(dir: &Path) -> PathBuf {
