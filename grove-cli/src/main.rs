@@ -7,58 +7,53 @@ use chrono::Utc;
 use clap::Parser;
 
 use crate::args::{CheckArgs, Cli, Command, ConnectionSpec, QueryArgs, QueryInputArgs, ReplArgs};
+use crate::error::{CliError, CliResult, EXIT_COMPILE, EXIT_FAILURE, EXIT_SUCCESS, EXIT_USAGE};
 
 mod args;
 mod diagnostics;
+mod error;
 mod render;
 
 fn main() {
     let cli = Cli::parse();
-    let code = match cli.command {
+    let result = match cli.command {
         Some(Command::Query(args)) => run_query(args),
         Some(Command::Check(args)) => run_check(args),
         Some(Command::Repl(args)) => run_repl(args),
         None => run_implicit_repl(cli.schema),
     };
-    std::process::exit(code);
+
+    match result {
+        Ok(()) => std::process::exit(EXIT_SUCCESS),
+        Err(error) => {
+            if let Some(message) = error.message {
+                eprintln!("error: {message}");
+            }
+            std::process::exit(error.code);
+        }
+    }
 }
 
-fn run_query(args: QueryArgs) -> i32 {
-    let spec = match args.backend.resolve() {
-        Ok(spec) => spec,
-        Err(message) => return fail(2, message),
-    };
-
-    let (schema_name, schema_source) = match read_schema(&args.schema) {
-        Ok(source) => source,
-        Err((code, message)) => return fail(code, message),
-    };
+fn run_query(args: QueryArgs) -> CliResult<()> {
+    let spec = args.backend.resolve().map_err(CliError::usage)?;
+    let (schema_name, schema_source) = read_schema(&args.schema)?;
 
     let schema_start = Instant::now();
     let Some(validated) = compile_schema(&schema_name, &schema_source) else {
-        return 3;
+        return Err(CliError::reported(EXIT_COMPILE));
     };
     let schema_elapsed = schema_start.elapsed();
 
-    let (query_name, query_source) = match read_query_input(&args.input) {
-        Ok(source) => source,
-        Err((code, message)) => return fail(code, message),
-    };
-
+    let (query_name, query_source) = read_query_input(&args.input)?;
     let compile_start = Instant::now();
     let Some(typed) = compile_query(&query_name, &query_source, &validated) else {
-        return 3;
+        return Err(CliError::reported(EXIT_COMPILE));
     };
     let compile_elapsed = compile_start.elapsed();
 
-    let conn = match open_connection(&spec) {
-        Ok(conn) => conn,
-        Err(message) => return fail(1, message),
-    };
-    let backend = match grove_exec::SqliteBackend::new(conn, &validated) {
-        Ok(backend) => backend,
-        Err(err) => return fail(1, format!("failed to open storage: {err}")),
-    };
+    let conn = open_connection(&spec)?;
+    let backend = grove_exec::SqliteBackend::new(conn, &validated)
+        .map_err(|err| CliError::runtime(format!("failed to open storage: {err}")))?;
 
     let options = grove_exec::ExecOptions {
         pushdown: !args.no_pushdown,
@@ -66,13 +61,8 @@ fn run_query(args: QueryArgs) -> i32 {
     let execute_start = Instant::now();
     match grove_exec::exec_file_with_options(&typed, &backend, &validated, Utc::now(), options) {
         Ok(Some(value)) => {
-            let text = match render::render(&value, &validated, args.output.format) {
-                Ok(text) => text,
-                Err(message) => return fail(1, message),
-            };
-            if let Err(message) = write_output(args.output.output.as_deref(), &text) {
-                return fail(1, message);
-            }
+            let text = render::render(&value, &validated, args.output.format)?;
+            write_output(args.output.output.as_deref(), &text)?;
         }
         Ok(None) => {}
         Err(grove_exec::ExecError::Abort { message, span }) => {
@@ -82,9 +72,9 @@ fn run_query(args: QueryArgs) -> i32 {
                 &query_name,
                 std::slice::from_ref(&diagnostic),
             );
-            return 1;
+            return Err(CliError::reported(EXIT_FAILURE));
         }
-        Err(err) => return fail(1, err.to_string()),
+        Err(err) => return Err(CliError::runtime(err.to_string())),
     }
     let execute_elapsed = execute_start.elapsed();
 
@@ -97,53 +87,43 @@ fn run_query(args: QueryArgs) -> i32 {
         );
     }
 
-    0
+    Ok(())
 }
 
-fn run_check(args: CheckArgs) -> i32 {
-    let (schema_name, schema_source) = match read_schema(&args.schema) {
-        Ok(source) => source,
-        Err((code, message)) => return fail(code, message),
-    };
-
+fn run_check(args: CheckArgs) -> CliResult<()> {
+    let (schema_name, schema_source) = read_schema(&args.schema)?;
     let Some(validated) = compile_schema(&schema_name, &schema_source) else {
-        return 3;
+        return Err(CliError::reported(EXIT_COMPILE));
     };
 
-    let (query_name, query_source) = match read_query_input(&args.input) {
-        Ok(source) => source,
-        Err((code, message)) => return fail(code, message),
-    };
-
+    let (query_name, query_source) = read_query_input(&args.input)?;
     if compile_query(&query_name, &query_source, &validated).is_none() {
-        3
+        Err(CliError::reported(EXIT_COMPILE))
     } else {
-        0
+        Ok(())
     }
 }
 
-fn run_repl(args: ReplArgs) -> i32 {
-    if let Err(message) = args.backend.resolve() {
-        return fail(2, message);
-    }
-    repl_not_implemented(&args.schema)
+fn run_repl(args: ReplArgs) -> CliResult<()> {
+    args.backend.resolve().map_err(CliError::usage)?;
+    Err(repl_not_implemented(&args.schema))
 }
 
-fn run_implicit_repl(schema: Option<PathBuf>) -> i32 {
+fn run_implicit_repl(schema: Option<PathBuf>) -> CliResult<()> {
     match schema {
-        Some(schema) => repl_not_implemented(&schema),
-        None => fail(2, "specify a schema or a subcommand"),
+        Some(schema) => Err(repl_not_implemented(&schema)),
+        None => Err(CliError::usage("specify a schema or a subcommand")),
     }
 }
 
-fn repl_not_implemented(schema: &Path) -> i32 {
-    fail(
-        2,
-        format!(
+fn repl_not_implemented(schema: &Path) -> CliError {
+    CliError {
+        code: EXIT_USAGE,
+        message: Some(format!(
             "interactive mode is not yet implemented (schema: {})",
             schema.display()
-        ),
-    )
+        )),
+    }
 }
 
 fn compile_schema(name: &str, source: &str) -> Option<grove_schema::ValidatedSchema> {
@@ -170,19 +150,24 @@ fn compile_query(
     typed
 }
 
-fn read_schema(path: &Path) -> Result<(String, String), (i32, String)> {
+fn read_schema(path: &Path) -> CliResult<(String, String)> {
     if !path.is_file() {
-        return Err((1, format!("schema file not found: {}", path.display())));
+        return Err(CliError::runtime(format!(
+            "schema file not found: {}",
+            path.display()
+        )));
     }
-    let source = fs::read_to_string(path)
-        .map_err(|err| (1, format!("error reading schema {}: {err}", path.display())))?;
+    let source = fs::read_to_string(path).map_err(|err| {
+        CliError::runtime(format!("error reading schema {}: {err}", path.display()))
+    })?;
     Ok((path.display().to_string(), source))
 }
 
-fn read_query_input(args: &QueryInputArgs) -> Result<(String, String), (i32, String)> {
+fn read_query_input(args: &QueryInputArgs) -> CliResult<(String, String)> {
     if let Some(path) = &args.query_file {
-        let source = fs::read_to_string(path)
-            .map_err(|err| (1, format!("error reading query {}: {err}", path.display())))?;
+        let source = fs::read_to_string(path).map_err(|err| {
+            CliError::runtime(format!("error reading query {}: {err}", path.display()))
+        })?;
         return Ok((path.display().to_string(), source));
     }
 
@@ -194,24 +179,23 @@ fn read_query_input(args: &QueryInputArgs) -> Result<(String, String), (i32, Str
     }
 
     if io::stdin().is_terminal() {
-        return Err((
-            2,
-            "no query given; pass a query, `-` for stdin, or --query-file".to_string(),
+        return Err(CliError::usage(
+            "no query given; pass a query, `-` for stdin, or --query-file",
         ));
     }
 
     Ok(("<stdin>".to_string(), read_stdin()?))
 }
 
-fn read_stdin() -> Result<String, (i32, String)> {
+fn read_stdin() -> CliResult<String> {
     let mut source = String::new();
     io::stdin()
         .read_to_string(&mut source)
-        .map_err(|err| (1, format!("error reading stdin: {err}")))?;
+        .map_err(|err| CliError::runtime(format!("error reading stdin: {err}")))?;
     Ok(source)
 }
 
-fn open_connection(spec: &ConnectionSpec) -> Result<rusqlite::Connection, String> {
+fn open_connection(spec: &ConnectionSpec) -> CliResult<rusqlite::Connection> {
     match spec {
         ConnectionSpec::Sqlite { file, readonly } => {
             let result = if *readonly {
@@ -222,26 +206,26 @@ fn open_connection(spec: &ConnectionSpec) -> Result<rusqlite::Connection, String
             } else {
                 rusqlite::Connection::open(file)
             };
-            result.map_err(|err| format!("error opening database {}: {err}", file.display()))
+            result.map_err(|err| {
+                CliError::runtime(format!("error opening database {}: {err}", file.display()))
+            })
         }
     }
 }
 
-fn write_output(path: Option<&Path>, text: &str) -> Result<(), String> {
+fn write_output(path: Option<&Path>, text: &str) -> CliResult<()> {
     if let Some(path) = path {
-        fs::write(path, format!("{text}\n"))
-            .map_err(|err| format!("error writing {}: {err}", path.display()))
+        let mut file = fs::File::create(path)
+            .map_err(|err| CliError::runtime(format!("error writing {}: {err}", path.display())))?;
+        writeln!(file, "{text}")
+            .map_err(|err| CliError::runtime(format!("error writing {}: {err}", path.display())))
     } else {
         let mut stdout = io::stdout().lock();
-        writeln!(stdout, "{text}").map_err(|err| format!("error writing stdout: {err}"))
+        writeln!(stdout, "{text}")
+            .map_err(|err| CliError::runtime(format!("error writing stdout: {err}")))
     }
 }
 
 fn millis(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
-}
-
-fn fail(code: i32, message: impl Into<String>) -> i32 {
-    eprintln!("error: {}", message.into());
-    code
 }
