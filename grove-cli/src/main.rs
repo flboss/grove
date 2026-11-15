@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use chrono::Utc;
 use clap::Parser;
 
-use crate::args::{Cli, Command, ConnectionSpec, QueryArgs, QueryInputArgs, ReplArgs};
+use crate::args::{CheckArgs, Cli, Command, ConnectionSpec, QueryArgs, QueryInputArgs, ReplArgs};
 
 mod args;
 mod diagnostics;
@@ -15,6 +15,7 @@ fn main() {
     let cli = Cli::parse();
     let code = match cli.command {
         Some(Command::Query(args)) => run_query(args),
+        Some(Command::Check(args)) => run_check(args),
         Some(Command::Repl(args)) => run_repl(args),
         None => run_implicit_repl(cli.schema),
     };
@@ -81,6 +82,28 @@ fn run_query(args: QueryArgs) -> i32 {
     }
 
     0
+}
+
+fn run_check(args: CheckArgs) -> i32 {
+    let (schema_name, schema_source) = match read_schema(&args.schema) {
+        Ok(source) => source,
+        Err((code, message)) => return fail(code, message),
+    };
+
+    let Some(validated) = compile_schema(&schema_name, &schema_source) else {
+        return 3;
+    };
+
+    let (query_name, query_source) = match read_query_input(&args.input) {
+        Ok(source) => source,
+        Err((code, message)) => return fail(code, message),
+    };
+
+    if compile_query(&query_name, &query_source, &validated).is_none() {
+        3
+    } else {
+        0
+    }
 }
 
 fn run_repl(args: ReplArgs) -> i32 {

@@ -29,6 +29,8 @@ pub struct Cli {
 pub enum Command {
     /// Compile and execute one query
     Query(QueryArgs),
+    /// Compile one query without opening storage
+    Check(CheckArgs),
     /// Start an interactive session
     Repl(ReplArgs),
 }
@@ -51,6 +53,16 @@ pub struct QueryArgs {
     /// Debug: Disable operation pushdown and always evaluate in Rust
     #[arg(long)]
     pub no_pushdown: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct CheckArgs {
+    /// Schema file
+    #[arg(value_name = "SCHEMA")]
+    pub schema: PathBuf,
+
+    #[command(flatten)]
+    pub input: QueryInputArgs,
 }
 
 #[derive(Args, Debug)]

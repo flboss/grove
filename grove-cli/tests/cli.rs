@@ -173,3 +173,101 @@ fn query_readonly_database() {
 
     assert_eq!(status(&output), 0, "stderr: {}", stderr(&output));
 }
+
+#[test]
+fn check_success() {
+    let dir = fixture("check");
+    let schema = write_schema(&dir);
+
+    let output = grove()
+        .arg("check")
+        .arg(&schema)
+        .arg("users { name }")
+        .output()
+        .expect("run grove");
+
+    assert_eq!(status(&output), 0, "stderr: {}", stderr(&output));
+    assert!(stdout(&output).is_empty());
+    assert!(stderr(&output).is_empty(), "{}", stderr(&output));
+}
+
+#[test]
+fn check_backend_flags_rejected() {
+    let dir = fixture("check-backend");
+    let schema = write_schema(&dir);
+    let db = write_db(&dir);
+
+    let output = grove()
+        .arg("check")
+        .arg(&schema)
+        .arg("users { name }")
+        .arg("--file")
+        .arg(&db)
+        .output()
+        .expect("run grove");
+
+    assert_eq!(status(&output), 2);
+    assert!(stderr(&output).contains("--file"), "{}", stderr(&output));
+}
+
+#[test]
+fn compile_error_exit_code_stderr() {
+    let dir = fixture("compile-error");
+    let schema = write_schema(&dir);
+
+    let output = grove()
+        .arg("check")
+        .arg(&schema)
+        .arg("users {")
+        .output()
+        .expect("run grove");
+
+    assert_eq!(status(&output), 3);
+    assert!(stdout(&output).is_empty());
+    assert!(!stderr(&output).is_empty());
+    assert!(
+        stderr(&output).contains("QP") || stderr(&output).contains("expected"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn missing_backend_file_exit_code() {
+    let dir = fixture("missing-file");
+    let schema = write_schema(&dir);
+
+    let output = grove()
+        .arg("query")
+        .arg(&schema)
+        .arg("users { name }")
+        .output()
+        .expect("run grove");
+
+    assert_eq!(status(&output), 2);
+    assert!(
+        stderr(&output).contains("--file is required"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn missing_schema_exit_code() {
+    let dir = fixture("missing-schema");
+    let missing = dir.join("missing.gschema");
+
+    let output = grove()
+        .arg("check")
+        .arg(&missing)
+        .arg("users { name }")
+        .output()
+        .expect("run grove");
+
+    assert_eq!(status(&output), 1);
+    assert!(
+        stderr(&output).contains("schema file not found"),
+        "{}",
+        stderr(&output)
+    );
+}
