@@ -9,6 +9,8 @@ use grove_types::Diagnostic;
 
 use ast::QueryFile;
 
+pub use typecheck::TypeBindings;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParseOutcome {
     Complete {

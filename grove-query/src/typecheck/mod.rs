@@ -1,5 +1,8 @@
+pub mod bindings;
 pub mod error;
 pub mod types;
+
+pub use bindings::TypeBindings;
 
 use std::collections::{HashMap, HashSet};
 
@@ -1839,8 +1842,22 @@ pub fn typecheck(
     file: QueryFile,
     schema: &ValidatedSchema,
 ) -> (Option<TypedQueryFile>, Vec<Diagnostic>) {
+    typecheck_with_bindings(file, schema, &TypeBindings::new())
+}
+
+pub fn typecheck_with_bindings(
+    file: QueryFile,
+    schema: &ValidatedSchema,
+    bindings: &TypeBindings,
+) -> (Option<TypedQueryFile>, Vec<Diagnostic>) {
     let (statements_src, result_src) = file.into_statements_and_output();
     let mut env = TypeEnv::new(schema);
+    for (name, ty) in bindings.iter() {
+        env.define(name.to_owned(), ty.clone(), IdentBinding::Let);
+    }
+    // repl turn scope always pushed, executor matching
+    env.push_scope();
+
     let mut diags: Vec<Diagnostic> = Vec::new();
     let mut statements = Vec::new();
 
@@ -2516,6 +2533,121 @@ mod tests {
         assert_eq!(
             typed.result.as_ref().unwrap().ty,
             QueryType::Scalar(ScalarType::Int)
+        );
+    }
+
+    #[test]
+    fn type_bindings_manage_entries() {
+        let mut bindings = TypeBindings::new();
+        assert!(bindings.is_empty());
+        bindings.define("n", QueryType::Scalar(ScalarType::Int));
+        bindings.define("s", QueryType::Scalar(ScalarType::String));
+        assert_eq!(bindings.len(), 2);
+        assert_eq!(bindings.get("n"), Some(&QueryType::Scalar(ScalarType::Int)));
+        assert_eq!(bindings.iter().count(), 2);
+        assert_eq!(
+            bindings.remove("n"),
+            Some(QueryType::Scalar(ScalarType::Int))
+        );
+        assert!(bindings.get("n").is_none());
+        bindings.clear();
+        assert!(bindings.is_empty());
+    }
+
+    #[test]
+    fn session_binding_resolves_at_depth_one() {
+        let mut bindings = TypeBindings::new();
+        bindings.define("min", QueryType::Scalar(ScalarType::Int));
+
+        let (file, _) = crate::parse_query("min");
+        let (typed, diags) = typecheck_with_bindings(file.unwrap(), &test_schema(), &bindings);
+        assert!(diags.is_empty(), "expected no errors, got {diags:?}");
+        let typed = typed.unwrap();
+        let output = typed.result.as_ref().unwrap();
+        assert_eq!(output.ty, QueryType::Scalar(ScalarType::Int));
+        let TypedExprKind::Ident {
+            name,
+            binding,
+            depth,
+        } = &output.kind
+        else {
+            panic!("expected ident output");
+        };
+        assert_eq!(name.value, "min");
+        assert_eq!(*binding, IdentBinding::Let);
+        assert_eq!(*depth, 1);
+    }
+
+    #[test]
+    fn session_binding_shadow_root() {
+        let mut bindings = TypeBindings::new();
+        bindings.define("users", QueryType::Scalar(ScalarType::Int));
+
+        let (file, _) = crate::parse_query("users");
+        let (typed, diags) = typecheck_with_bindings(file.unwrap(), &test_schema(), &bindings);
+        assert!(diags.is_empty(), "expected no errors, got {diags:?}");
+        let typed = typed.unwrap();
+        let output = typed.result.as_ref().unwrap();
+        assert_eq!(output.ty, QueryType::Scalar(ScalarType::Int));
+        let TypedExprKind::Ident {
+            name,
+            binding,
+            depth,
+        } = &output.kind
+        else {
+            panic!("expected ident output");
+        };
+        assert_eq!(name.value, "users");
+        assert_eq!(*binding, IdentBinding::Let);
+        assert_eq!(*depth, 1);
+    }
+
+    #[test]
+    fn turn_let_shadows_session_binding() {
+        let mut bindings = TypeBindings::new();
+        bindings.define("min", QueryType::Scalar(ScalarType::Int));
+
+        let (file, _) = crate::parse_query("let min = 5; users[age > min]");
+        let (typed, diags) = typecheck_with_bindings(file.unwrap(), &test_schema(), &bindings);
+        assert!(diags.is_empty(), "expected no errors, got {diags:?}");
+        let typed = typed.unwrap();
+        let output = typed.result.as_ref().unwrap();
+        let TypedExprKind::Method { args, .. } = &output.kind else {
+            panic!("expected filter method");
+        };
+        let TypedExprKind::Binary { rhs, .. } = &args[0].expr.kind else {
+            panic!("expected binary argument");
+        };
+        let TypedExprKind::Ident {
+            name,
+            binding,
+            depth,
+        } = &rhs.kind
+        else {
+            panic!("expected ident");
+        };
+        assert_eq!(name.value, "min");
+        assert_eq!(*binding, IdentBinding::Let);
+        assert_eq!(*depth, 1);
+    }
+
+    #[test]
+    fn typed_file_exposes_output_type_and_lets() {
+        let (file, _) = crate::parse_query("let x = 1; x");
+        let (typed, diags) = typecheck(file.unwrap(), &test_schema());
+        assert!(diags.is_empty(), "expected no errors, got {diags:?}");
+        let typed = typed.unwrap();
+        assert_eq!(
+            typed.output_type(),
+            Some(&QueryType::Scalar(ScalarType::Int))
+        );
+        let lets: Vec<_> = typed
+            .let_bindings()
+            .map(|(name, ty)| (name.to_string(), ty.clone()))
+            .collect();
+        assert_eq!(
+            lets,
+            vec![("x".to_string(), QueryType::Scalar(ScalarType::Int))]
         );
     }
 
