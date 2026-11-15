@@ -9,6 +9,7 @@ use crate::args::{Cli, Command, ConnectionSpec, QueryArgs, QueryInputArgs, ReplA
 
 mod args;
 mod diagnostics;
+mod render;
 
 fn main() {
     let cli = Cli::parse();
@@ -58,8 +59,11 @@ fn run_query(args: QueryArgs) -> i32 {
     };
     match grove_exec::exec_file_with_options(&typed, &backend, &validated, Utc::now(), options) {
         Ok(Some(value)) => {
-            let text = value.formatter(&validated).to_string();
-            if let Err(message) = write_output(&text) {
+            let text = match render::render(&value, &validated, args.output.format) {
+                Ok(text) => text,
+                Err(message) => return fail(1, message),
+            };
+            if let Err(message) = write_output(args.output.output.as_deref(), &text) {
                 return fail(1, message);
             }
         }
@@ -184,9 +188,14 @@ fn open_connection(spec: &ConnectionSpec) -> Result<rusqlite::Connection, String
     }
 }
 
-fn write_output(text: &str) -> Result<(), String> {
-    let mut stdout = io::stdout().lock();
-    writeln!(stdout, "{text}").map_err(|err| format!("error writing stdout: {err}"))
+fn write_output(path: Option<&Path>, text: &str) -> Result<(), String> {
+    if let Some(path) = path {
+        fs::write(path, format!("{text}\n"))
+            .map_err(|err| format!("error writing {}: {err}", path.display()))
+    } else {
+        let mut stdout = io::stdout().lock();
+        writeln!(stdout, "{text}").map_err(|err| format!("error writing stdout: {err}"))
+    }
 }
 
 fn fail(code: i32, message: impl Into<String>) -> i32 {
