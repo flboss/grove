@@ -122,10 +122,7 @@ fn render_auto(ctx: &RenderCtx<'_>, value: &Val, ty: Option<&QueryType>) -> CliR
             let compact = compact(ctx, value, 0);
             let limit = if is_scalar_list(items) { 20 } else { 10 };
             let within_row_cap = ctx.options.max_rows == 0 || items.len() <= ctx.options.max_rows;
-            if items.len() <= limit
-                && within_row_cap
-                && display_width(&compact.plain) <= ctx.options.width
-            {
+            if items.len() <= limit && within_row_cap && compact.width <= ctx.options.width {
                 Ok(compact.styled)
             } else {
                 Ok(block_lines(ctx, value, 0).join("\n"))
@@ -134,7 +131,7 @@ fn render_auto(ctx: &RenderCtx<'_>, value: &Val, ty: Option<&QueryType>) -> CliR
         Val::Record(_) => Ok(block_lines(ctx, value, 0).join("\n")),
         Val::Tuple(_) => {
             let compact = compact(ctx, value, 0);
-            if display_width(&compact.plain) <= ctx.options.width {
+            if compact.width <= ctx.options.width {
                 Ok(compact.styled)
             } else {
                 Ok(block_lines(ctx, value, 0).join("\n"))
@@ -151,15 +148,16 @@ struct RenderCtx<'a> {
 
 #[derive(Clone, Default)]
 struct Styled {
-    plain: String,
     styled: String,
+    width: usize,
 }
 
 impl Styled {
     fn painted(text: impl Into<String>, style: &str, color: bool) -> Self {
-        let plain = text.into();
-        let styled = paint(&plain, Some(style), color);
-        Styled { plain, styled }
+        let text = text.into();
+        let width = display_width(&text);
+        let styled = paint(&text, Some(style), color);
+        Styled { styled, width }
     }
 }
 
@@ -176,8 +174,8 @@ fn compact(ctx: &RenderCtx<'_>, value: &Val, depth: usize) -> Styled {
         Val::Some(inner) => {
             let inner = compact(ctx, inner, depth);
             Styled {
-                plain: format!("some({})", inner.plain),
                 styled: format!("some({})", inner.styled),
+                width: 5 + inner.width + 1,
             }
         }
         Val::Scalar(scalar) => {
@@ -199,56 +197,56 @@ fn compact(ctx: &RenderCtx<'_>, value: &Val, depth: usize) -> Styled {
             Styled::painted(text, STYLE_ENUM, ctx.options.color)
         }
         Val::List(items) => {
-            let mut plain = String::from("[");
             let mut styled = String::from("[");
+            let mut width = 1;
             for (index, item) in items.iter().enumerate() {
                 if index > 0 {
-                    plain.push_str(", ");
                     styled.push_str(", ");
+                    width += 2;
                 }
                 let item = compact(ctx, item, depth + 1);
-                plain.push_str(&item.plain);
                 styled.push_str(&item.styled);
+                width += item.width;
             }
-            plain.push(']');
             styled.push(']');
-            Styled { plain, styled }
+            width += 1;
+            Styled { styled, width }
         }
         Val::Tuple(items) => {
-            let mut plain = String::from("(");
             let mut styled = String::from("(");
+            let mut width = 1;
             for (index, item) in items.iter().enumerate() {
                 if index > 0 {
-                    plain.push_str(", ");
                     styled.push_str(", ");
+                    width += 2;
                 }
                 let item = compact(ctx, item, depth + 1);
-                plain.push_str(&item.plain);
                 styled.push_str(&item.styled);
+                width += item.width;
             }
-            plain.push(')');
             styled.push(')');
-            Styled { plain, styled }
+            width += 1;
+            Styled { styled, width }
         }
         Val::Record(fields) => {
-            let mut plain = String::from("{");
             let mut styled = String::from("{");
+            let mut width = 1;
             for (index, (name, value)) in fields.iter().enumerate() {
                 if index > 0 {
-                    plain.push_str(", ");
                     styled.push_str(", ");
+                    width += 2;
                 }
-                plain.push_str(name);
                 styled.push_str(&paint(name, Some(STYLE_BOLD), ctx.options.color));
-                plain.push_str(": ");
+                width += display_width(name);
                 styled.push_str(": ");
+                width += 2;
                 let value = compact(ctx, value, depth + 1);
-                plain.push_str(&value.plain);
                 styled.push_str(&value.styled);
+                width += value.width;
             }
-            plain.push('}');
             styled.push('}');
-            Styled { plain, styled }
+            width += 1;
+            Styled { styled, width }
         }
         Val::Ref { .. } => {
             let text = value.formatter(ctx.schema).to_string();
@@ -359,7 +357,7 @@ fn list_lines(ctx: &RenderCtx<'_>, items: &[Val], depth: usize) -> Vec<String> {
 fn cell_styled(ctx: &RenderCtx<'_>, value: &Val, depth: usize) -> Styled {
     let compact = compact(ctx, value, depth);
     let cap = ctx.options.max_cell_width;
-    if cap == 0 || display_width(&compact.plain) <= cap {
+    if cap == 0 || compact.width <= cap {
         return compact;
     }
 
@@ -372,10 +370,10 @@ fn cell_styled(ctx: &RenderCtx<'_>, value: &Val, depth: usize) -> Styled {
         Val::Record(fields) if !fields.is_empty() => {
             Styled::painted("{…}", STYLE_DIM, ctx.options.color)
         }
-        _ => truncate_styled(compact, cap),
+        _ => return truncate_styled(compact, cap),
     };
 
-    if display_width(&abbreviated.plain) <= cap {
+    if abbreviated.width <= cap {
         abbreviated
     } else {
         truncate_styled(abbreviated, cap)
@@ -548,7 +546,7 @@ fn finish_table(
     for row in &rows {
         for (index, cell) in row.iter().enumerate() {
             if let Some(width) = widths.get_mut(index) {
-                *width = (*width).max(display_width(&cell.content.plain));
+                *width = (*width).max(cell.content.width);
             }
         }
     }
@@ -686,7 +684,7 @@ fn note_row(note: &str, widths: &[usize], color: bool) -> String {
 }
 
 fn pad_styled(content: &Styled, width: usize, align: Align) -> String {
-    let padding = width.saturating_sub(display_width(&content.plain));
+    let padding = width.saturating_sub(content.width);
     let mut out = String::with_capacity(padding + content.styled.len());
     match align {
         Align::Left => {
@@ -778,18 +776,19 @@ fn truncate_display<'a>(text: impl Into<Cow<'a, str>>, max_width: usize) -> Stri
 }
 
 fn truncate_styled(styled: Styled, max_width: usize) -> Styled {
-    if max_width == 0 || display_width(&styled.plain) <= max_width {
+    if max_width == 0 || styled.width <= max_width {
         return styled;
     }
-    let combined = |trunc: String| Styled {
-        plain: truncate_display(styled.plain, max_width),
-        styled: trunc,
-    };
+
+    let has_ansi = styled.styled.contains('\x1b');
     if max_width == 1 {
-        return if styled.styled.contains('\x1b') {
-            combined(format!("…{RESET}"))
-        } else {
-            combined("…".to_string())
+        return Styled {
+            styled: if has_ansi {
+                format!("…{RESET}")
+            } else {
+                "…".to_string()
+            },
+            width: 1,
         };
     }
 
@@ -819,10 +818,11 @@ fn truncate_styled(styled: Styled, max_width: usize) -> Styled {
     }
 
     out.push('…');
-    if styled.styled.contains('\x1b') {
+    width += 1;
+    if has_ansi {
         out.push_str(RESET);
     }
-    combined(out)
+    Styled { styled: out, width }
 }
 
 fn paint(text: &str, style: Option<&str>, color: bool) -> String {
