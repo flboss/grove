@@ -453,13 +453,14 @@ fn exec_run(
         chrono::Utc::now(),
         options,
     ) {
-        Ok(value) => {
+        Ok(Some(value)) => {
             if raw_output {
                 println!("{value}");
             } else {
                 println!("{}", value.formatter(&validated_schema));
             }
         }
+        Ok(None) => println!("No result."),
         Err(e) => println!("No result. (execution failed: {e})"),
     }
     print_diagnostics(&query_source, &query_name, &typecheck_diagnostics, raw, "");

@@ -5,10 +5,30 @@ use grove_schema::validated::ScalarType;
 use grove_types::{Span, Spanned};
 use rust_decimal::Decimal;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct QueryFile {
     pub statements: Vec<Statement>,
-    pub result: Expr,
+}
+
+impl QueryFile {
+    pub fn output(&self) -> Option<&Expr> {
+        match self.statements.last() {
+            Some(Statement::Expr(expr)) => Some(expr),
+            _ => None,
+        }
+    }
+
+    pub fn into_statements_and_output(self) -> (Vec<Statement>, Option<Expr>) {
+        let mut statements = self.statements;
+        let output = match statements.last() {
+            Some(Statement::Expr(_)) => match statements.pop() {
+                Some(Statement::Expr(expr)) => Some(expr),
+                _ => unreachable!(),
+            },
+            _ => None,
+        };
+        (statements, output)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

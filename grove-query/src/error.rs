@@ -425,9 +425,8 @@ pub enum QueryParseError {
     ProjectionItemAliasRequired { span: Span },
     EmptyStatement { span: Span },
     DiscardedQuery { span: Span },
-    MutationAsResult { span: Span },
+    ExpectedSemicolon { span: Span, after: &'static str },
     LetEqualsExpected { span: Span },
-    LetAsResult { span: Span },
     MutationAsValue { span: Span },
     LetNameExpected { span: Span },
 }
@@ -599,30 +598,19 @@ impl From<QueryParseError> for Diagnostic {
                 span,
                 "query result is discarded",
             )
-            .with_help(
-                "remove the semicolon and all following content \
-                    to return the result of this expression",
-            ),
-            MutationAsResult { span } => error_simple(
-                "QP0025",
-                "mutation cannot be used as a result expression",
+            .with_help("move this expression to the end of the file to return its result"),
+            ExpectedSemicolon { span, after } => error_simple(
+                "QP0039",
+                format!("expected `;` after {after}"),
                 span,
-                "produces no value",
-            )
-            .with_help("add a semicolon to make this a statement, and provide a result expression"),
+                "expected `;`",
+            ),
             LetEqualsExpected { span } => error_simple(
                 "QP0026",
                 "expected `=` after `let` binding name",
                 span,
                 "expected `=`",
             ),
-            LetAsResult { span } => error_simple(
-                "QP0027",
-                "let binding cannot be used as a result expression",
-                span,
-                "produces no value",
-            )
-            .with_help("add a semicolon to make this a statement, and provide a result expression"),
             MutationAsValue { span } => error_simple(
                 "QP0028",
                 "mutation cannot be used as a `let` value",

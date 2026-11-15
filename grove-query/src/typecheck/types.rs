@@ -8,8 +8,25 @@ use grove_types::{NodeId, Span, Spanned};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypedQueryFile {
+    /// Side-effect statements and discarded expression statements
     pub statements: Vec<TypedStatement>,
-    pub result: TypedExpr,
+    /// Final expression statement, if present
+    pub result: Option<TypedExpr>,
+}
+
+impl TypedQueryFile {
+    pub fn output_type(&self) -> Option<&QueryType> {
+        self.result.as_ref().map(|expr| &expr.ty)
+    }
+
+    pub fn let_bindings(&self) -> impl Iterator<Item = (&str, &QueryType)> {
+        self.statements.iter().filter_map(|stmt| match stmt {
+            TypedStatement::Let(let_stmt) => {
+                Some((let_stmt.name.value.as_str(), &let_stmt.value.ty))
+            }
+            _ => None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

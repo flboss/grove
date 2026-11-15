@@ -9,7 +9,26 @@ use grove_types::Diagnostic;
 
 use ast::QueryFile;
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParseOutcome {
+    Complete {
+        file: QueryFile,
+        diagnostics: Vec<Diagnostic>,
+    },
+    Incomplete {
+        diagnostics: Vec<Diagnostic>,
+    },
+    Invalid {
+        diagnostics: Vec<Diagnostic>,
+    },
+}
+
 pub fn parse_query(source: &str) -> (Option<QueryFile>, Vec<Diagnostic>) {
     let parser = parse::Parser::new(source);
     parser.parse_query()
+}
+
+pub fn parse_query_repl(source: &str) -> ParseOutcome {
+    let parser = parse::Parser::new(source);
+    parser.parse_query_repl()
 }

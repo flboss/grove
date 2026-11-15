@@ -242,7 +242,7 @@ pub fn exec_file(
     storage: &dyn Storage,
     schema: &ValidatedSchema,
     now: DateTime<Utc>,
-) -> Result<Val, ExecError> {
+) -> Result<Option<Val>, ExecError> {
     exec_file_with_options(file, storage, schema, now, ExecOptions::default())
 }
 
@@ -253,7 +253,7 @@ pub fn exec_file_with_options(
     schema: &ValidatedSchema,
     now: DateTime<Utc>,
     options: ExecOptions,
-) -> Result<Val, ExecError> {
+) -> Result<Option<Val>, ExecError> {
     let plan = if options.pushdown {
         PushdownPlan::analyze(file, schema, now)
     } else {
@@ -268,8 +268,14 @@ pub fn exec_file_with_options(
             TypedStatement::Mutation(_) => todo!("mutations"),
         }
     }
-    let mut result = eval(&file.result, &mut ctx)?;
-    resolve_owning_values(&mut ctx, std::slice::from_mut(&mut result), None)?;
+
+    let result = if let Some(expr) = &file.result {
+        let mut result = eval(expr, &mut ctx)?;
+        resolve_owning_values(&mut ctx, std::slice::from_mut(&mut result), None)?;
+        Some(result)
+    } else {
+        None
+    };
     Ok(result)
 }
 
@@ -315,19 +321,20 @@ pub(crate) mod harness {
             ExecOptions { pushdown: false },
         );
         assert_pushdown_parity(src, &pushed, &unpushed);
-        pushed
+        pushed.map(|value| value.expect("query produced no output"))
     }
 
     fn assert_pushdown_parity(
         src: &str,
-        pushed: &Result<Val, ExecError>,
-        unpushed: &Result<Val, ExecError>,
+        pushed: &Result<Option<Val>, ExecError>,
+        unpushed: &Result<Option<Val>, ExecError>,
     ) {
         match (pushed, unpushed) {
-            (Ok(left), Ok(right)) => assert!(
+            (Ok(Some(left)), Ok(Some(right))) => assert!(
                 same_value(left, right),
                 "pushdown changed the result for `{src}`: {left:?} vs {right:?}"
             ),
+            (Ok(None), Ok(None)) => {}
             (Err(left), Err(right)) => {
                 assert_eq!(left, right, "pushdown changed the error for `{src}`")
             }
@@ -362,6 +369,16 @@ pub(crate) mod harness {
     ) -> Result<Val, ExecError> {
         let typed = typed_for(src, schema);
         exec_file_with_options(&typed, storage, schema, FIXED_NOW, options)
+            .map(|value| value.expect("query produced no output"))
+    }
+
+    pub(crate) fn run_optional_with_storage<S: Storage>(
+        src: &str,
+        schema: &ValidatedSchema,
+        storage: &S,
+    ) -> Result<Option<Val>, ExecError> {
+        let typed = typed_for(src, schema);
+        exec_file_with_options(&typed, storage, schema, FIXED_NOW, ExecOptions::default())
     }
 
     fn typed_for(src: &str, schema: &ValidatedSchema) -> TypedQueryFile {
@@ -750,5 +767,20 @@ mod tests {
                 rec(vec![("name", str("editor"))]),
             ]))
         );
+    }
+
+    #[test]
+    fn exec_statement_only_files() {
+        let schema = ValidatedSchema::default();
+        assert_eq!(
+            run_optional_with_storage("let x = 1;", &schema, &NoStorage),
+            Ok(None)
+        );
+        assert_eq!(run_optional_with_storage("", &schema, &NoStorage), Ok(None));
+        assert_eq!(
+            run_optional_with_storage("let x = 1; x", &schema, &NoStorage),
+            Ok(Some(int(1)))
+        );
+        assert_eq!(run_src("42;"), Ok(int(42)));
     }
 }

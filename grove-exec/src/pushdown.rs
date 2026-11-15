@@ -134,7 +134,9 @@ impl PushdownPlan {
                 TypedStatement::Expr(_) | TypedStatement::Mutation(_) => {}
             }
         }
-        builder.visit(&file.result, Need::Whole);
+        if let Some(result) = &file.result {
+            builder.visit(result, Need::Whole);
+        }
         builder.finish()
     }
 
@@ -927,7 +929,9 @@ mod tests {
                 TypedStatement::Mutation(_) => {}
             }
         }
-        walk(&file.result, f);
+        if let Some(result) = &file.result {
+            walk(result, f);
+        }
     }
 
     fn root_nodes(file: &TypedQueryFile) -> Vec<NodeId> {
