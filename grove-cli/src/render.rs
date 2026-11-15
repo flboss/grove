@@ -122,7 +122,10 @@ fn render_auto(ctx: &RenderCtx<'_>, value: &Val, ty: Option<&QueryType>) -> CliR
             let compact = compact(ctx, value, 0);
             let limit = if is_scalar_list(items) { 20 } else { 10 };
             let within_row_cap = ctx.options.max_rows == 0 || items.len() <= ctx.options.max_rows;
-            if items.len() <= limit && within_row_cap && fits_width(ctx, &compact.plain) {
+            if items.len() <= limit
+                && within_row_cap
+                && display_width(&compact.plain) <= ctx.options.width
+            {
                 Ok(compact.styled)
             } else {
                 Ok(block_lines(ctx, value, 0).join("\n"))
@@ -131,7 +134,7 @@ fn render_auto(ctx: &RenderCtx<'_>, value: &Val, ty: Option<&QueryType>) -> CliR
         Val::Record(_) => Ok(block_lines(ctx, value, 0).join("\n")),
         Val::Tuple(_) => {
             let compact = compact(ctx, value, 0);
-            if fits_width(ctx, &compact.plain) {
+            if display_width(&compact.plain) <= ctx.options.width {
                 Ok(compact.styled)
             } else {
                 Ok(block_lines(ctx, value, 0).join("\n"))
@@ -745,10 +748,6 @@ fn record_field_names(schema: &ValidatedSchema, source: &RecordSource) -> Option
             )
         }
     }
-}
-
-fn fits_width(ctx: &RenderCtx<'_>, text: &str) -> bool {
-    display_width(text) <= ctx.options.width
 }
 
 fn display_width(text: &str) -> usize {
