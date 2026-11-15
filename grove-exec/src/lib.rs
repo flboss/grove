@@ -6,7 +6,9 @@ pub mod sqlite;
 pub mod storage;
 pub mod value;
 
-pub use eval::ExecSession;
+pub use error::ExecError;
+pub use eval::{ExecOptions, ExecSession, exec_file, exec_file_with_options};
+pub use sqlite::SqliteBackend;
 
 #[cfg(test)]
 mod testdata;

@@ -290,6 +290,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "grove-cli"
+version = "0.1.0"
+dependencies = [
+ "ariadne",
+ "chrono",
+ "clap",
+ "grove-exec",
+ "grove-query",
+ "grove-schema",
+ "grove-types",
+ "rusqlite",
+]
+
+[[package]]
 name = "grove-debug"
 version = "0.1.0"
 dependencies = [

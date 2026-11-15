@@ -1,0 +1,19 @@
+[package]
+name = "grove-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "grove"
+path = "src/main.rs"
+
+[dependencies]
+grove-types.workspace = true
+grove-schema.workspace = true
+grove-query.workspace = true
+grove-exec.workspace = true
+
+ariadne.workspace = true
+chrono.workspace = true
+clap.workspace = true
+rusqlite.workspace = true

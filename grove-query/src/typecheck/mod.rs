@@ -3,6 +3,7 @@ pub mod error;
 pub mod types;
 
 pub use bindings::TypeBindings;
+pub use types::TypedQueryFile;
 
 use std::collections::{HashMap, HashSet};
 
