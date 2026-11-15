@@ -172,6 +172,10 @@ pub struct OutputArgs {
     /// Write results to a file instead of stdout
     #[arg(long, value_name = "PATH")]
     pub output: Option<PathBuf>,
+
+    /// Print phase timings to stderr
+    #[arg(long)]
+    pub stats: bool,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]

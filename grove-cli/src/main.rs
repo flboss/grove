@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use clap::Parser;
@@ -33,18 +34,22 @@ fn run_query(args: QueryArgs) -> i32 {
         Err((code, message)) => return fail(code, message),
     };
 
+    let schema_start = Instant::now();
     let Some(validated) = compile_schema(&schema_name, &schema_source) else {
         return 3;
     };
+    let schema_elapsed = schema_start.elapsed();
 
     let (query_name, query_source) = match read_query_input(&args.input) {
         Ok(source) => source,
         Err((code, message)) => return fail(code, message),
     };
 
+    let compile_start = Instant::now();
     let Some(typed) = compile_query(&query_name, &query_source, &validated) else {
         return 3;
     };
+    let compile_elapsed = compile_start.elapsed();
 
     let conn = match open_connection(&spec) {
         Ok(conn) => conn,
@@ -58,6 +63,7 @@ fn run_query(args: QueryArgs) -> i32 {
     let options = grove_exec::ExecOptions {
         pushdown: !args.no_pushdown,
     };
+    let execute_start = Instant::now();
     match grove_exec::exec_file_with_options(&typed, &backend, &validated, Utc::now(), options) {
         Ok(Some(value)) => {
             let text = match render::render(&value, &validated, args.output.format) {
@@ -79,6 +85,16 @@ fn run_query(args: QueryArgs) -> i32 {
             return 1;
         }
         Err(err) => return fail(1, err.to_string()),
+    }
+    let execute_elapsed = execute_start.elapsed();
+
+    if args.output.stats {
+        eprintln!(
+            "schema: {:.3} ms, compile: {:.3} ms, execute: {:.3} ms",
+            millis(schema_elapsed),
+            millis(compile_elapsed),
+            millis(execute_elapsed),
+        );
     }
 
     0
@@ -219,6 +235,10 @@ fn write_output(path: Option<&Path>, text: &str) -> Result<(), String> {
         let mut stdout = io::stdout().lock();
         writeln!(stdout, "{text}").map_err(|err| format!("error writing stdout: {err}"))
     }
+}
+
+fn millis(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
 }
 
 fn fail(code: i32, message: impl Into<String>) -> i32 {

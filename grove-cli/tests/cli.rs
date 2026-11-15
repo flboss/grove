@@ -175,6 +175,30 @@ fn query_readonly_database() {
 }
 
 #[test]
+fn query_stats_stderr() {
+    let dir = fixture("stats");
+    let schema = write_schema(&dir);
+    let db = write_db(&dir);
+
+    let output = grove()
+        .arg("query")
+        .arg(&schema)
+        .arg("users { name }")
+        .arg("--file")
+        .arg(&db)
+        .arg("--stats")
+        .output()
+        .expect("run grove");
+
+    assert_eq!(status(&output), 0, "stderr: {}", stderr(&output));
+    assert!(
+        stderr(&output).contains(" ms, compile: "),
+        "stderr: {}",
+        stderr(&output)
+    );
+}
+
+#[test]
 fn check_success() {
     let dir = fixture("check");
     let schema = write_schema(&dir);
