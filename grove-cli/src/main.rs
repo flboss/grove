@@ -7,12 +7,12 @@ use chrono::Utc;
 use clap::Parser;
 
 use crate::args::{
-    BackendArgs, CheckArgs, Cli, Command, ConnectionSpec, OutputArgs, QueryArgs, QueryInputArgs,
-    ReplArgs,
+    BackendArgs, CheckArgs, Cli, Command, OutputArgs, QueryArgs, QueryInputArgs, ReplArgs,
 };
 use crate::error::{CliError, CliResult, EXIT_COMPILE, EXIT_FAILURE, EXIT_SUCCESS};
 
 mod args;
+mod backend;
 mod diagnostics;
 mod error;
 mod render;
@@ -55,8 +55,8 @@ fn run_query(args: QueryArgs) -> CliResult<()> {
     };
     let compile_elapsed = compile_start.elapsed();
 
-    let conn = open_connection(&spec)?;
-    let backend = grove_exec::SqliteBackend::new(conn, &validated)
+    let backend = spec
+        .open(&validated)
         .map_err(|err| CliError::runtime(format!("failed to open storage: {err}")))?;
 
     let options = grove_exec::ExecOptions {
@@ -65,7 +65,13 @@ fn run_query(args: QueryArgs) -> CliResult<()> {
     let render_options =
         render::RenderOptions::from_args(&args.output, args.output.color_enabled());
     let execute_start = Instant::now();
-    match grove_exec::exec_file_with_options(&typed, &backend, &validated, Utc::now(), options) {
+    match grove_exec::exec_file_with_options(
+        &typed,
+        backend.as_ref(),
+        &validated,
+        Utc::now(),
+        options,
+    ) {
         Ok(Some(value)) => {
             let text = render::render(&value, typed.output_type(), &validated, &render_options)?;
             write_output(args.output.output.as_deref(), &text)?;
@@ -193,24 +199,6 @@ fn read_stdin() -> CliResult<String> {
         .read_to_string(&mut source)
         .map_err(|err| CliError::runtime(format!("error reading stdin: {err}")))?;
     Ok(source)
-}
-
-pub(crate) fn open_connection(spec: &ConnectionSpec) -> CliResult<rusqlite::Connection> {
-    match spec {
-        ConnectionSpec::Sqlite { file, readonly } => {
-            let result = if *readonly {
-                rusqlite::Connection::open_with_flags(
-                    file,
-                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-                )
-            } else {
-                rusqlite::Connection::open(file)
-            };
-            result.map_err(|err| {
-                CliError::runtime(format!("error opening database {}: {err}", file.display()))
-            })
-        }
-    }
 }
 
 pub(crate) fn write_output(path: Option<&Path>, text: &str) -> CliResult<()> {

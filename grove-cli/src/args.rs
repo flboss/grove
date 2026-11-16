@@ -3,6 +3,8 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+pub use crate::backend::{BackendArgs, ConnectionSpec};
+
 #[derive(Parser, Debug)]
 #[command(
     name = "grove",
@@ -92,48 +94,6 @@ pub struct QueryInputArgs {
     /// Read query source from a file
     #[arg(long, value_name = "PATH", conflicts_with = "query")]
     pub query_file: Option<PathBuf>,
-}
-
-#[derive(Args, Debug, Clone)]
-pub struct BackendArgs {
-    /// Storage backend
-    #[arg(long, value_enum, default_value = "sqlite")]
-    pub backend: BackendKind,
-
-    /// Database file (required for the sqlite backend)
-    #[arg(long, alias = "db", value_name = "PATH")]
-    pub file: Option<PathBuf>,
-
-    /// Open the database read-only
-    #[arg(long)]
-    pub readonly: bool,
-}
-
-#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BackendKind {
-    Sqlite,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConnectionSpec {
-    Sqlite { file: PathBuf, readonly: bool },
-}
-
-impl BackendArgs {
-    pub fn resolve(&self) -> Result<ConnectionSpec, String> {
-        match self.backend {
-            BackendKind::Sqlite => {
-                let file = self
-                    .file
-                    .clone()
-                    .ok_or_else(|| "--file is required for --backend sqlite".to_string())?;
-                Ok(ConnectionSpec::Sqlite {
-                    file,
-                    readonly: self.readonly,
-                })
-            }
-        }
-    }
 }
 
 #[derive(Args, Debug, Clone)]

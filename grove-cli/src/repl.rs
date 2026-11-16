@@ -18,7 +18,7 @@ use crate::render::{self, RenderOptions};
 #[derive(Debug)]
 enum ReplOutcome {
     Quit,
-    OpenDatabase(PathBuf),
+    OpenBackend(ConnectionSpec),
     ReloadSchema(Box<ValidatedSchema>),
 }
 
@@ -29,6 +29,7 @@ struct ReplSettings {
 
 struct ReplSession<'a> {
     schema: &'a ValidatedSchema,
+    spec: &'a ConnectionSpec,
     schema_path: PathBuf,
     exec: ExecSession<'a>,
     types: TypeBindings,
@@ -98,16 +99,17 @@ fn repl_loop(
     editor: &mut rustyline::DefaultEditor,
 ) -> CliResult<()> {
     loop {
-        let conn = crate::open_connection(spec)?;
-        let backend = grove_exec::SqliteBackend::new(conn, schema)
-            .map_err(|err| CliError::runtime(format!("failed to open storage: {err}")))?;
-        print_banner(spec, schema_path);
-
         let outcome = {
+            let backend = spec
+                .open(schema)
+                .map_err(|err| CliError::runtime(format!("failed to open storage: {err}")))?;
+            print_banner(spec, schema_path);
+
             let mut session = ReplSession {
                 schema,
+                spec,
                 schema_path: schema_path.to_path_buf(),
-                exec: ExecSession::new(&backend, schema),
+                exec: ExecSession::new(backend.as_ref(), schema),
                 types: TypeBindings::new(),
                 settings,
                 exec_options,
@@ -118,11 +120,8 @@ fn repl_loop(
 
         match outcome {
             ReplOutcome::Quit => break,
-            ReplOutcome::OpenDatabase(file) => {
-                let readonly = match spec {
-                    ConnectionSpec::Sqlite { readonly, .. } => *readonly,
-                };
-                *spec = ConnectionSpec::Sqlite { file, readonly };
+            ReplOutcome::OpenBackend(new_spec) => {
+                *spec = new_spec;
             }
             ReplOutcome::ReloadSchema(new_schema) => {
                 *schema = *new_schema;
@@ -134,19 +133,13 @@ fn repl_loop(
 }
 
 fn print_banner(spec: &ConnectionSpec, schema_path: &Path) {
-    match spec {
-        ConnectionSpec::Sqlite { file, readonly } => {
-            let mode = if *readonly { " (read-only)" } else { "" };
-            println!(
-                "grove {} — sqlite: {}{} — schema: {}",
-                env!("CARGO_PKG_VERSION"),
-                file.display(),
-                mode,
-                schema_path.display()
-            );
-        }
-    }
-    println!("Type .help for commands.");
+    println!(
+        "grove {} — {} — schema: {}",
+        env!("CARGO_PKG_VERSION"),
+        spec.description(),
+        schema_path.display()
+    );
+    println!("Type .help for a list of commands.");
 }
 
 impl<'a> ReplSession<'a> {
@@ -220,6 +213,17 @@ impl<'a> ReplSession<'a> {
         let command = parts.next().unwrap_or("");
         let argument = parts.next().unwrap_or("").trim();
 
+        if let Some(spec_command) = self.spec.repl_command(command) {
+            match (spec_command.parse)(argument) {
+                Ok(action) => match self.spec.apply_repl_action(action) {
+                    Ok(new_spec) => return Ok(Some(ReplOutcome::OpenBackend(new_spec))),
+                    Err(message) => eprintln!("{message}"),
+                },
+                Err(message) => eprintln!("{message}"),
+            }
+            return Ok(None);
+        }
+
         match command {
             ".quit" | ".exit" => return Ok(Some(ReplOutcome::Quit)),
             ".help" => self.print_help(),
@@ -236,15 +240,6 @@ impl<'a> ReplSession<'a> {
                     return self.reload_schema();
                 }
                 self.print_schema();
-            }
-            ".open" => {
-                if argument.is_empty() {
-                    eprintln!("usage: .open PATH");
-                } else if !Path::new(argument).is_file() {
-                    eprintln!("database file not found: {argument}");
-                } else {
-                    return Ok(Some(ReplOutcome::OpenDatabase(PathBuf::from(argument))));
-                }
             }
             ".format" => {
                 if let Some(format) = Format::parse(argument) {
@@ -457,21 +452,29 @@ impl<'a> ReplSession<'a> {
     fn print_help(&self) {
         println!(
             "\
-.help                  Show this command list
-.quit, .exit           Quit the REPL
-.vars, .lets           List let bindings
-.unlet NAME            Remove a binding
-.clear                 Clear all bindings
-.read PATH             Run a query file in this session
-.schema [reload]       Show schema summary or reload it
-.open PATH             Open a new SQLite database
-.format MODE           auto|inline|raw|table|vertical
-.headers on|off        Toggle table headers
-.stats on|off          Toggle per-turn query stats
-.width N|auto          Set render width
-.maxrows N|unlimited   Set the table render row limit
-.output PATH|stdout    Redirect results"
+.help                          Show this command list
+.quit, .exit                   Quit the REPL
+.vars, .lets                   List let bindings
+.unlet NAME                    Remove a binding
+.clear                         Clear all bindings
+.read PATH                     Run a query file in this session
+.schema [reload]               Show schema summary or reload it
+.format MODE                   auto|inline|raw|table|vertical
+.headers on|off                Toggle table headers
+.stats on|off                  Toggle per-turn query stats
+.width N|auto                  Set render width
+.maxrows N|unlimited           Set the table render row limit
+.output PATH|stdout            Redirect results"
         );
+
+        let backend_commands = self.spec.repl_commands();
+        if !backend_commands.is_empty() {
+            println!();
+            println!("Backend commands:");
+            for command in backend_commands {
+                println!("{:<32} {}", command.usage, command.description);
+            }
+        }
     }
 
     fn report_error(&self, error: CliError) {
@@ -517,14 +520,23 @@ mod tests {
         }
     }
 
+    fn spec() -> ConnectionSpec {
+        ConnectionSpec::Sqlite {
+            file: PathBuf::from("<test>"),
+            readonly: false,
+        }
+    }
+
     fn session<'a>(
         schema: &'a ValidatedSchema,
+        spec: &'a ConnectionSpec,
         backend: &'a SqliteBackend<'a>,
         settings: &'a mut ReplSettings,
         turn: &'a mut usize,
     ) -> ReplSession<'a> {
         ReplSession {
             schema,
+            spec,
             schema_path: PathBuf::from("<test>"),
             exec: ExecSession::new(backend, schema),
             types: TypeBindings::new(),
@@ -539,8 +551,9 @@ mod tests {
         let schema = ValidatedSchema::default();
         let backend = SqliteBackend::open_in_memory(&schema).expect("backend");
         let mut settings = settings();
+        let spec = spec();
         let mut turn = 0;
-        let mut session = session(&schema, &backend, &mut settings, &mut turn);
+        let mut session = session(&schema, &spec, &backend, &mut settings, &mut turn);
 
         assert_eq!(
             session.execute_source("let x = 41;", "<test:1>").unwrap(),
@@ -558,8 +571,9 @@ mod tests {
         let schema = ValidatedSchema::default();
         let backend = SqliteBackend::open_in_memory(&schema).expect("backend");
         let mut settings = settings();
+        let spec = spec();
         let mut turn = 0;
-        let mut session = session(&schema, &backend, &mut settings, &mut turn);
+        let mut session = session(&schema, &spec, &backend, &mut settings, &mut turn);
 
         session.execute_source("let x = 1;", "<test:1>").unwrap();
         session.meta_command(".clear").unwrap();
@@ -572,8 +586,9 @@ mod tests {
         let schema = ValidatedSchema::default();
         let backend = SqliteBackend::open_in_memory(&schema).expect("backend");
         let mut settings = settings();
+        let spec = spec();
         let mut turn = 0;
-        let mut session = session(&schema, &backend, &mut settings, &mut turn);
+        let mut session = session(&schema, &spec, &backend, &mut settings, &mut turn);
 
         session.execute_source("let x = 1;", "<test:1>").unwrap();
         session.execute_source("let y = 2;", "<test:2>").unwrap();
@@ -588,8 +603,9 @@ mod tests {
         let schema = ValidatedSchema::default();
         let backend = SqliteBackend::open_in_memory(&schema).expect("backend");
         let mut settings = settings();
+        let spec = spec();
         let mut turn = 0;
-        let mut session = session(&schema, &backend, &mut settings, &mut turn);
+        let mut session = session(&schema, &spec, &backend, &mut settings, &mut turn);
 
         session.execute_source("let x = 1;", "<test:1>").unwrap();
         session.meta_command(".vars").unwrap();
@@ -602,8 +618,9 @@ mod tests {
         let schema = ValidatedSchema::default();
         let backend = SqliteBackend::open_in_memory(&schema).expect("backend");
         let mut settings = settings();
+        let spec = spec();
         let mut turn = 0;
-        let mut session = session(&schema, &backend, &mut settings, &mut turn);
+        let mut session = session(&schema, &spec, &backend, &mut settings, &mut turn);
 
         let path = std::env::temp_dir().join(format!("grove-repl-read-{}.grv", std::process::id()));
         fs::write(&path, "let y = 2;").expect("write query file");
@@ -619,8 +636,9 @@ mod tests {
         let schema = ValidatedSchema::default();
         let backend = SqliteBackend::open_in_memory(&schema).expect("backend");
         let mut settings = settings();
+        let spec = spec();
         let mut turn = 0;
-        let mut session = session(&schema, &backend, &mut settings, &mut turn);
+        let mut session = session(&schema, &spec, &backend, &mut settings, &mut turn);
 
         session.execute_source("let x = 1;", "<test:1>").unwrap();
         assert_eq!(
@@ -638,8 +656,9 @@ mod tests {
         let schema = ValidatedSchema::default();
         let backend = SqliteBackend::open_in_memory(&schema).expect("backend");
         let mut settings = settings();
+        let spec = spec();
         let mut turn = 0;
-        let mut session = session(&schema, &backend, &mut settings, &mut turn);
+        let mut session = session(&schema, &spec, &backend, &mut settings, &mut turn);
 
         session.meta_command(".format vertical").unwrap();
         session.meta_command(".headers off").unwrap();
