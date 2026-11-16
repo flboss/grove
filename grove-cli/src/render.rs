@@ -326,29 +326,43 @@ fn list_lines(ctx: &RenderCtx<'_>, items: &[Val], depth: usize) -> Vec<String> {
     let (items, note) = cap_items(items, ctx.options.max_rows, "item");
     let mut lines = Vec::new();
 
-    for item in items {
-        if let Val::List(_) = item {
-            lines.push("-".to_string());
-            for mut line in block_lines(ctx, item, depth + 1) {
-                line.insert_str(0, "  ");
-                lines.push(line);
-            }
+    for (index, item) in items.iter().enumerate() {
+        let is_last = index + 1 == items.len() && note.is_none();
+        let mut item_lines = if let Val::List(_) = item {
+            let mut nested = block_lines(ctx, item, depth + 1);
+            let mut lines = Vec::with_capacity(nested.len() + 1);
+            lines.push(String::new());
+            lines.append(&mut nested);
+            lines
         } else if expandable(item) {
-            for (index, mut line) in block_lines(ctx, item, depth + 1).into_iter().enumerate() {
-                if index == 0 {
-                    line.insert_str(0, "- ");
-                } else {
-                    line.insert_str(0, "  ");
-                }
-                lines.push(line);
-            }
+            block_lines(ctx, item, depth + 1)
         } else {
-            lines.push(format!("- {}", cell_styled(ctx, item, depth + 1).styled));
+            vec![cell_styled(ctx, item, depth + 1).styled]
+        };
+
+        for (line_index, line) in item_lines.drain(..).enumerate() {
+            let prefix = if line_index == 0 {
+                if is_last { "└─" } else { "├─" }
+            } else if is_last {
+                "  "
+            } else {
+                "│ "
+            };
+            let prefix = paint(prefix, Some(STYLE_DIM), ctx.options.color);
+            if line_index == 0 && line.is_empty() {
+                lines.push(prefix);
+            } else {
+                lines.push(format!("{prefix} {line}"));
+            }
         }
     }
 
     if let Some(note) = note {
-        lines.push(paint(&note, Some(STYLE_DIM), ctx.options.color));
+        lines.push(format!(
+            "{} {}",
+            paint("└─", Some(STYLE_DIM), ctx.options.color),
+            paint(&note, Some(STYLE_DIM), ctx.options.color)
+        ));
     }
 
     lines
@@ -1027,9 +1041,9 @@ mod tests {
         let mut options = options(Format::Auto);
         options.max_rows = 2;
         let output = render_value(&value, &ty, &options);
-        assert!(output.contains("- 1"), "{output}");
-        assert!(!output.contains("- 3"), "{output}");
-        assert!(output.contains("1 more item"), "{output}");
+        assert!(output.contains("├─ 1"), "{output}");
+        assert!(!output.contains("├─ 3"), "{output}");
+        assert!(output.contains("└─ … 1 more item"), "{output}");
     }
 
     #[test]
@@ -1079,7 +1093,7 @@ mod tests {
             ScalarType::Int,
         )))));
         let output = render_value(&value, &ty, &options(Format::Vertical));
-        assert!(output.contains("-\n  - 1"), "{output}");
-        assert!(output.contains("  - 3"), "{output}");
+        assert!(output.contains("│  ├─ 1"), "{output}");
+        assert!(output.contains("   └─ 3"), "{output}");
     }
 }

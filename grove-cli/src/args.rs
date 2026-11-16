@@ -119,7 +119,7 @@ pub struct OutputArgs {
     pub max_depth: usize,
 
     /// Maximum cell width before truncation
-    #[arg(long, value_name = "N", default_value_t = 40)]
+    #[arg(long, value_name = "N", default_value_t = 60)]
     pub max_cell_width: usize,
 
     /// Disable depth and cell truncation
