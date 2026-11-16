@@ -298,20 +298,35 @@ fn named_lines(ctx: &RenderCtx<'_>, entries: &[(String, &Val)], depth: usize) ->
         .unwrap_or(0);
     let mut lines = Vec::new();
 
-    for (key, value) in entries {
+    for (index, (key, value)) in entries.iter().enumerate() {
+        let is_last = index + 1 == entries.len();
+        let marker = if entries.len() == 1 {
+            "· "
+        } else if index == 0 {
+            "╭ "
+        } else if is_last {
+            "╰ "
+        } else {
+            "┊ "
+        };
+        let mut line = paint(marker, Some(STYLE_DIM), ctx.options.color);
         let key = pad(key, key_width, Align::Left);
-        let mut key = paint(&key, Some(STYLE_BOLD), ctx.options.color);
+        line.push_str(&paint(&key, Some(STYLE_BOLD), ctx.options.color));
         if expandable(value) && can_expand(ctx, depth + 1) {
-            key.push(':');
-            lines.push(key);
+            line.push(':');
+            lines.push(line);
             for mut line in block_lines(ctx, value, depth + 1) {
-                line.insert_str(0, "  ");
+                if is_last {
+                    line.insert_str(0, "  ");
+                } else {
+                    line.insert_str(0, "┊ ");
+                }
                 lines.push(line);
             }
         } else {
-            key.push_str(": ");
-            key.push_str(&cell_styled(ctx, value, depth + 1).styled);
-            lines.push(key);
+            line.push_str(": ");
+            line.push_str(&cell_styled(ctx, value, depth + 1).styled);
+            lines.push(line);
         }
     }
 
@@ -328,13 +343,20 @@ fn list_lines(ctx: &RenderCtx<'_>, items: &[Val], depth: usize) -> Vec<String> {
 
     for (index, item) in items.iter().enumerate() {
         let is_last = index + 1 == items.len() && note.is_none();
-        let mut item_lines = if let Val::List(_) = item {
-            let mut nested = block_lines(ctx, item, depth + 1);
-            let mut lines = Vec::with_capacity(nested.len() + 1);
-            lines.push(String::new());
-            lines.append(&mut nested);
-            lines
-        } else if expandable(item) {
+
+        if matches!(item, Val::List(inner) if !inner.is_empty()) && can_expand(ctx, depth + 1) {
+            let branch = if is_last { "└─┐" } else { "├─┐" };
+            lines.push(paint(branch, Some(STYLE_DIM), ctx.options.color));
+            let continuation = if is_last { "  " } else { "│ " };
+            let continuation = paint(continuation, Some(STYLE_DIM), ctx.options.color);
+            for mut line in block_lines(ctx, item, depth + 1) {
+                line.insert_str(0, &continuation);
+                lines.push(line);
+            }
+            continue;
+        }
+
+        let mut item_lines = if expandable(item) {
             block_lines(ctx, item, depth + 1)
         } else {
             vec![cell_styled(ctx, item, depth + 1).styled]
@@ -342,27 +364,22 @@ fn list_lines(ctx: &RenderCtx<'_>, items: &[Val], depth: usize) -> Vec<String> {
 
         for (line_index, line) in item_lines.drain(..).enumerate() {
             let prefix = if line_index == 0 {
-                if is_last { "└─" } else { "├─" }
+                if is_last { "└─ " } else { "├─ " }
             } else if is_last {
-                "  "
+                "   "
             } else {
-                "│ "
+                "│  "
             };
-            let prefix = paint(prefix, Some(STYLE_DIM), ctx.options.color);
-            if line_index == 0 && line.is_empty() {
-                lines.push(prefix);
-            } else {
-                lines.push(format!("{prefix} {line}"));
-            }
+            let mut prefix = paint(prefix, Some(STYLE_DIM), ctx.options.color);
+            prefix.push_str(&line);
+            lines.push(prefix);
         }
     }
 
     if let Some(note) = note {
-        lines.push(format!(
-            "{} {}",
-            paint("└─", Some(STYLE_DIM), ctx.options.color),
-            paint(&note, Some(STYLE_DIM), ctx.options.color)
-        ));
+        let mut prefix = paint("└─ ", Some(STYLE_DIM), ctx.options.color);
+        prefix.push_str(&paint(&note, Some(STYLE_DIM), ctx.options.color));
+        lines.push(prefix);
     }
 
     lines
@@ -978,7 +995,38 @@ mod tests {
     fn record_auto_vertical() {
         let value = user("Alice", 30, true);
         let output = render_value(&value, &record_ty(), &options(Format::Auto));
-        assert_eq!(output, "name  : \"Alice\"\nage   : 30\nactive: true");
+        assert_eq!(output, "╭ name  : \"Alice\"\n┊ age   : 30\n╰ active: true");
+    }
+
+    #[test]
+    fn single_field_record_dot() {
+        let value = Val::Record(vec![(Rc::from("name"), string("Alice"))]);
+        let output = render_value(&value, &record_ty(), &options(Format::Vertical));
+        assert_eq!(output, "· name: \"Alice\"");
+    }
+
+    #[test]
+    fn tuple_vertical_rails() {
+        let value = Val::Tuple(vec![int(1), string("a"), Val::Scalar(Scalar::Bool(true))]);
+        let ty = QueryType::Tuple(vec![
+            QueryType::Scalar(ScalarType::Int),
+            QueryType::Scalar(ScalarType::String),
+            QueryType::Scalar(ScalarType::Bool),
+        ]);
+        let output = render_value(&value, &ty, &options(Format::Vertical));
+        assert_eq!(output, "╭ .0: 1\n┊ .1: \"a\"\n╰ .2: true");
+    }
+
+    #[test]
+    fn record_nested_vertical_rails() {
+        let value = Val::List(vec![user("Alice", 30, true), user("Bob", 9, false)]);
+        let output = render_value(&value, &list_record_ty(), &options(Format::Vertical));
+        assert!(output.contains("├─ ╭ name"), "{output}");
+        assert!(output.contains("│  ┊ age"), "{output}");
+        assert!(output.contains("│  ╰ active"), "{output}");
+        assert!(output.contains("└─ ╭ name"), "{output}");
+        assert!(output.contains("   ┊ age"), "{output}");
+        assert!(output.contains("   ╰ active"), "{output}");
     }
 
     #[test]
@@ -1093,7 +1141,8 @@ mod tests {
             ScalarType::Int,
         )))));
         let output = render_value(&value, &ty, &options(Format::Vertical));
-        assert!(output.contains("│  ├─ 1"), "{output}");
-        assert!(output.contains("   └─ 3"), "{output}");
+        assert!(output.contains("├─┐"), "{output}");
+        assert!(output.contains("│ ├─ 1"), "{output}");
+        assert!(output.contains("  └─ 3"), "{output}");
     }
 }
