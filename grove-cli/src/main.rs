@@ -6,21 +6,25 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use clap::Parser;
 
-use crate::args::{CheckArgs, Cli, Command, ConnectionSpec, QueryArgs, QueryInputArgs, ReplArgs};
-use crate::error::{CliError, CliResult, EXIT_COMPILE, EXIT_FAILURE, EXIT_SUCCESS, EXIT_USAGE};
+use crate::args::{
+    BackendArgs, CheckArgs, Cli, Command, ConnectionSpec, OutputArgs, QueryArgs, QueryInputArgs,
+    ReplArgs,
+};
+use crate::error::{CliError, CliResult, EXIT_COMPILE, EXIT_FAILURE, EXIT_SUCCESS};
 
 mod args;
 mod diagnostics;
 mod error;
 mod render;
+mod repl;
 
 fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
         Some(Command::Query(args)) => run_query(args),
         Some(Command::Check(args)) => run_check(args),
-        Some(Command::Repl(args)) => run_repl(args),
-        None => run_implicit_repl(cli.schema),
+        Some(Command::Repl(args)) => repl::run(args),
+        None => run_implicit_repl(cli.schema, cli.backend, cli.output),
     };
 
     match result {
@@ -106,29 +110,23 @@ fn run_check(args: CheckArgs) -> CliResult<()> {
     }
 }
 
-fn run_repl(args: ReplArgs) -> CliResult<()> {
-    args.backend.resolve().map_err(CliError::usage)?;
-    Err(repl_not_implemented(&args.schema))
-}
-
-fn run_implicit_repl(schema: Option<PathBuf>) -> CliResult<()> {
+fn run_implicit_repl(
+    schema: Option<PathBuf>,
+    backend: BackendArgs,
+    output: OutputArgs,
+) -> CliResult<()> {
     match schema {
-        Some(schema) => Err(repl_not_implemented(&schema)),
+        Some(schema) => repl::run(ReplArgs {
+            schema,
+            backend,
+            output,
+            no_pushdown: false,
+        }),
         None => Err(CliError::usage("specify a schema or a subcommand")),
     }
 }
 
-fn repl_not_implemented(schema: &Path) -> CliError {
-    CliError {
-        code: EXIT_USAGE,
-        message: Some(format!(
-            "interactive mode is not yet implemented (schema: {})",
-            schema.display()
-        )),
-    }
-}
-
-fn compile_schema(name: &str, source: &str) -> Option<grove_schema::ValidatedSchema> {
+pub(crate) fn compile_schema(name: &str, source: &str) -> Option<grove_schema::ValidatedSchema> {
     let (schema, diagnostics) = grove_schema::parse_schema(source);
     diagnostics::print(source, name, &diagnostics);
     let schema = schema?;
@@ -152,7 +150,7 @@ fn compile_query(
     typed
 }
 
-fn read_schema(path: &Path) -> CliResult<(String, String)> {
+pub(crate) fn read_schema(path: &Path) -> CliResult<(String, String)> {
     if !path.is_file() {
         return Err(CliError::runtime(format!(
             "schema file not found: {}",
@@ -197,7 +195,7 @@ fn read_stdin() -> CliResult<String> {
     Ok(source)
 }
 
-fn open_connection(spec: &ConnectionSpec) -> CliResult<rusqlite::Connection> {
+pub(crate) fn open_connection(spec: &ConnectionSpec) -> CliResult<rusqlite::Connection> {
     match spec {
         ConnectionSpec::Sqlite { file, readonly } => {
             let result = if *readonly {
@@ -215,7 +213,7 @@ fn open_connection(spec: &ConnectionSpec) -> CliResult<rusqlite::Connection> {
     }
 }
 
-fn write_output(path: Option<&Path>, text: &str) -> CliResult<()> {
+pub(crate) fn write_output(path: Option<&Path>, text: &str) -> CliResult<()> {
     if let Some(path) = path {
         let mut file = fs::File::create(path)
             .map_err(|err| CliError::runtime(format!("error writing {}: {err}", path.display())))?;
@@ -228,6 +226,6 @@ fn write_output(path: Option<&Path>, text: &str) -> CliResult<()> {
     }
 }
 
-fn millis(duration: Duration) -> f64 {
+pub(crate) fn millis(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
 }

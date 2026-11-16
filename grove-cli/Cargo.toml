@@ -18,4 +18,5 @@ chrono.workspace = true
 clap.workspace = true
 libc.workspace = true
 rusqlite.workspace = true
+rustyline.workspace = true
 unicode-width.workspace = true

@@ -202,6 +202,29 @@ pub enum Format {
     Vertical,
 }
 
+impl Format {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "auto" => Some(Format::Auto),
+            "inline" => Some(Format::Inline),
+            "raw" => Some(Format::Raw),
+            "table" => Some(Format::Table),
+            "vertical" => Some(Format::Vertical),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Format::Auto => "auto",
+            Format::Inline => "inline",
+            Format::Raw => "raw",
+            Format::Table => "table",
+            Format::Vertical => "vertical",
+        }
+    }
+}
+
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColorChoice {
     Auto,
