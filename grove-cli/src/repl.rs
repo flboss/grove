@@ -472,7 +472,7 @@ impl<'a> ReplSession<'a> {
             println!();
             println!("Backend commands:");
             for command in backend_commands {
-                println!("{:<32} {}", command.usage, command.description);
+                println!("{:<30} {}", command.usage, command.description);
             }
         }
     }
