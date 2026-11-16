@@ -499,15 +499,6 @@ mod tests {
     use super::*;
     use crate::args::ColorChoice;
 
-    fn schema() -> ValidatedSchema {
-        let source = "root users: User; struct User { name: String }";
-        let (schema, diagnostics) = grove_schema::parse_schema(source);
-        assert!(diagnostics.is_empty(), "{diagnostics:?}");
-        let (schema, diagnostics) = grove_schema::validate(schema.unwrap());
-        assert!(diagnostics.is_empty(), "{diagnostics:?}");
-        schema.unwrap()
-    }
-
     fn settings() -> ReplSettings {
         ReplSettings {
             output: OutputArgs {
@@ -545,7 +536,7 @@ mod tests {
 
     #[test]
     fn bindings_persistence_across_turns() {
-        let schema = schema();
+        let schema = ValidatedSchema::default();
         let backend = SqliteBackend::open_in_memory(&schema).expect("backend");
         let mut settings = settings();
         let mut turn = 0;
@@ -564,7 +555,7 @@ mod tests {
 
     #[test]
     fn clear_bindings_types_and_values() {
-        let schema = schema();
+        let schema = ValidatedSchema::default();
         let backend = SqliteBackend::open_in_memory(&schema).expect("backend");
         let mut settings = settings();
         let mut turn = 0;
@@ -578,7 +569,7 @@ mod tests {
 
     #[test]
     fn unlet_remove_binding() {
-        let schema = schema();
+        let schema = ValidatedSchema::default();
         let backend = SqliteBackend::open_in_memory(&schema).expect("backend");
         let mut settings = settings();
         let mut turn = 0;
@@ -594,7 +585,7 @@ mod tests {
 
     #[test]
     fn vars_empty_contexts() {
-        let schema = schema();
+        let schema = ValidatedSchema::default();
         let backend = SqliteBackend::open_in_memory(&schema).expect("backend");
         let mut settings = settings();
         let mut turn = 0;
@@ -608,7 +599,7 @@ mod tests {
 
     #[test]
     fn read_execute_file_in_session() {
-        let schema = schema();
+        let schema = ValidatedSchema::default();
         let backend = SqliteBackend::open_in_memory(&schema).expect("backend");
         let mut settings = settings();
         let mut turn = 0;
@@ -625,7 +616,7 @@ mod tests {
 
     #[test]
     fn failed_turn_no_bindings_committed() {
-        let schema = schema();
+        let schema = ValidatedSchema::default();
         let backend = SqliteBackend::open_in_memory(&schema).expect("backend");
         let mut settings = settings();
         let mut turn = 0;
@@ -644,7 +635,7 @@ mod tests {
 
     #[test]
     fn meta_commands_render_settings() {
-        let schema = schema();
+        let schema = ValidatedSchema::default();
         let backend = SqliteBackend::open_in_memory(&schema).expect("backend");
         let mut settings = settings();
         let mut turn = 0;
