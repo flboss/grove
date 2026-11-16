@@ -18,8 +18,14 @@ use crate::render::{self, RenderOptions};
 #[derive(Debug)]
 enum ReplOutcome {
     Quit,
-    OpenBackend(ConnectionSpec),
-    ReloadSchema(Box<ValidatedSchema>),
+    ChangeBackend {
+        spec: ConnectionSpec,
+        schema: Option<(PathBuf, Box<ValidatedSchema>)>,
+    },
+    ReloadSchema {
+        schema: Box<ValidatedSchema>,
+        path: PathBuf,
+    },
 }
 
 struct ReplSettings {
@@ -40,7 +46,7 @@ struct ReplSession<'a> {
 
 pub fn run(args: ReplArgs) -> CliResult<()> {
     let ReplArgs {
-        schema: schema_path,
+        schema: mut schema_path,
         backend,
         output,
         no_pushdown,
@@ -73,7 +79,7 @@ pub fn run(args: ReplArgs) -> CliResult<()> {
         &mut schema,
         &mut spec,
         &mut settings,
-        &schema_path,
+        &mut schema_path,
         exec_options,
         &mut turn,
         &mut editor,
@@ -93,7 +99,7 @@ fn repl_loop(
     schema: &mut ValidatedSchema,
     spec: &mut ConnectionSpec,
     settings: &mut ReplSettings,
-    schema_path: &Path,
+    schema_path: &mut PathBuf,
     exec_options: ExecOptions,
     turn: &mut usize,
     editor: &mut rustyline::DefaultEditor,
@@ -103,12 +109,12 @@ fn repl_loop(
             let backend = spec
                 .open(schema)
                 .map_err(|err| CliError::runtime(format!("failed to open storage: {err}")))?;
-            print_banner(spec, schema_path);
+            print_banner(spec, schema_path.as_path());
 
             let mut session = ReplSession {
                 schema,
                 spec,
-                schema_path: schema_path.to_path_buf(),
+                schema_path: schema_path.clone(),
                 exec: ExecSession::new(backend.as_ref(), schema),
                 types: TypeBindings::new(),
                 settings,
@@ -120,11 +126,22 @@ fn repl_loop(
 
         match outcome {
             ReplOutcome::Quit => break,
-            ReplOutcome::OpenBackend(new_spec) => {
+            ReplOutcome::ChangeBackend {
+                spec: new_spec,
+                schema: new_schema,
+            } => {
                 *spec = new_spec;
+                if let Some((path, new_schema)) = new_schema {
+                    *schema = *new_schema;
+                    *schema_path = path;
+                }
             }
-            ReplOutcome::ReloadSchema(new_schema) => {
+            ReplOutcome::ReloadSchema {
+                schema: new_schema,
+                path,
+            } => {
                 *schema = *new_schema;
+                *schema_path = path;
             }
         }
     }
@@ -214,14 +231,32 @@ impl<'a> ReplSession<'a> {
         let argument = parts.next().unwrap_or("").trim();
 
         if let Some(spec_command) = self.spec.repl_command(command) {
-            match (spec_command.parse)(argument) {
-                Ok(action) => match self.spec.apply_repl_action(action) {
-                    Ok(new_spec) => return Ok(Some(ReplOutcome::OpenBackend(new_spec))),
-                    Err(message) => eprintln!("{message}"),
-                },
-                Err(message) => eprintln!("{message}"),
-            }
-            return Ok(None);
+            let action = match (spec_command.parse)(argument) {
+                Ok(action) => action,
+                Err(message) => {
+                    eprintln!("{message}");
+                    return Ok(None);
+                }
+            };
+            let change = match self.spec.apply_repl_action(action) {
+                Ok(change) => change,
+                Err(message) => {
+                    eprintln!("{message}");
+                    return Ok(None);
+                }
+            };
+            let new_schema = if let Some(path) = &change.schema {
+                match self.load_schema(path) {
+                    Some(schema) => Some((path.clone(), Box::new(schema))),
+                    None => return Ok(None),
+                }
+            } else {
+                None
+            };
+            return Ok(Some(ReplOutcome::ChangeBackend {
+                spec: change.spec,
+                schema: new_schema,
+            }));
         }
 
         match command {
@@ -236,10 +271,12 @@ impl<'a> ReplSession<'a> {
             }
             ".read" => self.read_file(argument)?,
             ".schema" => {
-                if argument == "reload" {
-                    return self.reload_schema();
+                let argument = argument.trim();
+                if argument.is_empty() {
+                    self.print_schema();
                 }
-                self.print_schema();
+                let path = (argument != "reload").then(|| PathBuf::from(argument));
+                return self.reload_schema(path);
             }
             ".format" => {
                 if let Some(format) = Format::parse(argument) {
@@ -386,8 +423,9 @@ impl<'a> ReplSession<'a> {
         Ok(())
     }
 
-    fn reload_schema(&mut self) -> CliResult<Option<ReplOutcome>> {
-        let (name, source) = match crate::read_schema(&self.schema_path) {
+    fn reload_schema(&mut self, path: Option<PathBuf>) -> CliResult<Option<ReplOutcome>> {
+        let path = path.unwrap_or_else(|| self.schema_path.clone());
+        let (name, source) = match crate::read_schema(&path) {
             Ok(source) => source,
             Err(error) => {
                 self.report_error(error);
@@ -397,7 +435,21 @@ impl<'a> ReplSession<'a> {
         let Some(schema) = crate::compile_schema(&name, &source) else {
             return Ok(None);
         };
-        Ok(Some(ReplOutcome::ReloadSchema(Box::new(schema))))
+        Ok(Some(ReplOutcome::ReloadSchema {
+            schema: Box::new(schema),
+            path,
+        }))
+    }
+
+    fn load_schema(&self, path: &Path) -> Option<ValidatedSchema> {
+        let (name, source) = match crate::read_schema(path) {
+            Ok(source) => source,
+            Err(error) => {
+                self.report_error(error);
+                return None;
+            }
+        };
+        crate::compile_schema(&name, &source)
     }
 
     // TODO: option to print a more complete representation of the schema
@@ -458,7 +510,7 @@ impl<'a> ReplSession<'a> {
 .unlet NAME                    Remove a binding
 .clear                         Clear all bindings
 .read PATH                     Run a query file in this session
-.schema [reload]               Show schema summary or reload it
+.schema [reload|PATH]          Show schema summary or load from file
 .format MODE                   auto|inline|raw|table|vertical
 .headers on|off                Toggle table headers
 .stats on|off                  Toggle per-turn query stats
@@ -669,5 +721,81 @@ mod tests {
         assert!(session.settings.output.no_headers);
         assert_eq!(session.settings.output.width, Some(42));
         assert_eq!(session.settings.output.max_rows, 5);
+    }
+
+    #[test]
+    fn schema_command_load_new_path() {
+        let schema = ValidatedSchema::default();
+        let backend = SqliteBackend::open_in_memory(&schema).expect("backend");
+        let mut settings = settings();
+        let spec = spec();
+        let mut turn = 0;
+        let mut session = session(&schema, &spec, &backend, &mut settings, &mut turn);
+
+        let path =
+            std::env::temp_dir().join(format!("grove-repl-schema-{}.gschema", std::process::id()));
+        fs::write(&path, "root items: Item; struct Item { id: Int }").expect("write schema");
+        let outcome = session
+            .meta_command(&format!(".schema {}", path.display()))
+            .unwrap()
+            .expect("reload outcome");
+        let _ = fs::remove_file(&path);
+
+        match outcome {
+            ReplOutcome::ReloadSchema {
+                path: actual_path, ..
+            } => assert_eq!(actual_path, path),
+            other => panic!("expected schema reload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_command_accepts_schema() {
+        let schema = ValidatedSchema::default();
+        let backend = SqliteBackend::open_in_memory(&schema).expect("backend");
+        let mut settings = settings();
+        let spec = ConnectionSpec::Memory;
+        let mut turn = 0;
+        let mut session = session(&schema, &spec, &backend, &mut settings, &mut turn);
+
+        let schema_path =
+            std::env::temp_dir().join(format!("grove-repl-open-{}.gschema", std::process::id()));
+        fs::write(&schema_path, "root items: Item; struct Item { id: Int }").expect("write schema");
+        let db = std::env::current_dir().unwrap().join("Cargo.toml");
+        let outcome = session
+            .meta_command(&format!(".open {} {}", db.display(), schema_path.display()))
+            .unwrap()
+            .expect("open outcome");
+        let _ = fs::remove_file(&schema_path);
+
+        match outcome {
+            ReplOutcome::ChangeBackend {
+                spec: ConnectionSpec::Sqlite { .. },
+                schema: Some((path, _)),
+            } => assert_eq!(path, schema_path),
+            other => panic!("expected backend change, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn close_command_switch_to_memory() {
+        let schema = ValidatedSchema::default();
+        let backend = SqliteBackend::open_in_memory(&schema).expect("backend");
+        let mut settings = settings();
+        let spec = spec();
+        let mut turn = 0;
+        let mut session = session(&schema, &spec, &backend, &mut settings, &mut turn);
+
+        let outcome = session
+            .meta_command(".close")
+            .unwrap()
+            .expect("close outcome");
+        match outcome {
+            ReplOutcome::ChangeBackend {
+                spec: ConnectionSpec::Memory,
+                schema: None,
+            } => {}
+            other => panic!("expected memory backend, got {other:?}"),
+        }
     }
 }

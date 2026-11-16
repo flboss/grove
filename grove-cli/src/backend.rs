@@ -98,8 +98,8 @@ impl ConnectionSpec {
 
     pub fn repl_commands(&self) -> &'static [ReplCommandSpec] {
         match self {
-            ConnectionSpec::Sqlite { .. } => &[OPEN_FILE_CMD],
-            ConnectionSpec::Memory => &[],
+            ConnectionSpec::Sqlite { .. } => &[OPEN_FILE_CMD, CLOSE_CMD],
+            ConnectionSpec::Memory => &[OPEN_FILE_CMD],
         }
     }
 
@@ -109,15 +109,28 @@ impl ConnectionSpec {
             .find(|spec_cmd| spec_cmd.name == cmd)
     }
 
-    pub fn apply_repl_action(&self, action: BackendReplAction) -> Result<ConnectionSpec, String> {
+    pub fn apply_repl_action(
+        &self,
+        action: BackendReplAction,
+    ) -> Result<BackendCommandOutcome, String> {
         match (self, action) {
-            (ConnectionSpec::Sqlite { readonly, .. }, BackendReplAction::OpenFile(file)) => {
+            (_, BackendReplAction::OpenFile { file, schema }) => {
                 if !file.is_file() {
                     return Err(format!("database file not found: {}", file.display()));
                 }
-                Ok(ConnectionSpec::Sqlite {
-                    file,
-                    readonly: *readonly,
+                let readonly = match self {
+                    ConnectionSpec::Sqlite { readonly, .. } => *readonly,
+                    ConnectionSpec::Memory => false,
+                };
+                Ok(BackendCommandOutcome {
+                    spec: ConnectionSpec::Sqlite { file, readonly },
+                    schema,
+                })
+            }
+            (ConnectionSpec::Sqlite { .. }, BackendReplAction::Close) => {
+                Ok(BackendCommandOutcome {
+                    spec: ConnectionSpec::Memory,
+                    schema: None,
                 })
             }
             _ => Err("command is not supported by the selected backend".to_string()),
@@ -126,8 +139,18 @@ impl ConnectionSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendCommandOutcome {
+    pub spec: ConnectionSpec,
+    pub schema: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendReplAction {
-    OpenFile(PathBuf),
+    OpenFile {
+        file: PathBuf,
+        schema: Option<PathBuf>,
+    },
+    Close,
 }
 
 pub struct ReplCommandSpec {
@@ -139,16 +162,36 @@ pub struct ReplCommandSpec {
 
 const OPEN_FILE_CMD: ReplCommandSpec = ReplCommandSpec {
     name: ".open",
-    usage: ".open PATH",
+    usage: ".open PATH [SCHEMA]",
     description: "Open an SQLite database file",
     parse: parse_open_file,
 };
 
+const CLOSE_CMD: ReplCommandSpec = ReplCommandSpec {
+    name: ".close",
+    usage: ".close",
+    description: "Switch to a transient in-memory session",
+    parse: parse_close,
+};
+
 fn parse_open_file(argument: &str) -> Result<BackendReplAction, String> {
+    let mut parts = argument.splitn(2, char::is_whitespace);
+    let file = parts.next().unwrap_or("").trim();
+    let schema = parts.next().unwrap_or("").trim();
+    if file.is_empty() {
+        return Err("usage: .open PATH [SCHEMA]".to_string());
+    }
+    Ok(BackendReplAction::OpenFile {
+        file: PathBuf::from(file),
+        schema: (!schema.is_empty()).then(|| PathBuf::from(schema)),
+    })
+}
+
+fn parse_close(argument: &str) -> Result<BackendReplAction, String> {
     if argument.is_empty() {
-        Err("usage: .open PATH".to_string())
+        Ok(BackendReplAction::Close)
     } else {
-        Ok(BackendReplAction::OpenFile(PathBuf::from(argument)))
+        Err("usage: .close".to_string())
     }
 }
 
@@ -265,8 +308,52 @@ mod tests {
             .iter()
             .map(|command| command.name)
             .collect::<Vec<_>>(),
+            vec![".open", ".close"]
+        );
+        assert_eq!(
+            ConnectionSpec::Memory
+                .repl_commands()
+                .iter()
+                .map(|command| command.name)
+                .collect::<Vec<_>>(),
             vec![".open"]
         );
-        assert!(ConnectionSpec::Memory.repl_commands().is_empty());
+    }
+
+    #[test]
+    fn open_close_actions() {
+        let sqlite = ConnectionSpec::Sqlite {
+            file: PathBuf::from("data.db"),
+            readonly: false,
+        };
+        let open = sqlite.repl_command(".open").expect("open command");
+        assert_eq!(
+            (open.parse)("next.db next.gschema").unwrap(),
+            BackendReplAction::OpenFile {
+                file: PathBuf::from("next.db"),
+                schema: Some(PathBuf::from("next.gschema")),
+            }
+        );
+
+        let close = sqlite.repl_command(".close").expect("close command");
+        assert_eq!(
+            sqlite
+                .apply_repl_action((close.parse)("").unwrap())
+                .unwrap(),
+            BackendCommandOutcome {
+                spec: ConnectionSpec::Memory,
+                schema: None,
+            }
+        );
+
+        let file = std::env::current_dir().unwrap().join("Cargo.toml");
+        let outcome = ConnectionSpec::Memory
+            .apply_repl_action(BackendReplAction::OpenFile {
+                file,
+                schema: Some(PathBuf::from("next.gschema")),
+            })
+            .unwrap();
+        assert!(matches!(outcome.spec, ConnectionSpec::Sqlite { .. }));
+        assert_eq!(outcome.schema, Some(PathBuf::from("next.gschema")));
     }
 }
