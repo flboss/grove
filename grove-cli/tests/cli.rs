@@ -227,6 +227,50 @@ fn query_readonly_database() {
 }
 
 #[test]
+fn query_memory_backend() {
+    let dir = fixture("memory");
+    let schema = write_schema(&dir);
+
+    let output = grove()
+        .arg("query")
+        .arg(&schema)
+        .arg("users { name }")
+        .arg("--backend")
+        .arg("memory")
+        .output()
+        .expect("run grove");
+
+    assert_eq!(status(&output), 0, "stderr: {}", stderr(&output));
+    assert!(stdout(&output).contains("name"), "{}", stdout(&output));
+    assert!(stderr(&output).is_empty(), "{}", stderr(&output));
+}
+
+#[test]
+fn memory_backend_file_rejected() {
+    let dir = fixture("memory-file");
+    let schema = write_schema(&dir);
+    let db = write_db(&dir);
+
+    let output = grove()
+        .arg("query")
+        .arg(&schema)
+        .arg("users { name }")
+        .arg("--backend")
+        .arg("memory")
+        .arg("--file")
+        .arg(&db)
+        .output()
+        .expect("run grove");
+
+    assert_eq!(status(&output), 2);
+    assert!(
+        stderr(&output).contains("--file is not valid"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
 fn query_stats_stderr() {
     let dir = fixture("stats");
     let schema = write_schema(&dir);
