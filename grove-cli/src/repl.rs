@@ -73,6 +73,7 @@ pub fn run(args: ReplArgs) -> CliResult<()> {
     }
     let exec_options = ExecOptions {
         pushdown: !no_pushdown,
+        materialize_lets: true,
     };
 
     let result = repl_loop(
@@ -274,6 +275,7 @@ impl<'a> ReplSession<'a> {
                 let argument = argument.trim();
                 if argument.is_empty() {
                     self.print_schema();
+                    return Ok(None);
                 }
                 let path = (argument != "reload").then(|| PathBuf::from(argument));
                 return self.reload_schema(path);
@@ -593,7 +595,10 @@ mod tests {
             exec: ExecSession::new(backend, schema),
             types: TypeBindings::new(),
             settings,
-            exec_options: ExecOptions::default(),
+            exec_options: ExecOptions {
+                pushdown: true,
+                materialize_lets: true,
+            },
             turn,
         }
     }
@@ -616,6 +621,51 @@ mod tests {
             session.execute_source("x + 1", "<test:2>").unwrap(),
             Some(Val::Scalar(Scalar::Int(42)))
         );
+    }
+
+    #[test]
+    fn persisted_let_all_fields_kept() {
+        let source = "root users: User; struct User { name: String, age: Int }";
+        let (schema, diagnostics) = grove_schema::parse_schema(source);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let (schema, diagnostics) = grove_schema::validate(schema.unwrap());
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let schema = schema.unwrap();
+
+        let conn = rusqlite::Connection::open_in_memory().expect("in-memory database");
+        conn.execute_batch(
+            "CREATE TABLE users (name TEXT NOT NULL, age INTEGER NOT NULL);\
+             INSERT INTO users (name, age) VALUES ('Alice', 30);",
+        )
+        .expect("seed users");
+        let backend = SqliteBackend::new(conn, &schema).expect("backend");
+        let mut settings = settings();
+        let spec = spec();
+        let mut turn = 0;
+        let mut session = session(&schema, &spec, &backend, &mut settings, &mut turn);
+
+        assert_eq!(
+            session
+                .execute_source("let a = users.first();", "<test:1>")
+                .unwrap(),
+            None
+        );
+        let value = session
+            .execute_source("a", "<test:2>")
+            .unwrap()
+            .expect("record");
+        let Val::Some(inner) = value else {
+            panic!("expected some(record), got {value:?}");
+        };
+        let Val::Record(fields) = inner.as_ref() else {
+            panic!("expected record, got {inner:?}");
+        };
+        assert!(fields.iter().any(|(name, value)| {
+            name.as_ref() == "name" && *value == Val::Scalar(Scalar::String("Alice".into()))
+        }));
+        assert!(fields.iter().any(|(name, value)| {
+            name.as_ref() == "age" && *value == Val::Scalar(Scalar::Int(30))
+        }));
     }
 
     #[test]

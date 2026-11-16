@@ -285,11 +285,16 @@ pub fn eval_let(stmt: &TypedLetStmt, ctx: &mut EvalCtx<'_>) -> Result<(), ExecEr
 pub struct ExecOptions {
     /// Push simple operations into the storage backend
     pub pushdown: bool,
+    /// Materialize complete values for let bindings (for turn-based repl mode)
+    pub materialize_lets: bool,
 }
 
 impl Default for ExecOptions {
     fn default() -> Self {
-        ExecOptions { pushdown: true }
+        ExecOptions {
+            pushdown: true,
+            materialize_lets: false,
+        }
     }
 }
 
@@ -353,7 +358,10 @@ pub(crate) mod harness {
             storage,
             schema,
             FIXED_NOW,
-            ExecOptions { pushdown: false },
+            ExecOptions {
+                pushdown: false,
+                materialize_lets: false,
+            },
         );
         assert_pushdown_parity(src, &pushed, &unpushed);
         pushed.map(|value| value.expect("query produced no output"))

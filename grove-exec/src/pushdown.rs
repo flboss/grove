@@ -116,6 +116,7 @@ impl PushdownPlan {
         file: &TypedQueryFile,
         schema: &ValidatedSchema,
         now: DateTime<Utc>,
+        materialize_lets: bool,
     ) -> PushdownPlan {
         let mut builder = PlanBuilder {
             schema,
@@ -128,7 +129,12 @@ impl PushdownPlan {
         for statement in &file.statements {
             match statement {
                 TypedStatement::Let(let_stmt) => {
-                    builder.visit(&let_stmt.value, Need::Narrow);
+                    let need = if materialize_lets {
+                        Need::Whole
+                    } else {
+                        Need::Narrow
+                    };
+                    builder.visit(&let_stmt.value, need);
                 }
                 TypedStatement::Expr(_) | TypedStatement::Mutation(_) => {}
             }
@@ -867,7 +873,7 @@ mod tests {
     fn typed_and_plan(src: &str) -> (TypedQueryFile, PushdownPlan, ValidatedSchema) {
         let schema = testdata::schema();
         let file = typed(src, &schema);
-        let plan = PushdownPlan::analyze(&file, &schema, FIXED_NOW);
+        let plan = PushdownPlan::analyze(&file, &schema, FIXED_NOW, false);
         (file, plan, schema)
     }
 
@@ -1618,6 +1624,24 @@ mod tests {
 
         let (_file, plan, schema) = typed_and_plan("users.map($.name)");
         assert_fields(&plan, &schema, "User", &["name"]);
+    }
+
+    #[test]
+    fn materialized_lets_whole_records_fetched() {
+        let schema = testdata::schema();
+        let file = typed("let a = users.first();", &schema);
+        let narrow = PushdownPlan::analyze(&file, &schema, FIXED_NOW, false);
+        let whole = PushdownPlan::analyze(&file, &schema, FIXED_NOW, true);
+        let user = testdata::struct_id(&schema, "User");
+        let expected: Vec<&str> = schema.structs[user.index()]
+            .fields
+            .iter()
+            .filter(|field| !matches!(field, Field::Ref { .. }))
+            .map(|field| field.name())
+            .collect();
+
+        assert_fields(&whole, &schema, "User", &expected);
+        assert!(narrow.fields_for(user).len() < whole.fields_for(user).len());
     }
 
     #[test]

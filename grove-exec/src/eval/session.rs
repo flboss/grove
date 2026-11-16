@@ -52,7 +52,7 @@ impl<'a> ExecSession<'a> {
         options: ExecOptions,
     ) -> Result<Option<Val>, ExecError> {
         let plan = if options.pushdown {
-            PushdownPlan::analyze(file, self.schema, now)
+            PushdownPlan::analyze(file, self.schema, now, options.materialize_lets)
         } else {
             PushdownPlan::disabled(self.schema)
         };

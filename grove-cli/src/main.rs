@@ -61,6 +61,7 @@ fn run_query(args: QueryArgs) -> CliResult<()> {
 
     let options = grove_exec::ExecOptions {
         pushdown: !args.no_pushdown,
+        materialize_lets: false,
     };
     let render_options =
         render::RenderOptions::from_args(&args.output, args.output.color_enabled());

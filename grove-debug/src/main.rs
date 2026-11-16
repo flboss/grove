@@ -445,6 +445,7 @@ fn exec_run(
     };
     let options = grove_exec::eval::ExecOptions {
         pushdown: !no_pushdown,
+        materialize_lets: false,
     };
     match grove_exec::eval::exec_file_with_options(
         &typed_file,
