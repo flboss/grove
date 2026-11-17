@@ -379,21 +379,19 @@ fn named_lines(ctx: &RenderCtx<'_>, entries: &[(String, &Val)], depth: usize) ->
             let prefix = if is_last { " " } else { VERTICAL_DASHED };
             let mut prefix = paint(prefix, Some(ANSI_DIM), ctx.options.color).into_owned();
             prefix.push_str("   ");
-            for mut line in block_lines(ctx, inner, depth + 1) {
-                line.insert_str(0, &prefix);
-                lines.push(line);
+            for mut inner_line in block_lines(ctx, inner, depth + 1) {
+                inner_line.insert_str(0, &prefix);
+                lines.push(inner_line);
             }
         } else if expandable(value) && can_expand(ctx, depth + 1) {
             line.push(':');
             lines.push(line);
-            for mut line in block_lines(ctx, value, depth + 1) {
-                if is_last {
-                    line.insert_str(0, "  ");
-                } else {
-                    line.insert(0, ' ');
-                    line.insert_str(0, VERTICAL_DASHED);
-                }
-                lines.push(line);
+            let prefix = if is_last { " " } else { VERTICAL_DASHED };
+            let mut prefix = paint(prefix, Some(ANSI_DIM), ctx.options.color).into_owned();
+            prefix.push(' ');
+            for mut inner_line in block_lines(ctx, value, depth + 1) {
+                inner_line.insert_str(0, &prefix);
+                lines.push(inner_line);
             }
         } else {
             line.push_str(": ");
