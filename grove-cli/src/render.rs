@@ -261,6 +261,9 @@ fn block_lines(ctx: &RenderCtx<'_>, value: &Val, depth: usize) -> Vec<String> {
             Val::Record(fields) => return record_lines(ctx, fields, depth),
             Val::Tuple(items) => return tuple_lines(ctx, items, depth),
             Val::List(items) => return list_lines(ctx, items, depth),
+            Val::Some(inner) if expandable(inner) && can_expand(ctx, depth + 1) => {
+                return some_lines(ctx, inner, depth);
+            }
             _ => {}
         }
     }
@@ -290,6 +293,15 @@ fn tuple_lines(ctx: &RenderCtx<'_>, items: &[Val], depth: usize) -> Vec<String> 
     named_lines(ctx, &entries, depth)
 }
 
+fn some_lines(ctx: &RenderCtx<'_>, inner: &Val, depth: usize) -> Vec<String> {
+    let mut lines = vec!["some".to_string()];
+    for mut line in block_lines(ctx, inner, depth + 1) {
+        line.insert_str(0, "  ");
+        lines.push(line);
+    }
+    lines
+}
+
 fn named_lines(ctx: &RenderCtx<'_>, entries: &[(String, &Val)], depth: usize) -> Vec<String> {
     let key_width = entries
         .iter()
@@ -312,7 +324,19 @@ fn named_lines(ctx: &RenderCtx<'_>, entries: &[(String, &Val)], depth: usize) ->
         let mut line = paint(marker, Some(STYLE_DIM), ctx.options.color);
         let key = pad(key, key_width, Align::Left);
         line.push_str(&paint(&key, Some(STYLE_BOLD), ctx.options.color));
-        if expandable(value) && can_expand(ctx, depth + 1) {
+        if let Val::Some(inner) = value
+            && expandable(inner)
+            && can_expand(ctx, depth + 1)
+        {
+            line.push_str(": some");
+            lines.push(line);
+            let prefix = if is_last { "    " } else { "┊   " };
+            let prefix = paint(prefix, Some(STYLE_DIM), ctx.options.color);
+            for mut line in block_lines(ctx, inner, depth + 1) {
+                line.insert_str(0, &prefix);
+                lines.push(line);
+            }
+        } else if expandable(value) && can_expand(ctx, depth + 1) {
             line.push(':');
             lines.push(line);
             for mut line in block_lines(ctx, value, depth + 1) {
@@ -415,6 +439,7 @@ fn expandable(value: &Val) -> bool {
     match value {
         Val::Record(fields) => !fields.is_empty(),
         Val::Tuple(items) | Val::List(items) => !items.is_empty(),
+        Val::Some(inner) => expandable(inner),
         _ => false,
     }
 }
@@ -1015,6 +1040,36 @@ mod tests {
         ]);
         let output = render_value(&value, &ty, &options(Format::Vertical));
         assert_eq!(output, "╭ .0: 1\n┊ .1: \"a\"\n╰ .2: true");
+    }
+
+    #[test]
+    fn some_record_vertical() {
+        let value = Val::Some(Box::new(user("Alice", 30, true)));
+        let output = render_value(&value, &record_ty(), &options(Format::Vertical));
+        assert_eq!(
+            output,
+            "some\n  ╭ name  : \"Alice\"\n  ┊ age   : 30\n  ╰ active: true"
+        );
+    }
+
+    #[test]
+    fn record_field_some_vertical() {
+        let value = Val::Record(vec![(
+            Rc::from("profile"),
+            Val::Some(Box::new(user("Alice", 30, true))),
+        )]);
+        let output = render_value(&value, &record_ty(), &options(Format::Vertical));
+        assert_eq!(
+            output,
+            "· profile: some\n    ╭ name  : \"Alice\"\n    ┊ age   : 30\n    ╰ active: true"
+        );
+    }
+
+    #[test]
+    fn some_scalar_compact_vertical() {
+        let value = Val::Some(Box::new(int(3)));
+        let output = render_value(&value, &record_ty(), &options(Format::Vertical));
+        assert_eq!(output, "some(3)");
     }
 
     #[test]
