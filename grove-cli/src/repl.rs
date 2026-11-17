@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -9,6 +11,7 @@ use grove_query::ast::QueryFile;
 use grove_query::{ParseOutcome, TypeBindings};
 use grove_schema::ValidatedSchema;
 use rustyline::error::ReadlineError;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::args::{ConnectionSpec, Format, OutputArgs, ReplArgs};
 use crate::diagnostics;
@@ -165,12 +168,13 @@ impl<'a> ReplSession<'a> {
         let mut buffer = String::new();
 
         loop {
-            let prompt = if buffer.is_empty() {
-                "grove> "
+            let (prompt, continuation) = self.prompts();
+            let active_prompt = if buffer.is_empty() {
+                prompt.as_str()
             } else {
-                "  ...> "
+                continuation.as_str()
             };
-            match editor.readline(prompt) {
+            match editor.readline(active_prompt) {
                 Ok(line) => {
                     let trimmed = line.trim();
                     if !trimmed.is_empty() {
@@ -394,7 +398,7 @@ impl<'a> ReplSession<'a> {
                 if let Some(value) = &result {
                     let options = RenderOptions::from_args(
                         &self.settings.output,
-                        self.settings.output.color_enabled(),
+                        self.settings.output.output_color_enabled(),
                     );
                     match render::render(value, typed.output_type(), self.schema, &options) {
                         Ok(text) => {
@@ -516,6 +520,61 @@ impl<'a> ReplSession<'a> {
         }
     }
 
+    fn prompts(&self) -> (String, String) {
+        let colored = self.settings.output.repl_color_enabled();
+        let schema_name = truncated_file_name(&self.schema_path, 24);
+        let mut prompt = String::new();
+        let mut prompt_width = 0;
+
+        const PROMPT_GROVE: &str = "grove";
+        prompt.push_str(&crate::render::paint(PROMPT_GROVE, Some("1;36"), colored));
+        prompt.push(' ');
+        prompt.push_str(&crate::render::paint(&schema_name, Some("1;32"), colored));
+        prompt.push(' ');
+        prompt_width += PROMPT_GROVE.len() + 1 + schema_name.len() + 1;
+
+        match self.spec {
+            ConnectionSpec::Sqlite { file, .. } => {
+                const PROMPT_SQLITE: &str = "SQLite:";
+                let file_name = truncated_file_name(file, 24);
+                prompt.push_str(&crate::render::paint(PROMPT_SQLITE, Some("34"), colored));
+                prompt.push(' ');
+                prompt.push_str(&crate::render::paint(&file_name, Some("1;34"), colored));
+                prompt.push(' ');
+                prompt_width += PROMPT_SQLITE.len() + 1 + file_name.len() + 1;
+            }
+            ConnectionSpec::Memory => {
+                const PROMPT_INMEMORY: &str = "in-memory";
+                prompt.push_str(&crate::render::paint(
+                    PROMPT_INMEMORY,
+                    Some("1;35"),
+                    colored,
+                ));
+                prompt.push(' ');
+                prompt_width += PROMPT_INMEMORY.len() + 1;
+            }
+        }
+
+        const PROMPT_MARKER: &str = "> ";
+        let prompt_marker = crate::render::paint(PROMPT_MARKER, Some("36"), colored);
+        prompt.push_str(&prompt_marker);
+
+        const CONTINATION_PREFIX: &str = "...";
+        let continuation_prefix = crate::render::paint(CONTINATION_PREFIX, Some("36"), colored);
+        let mut continuation = String::with_capacity(
+            prompt_width - CONTINATION_PREFIX.len()
+                + continuation_prefix.len()
+                + prompt_marker.len(),
+        );
+        continuation.extend(std::iter::repeat_n(
+            ' ',
+            prompt_width - CONTINATION_PREFIX.len(),
+        ));
+        continuation.push_str(&continuation_prefix);
+        continuation.push_str(&prompt_marker);
+        (prompt, continuation)
+    }
+
     fn print_help(&self) {
         println!(
             "\
@@ -550,6 +609,34 @@ impl<'a> ReplSession<'a> {
             eprintln!("error: {message}");
         }
     }
+}
+
+fn truncated_file_name(path: &Path, max_width: usize) -> Cow<'_, str> {
+    if max_width == 1 {
+        return Cow::Borrowed("…");
+    }
+    let file_name = path
+        .file_name()
+        .map(OsStr::to_string_lossy)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| Cow::Owned(path.display().to_string()));
+
+    if max_width == 0 || UnicodeWidthStr::width(file_name.as_ref()) <= max_width {
+        return file_name;
+    }
+    let file_name = file_name.into_owned();
+    let mut out = String::new();
+    let mut width = 0;
+    for ch in file_name.chars() {
+        let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + char_width > max_width - 1 {
+            break;
+        }
+        out.push(ch);
+        width += char_width;
+    }
+    out.push('…');
+    Cow::Owned(out)
 }
 
 fn history_path() -> Option<PathBuf> {
@@ -788,6 +875,58 @@ mod tests {
         assert_eq!(session.settings.output.width, Some(42));
         assert_eq!(session.settings.output.max_rows, 5);
         assert!(session.settings.output.hide_refs);
+    }
+
+    #[test]
+    fn prompt_sqlite_backend_aligned_continuation() {
+        let schema = ValidatedSchema::default();
+        let backend = SqliteBackend::open_in_memory(&schema).expect("backend");
+        let spec = ConnectionSpec::Sqlite {
+            file: PathBuf::from("/tmp/db.sqlite3"),
+            readonly: false,
+        };
+        let mut settings = settings();
+        let mut turn = 0;
+
+        let session = ReplSession {
+            schema: &schema,
+            spec: &spec,
+            schema_path: PathBuf::from("/tmp/schema.gschema"),
+            exec: ExecSession::new(&backend, &schema),
+            types: TypeBindings::new(),
+            settings: &mut settings,
+            exec_options: ExecOptions::default(),
+            turn: &mut turn,
+        };
+
+        let (full, continuation) = session.prompts();
+        assert_eq!(full, "grove schema.gschema SQLite: db.sqlite3 > ");
+        assert_eq!(full.find('>'), continuation.find('>'));
+    }
+
+    #[test]
+    fn prompt_file_names_truncated() {
+        let schema = ValidatedSchema::default();
+        let backend = SqliteBackend::open_in_memory(&schema).expect("backend");
+        let spec = ConnectionSpec::Memory;
+        let mut settings = settings();
+        let mut turn = 0;
+        let long_schema = std::env::temp_dir().join(format!("{}-schema.gschema", "x".repeat(40)));
+        let session = ReplSession {
+            schema: &schema,
+            spec: &spec,
+            schema_path: long_schema,
+            exec: ExecSession::new(&backend, &schema),
+            types: TypeBindings::new(),
+            settings: &mut settings,
+            exec_options: ExecOptions::default(),
+            turn: &mut turn,
+        };
+
+        let (full, _) = session.prompts();
+        assert!(full.contains("in-memory"), "{full}");
+        assert!(full.contains('…'), "{full}");
+        assert!(!full.contains(&"x".repeat(40)), "{full}");
     }
 
     #[test]

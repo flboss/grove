@@ -144,7 +144,7 @@ pub struct OutputArgs {
 }
 
 impl OutputArgs {
-    pub fn color_enabled(&self) -> bool {
+    pub fn output_color_enabled(&self) -> bool {
         match self.color {
             ColorChoice::Always => true,
             ColorChoice::Never => false,
@@ -152,6 +152,16 @@ impl OutputArgs {
                 self.output.is_none()
                     && std::io::stdout().is_terminal()
                     && std::env::var_os("NO_COLOR").is_none()
+            }
+        }
+    }
+
+    pub fn repl_color_enabled(&self) -> bool {
+        match self.color {
+            ColorChoice::Always => true,
+            ColorChoice::Never => false,
+            ColorChoice::Auto => {
+                std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
             }
         }
     }

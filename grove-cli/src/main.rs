@@ -64,7 +64,7 @@ fn run_query(args: QueryArgs) -> CliResult<()> {
         materialize_lets: false,
     };
     let render_options =
-        render::RenderOptions::from_args(&args.output, args.output.color_enabled());
+        render::RenderOptions::from_args(&args.output, args.output.output_color_enabled());
     let execute_start = Instant::now();
     match grove_exec::exec_file_with_options(
         &typed,

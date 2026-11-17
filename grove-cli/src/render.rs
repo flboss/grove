@@ -911,7 +911,7 @@ fn truncate_styled(styled: Styled, max_width: usize) -> Styled {
     Styled { styled: out, width }
 }
 
-fn paint(text: &str, style: Option<&str>, color: bool) -> String {
+pub fn paint(text: &str, style: Option<&str>, color: bool) -> String {
     match (color, style) {
         (true, Some(style)) => format!("\x1b[{style}m{text}{RESET}"),
         _ => text.to_string(),
