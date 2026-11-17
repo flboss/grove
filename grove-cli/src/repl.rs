@@ -529,7 +529,7 @@ impl<'a> ReplSession<'a> {
         const PROMPT_GROVE: &str = "grove";
         prompt.push_str(&render::paint(PROMPT_GROVE, Some("1;36"), colored));
         prompt.push(' ');
-        prompt.push_str(&render::paint(&schema_name, Some("1;32"), colored));
+        prompt.push_str(&render::paint(schema_name.as_ref(), Some("1;32"), colored));
         prompt.push(' ');
         prompt_width += PROMPT_GROVE.width() + 1 + schema_name.width() + 1;
 
@@ -539,7 +539,7 @@ impl<'a> ReplSession<'a> {
                 let file_name = truncated_file_name(file, 24);
                 prompt.push_str(&render::paint(PROMPT_SQLITE, Some("34"), colored));
                 prompt.push(' ');
-                prompt.push_str(&render::paint(&file_name, Some("1;34"), colored));
+                prompt.push_str(&render::paint(file_name.as_ref(), Some("1;34"), colored));
                 prompt.push(' ');
                 prompt_width += PROMPT_SQLITE.width() + 1 + file_name.width() + 1;
             }

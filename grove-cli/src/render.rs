@@ -174,10 +174,10 @@ struct Styled {
 }
 
 impl Styled {
-    fn painted(text: impl Into<String>, style: &str, color: bool) -> Self {
+    fn painted<'a>(text: impl Into<Cow<'a, str>>, style: &str, color: bool) -> Self {
         let text = text.into();
         let width = display_width(&text);
-        let styled = paint(&text, Some(style), color);
+        let styled = paint(text, Some(style), color).into_owned();
         Styled { styled, width }
     }
 }
@@ -257,7 +257,7 @@ fn compact(ctx: &RenderCtx<'_>, value: &Val, depth: usize) -> Styled {
                     styled.push_str(", ");
                     width += 2;
                 }
-                styled.push_str(&paint(name, Some(STYLE_BOLD), ctx.options.color));
+                styled.push_str(&paint(name.as_ref(), Some(STYLE_BOLD), ctx.options.color));
                 width += display_width(name);
                 styled.push_str(": ");
                 width += 2;
@@ -342,9 +342,9 @@ fn named_lines(ctx: &RenderCtx<'_>, entries: &[(String, &Val)], depth: usize) ->
         } else {
             "┊ "
         };
-        let mut line = paint(marker, Some(STYLE_DIM), ctx.options.color);
+        let mut line = paint(marker, Some(STYLE_DIM), ctx.options.color).into_owned();
         let key = pad(key, key_width, Align::Left);
-        line.push_str(&paint(&key, Some(STYLE_BOLD), ctx.options.color));
+        line.push_str(&paint(key, Some(STYLE_BOLD), ctx.options.color));
         if let Val::Some(inner) = value
             && expandable(inner)
             && can_expand(ctx, depth + 1)
@@ -391,7 +391,7 @@ fn list_lines(ctx: &RenderCtx<'_>, items: &[Val], depth: usize) -> Vec<String> {
 
         if matches!(item, Val::List(inner) if !inner.is_empty()) && can_expand(ctx, depth + 1) {
             let branch = if is_last { "└─┐" } else { "├─┐" };
-            lines.push(paint(branch, Some(STYLE_DIM), ctx.options.color));
+            lines.push(paint(branch, Some(STYLE_DIM), ctx.options.color).into_owned());
             let continuation = if is_last { "  " } else { "│ " };
             let continuation = paint(continuation, Some(STYLE_DIM), ctx.options.color);
             for mut line in block_lines(ctx, item, depth + 1) {
@@ -407,7 +407,7 @@ fn list_lines(ctx: &RenderCtx<'_>, items: &[Val], depth: usize) -> Vec<String> {
             vec![cell_styled(ctx, item, depth + 1).styled]
         };
 
-        for (line_index, line) in item_lines.drain(..).enumerate() {
+        for (line_index, mut line) in item_lines.drain(..).enumerate() {
             let prefix = if line_index == 0 {
                 if is_last { "└─ " } else { "├─ " }
             } else if is_last {
@@ -415,15 +415,15 @@ fn list_lines(ctx: &RenderCtx<'_>, items: &[Val], depth: usize) -> Vec<String> {
             } else {
                 "│  "
             };
-            let mut prefix = paint(prefix, Some(STYLE_DIM), ctx.options.color);
-            prefix.push_str(&line);
-            lines.push(prefix);
+            let prefix = paint(prefix, Some(STYLE_DIM), ctx.options.color);
+            line.insert_str(0, &prefix);
+            lines.push(line);
         }
     }
 
     if let Some(note) = note {
-        let mut prefix = paint("└─ ", Some(STYLE_DIM), ctx.options.color);
-        prefix.push_str(&paint(&note, Some(STYLE_DIM), ctx.options.color));
+        let mut prefix = paint("└─ ", Some(STYLE_DIM), ctx.options.color).into_owned();
+        prefix.push_str(&paint(note, Some(STYLE_DIM), ctx.options.color));
         lines.push(prefix);
     }
 
@@ -665,9 +665,9 @@ fn render_table(ctx: &RenderCtx<'_>, data: TableData) -> String {
     if ctx.options.headers {
         let header_cells: Vec<TableCell> = data
             .headers
-            .iter()
+            .into_iter()
             .map(|header| TableCell {
-                content: Styled::painted(header.as_str(), STYLE_BOLD, ctx.options.color),
+                content: Styled::painted(header, STYLE_BOLD, ctx.options.color),
                 align: Align::Left,
             })
             .collect();
@@ -724,13 +724,13 @@ fn border_line(
         }
     }
     line.push(right);
-    paint(&line, Some(STYLE_DIM), color)
+    paint(line, Some(STYLE_DIM), color).into_owned()
 }
 
 fn table_row(cells: &[TableCell], separator: char, widths: &[usize], color: bool) -> String {
-    let border = paint(&separator.to_string(), Some(STYLE_DIM), color);
+    let border = paint(separator.to_string(), Some(STYLE_DIM), color);
     let empty = Styled::default();
-    let mut row = border.clone();
+    let mut row = border.clone().into_owned();
     for (index, width) in widths.iter().enumerate() {
         let cell = cells.get(index);
         let content = cell.map(|cell| &cell.content).unwrap_or(&empty);
@@ -755,7 +755,7 @@ fn note_row(note: &str, widths: &[usize], color: bool) -> String {
     let border = paint("│", Some(STYLE_DIM), color);
     format!(
         "{border} {}{} {border}",
-        paint(&text, Some(STYLE_DIM), color),
+        paint(text, Some(STYLE_DIM), color),
         " ".repeat(padding)
     )
 }
@@ -902,10 +902,11 @@ fn truncate_styled(styled: Styled, max_width: usize) -> Styled {
     Styled { styled: out, width }
 }
 
-pub fn paint(text: &str, style: Option<&str>, color: bool) -> String {
+pub fn paint<'a>(text: impl Into<Cow<'a, str>>, style: Option<&str>, color: bool) -> Cow<'a, str> {
+    let text = text.into();
     match (color, style) {
-        (true, Some(style)) => format!("\x1b[{style}m{text}{RESET}"),
-        _ => text.to_string(),
+        (true, Some(style)) => Cow::Owned(format!("\x1b[{style}m{text}{RESET}")),
+        _ => text,
     }
 }
 
