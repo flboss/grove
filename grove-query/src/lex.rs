@@ -85,7 +85,7 @@ impl<'src> Lexer<'src> {
                 ')' => self.make_token(start, TokenKind::RParen),
                 ',' => self.make_token(start, TokenKind::Comma),
                 ';' => self.make_token(start, TokenKind::Semicolon),
-                '.' => self.make_token(start, TokenKind::Dot),
+                '.' => self.scan_dot(start),
                 '$' => {
                     let mut count = 1;
                     while self.peek_char() == Some('$') {
@@ -189,6 +189,15 @@ impl<'src> Lexer<'src> {
         } else {
             self.make_token(start, single)
         }
+    }
+
+    fn scan_dot(&mut self, start: usize) -> Token {
+        if self.peek_char() == Some('.') && self.peek_char2() == Some('.') {
+            self.bump();
+            self.bump();
+            return self.make_token(start, TokenKind::TripleDot);
+        }
+        self.make_token(start, TokenKind::Dot)
     }
 
     fn scan_amp_or_error(&mut self, start: usize) -> Token {
@@ -1879,6 +1888,18 @@ mod tests {
         assert_token!(lex, TokenKind::Star);
         assert_token!(lex, TokenKind::Percent);
         assert_token!(lex, TokenKind::Minus);
+        assert_eof!(lex);
+    }
+
+    #[test]
+    fn triple_dot() {
+        let mut lex = Lexer::new(".. ... .0...");
+        assert_token!(lex, TokenKind::Dot);
+        assert_token!(lex, TokenKind::Dot);
+        assert_token!(lex, TokenKind::TripleDot);
+        assert_token!(lex, TokenKind::Dot);
+        assert_eq!(lex.next_token().value, TokenKind::IntLit(0));
+        assert_token!(lex, TokenKind::TripleDot);
         assert_eof!(lex);
     }
 

@@ -53,6 +53,7 @@ pub enum TokenKind {
     Colon,
     Semicolon,
     Dot,
+    TripleDot,
     Question(usize),
     QuestionDot(usize),
     Dollar(usize),
