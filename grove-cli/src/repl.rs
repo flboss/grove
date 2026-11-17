@@ -559,16 +559,16 @@ impl<'a> ReplSession<'a> {
         let prompt_marker = crate::render::paint(PROMPT_MARKER, Some("36"), colored);
         prompt.push_str(&prompt_marker);
 
-        const CONTINATION_PREFIX: &str = "...";
-        let continuation_prefix = crate::render::paint(CONTINATION_PREFIX, Some("36"), colored);
+        const CONTINUATION_PREFIX: &str = "...";
+        let continuation_prefix = crate::render::paint(CONTINUATION_PREFIX, Some("36"), colored);
         let mut continuation = String::with_capacity(
-            prompt_width - CONTINATION_PREFIX.len()
+            prompt_width - CONTINUATION_PREFIX.len()
                 + continuation_prefix.len()
                 + prompt_marker.len(),
         );
         continuation.extend(std::iter::repeat_n(
             ' ',
-            prompt_width - CONTINATION_PREFIX.len(),
+            prompt_width - CONTINUATION_PREFIX.len(),
         ));
         continuation.push_str(&continuation_prefix);
         continuation.push_str(&prompt_marker);
