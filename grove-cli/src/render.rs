@@ -655,7 +655,7 @@ fn finish_table(
 
     let headers: Vec<String> = headers
         .into_iter()
-        .map(|header| truncate_display(header, ctx.options.max_cell_width))
+        .map(|header| truncate_display(header, ctx.options.max_cell_width).into_owned())
         .collect();
     let mut widths: Vec<usize> = headers.iter().map(|header| display_width(header)).collect();
     for row in &rows {
@@ -790,7 +790,7 @@ fn note_row(note: &str, widths: &[usize], color: bool) -> String {
     let total = widths.iter().sum::<usize>() + widths.len() * 3 + 1;
     let text_area = total.saturating_sub(4);
     let text = if text_area == 0 {
-        String::new()
+        "".into()
     } else {
         truncate_display(note, text_area)
     };
@@ -872,13 +872,13 @@ fn display_width(text: &str) -> usize {
     UnicodeWidthStr::width(text)
 }
 
-fn truncate_display<'a>(text: impl Into<Cow<'a, str>>, max_width: usize) -> String {
+fn truncate_display<'a>(text: impl Into<Cow<'a, str>>, max_width: usize) -> Cow<'a, str> {
     let text = text.into();
     if max_width == 0 || display_width(&text) <= max_width {
-        return text.into_owned();
+        return text;
     }
     if max_width == 1 {
-        return TRIPLE_DOTS.to_string();
+        return Cow::Borrowed(TRIPLE_DOTS);
     }
 
     let mut out = String::new();
@@ -892,7 +892,7 @@ fn truncate_display<'a>(text: impl Into<Cow<'a, str>>, max_width: usize) -> Stri
         width += char_width;
     }
     out.push_str(TRIPLE_DOTS);
-    out
+    Cow::Owned(out)
 }
 
 fn truncate_styled(styled: Styled, max_width: usize) -> Styled {
