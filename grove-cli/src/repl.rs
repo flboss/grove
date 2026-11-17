@@ -391,11 +391,11 @@ impl<'a> ReplSession<'a> {
         let elapsed = start.elapsed();
 
         match result {
-            Ok(result) => {
+            Ok(mut result) => {
                 for (name, ty) in typed.let_bindings() {
                     self.types.define(name, ty.clone());
                 }
-                if let Some(value) = &result {
+                if let Some(value) = &mut result {
                     let options = RenderOptions::from_args(
                         &self.settings.output,
                         self.settings.output.output_color_enabled(),

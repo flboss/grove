@@ -73,8 +73,9 @@ fn run_query(args: QueryArgs) -> CliResult<()> {
         Utc::now(),
         options,
     ) {
-        Ok(Some(value)) => {
-            let text = render::render(&value, typed.output_type(), &validated, &render_options)?;
+        Ok(Some(mut value)) => {
+            let text =
+                render::render(&mut value, typed.output_type(), &validated, &render_options)?;
             write_output(args.output.output.as_deref(), &text)?;
         }
         Ok(None) => {}
