@@ -979,19 +979,23 @@ mod tests {
     }
 
     #[test]
-    fn ref_links_comparison_unknown() {
+    fn ref_links_ignored_in_equality() {
         let user_struct = testdata::struct_id(&testdata::schema(), "User");
         let manager_field = testdata::field_id(&testdata::schema(), user_struct, "manager");
         let link = Val::Ref {
             field: manager_field,
             parent: Key(1),
         };
+        let other_link = Val::Ref {
+            field: manager_field,
+            parent: Key(2),
+        };
         assert_eq!(
             link.to_string(),
             format!("ref({}:{})", user_struct.index(), manager_field.local())
         );
+        assert_eq!(link.eq(&other_link), Some(true));
         assert_eq!(link.eq(&int(1)), None);
-        assert_eq!(link.eq(&link.clone()), None);
     }
 
     #[test]

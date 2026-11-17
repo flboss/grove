@@ -165,7 +165,7 @@ impl Val {
                     x.eq(y).map(|equal| all_equal & equal)
                 })
             }
-            (Val::Ref { .. }, _) | (_, Val::Ref { .. }) => None,
+            (Val::Ref { .. }, Val::Ref { .. }) => Some(true),
             _ => None,
         }
     }

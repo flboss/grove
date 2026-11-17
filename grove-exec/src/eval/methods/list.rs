@@ -365,5 +365,9 @@ mod tests {
             run_seeded("users { id, name }.contains({ id = 9, name = \"A\" })"),
             Ok(bool(false))
         );
+        assert_eq!(
+            run_seeded("users.contains(users.first().unwrap())"),
+            Ok(bool(true))
+        );
     }
 }

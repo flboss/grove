@@ -485,6 +485,13 @@ mod tests {
     }
 
     #[test]
+    fn eval_equality_non_owning_refs_ignored() {
+        assert_eq!(run_seeded("users == users"), Ok(bool(true)));
+        assert_eq!(run_seeded("users != users"), Ok(bool(false)));
+        assert_eq!(run_seeded("users in (users,)"), Ok(bool(true)));
+    }
+
+    #[test]
     fn eval_equality_nan() {
         let off = r#"config { float_checks = false }"#;
         assert_eq!(
