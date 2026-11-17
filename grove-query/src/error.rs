@@ -423,6 +423,7 @@ pub enum QueryParseError {
     },
     ExpectedEnumVariantName { span: Span },
     ProjectionItemAliasRequired { span: Span },
+    ProjectionSpreadNotLast { span: Span },
     EmptyStatement { span: Span },
     DiscardedQuery { span: Span },
     ExpectedSemicolon { span: Span, after: &'static str },
@@ -589,6 +590,13 @@ impl From<QueryParseError> for Diagnostic {
                 "expected a plain field path or an explicit alias",
             )
             .with_help("add an alias to name the projection item: `alias = ...`"),
+            ProjectionSpreadNotLast { span } => error_simple(
+                "QP0040",
+                "projection spread must be the last item",
+                span,
+                "spread is not last",
+            )
+            .with_help("move `...` to the end of the projection"),
             EmptyStatement { span } => {
                 error_simple("QP0023", "empty statement", span, "expected an expression")
             }

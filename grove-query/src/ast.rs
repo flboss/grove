@@ -140,6 +140,7 @@ pub enum Expr {
     Projection {
         base: Box<Expr>,
         items: Vec<ProjectionItem>,
+        spread: Option<Span>,
         span: Span,
     },
 }

@@ -285,7 +285,7 @@ fn infer(expr: &Expr, env: &mut TypeEnv) -> Result<TypedExpr, TypeError> {
             span,
         } => infer_if(arms, default, *span, env),
         Expr::Cast { expr, ty, .. } => infer_cast(expr, ty, env),
-        Expr::Projection { base, items, span } => infer_projection(base, items, *span, env),
+        Expr::Projection { base, items, span, .. } => infer_projection(base, items, *span, env),
         Expr::TypeConstant { ty, name } => infer_type_constant(ty, name, env),
         Expr::Struct { fields, span } => infer_struct_literal(fields, *span, env),
     }

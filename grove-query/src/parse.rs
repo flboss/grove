@@ -374,7 +374,7 @@ impl<'src> Parser<'src> {
                 }
                 TokenKind::LBrace if allow_projection_braces => {
                     self.bump();
-                    let items = self.parse_projection_body()?;
+                    let (items, spread) = self.parse_projection_body()?;
                     self.expect(
                         |k| matches!(k, TokenKind::RBrace),
                         |span| QueryParseError::ExpectedProjectionRBrace { span },
@@ -383,6 +383,7 @@ impl<'src> Parser<'src> {
                     expr = Expr::Projection {
                         base: Box::new(expr),
                         items,
+                        spread,
                         span,
                     };
                 }
@@ -455,9 +456,22 @@ impl<'src> Parser<'src> {
         Ok(args)
     }
 
-    fn parse_projection_body(&mut self) -> Result<Vec<ProjectionItem>, ()> {
+    fn parse_projection_body(&mut self) -> Result<(Vec<ProjectionItem>, Option<Span>), ()> {
         let mut items = Vec::new();
+        let mut spread = None;
         while !matches!(self.current.value, TokenKind::RBrace | TokenKind::Eof) {
+            if let Some(span) = spread {
+                self.emit_error(QueryParseError::ProjectionSpreadNotLast { span });
+                self.sync_to(&[TokenKind::RBrace]);
+                break;
+            }
+            if matches!(self.current.value, TokenKind::TripleDot) {
+                spread = Some(self.bump().span);
+                if matches!(self.current.value, TokenKind::Comma) {
+                    self.bump();
+                }
+                continue;
+            }
             match self.parse_projection_item() {
                 Ok(item) => {
                     items.push(item);
@@ -475,7 +489,7 @@ impl<'src> Parser<'src> {
             }
             self.bump();
         }
-        Ok(items)
+        Ok((items, spread))
     }
 
     fn parse_projection_item(&mut self) -> Result<ProjectionItem, ()> {
@@ -2009,6 +2023,43 @@ mod tests {
         };
         assert_eq!(items.len(), 1);
         assert!(items[0].alias.is_some());
+    }
+
+    #[test]
+    fn projection_spread_only() {
+        let expr = parse_ok("users { ... }");
+        assert!(matches!(
+            expr,
+            Expr::Projection {
+                items,
+                spread: Some(_),
+                ..
+            } if items.is_empty()
+        ));
+    }
+
+    #[test]
+    fn projection_spread_last() {
+        let expr = parse_ok("users { name, ..., }");
+        let Expr::Projection {
+            items,
+            spread: Some(_),
+            ..
+        } = expr
+        else {
+            panic!("expected projection with spread");
+        };
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].alias, None);
+    }
+
+    #[test]
+    fn projection_spread_not_last() {
+        for source in ["users { ..., name }", "users { name, ..., age, }"] {
+            let (file, diags) = parse_query(source);
+            assert!(file.is_none(), "source: {source}");
+            assert_eq!(codes(&diags), vec!["QP0040"], "source: {source}");
+        }
     }
 
     #[test]
