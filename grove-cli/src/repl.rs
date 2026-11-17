@@ -314,7 +314,7 @@ impl<'a> ReplSession<'a> {
                 }
                 _ => eprintln!("usage: .stats on|off"),
             },
-            ".hide-refs" => match argument {
+            ".hiderefs" => match argument {
                 "on" => {
                     self.settings.output.hide_refs = true;
                     println!("hide refs: on");
@@ -323,7 +323,7 @@ impl<'a> ReplSession<'a> {
                     self.settings.output.hide_refs = false;
                     println!("hide refs: off");
                 }
-                _ => eprintln!("usage: .hide-refs on|off"),
+                _ => eprintln!("usage: .hiderefs on|off"),
             },
             ".width" => {
                 if argument == "auto" {
@@ -357,7 +357,9 @@ impl<'a> ReplSession<'a> {
                 }
             }
             _ => {
-                eprintln!("unknown REPL command: {command}. Type \".help\" for a list of commands.")
+                eprintln!(
+                    "unknown REPL command: \"{command}\". Type \".help\" for a list of commands."
+                )
             }
         }
 
@@ -584,7 +586,7 @@ impl<'a> ReplSession<'a> {
 .format MODE                   auto|inline|raw|table|vertical
 .headers on|off                Toggle table headers
 .stats on|off                  Toggle per-turn query stats
-.hide-refs on|off              Hide unresolved non-owning references
+.hiderefs on|off               Hide unresolved non-owning references
 .width N|auto                  Set render width
 .maxrows N|unlimited           Set the table render row limit
 .output PATH|stdout            Redirect results"
@@ -864,7 +866,7 @@ mod tests {
         session.meta_command(".headers off").unwrap();
         session.meta_command(".width 42").unwrap();
         session.meta_command(".maxrows 5").unwrap();
-        session.meta_command(".hide-refs on").unwrap();
+        session.meta_command(".hiderefs on").unwrap();
 
         assert_eq!(session.settings.output.format, Format::Vertical);
         assert!(session.settings.output.no_headers);
