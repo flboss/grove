@@ -310,6 +310,17 @@ impl<'a> ReplSession<'a> {
                 }
                 _ => eprintln!("usage: .stats on|off"),
             },
+            ".hide-refs" => match argument {
+                "on" => {
+                    self.settings.output.hide_refs = true;
+                    println!("hide refs: on");
+                }
+                "off" => {
+                    self.settings.output.hide_refs = false;
+                    println!("hide refs: off");
+                }
+                _ => eprintln!("usage: .hide-refs on|off"),
+            },
             ".width" => {
                 if argument == "auto" {
                     self.settings.output.width = None;
@@ -516,6 +527,7 @@ impl<'a> ReplSession<'a> {
 .format MODE                   auto|inline|raw|table|vertical
 .headers on|off                Toggle table headers
 .stats on|off                  Toggle per-turn query stats
+.hide-refs on|off              Hide unresolved non-owning references
 .width N|auto                  Set render width
 .maxrows N|unlimited           Set the table render row limit
 .output PATH|stdout            Redirect results"
@@ -567,6 +579,7 @@ mod tests {
                 max_cell_width: 40,
                 full: false,
                 no_headers: false,
+                hide_refs: false,
                 output: None,
                 stats: false,
             },
@@ -766,11 +779,13 @@ mod tests {
         session.meta_command(".headers off").unwrap();
         session.meta_command(".width 42").unwrap();
         session.meta_command(".maxrows 5").unwrap();
+        session.meta_command(".hide-refs on").unwrap();
 
         assert_eq!(session.settings.output.format, Format::Vertical);
         assert!(session.settings.output.no_headers);
         assert_eq!(session.settings.output.width, Some(42));
         assert_eq!(session.settings.output.max_rows, 5);
+        assert!(session.settings.output.hide_refs);
     }
 
     #[test]

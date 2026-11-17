@@ -26,6 +26,7 @@ pub struct RenderOptions {
     pub max_depth: usize,
     pub max_cell_width: usize,
     pub headers: bool,
+    pub hide_refs: bool,
 }
 
 impl RenderOptions {
@@ -50,6 +51,7 @@ impl RenderOptions {
             max_depth,
             max_cell_width,
             headers: !args.no_headers,
+            hide_refs: args.hide_refs,
         }
     }
 }
@@ -82,6 +84,18 @@ pub fn render(
     schema: &ValidatedSchema,
     options: &RenderOptions,
 ) -> CliResult<String> {
+    let filtered;
+    let value = if options.hide_refs {
+        match filter_refs(value) {
+            Some(value) => {
+                filtered = value;
+                &filtered
+            }
+            None => return Ok(String::new()),
+        }
+    } else {
+        value
+    };
     let ctx = RenderCtx { schema, options };
 
     match options.format {
@@ -99,6 +113,22 @@ pub fn render(
             ))),
         },
         Format::Auto => render_auto(&ctx, value, ty),
+    }
+}
+
+fn filter_refs(value: &Val) -> Option<Val> {
+    match value {
+        Val::Ref { .. } => None,
+        Val::Some(inner) => filter_refs(inner).map(|value| Val::Some(Box::new(value))),
+        Val::List(items) => Some(Val::List(items.iter().filter_map(filter_refs).collect())),
+        Val::Tuple(items) => Some(Val::Tuple(items.iter().filter_map(filter_refs).collect())),
+        Val::Record(fields) => Some(Val::Record(
+            fields
+                .iter()
+                .filter_map(|(name, value)| filter_refs(value).map(|value| (name.clone(), value)))
+                .collect(),
+        )),
+        _ => Some(value.clone()),
     }
 }
 
@@ -939,6 +969,7 @@ mod tests {
             max_depth: 6,
             max_cell_width: 40,
             headers: true,
+            hide_refs: false,
         }
     }
 
@@ -1174,6 +1205,49 @@ mod tests {
         options.color = true;
         let output = render_value(&value, &ty, &options);
         assert!(output.contains("some(\x1b[36m3\x1b[0m)"), "{output}");
+    }
+
+    #[test]
+    fn hide_refs_omits_fields_and_list_items() {
+        let schema = schema();
+        let reference = Val::Ref {
+            field: FieldId::new(StructId::new(0), 0),
+            parent: Key(7),
+        };
+        let record = Val::Record(vec![
+            (Rc::from("name"), string("Alice")),
+            (Rc::from("link"), reference.clone()),
+        ]);
+        let mut opts = options(Format::Vertical);
+        opts.hide_refs = true;
+        let output = render(&record, None, &schema, &opts).unwrap();
+        assert!(output.contains("name"), "{output}");
+        assert!(!output.contains("link"), "{output}");
+        assert!(!output.contains("ref("), "{output}");
+
+        let list = Val::List(vec![reference, int(1)]);
+        let mut opts = options(Format::Auto);
+        opts.hide_refs = true;
+        let output = render(&list, None, &schema, &opts).unwrap();
+        assert_eq!(output, "[1]");
+    }
+
+    #[test]
+    fn hide_refs_removes_table_columns() {
+        let schema = schema();
+        let reference = Val::Ref {
+            field: FieldId::new(StructId::new(0), 0),
+            parent: Key(7),
+        };
+        let value = Val::List(vec![Val::Record(vec![
+            (Rc::from("name"), string("Alice")),
+            (Rc::from("link"), reference),
+        ])]);
+        let mut opts = options(Format::Table);
+        opts.hide_refs = true;
+        let output = render(&value, None, &schema, &opts).unwrap();
+        assert!(output.contains("name"), "{output}");
+        assert!(!output.contains("link"), "{output}");
     }
 
     #[test]

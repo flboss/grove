@@ -130,6 +130,10 @@ pub struct OutputArgs {
     #[arg(long)]
     pub no_headers: bool,
 
+    /// Hide unresolved non-owning reference values in output
+    #[arg(long)]
+    pub hide_refs: bool,
+
     /// Write results to a file instead of stdout
     #[arg(long, value_name = "PATH")]
     pub output: Option<PathBuf>,
