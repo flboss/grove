@@ -527,48 +527,44 @@ impl<'a> ReplSession<'a> {
         let mut prompt_width = 0;
 
         const PROMPT_GROVE: &str = "grove";
-        prompt.push_str(&crate::render::paint(PROMPT_GROVE, Some("1;36"), colored));
+        prompt.push_str(&render::paint(PROMPT_GROVE, Some("1;36"), colored));
         prompt.push(' ');
-        prompt.push_str(&crate::render::paint(&schema_name, Some("1;32"), colored));
+        prompt.push_str(&render::paint(&schema_name, Some("1;32"), colored));
         prompt.push(' ');
-        prompt_width += PROMPT_GROVE.len() + 1 + schema_name.len() + 1;
+        prompt_width += PROMPT_GROVE.width() + 1 + schema_name.width() + 1;
 
         match self.spec {
             ConnectionSpec::Sqlite { file, .. } => {
                 const PROMPT_SQLITE: &str = "SQLite:";
                 let file_name = truncated_file_name(file, 24);
-                prompt.push_str(&crate::render::paint(PROMPT_SQLITE, Some("34"), colored));
+                prompt.push_str(&render::paint(PROMPT_SQLITE, Some("34"), colored));
                 prompt.push(' ');
-                prompt.push_str(&crate::render::paint(&file_name, Some("1;34"), colored));
+                prompt.push_str(&render::paint(&file_name, Some("1;34"), colored));
                 prompt.push(' ');
-                prompt_width += PROMPT_SQLITE.len() + 1 + file_name.len() + 1;
+                prompt_width += PROMPT_SQLITE.width() + 1 + file_name.width() + 1;
             }
             ConnectionSpec::Memory => {
                 const PROMPT_INMEMORY: &str = "in-memory";
-                prompt.push_str(&crate::render::paint(
-                    PROMPT_INMEMORY,
-                    Some("1;35"),
-                    colored,
-                ));
+                prompt.push_str(&render::paint(PROMPT_INMEMORY, Some("1;35"), colored));
                 prompt.push(' ');
-                prompt_width += PROMPT_INMEMORY.len() + 1;
+                prompt_width += PROMPT_INMEMORY.width() + 1;
             }
         }
 
         const PROMPT_MARKER: &str = "> ";
-        let prompt_marker = crate::render::paint(PROMPT_MARKER, Some("36"), colored);
+        let prompt_marker = render::paint(PROMPT_MARKER, Some("36"), colored);
         prompt.push_str(&prompt_marker);
 
         const CONTINUATION_PREFIX: &str = "...";
-        let continuation_prefix = crate::render::paint(CONTINUATION_PREFIX, Some("36"), colored);
+        let continuation_prefix = render::paint(CONTINUATION_PREFIX, Some("36"), colored);
         let mut continuation = String::with_capacity(
-            prompt_width - CONTINUATION_PREFIX.len()
+            prompt_width - CONTINUATION_PREFIX.width()
                 + continuation_prefix.len()
                 + prompt_marker.len(),
         );
         continuation.extend(std::iter::repeat_n(
             ' ',
-            prompt_width - CONTINUATION_PREFIX.len(),
+            prompt_width - CONTINUATION_PREFIX.width(),
         ));
         continuation.push_str(&continuation_prefix);
         continuation.push_str(&prompt_marker);
