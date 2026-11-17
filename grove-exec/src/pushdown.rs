@@ -1528,6 +1528,17 @@ mod tests {
     }
 
     #[test]
+    fn liveness_projection_spread_all_fields_kept() {
+        let (_file, plan, schema) = typed_and_plan("users { name, ... }");
+        assert_fields(
+            &plan,
+            &schema,
+            "User",
+            &non_ref_field_names(&schema, "User"),
+        );
+    }
+
+    #[test]
     fn liveness_whole_record() {
         let (_file, plan, schema) = typed_and_plan("users");
         assert_fields(

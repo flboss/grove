@@ -285,7 +285,12 @@ fn infer(expr: &Expr, env: &mut TypeEnv) -> Result<TypedExpr, TypeError> {
             span,
         } => infer_if(arms, default, *span, env),
         Expr::Cast { expr, ty, .. } => infer_cast(expr, ty, env),
-        Expr::Projection { base, items, span, .. } => infer_projection(base, items, *span, env),
+        Expr::Projection {
+            base,
+            items,
+            spread,
+            span,
+        } => infer_projection(base, items, *spread, *span, env),
         Expr::TypeConstant { ty, name } => infer_type_constant(ty, name, env),
         Expr::Struct { fields, span } => infer_struct_literal(fields, *span, env),
     }
@@ -557,10 +562,11 @@ fn infer_struct_literal(
 fn infer_projection(
     base: &Expr,
     items: &[ProjectionItem],
+    spread: Option<Span>,
     span: Span,
     env: &mut TypeEnv,
 ) -> Result<TypedExpr, TypeError> {
-    if items.is_empty() {
+    if items.is_empty() && spread.is_none() {
         return Err(TypeError::EmptyProjection { span });
     }
 
@@ -615,6 +621,27 @@ fn infer_projection(
         });
     }
 
+    if let Some(spread_span) = spread {
+        for field_name in projection_base_fields(&typed_base.ty, env.schema()) {
+            if seen_names.contains_key(field_name.as_str()) {
+                continue;
+            }
+            let alias = Spanned {
+                value: field_name,
+                span: spread_span,
+            };
+            let value = Expr::Ident(alias);
+            let typed_value = infer(&value, env)?;
+            let Expr::Ident(alias) = value else {
+                unreachable!();
+            };
+            typed_items.push(TypedProjectionItem {
+                alias,
+                value: typed_value,
+            });
+        }
+    }
+
     let is_list = matches!(&typed_base.ty, QueryType::List(_));
     let proj_source = RecordSource::Projection(
         typed_items
@@ -643,6 +670,21 @@ fn infer_projection(
         result_ty,
         span,
     ))
+}
+
+fn projection_base_fields(ty: &QueryType, schema: &ValidatedSchema) -> Vec<String> {
+    match ty {
+        QueryType::Record(RecordSource::Schema(struct_id)) => schema.structs[struct_id.index()]
+            .fields
+            .iter()
+            .map(|field| field.name().to_string())
+            .collect(),
+        QueryType::Record(RecordSource::Projection(fields)) => {
+            fields.iter().map(|field| field.name.clone()).collect()
+        }
+        QueryType::List(inner) => projection_base_fields(inner, schema),
+        _ => Vec::new(),
+    }
 }
 
 fn infer_field(
@@ -4068,6 +4110,114 @@ mod tests {
             },
             other => panic!("expected List, got {other:?}"),
         }
+    }
+
+    fn projected_fields(expr: TypedExpr) -> (Vec<String>, Vec<QueryType>) {
+        let ty = match expr.ty {
+            QueryType::List(inner) => *inner,
+            ty => ty,
+        };
+        let QueryType::Record(RecordSource::Projection(fields)) = ty else {
+            panic!("expected projection record, got {ty:?}");
+        };
+        fields
+            .into_iter()
+            .map(|field| (field.name, field.ty))
+            .unzip()
+    }
+
+    #[test]
+    fn projection_spread_all_fields() {
+        let result = infer_ok("users { ... }", &test_schema());
+        assert_eq!(
+            projected_fields(result).0,
+            [
+                "name",
+                "age",
+                "score",
+                "balance",
+                "active",
+                "created",
+                "profile",
+                "maybe_pos",
+            ]
+        );
+    }
+
+    #[test]
+    fn projection_spread_existing_preserved() {
+        let result = infer_ok("users { active, ... }", &test_schema());
+        assert_eq!(
+            projected_fields(result).0,
+            [
+                "active",
+                "name",
+                "age",
+                "score",
+                "balance",
+                "created",
+                "profile",
+                "maybe_pos",
+            ]
+        );
+    }
+
+    #[test]
+    fn projection_spread_match_by_name() {
+        let result = infer_ok("users { n = name, ... }", &test_schema());
+        assert_eq!(
+            projected_fields(result).0,
+            [
+                "n",
+                "name",
+                "age",
+                "score",
+                "balance",
+                "active",
+                "created",
+                "profile",
+                "maybe_pos",
+            ]
+        );
+
+        let result = infer_ok("users { name = 1, ... }", &test_schema());
+        let fields = projected_fields(result);
+        assert_eq!(fields.0[0], "name");
+        assert_eq!(fields.1[0], QueryType::Scalar(ScalarType::Int));
+        assert_eq!(
+            fields.0,
+            [
+                "name",
+                "age",
+                "score",
+                "balance",
+                "active",
+                "created",
+                "profile",
+                "maybe_pos",
+            ]
+        );
+    }
+
+    #[test]
+    fn projection_spread_chained_projection() {
+        let result = infer_ok("users { name, age } { age, ... }", &test_schema());
+        assert_eq!(projected_fields(result).0, ["age", "name"]);
+    }
+
+    #[test]
+    fn projection_spread_literal() {
+        let result = infer_ok("{ a = 1, b = 2 } { b, ... }", &test_schema());
+        assert_eq!(projected_fields(result).0, ["b", "a"]);
+    }
+
+    #[test]
+    fn projection_spread_noop_all_fields_named() {
+        let result = infer_ok(
+            "users { name, age, score, balance, active, created, profile, maybe_pos, ... }",
+            &test_schema(),
+        );
+        assert_eq!(projected_fields(result).0.len(), 8);
     }
 
     #[test]

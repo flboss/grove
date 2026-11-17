@@ -375,6 +375,80 @@ mod tests {
     }
 
     #[test]
+    fn projection_spread_struct_literal_aliases() {
+        assert_eq!(
+            run_src("{ a = 1, b = 2, c = 3 } { b, ... }"),
+            Ok(rec(vec![("b", int(2)), ("a", int(1)), ("c", int(3))]))
+        );
+        assert_eq!(
+            run_src("{ a = 1, b = 2 } { x = a, ... }"),
+            Ok(rec(vec![("x", int(1)), ("a", int(1)), ("b", int(2)),]))
+        );
+        assert_eq!(
+            run_src("{ a = 1, b = 2 } { a = 9, ... }"),
+            Ok(rec(vec![("a", int(9)), ("b", int(2))]))
+        );
+        assert_eq!(
+            run_src("[{ a = 1, b = 2 }, { a = 3, b = 4 }] { a, ... }"),
+            Ok(Val::List(vec![
+                rec(vec![("a", int(1)), ("b", int(2))]),
+                rec(vec![("a", int(3)), ("b", int(4))]),
+            ]))
+        );
+    }
+
+    #[test]
+    fn projection_spread_nested_projection() {
+        assert_eq!(
+            run_src("{ inner = { a = 1, b = 2 } { ... }, c = 3 } { c, ... }"),
+            Ok(rec(vec![
+                ("c", int(3)),
+                ("inner", rec(vec![("a", int(1)), ("b", int(2))])),
+            ]))
+        );
+    }
+
+    #[test]
+    fn projection_spread_refs_resolved() {
+        let Ok(Val::Record(fields)) = run_seeded("users.first().unwrap() { ... }") else {
+            panic!("expected a projected user record");
+        };
+        let manager = fields
+            .iter()
+            .find(|(name, _)| name.as_ref() == "manager")
+            .map(|(_, value)| value)
+            .expect("spread should include manager");
+        let Val::Some(manager) = manager else {
+            panic!("expected manager to resolve, got {manager:?}");
+        };
+        let Val::Record(manager) = manager.as_ref() else {
+            panic!("expected manager record");
+        };
+        assert!(
+            manager
+                .iter()
+                .any(|(name, value)| { name.as_ref() == "name" && *value == str("Bob") })
+        );
+
+        let profile = fields
+            .iter()
+            .find(|(name, _)| name.as_ref() == "profile")
+            .map(|(_, value)| value)
+            .expect("spread should include profile");
+        let Val::Some(profile) = profile else {
+            panic!("expected profile to resolve, got {profile:?}");
+        };
+        let Val::Record(profile) = profile.as_ref() else {
+            panic!("expected profile record");
+        };
+        assert!(
+            profile
+                .iter()
+                .any(|(name, value)| { name.as_ref() == "bio" && *value == str("AdaBio") })
+        );
+    }
+
+    #[test]
     fn projection_alias() {
         match run_seeded("users { n = name, id }") {
             Ok(Val::List(rows)) => {
