@@ -157,7 +157,7 @@ fn print_banner(spec: &ConnectionSpec, schema_path: &Path) {
         spec.description(),
         schema_path.display()
     );
-    println!("Type .help for a list of commands.");
+    println!("Type \".help\" for a list of commands.");
 }
 
 impl<'a> ReplSession<'a> {
@@ -352,7 +352,9 @@ impl<'a> ReplSession<'a> {
                     println!("output: {argument}");
                 }
             }
-            _ => eprintln!("unknown REPL command: {command}. Type .help for commands."),
+            _ => {
+                eprintln!("unknown REPL command: {command}. Type \".help\" for a list of commands.")
+            }
         }
 
         Ok(None)
