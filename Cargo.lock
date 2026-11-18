@@ -328,6 +328,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "grove-codec"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "rust_decimal",
+]
+
+[[package]]
 name = "grove-debug"
 version = "0.1.0"
 dependencies = [
@@ -346,6 +354,7 @@ name = "grove-exec"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "grove-codec",
  "grove-query",
  "grove-schema",
  "grove-types",

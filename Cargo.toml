@@ -4,6 +4,7 @@ members = [
   "grove-types",
   "grove-schema",
   "grove-query",
+  "grove-codec",
   "grove-exec",
   "grove-debug",
   "grove-cli",
@@ -17,6 +18,7 @@ edition = "2024"
 grove-types = { path = "grove-types" }
 grove-schema = { path = "grove-schema" }
 grove-query = { path = "grove-query" }
+grove-codec = { path = "grove-codec" }
 grove-exec = { path = "grove-exec" }
 
 chrono = "0.4"
