@@ -1,6 +1,7 @@
 pub mod ast;
 pub mod error;
 pub mod lex;
+pub mod methods;
 pub mod parse;
 pub mod token;
 pub mod typecheck;
