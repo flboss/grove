@@ -1,6 +1,7 @@
 use std::fmt;
 
 use chrono::TimeDelta;
+use grove_query::methods::MethodId;
 use grove_query::typecheck::types::TypedMethodArg;
 use grove_schema::validated::Config;
 use grove_types::Span;
@@ -22,12 +23,12 @@ pub(super) enum ReduceKind {
 }
 
 impl ReduceKind {
-    pub(super) fn from_str(name: &str) -> Option<ReduceKind> {
-        Some(match name {
-            "sum" => ReduceKind::Sum,
-            "avg" => ReduceKind::Avg,
-            "max" => ReduceKind::Max,
-            "min" => ReduceKind::Min,
+    pub(super) fn from_method(method: MethodId) -> Option<ReduceKind> {
+        Some(match method {
+            MethodId::ListSum => ReduceKind::Sum,
+            MethodId::ListAvg => ReduceKind::Avg,
+            MethodId::ListMax => ReduceKind::Max,
+            MethodId::ListMin => ReduceKind::Min,
             _ => return None,
         })
     }
@@ -53,12 +54,12 @@ pub(super) enum KeyedReduceKind {
 }
 
 impl KeyedReduceKind {
-    pub(super) fn from_str(name: &str) -> Option<KeyedReduceKind> {
-        Some(match name {
-            "sum_over" => KeyedReduceKind::SumOver,
-            "avg_over" => KeyedReduceKind::AvgOver,
-            "max_by" => KeyedReduceKind::MaxBy,
-            "min_by" => KeyedReduceKind::MinBy,
+    pub(super) fn from_method(method: MethodId) -> Option<KeyedReduceKind> {
+        Some(match method {
+            MethodId::ListSumOver => KeyedReduceKind::SumOver,
+            MethodId::ListAvgOver => KeyedReduceKind::AvgOver,
+            MethodId::ListMaxBy => KeyedReduceKind::MaxBy,
+            MethodId::ListMinBy => KeyedReduceKind::MinBy,
             _ => return None,
         })
     }

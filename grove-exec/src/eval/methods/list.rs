@@ -1,3 +1,4 @@
+use grove_query::methods::{self, MethodId};
 use grove_types::Span;
 
 use crate::error::ExecError;
@@ -5,11 +6,16 @@ use crate::eval::{EvalCtx, data::resolve_owning_values};
 use crate::value::{Scalar, Val};
 
 pub(super) fn eval_slice(
-    name: &str,
+    id: MethodId,
     base: Val,
     args: &[Val],
     span: Span,
 ) -> Result<Val, ExecError> {
+    let name = methods::method(id)
+        .names
+        .first()
+        .copied()
+        .unwrap_or("<list-method>");
     let mut items = match base {
         Val::List(items) => items,
         other => {
@@ -18,23 +24,23 @@ pub(super) fn eval_slice(
             });
         }
     };
-    let index_arg = |method: &str| -> Result<i64, ExecError> {
+    let index_arg = || -> Result<i64, ExecError> {
         let [arg] = args else {
             return Err(ExecError::Integrity {
-                message: format!("`{method}()` expects one argument (internal error)"),
+                message: format!("`{name}()` expects one argument (internal error)"),
             });
         };
         match arg {
             Val::Scalar(Scalar::Int(n)) => Ok(*n),
             _ => Err(ExecError::Integrity {
-                message: format!("`{method}()` expects an Int argument (internal error)"),
+                message: format!("`{name}()` expects an Int argument (internal error)"),
             }),
         }
     };
-    let result = match name {
+    let result = match id {
         // take/skip: negative bounds abort
-        "take" | "skip" => {
-            let n = index_arg(name)?;
+        MethodId::ListTake | MethodId::ListSkip => {
+            let n = index_arg()?;
             if n < 0 {
                 return Err(ExecError::Abort {
                     message: format!("`{name}()` called with negative bound {n}"),
@@ -42,21 +48,20 @@ pub(super) fn eval_slice(
                 });
             }
             let n = (n as usize).min(items.len());
-            if name == "take" {
+            if id == MethodId::ListTake {
                 items.truncate(n);
             } else {
                 items.drain(..n);
             }
             Val::List(items)
         }
-        // first: head or None
-        "first" => match items.into_iter().next() {
+        MethodId::ListFirst => match items.into_iter().next() {
             Some(head) => Val::Some(Box::new(head)),
             None => Val::None,
         },
-        // nth: 0-based, negative indices from back, out-of-range is None
-        "nth" => {
-            let n = index_arg(name)?;
+        // nth: 0-based, negative indices from back
+        MethodId::ListNth => {
+            let n = index_arg()?;
             let len = items.len() as i64;
             let index = if n >= 0 { n } else { len + n };
             if index < 0 || index >= len {

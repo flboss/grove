@@ -11,6 +11,7 @@ use crate::ast::{
     Arg, BinaryOp, Expr, Literal, MutationKind, MutationStmt, ProjectionItem, QueryFile, Statement,
     TypeExpr, TypeName, UnaryOp,
 };
+use crate::methods::{self, ArgCount, ArgSpec, ScopeSpec};
 use crate::typecheck::error::TypeError;
 use crate::typecheck::types::*;
 use grove_schema::validated::{Field, FieldId, ScalarType, StructId, ValidatedSchema, ValueType};
@@ -771,15 +772,11 @@ fn infer_tuple_access(
     ))
 }
 
-fn list_element_ty(ty: &QueryType) -> QueryType {
+fn element_ty(ty: &QueryType) -> QueryType {
     match ty {
-        QueryType::List(inner) => inner.as_ref().clone(),
+        QueryType::List(inner) | QueryType::Optional(inner) => inner.as_ref().clone(),
         _ => QueryType::Unknown,
     }
-}
-
-fn element_is_record(ty: &QueryType) -> bool {
-    matches!(ty, QueryType::List(inner) if matches!(inner.as_ref(), QueryType::Record(_)))
 }
 
 fn infer_method(
@@ -797,25 +794,26 @@ fn infer_method(
         }
     })?;
 
-    let mut signature =
-        method_signature(resolve_ty, name).ok_or_else(|| TypeError::UnknownMethod {
-            method: name.value.clone(),
-            base_ty: base.ty.to_string(),
-            span: name.span,
-        })?;
+    let def = methods::resolve(resolve_ty, name).ok_or_else(|| TypeError::UnknownMethod {
+        method: name.value.clone(),
+        base_ty: base.ty.to_string(),
+        span: name.span,
+    })?;
 
-    match &signature.args {
-        ArgCheck::Fixed(expected) => {
-            if args.len() != expected.len() {
+    let mut fixed_args = def.fixed_arg_types(resolve_ty);
+
+    match &def.args {
+        ArgSpec::Fixed(_) => {
+            if args.len() != fixed_args.len() {
                 return Err(TypeError::WrongArgCount {
                     method: name.value.clone(),
-                    expected: expected.len(),
+                    expected: fixed_args.len(),
                     got: args.len(),
                     span: name.span,
                 });
             }
         }
-        ArgCheck::Scoped { count, .. } => match count {
+        ArgSpec::Scoped { count, .. } => match count {
             ArgCount::Exact(n) => {
                 if args.len() != *n {
                     return Err(TypeError::WrongArgCount {
@@ -839,25 +837,22 @@ fn infer_method(
         },
     }
 
-    let (pushed_scope, pushed_element) = match (&signature.args, name.value.as_str()) {
-        (ArgCheck::Scoped { .. }, "map") => {
+    let (pushed_scope, pushed_element) = match def.scope {
+        ScopeSpec::None => (false, false),
+        ScopeSpec::ElementOfReceiver => {
             env.push_scope();
-            env.push_element(list_element_ty(resolve_ty));
+            env.push_element(element_ty(resolve_ty));
             (true, true)
         }
-        (ArgCheck::Scoped { .. }, _) => {
-            let pushed = env.push_record_fields(resolve_ty);
-            if element_is_record(resolve_ty) {
-                (pushed, false)
+        ScopeSpec::FieldsOrElement => {
+            if env.push_record_fields(resolve_ty) {
+                (true, false)
             } else {
-                if !pushed {
-                    env.push_scope();
-                }
-                env.push_element(list_element_ty(resolve_ty));
+                env.push_scope();
+                env.push_element(element_ty(resolve_ty));
                 (true, true)
             }
         }
-        _ => (false, false),
     };
 
     let mut typed_args = Vec::new();
@@ -870,9 +865,9 @@ fn infer_method(
                 break;
             }
         };
-        match &mut signature.args {
-            ArgCheck::Fixed(expected) => {
-                if let Some(exp_ty) = expected.get_mut(i)
+        match &def.args {
+            ArgSpec::Fixed(_) => {
+                if let Some(exp_ty) = fixed_args.get_mut(i)
                     && !types_compatible(&mut typed.ty, exp_ty, env.schema())
                 {
                     arg_error = Some(TypeError::ArgTypeMismatch {
@@ -884,7 +879,7 @@ fn infer_method(
                     break;
                 }
             }
-            ArgCheck::Scoped { constraint, .. } => {
+            ArgSpec::Scoped { constraint, .. } => {
                 if !constraint(&typed.ty) {
                     arg_error = Some(TypeError::ArgTypeMismatch {
                         method: name.value.clone(),
@@ -912,21 +907,14 @@ fn infer_method(
         return Err(err);
     }
 
-    let return_ty = match (name.value.as_str(), &signature.return_type) {
-        ("map", _) if !typed_args.is_empty() => {
-            QueryType::List(Box::new(typed_args[0].expr.ty.clone()))
-        }
-        (_, QueryType::Unknown) if !typed_args.is_empty() => {
-            typed_args[0].expr.ty.clone().wrap_optional()
-        }
-        _ => signature.return_type,
-    };
-
-    let return_ty = return_ty.wrap_optional_depth(opt_depth);
+    let return_ty = def
+        .return_type(resolve_ty, typed_args.first().map(|arg| &arg.expr.ty))
+        .wrap_optional_depth(opt_depth);
 
     let span = Span::new(base.span.start, name.span.end);
     Ok(env.typed(
         TypedExprKind::Method {
+            method: def.id,
             base: Box::new(base),
             name: name.clone(),
             args: typed_args,
@@ -1235,204 +1223,6 @@ fn record_schema_matches_projection(
         }
     }
     true
-}
-
-#[derive(Debug, Clone, Copy)]
-enum ArgCount {
-    Exact(usize),
-    AtLeast(usize),
-}
-
-#[derive(Debug, Clone)]
-enum ArgCheck {
-    Fixed(Vec<QueryType>),
-    Scoped {
-        count: ArgCount,
-        constraint: fn(&QueryType) -> bool,
-    },
-}
-
-#[derive(Debug, Clone)]
-struct MethodSig {
-    return_type: QueryType,
-    args: ArgCheck,
-}
-
-impl MethodSig {
-    fn fixed(return_type: QueryType, params: Vec<QueryType>) -> Self {
-        MethodSig {
-            return_type,
-            args: ArgCheck::Fixed(params),
-        }
-    }
-
-    fn no_args(return_type: QueryType) -> Self {
-        Self::fixed(return_type, vec![])
-    }
-
-    fn one_arg(return_type: QueryType, param: QueryType) -> Self {
-        Self::fixed(return_type, vec![param])
-    }
-
-    fn scoped_fixed(return_type: QueryType, n: usize, constraint: fn(&QueryType) -> bool) -> Self {
-        MethodSig {
-            return_type,
-            args: ArgCheck::Scoped {
-                count: ArgCount::Exact(n),
-                constraint,
-            },
-        }
-    }
-
-    fn scoped_at_least(
-        return_type: QueryType,
-        min: usize,
-        constraint: fn(&QueryType) -> bool,
-    ) -> Self {
-        MethodSig {
-            return_type,
-            args: ArgCheck::Scoped {
-                count: ArgCount::AtLeast(min),
-                constraint,
-            },
-        }
-    }
-}
-
-fn method_signature(base: &QueryType, method: &str) -> Option<MethodSig> {
-    use ScalarType::*;
-
-    match base {
-        QueryType::Scalar(s) => scalar_method(s, method),
-        QueryType::Optional(inner) => match method {
-            "unwrap" => Some(MethodSig::no_args(inner.as_ref().clone())),
-            "unwrap_or" => Some(MethodSig::one_arg(
-                inner.as_ref().clone(),
-                inner.as_ref().clone(),
-            )),
-            "is_none" | "is_some" => Some(MethodSig::no_args(QueryType::Scalar(Bool))),
-            _ => None,
-        },
-        QueryType::List(inner) => match method {
-            "len" => Some(MethodSig::no_args(QueryType::Scalar(Int))),
-            "first" => Some(MethodSig::no_args(inner.clone().wrap_optional())),
-            "nth" => Some(MethodSig::one_arg(
-                inner.clone().wrap_optional(),
-                QueryType::Scalar(Int),
-            )),
-            "flatten" if matches!(inner.as_ref(), QueryType::List(_)) => {
-                Some(MethodSig::no_args(inner.as_ref().clone()))
-            }
-            "extend" => Some(MethodSig::one_arg(
-                QueryType::List(inner.clone()),
-                QueryType::List(inner.clone()),
-            )),
-            "contains" => Some(MethodSig::one_arg(
-                QueryType::Scalar(Bool),
-                inner.as_ref().clone(),
-            )),
-            "filter" if matches!(inner.as_ref(), QueryType::Record(_)) => Some(
-                MethodSig::scoped_fixed(QueryType::List(inner.clone()), 1, QueryType::is_bool),
-            ),
-            "filter" => Some(MethodSig::scoped_fixed(
-                QueryType::List(inner.clone()),
-                1,
-                QueryType::is_bool,
-            )),
-            "map" => Some(MethodSig::scoped_fixed(QueryType::Unknown, 1, |_| true)),
-            "sum" if inner.is_summable() => Some(MethodSig::no_args(inner.clone().wrap_optional())),
-            "avg"
-                if inner.is_summable()
-                    || matches!(inner.as_ref(), QueryType::Scalar(ScalarType::Instant)) =>
-            {
-                Some(MethodSig::no_args(inner.clone().wrap_optional()))
-            }
-            "max" | "min" if inner.has_defined_order() => {
-                Some(MethodSig::no_args(inner.clone().wrap_optional()))
-            }
-            "sort" | "sort_asc" | "sort_desc" if inner.has_defined_order() => {
-                Some(MethodSig::no_args(QueryType::List(inner.clone())))
-            }
-            "sort_over" | "sort_asc_over" | "sort_desc_over" => Some(MethodSig::scoped_at_least(
-                QueryType::List(inner.clone()),
-                1,
-                QueryType::has_defined_order,
-            )),
-            "take" | "skip" => Some(MethodSig::one_arg(
-                QueryType::List(inner.clone()),
-                QueryType::Scalar(Int),
-            )),
-            "sum_over" => Some(MethodSig::scoped_fixed(
-                QueryType::Unknown,
-                1,
-                QueryType::is_summable,
-            )),
-            "avg_over" => Some(MethodSig::scoped_fixed(QueryType::Unknown, 1, |ty| {
-                ty.is_summable() || matches!(ty, QueryType::Scalar(ScalarType::Instant))
-            })),
-            "max_by" | "min_by" => Some(MethodSig::scoped_fixed(
-                inner.clone().wrap_optional(),
-                1,
-                QueryType::has_defined_order,
-            )),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-fn scalar_method(s: &ScalarType, method: &str) -> Option<MethodSig> {
-    use ScalarType::*;
-    match s {
-        String => match method {
-            "contains" | "starts_with" | "ends_with" => Some(MethodSig::one_arg(
-                QueryType::Scalar(Bool),
-                QueryType::Scalar(String),
-            )),
-            "to_upper" | "to_lower" => Some(MethodSig::no_args(QueryType::Scalar(String))),
-            "len" => Some(MethodSig::no_args(QueryType::Scalar(Int))),
-            _ => None,
-        },
-        Instant => match method {
-            "year" | "month" | "day" | "hour" | "minute" | "weekday" => {
-                Some(MethodSig::no_args(QueryType::Scalar(Int)))
-            }
-            "second" | "epoch" => Some(MethodSig::no_args(QueryType::Scalar(Dec))),
-            "to_rfc3339" => Some(MethodSig::no_args(QueryType::Scalar(String))),
-            _ => None,
-        },
-        Duration => match method {
-            "as_seconds" | "as_minutes" | "as_hours" | "as_days" => {
-                Some(MethodSig::no_args(QueryType::Scalar(Dec)))
-            }
-            _ => None,
-        },
-        Dec => match method {
-            "round_dp" => Some(MethodSig::one_arg(
-                QueryType::Scalar(Dec),
-                QueryType::Scalar(Int),
-            )),
-            "to_string" => Some(MethodSig::no_args(QueryType::Scalar(String))),
-            _ => None,
-        },
-        Int => match method {
-            "to_string" => Some(MethodSig::no_args(QueryType::Scalar(String))),
-            _ => None,
-        },
-        Float => match method {
-            "to_string" => Some(MethodSig::no_args(QueryType::Scalar(String))),
-            "round" | "floor" | "ceil" => Some(MethodSig::no_args(QueryType::Scalar(Float))),
-            _ => None,
-        },
-        Bool => match method {
-            "to_string" => Some(MethodSig::no_args(QueryType::Scalar(String))),
-            _ => None,
-        },
-        Bytes => match method {
-            "len" => Some(MethodSig::no_args(QueryType::Scalar(Int))),
-            _ => None,
-        },
-    }
 }
 
 fn check(

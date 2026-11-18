@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use grove_query::ast::{BinaryOp, Literal, SortDir, UnaryOp};
+use grove_query::methods::MethodId;
 use grove_query::typecheck::types::{
     IdentBinding, QueryType, RecordSource, TypedExpr, TypedExprKind, TypedMethodArg,
     TypedQueryFile, TypedStatement,
@@ -10,6 +11,7 @@ use grove_schema::validated::{Field, FieldId, ScalarType, StructId, ValidatedSch
 use grove_types::NodeId;
 
 use crate::eval::literals::{decode_literal, eval_type_constant};
+use crate::method_meta::{self, BaseNeed};
 use crate::value::{Scalar, Val, enum_variant_scalar};
 
 /// Backend-agnostic constraint set attached to a storage read
@@ -330,17 +332,18 @@ impl<'a> PlanBuilder<'a> {
                 None
             }
             TypedExprKind::Method {
+                method,
                 base,
-                name,
                 args,
                 opt_depth,
+                ..
             } => {
-                let base_need = method_base_need(name, need);
+                let base_need = method_base_need(*method, need);
                 let summary = self.visit(base, base_need);
                 for arg in args {
                     self.visit(&arg.expr, Need::Whole);
                 }
-                self.extend_chain(expr.id, name, *opt_depth, args, summary)
+                self.extend_chain(expr.id, *method, *opt_depth, args, summary)
             }
             TypedExprKind::Binary { lhs, rhs, .. } => {
                 self.visit(lhs, Need::Whole);
@@ -473,7 +476,7 @@ impl<'a> PlanBuilder<'a> {
     fn extend_chain(
         &mut self,
         node: NodeId,
-        method: &str,
+        method: MethodId,
         opt_depth: usize,
         args: &[TypedMethodArg],
         base: Option<ChainSummary>,
@@ -483,7 +486,7 @@ impl<'a> PlanBuilder<'a> {
             return None;
         }
         match method {
-            "filter" => {
+            MethodId::ListFilter => {
                 let [arg] = args else {
                     return None;
                 };
@@ -499,10 +502,16 @@ impl<'a> PlanBuilder<'a> {
                 }
                 Some(chain)
             }
-            "sort" | "sort_asc" | "sort_desc" | "sort_over" | "sort_asc_over"
-            | "sort_desc_over" => {
-                let keyed = matches!(method, "sort_over" | "sort_asc_over" | "sort_desc_over");
-                let default_desc = matches!(method, "sort_desc" | "sort_desc_over");
+            MethodId::ListSortAsc
+            | MethodId::ListSortDesc
+            | MethodId::ListSortAscOver
+            | MethodId::ListSortDescOver => {
+                let keyed = matches!(
+                    method,
+                    MethodId::ListSortAscOver | MethodId::ListSortDescOver
+                );
+                let default_desc =
+                    matches!(method, MethodId::ListSortDesc | MethodId::ListSortDescOver);
                 let keys = if keyed {
                     self.translate_sort(args, chain.struct_id, default_desc)
                 } else {
@@ -524,7 +533,7 @@ impl<'a> PlanBuilder<'a> {
                 }
                 Some(chain)
             }
-            "take" | "skip" => {
+            MethodId::ListTake | MethodId::ListSkip => {
                 let state = self.chains.get_mut(&chain.site)?;
                 state.cap_seen = true;
                 let Some(bound) = const_int_arg(args) else {
@@ -538,7 +547,7 @@ impl<'a> PlanBuilder<'a> {
                     state.cap_closed = true;
                     return None;
                 }
-                if method == "take" {
+                if method == MethodId::ListTake {
                     apply_take(state, bound);
                 } else {
                     apply_skip(state, bound);
@@ -552,7 +561,7 @@ impl<'a> PlanBuilder<'a> {
                 );
                 Some(chain)
             }
-            "first" => {
+            MethodId::ListFirst => {
                 let state = self.chains.get_mut(&chain.site)?;
                 state.cap_seen = true;
                 if !args.is_empty() {
@@ -569,7 +578,7 @@ impl<'a> PlanBuilder<'a> {
                 apply_take(state, 1);
                 Some(chain)
             }
-            "nth" => {
+            MethodId::ListNth => {
                 let state = self.chains.get_mut(&chain.site)?;
                 state.cap_seen = true;
                 let Some(index) = const_int_arg(args) else {
@@ -751,20 +760,25 @@ impl<'a> PlanBuilder<'a> {
                 Some(PushExpr::Not(Box::new(self.translate_expr(inner, source)?)))
             }
             TypedExprKind::Method {
+                method,
                 base,
-                name,
                 args,
                 opt_depth: 0,
+                ..
             } => {
                 let QueryType::Scalar(ScalarType::String) = &base.ty else {
                     return None;
                 };
-                match name.value.as_str() {
-                    "contains" | "starts_with" | "ends_with" if args.len() == 1 => {
-                        let op = match name.value.as_str() {
-                            "contains" => StringOp::Contains,
-                            "starts_with" => StringOp::StartsWith,
-                            "ends_with" => StringOp::EndsWith,
+                match method {
+                    MethodId::StringContains
+                    | MethodId::StringStartsWith
+                    | MethodId::StringEndsWith
+                        if args.len() == 1 =>
+                    {
+                        let op = match method {
+                            MethodId::StringContains => StringOp::Contains,
+                            MethodId::StringStartsWith => StringOp::StartsWith,
+                            MethodId::StringEndsWith => StringOp::EndsWith,
                             _ => unreachable!(),
                         };
                         Some(PushExpr::StringOp {
@@ -773,7 +787,7 @@ impl<'a> PlanBuilder<'a> {
                             needle: Box::new(self.translate_expr(&args[0].expr, source)?),
                         })
                     }
-                    "len" if args.is_empty() => Some(PushExpr::StringLen(Box::new(
+                    MethodId::StringLen if args.is_empty() => Some(PushExpr::StringLen(Box::new(
                         self.translate_expr(base, source)?,
                     ))),
                     _ => None,
@@ -813,15 +827,11 @@ fn expand_whole(schema: &ValidatedSchema, usage: &mut HashMap<StructId, FieldPla
     }
 }
 
-fn method_base_need(method: &str, output: Need) -> Need {
-    match method {
-        "map" | "sum_over" | "avg_over" | "max_by" | "min_by" | "sum" | "avg" | "max" | "min"
-        | "len" | "is_some" | "is_none" => Need::Narrow,
-        "contains" => Need::Whole,
-        "filter" | "sort" | "sort_asc" | "sort_desc" | "sort_over" | "sort_asc_over"
-        | "sort_desc_over" | "take" | "skip" | "first" | "nth" | "flatten" | "extend"
-        | "unwrap" | "unwrap_or" => output,
-        _ => Need::Whole,
+fn method_base_need(method: MethodId, output: Need) -> Need {
+    match method_meta::base_need(method) {
+        BaseNeed::Narrow => Need::Narrow,
+        BaseNeed::Whole => Need::Whole,
+        BaseNeed::Output => output,
     }
 }
 

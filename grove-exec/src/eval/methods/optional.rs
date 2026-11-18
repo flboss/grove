@@ -1,5 +1,6 @@
 use std::fmt;
 
+use grove_query::methods::MethodId;
 use grove_query::typecheck::types::TypedMethodArg;
 use grove_types::Span;
 
@@ -16,12 +17,12 @@ pub(super) enum OptMethodKind {
 }
 
 impl OptMethodKind {
-    pub(super) fn from_str(name: &str) -> Option<OptMethodKind> {
-        Some(match name {
-            "is_some" => OptMethodKind::IsSome,
-            "is_none" => OptMethodKind::IsNone,
-            "unwrap" => OptMethodKind::Unwrap,
-            "unwrap_or" => OptMethodKind::UnwrapOr,
+    pub(super) fn from_method(method: MethodId) -> Option<OptMethodKind> {
+        Some(match method {
+            MethodId::OptionalIsSome => OptMethodKind::IsSome,
+            MethodId::OptionalIsNone => OptMethodKind::IsNone,
+            MethodId::OptionalUnwrap => OptMethodKind::Unwrap,
+            MethodId::OptionalUnwrapOr => OptMethodKind::UnwrapOr,
             _ => return None,
         })
     }

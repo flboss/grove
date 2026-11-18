@@ -1,12 +1,14 @@
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+use grove_query::methods;
 use grove_query::typecheck::types::{IdentBinding, TypedExpr, TypedExprKind};
 use grove_schema::validated::{Field, FieldId, StructId, ValidatedSchema};
 use grove_types::NodeId;
 
 use crate::error::ExecError;
 use crate::eval::{EvalCtx, eval};
+use crate::method_meta;
 use crate::pushdown::FetchConstraints;
 use crate::storage::{Key, Row};
 use crate::value::{Val, rewrap_optional, unwrap_optional_depth};
@@ -432,10 +434,10 @@ fn collect_owning_refs_at(
             collect_owning_refs_at(base, schema, skip, frames, fields);
         }
         TypedExprKind::Method {
-            base, name, args, ..
+            method, base, args, ..
         } => {
             collect_owning_refs_at(base, schema, skip, frames, fields);
-            if is_scoped_method(name) {
+            if methods::method(*method).is_scoped() {
                 let nested = rooted_frame(base, schema, frames).is_some_and(|frame| frames[frame]);
                 frames.push(nested);
                 for arg in args {
@@ -493,47 +495,6 @@ fn collect_owning_refs_at(
     }
 }
 
-fn is_scoped_method(method: &str) -> bool {
-    matches!(
-        method,
-        "filter"
-            | "sort_over"
-            | "sort_asc_over"
-            | "sort_desc_over"
-            | "map"
-            | "sum_over"
-            | "avg_over"
-            | "max_by"
-            | "min_by"
-    )
-}
-
-/// Methods whose result is still made of the same underlying element values
-/// as their base
-fn is_element_preserving_method(method: &str) -> bool {
-    matches!(
-        method,
-        // subset
-        "filter"
-        // reordering
-            | "sort"
-            | "sort_asc"
-            | "sort_desc"
-            | "sort_over"
-            | "sort_asc_over"
-            | "sort_desc_over"
-        // subsequence
-            | "take"
-            | "skip"
-        // removes nesting level
-            | "flatten"
-        // single element exposed
-            | "first"
-            | "nth"
-            | "unwrap"
-    )
-}
-
 /// Frame from which `expr`'s value is reachable through `$`/owning Refs, if any
 fn rooted_frame(expr: &TypedExpr, schema: &ValidatedSchema, frames: &[bool]) -> Option<usize> {
     let current = frames.len().checked_sub(1)?;
@@ -561,7 +522,9 @@ fn rooted_frame(expr: &TypedExpr, schema: &ValidatedSchema, frames: &[bool]) -> 
                 || schema.field_is_ref_owning(field) == Some(true))
             .then_some(frame)
         }
-        TypedExprKind::Method { base, name, .. } if is_element_preserving_method(name) => {
+        TypedExprKind::Method { method, base, .. }
+            if method_meta::is_element_preserving(*method) =>
+        {
             rooted_frame(base, schema, frames)
         }
         _ => None,

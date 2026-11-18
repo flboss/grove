@@ -1,6 +1,7 @@
 pub mod codec;
 pub mod error;
 pub mod eval;
+pub(crate) mod method_meta;
 pub mod pushdown;
 pub mod sqlite;
 pub mod storage;

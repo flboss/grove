@@ -1,6 +1,7 @@
 use std::fmt;
 
 use crate::ast::{BinaryOp, ConstantName, Literal, SortDir, TypeName, UnaryOp};
+use crate::methods::MethodId;
 use grove_schema::validated::{
     EnumId, Field, FieldId, ScalarType, StructId, ValidatedSchema, ValueType,
 };
@@ -92,6 +93,7 @@ pub enum TypedExprKind {
         opt_depth: usize,
     },
     Method {
+        method: MethodId,
         base: Box<TypedExpr>,
         name: Spanned<String>,
         args: Vec<TypedMethodArg>,

@@ -224,12 +224,7 @@ pub fn eval(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
             index,
             opt_depth,
         } => eval_tuple_access(base, *index, *opt_depth, ctx),
-        TypedExprKind::Method {
-            base,
-            name,
-            args,
-            opt_depth,
-        } => eval_method(base, name, args, *opt_depth, expr.id, ctx, expr.span),
+        TypedExprKind::Method { .. } => eval_method(expr, ctx),
         TypedExprKind::Cast { expr: inner, ty } => {
             let value = eval(inner, ctx)?;
             eval_cast(value, ty.value, expr.span, ctx.schema)

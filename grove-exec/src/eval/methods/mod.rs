@@ -9,8 +9,8 @@ mod sort;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use grove_query::typecheck::types::{TypedExpr, TypedMethodArg};
-use grove_types::{NodeId, Span};
+use grove_query::methods::{self, MethodId};
+use grove_query::typecheck::types::{TypedExpr, TypedExprKind, TypedMethodArg};
 
 use self::filter::eval_filter;
 use self::list::{eval_extend, eval_flatten, eval_list_contains, eval_list_len, eval_slice};
@@ -25,15 +25,22 @@ use crate::error::ExecError;
 use crate::pushdown::CapRewrite;
 use crate::value::{Scalar, Val, rewrap_optional, unwrap_optional_depth};
 
-pub(super) fn eval_method(
-    base: &TypedExpr,
-    name: &str,
-    args: &[TypedMethodArg],
-    opt_depth: usize,
-    node: NodeId,
-    ctx: &mut EvalCtx<'_>,
-    span: Span,
-) -> Result<Val, ExecError> {
+pub(super) fn eval_method(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
+    let TypedExprKind::Method {
+        method,
+        base,
+        name,
+        args,
+        opt_depth,
+    } = &expr.kind
+    else {
+        unreachable!("eval_method called on a non-method expression");
+    };
+    let method = *method;
+    let opt_depth = *opt_depth;
+    let node = expr.id;
+    let span = expr.span;
+    let name = name.value.as_str();
     let base = eval(base, ctx)?;
     let base = resolve_base_link(ctx, base)?;
     let (base, peeled) = unwrap_optional_depth(base, opt_depth)?;
@@ -42,58 +49,92 @@ pub(super) fn eval_method(
     }
     if let Some(cap) = ctx.plan.cap_plan(node)
         && ctx.applied_triggers.contains(&cap.trigger)
-        && let (CapRewrite::Skip, "take" | "skip") = (cap.rewrite, name)
     {
-        return Ok(rewrap_optional(opt_depth, base));
-    }
-    if let Some(cap) = ctx.plan.cap_plan(node)
-        && ctx.applied_triggers.contains(&cap.trigger)
-        && let (CapRewrite::First, "nth") = (cap.rewrite, name)
-    {
-        return Ok(rewrap_optional(
-            opt_depth,
-            eval_slice("first", base, &[], span)?,
-        ));
+        match (cap.rewrite, method) {
+            (CapRewrite::Skip, MethodId::ListTake | MethodId::ListSkip) => {
+                return Ok(rewrap_optional(opt_depth, base));
+            }
+            (CapRewrite::First, MethodId::ListNth) => {
+                return Ok(rewrap_optional(
+                    opt_depth,
+                    eval_slice(MethodId::ListFirst, base, &[], span)?,
+                ));
+            }
+            _ => {}
+        }
     }
 
-    let result = if let Some(sort_kind) = SortKind::from_str(name) {
-        eval_sort(sort_kind, base, args, ctx, span)
-    } else if name == "filter" {
-        eval_filter(base, args, ctx)
-    } else if name == "map" {
-        eval_map(base, args, ctx)
-    } else if let Some(kind) = ReduceKind::from_str(name) {
-        eval_reduce(kind, base, ctx, span)
-    } else if let Some(kind) = KeyedReduceKind::from_str(name) {
-        eval_reduce_over(kind, base, args, ctx, span)
-    } else if let Some(opt_kind) = OptMethodKind::from_str(name) {
-        eval_optional(opt_kind, base, args, ctx, span)
-    } else {
-        let mut arg_vals = args
-            .iter()
-            .map(|arg| eval(&arg.expr, ctx))
-            .collect::<Result<Vec<_>, _>>()?;
-        if name == "flatten" {
-            eval_flatten(base)
-        } else if name == "extend" {
-            eval_extend(base, arg_vals)
-        } else if matches!(name, "take" | "skip" | "first" | "nth") {
-            eval_slice(name, base, &arg_vals, span)
-        } else if name == "len" && matches!(base, Val::List(_)) {
-            eval_list_len(base)
-        } else if name == "contains" && matches!(&base, Val::List(_)) {
+    let result = match method {
+        MethodId::ListSortAsc
+        | MethodId::ListSortDesc
+        | MethodId::ListSortAscOver
+        | MethodId::ListSortDescOver => eval_sort(
+            SortKind::from_method(method).expect("sort method id has a sort kind"),
+            base,
+            args,
+            ctx,
+            span,
+        ),
+        MethodId::ListFilter => eval_filter(base, args, ctx),
+        MethodId::ListMap => eval_map(base, args, ctx),
+        MethodId::ListSum | MethodId::ListAvg | MethodId::ListMax | MethodId::ListMin => {
+            eval_reduce(
+                ReduceKind::from_method(method).expect("reduce method id has a reduce kind"),
+                base,
+                ctx,
+                span,
+            )
+        }
+        MethodId::ListSumOver
+        | MethodId::ListAvgOver
+        | MethodId::ListMaxBy
+        | MethodId::ListMinBy => eval_reduce_over(
+            KeyedReduceKind::from_method(method).expect("reduce method id has a keyed reduce kind"),
+            base,
+            args,
+            ctx,
+            span,
+        ),
+        MethodId::OptionalIsSome
+        | MethodId::OptionalIsNone
+        | MethodId::OptionalUnwrap
+        | MethodId::OptionalUnwrapOr => eval_optional(
+            OptMethodKind::from_method(method).expect("optional method id has an optional kind"),
+            base,
+            args,
+            ctx,
+            span,
+        ),
+        MethodId::ListFlatten => eval_flatten(base),
+        MethodId::ListExtend => eval_extend(base, eval_args(args, ctx)?),
+        MethodId::ListTake | MethodId::ListSkip | MethodId::ListFirst | MethodId::ListNth => {
+            eval_slice(method, base, &eval_args(args, ctx)?, span)
+        }
+        MethodId::ListLen => eval_list_len(base),
+        MethodId::ListContains => {
+            let mut arg_vals = eval_args(args, ctx)?;
             let Some(needle) = arg_vals.pop() else {
                 return Err(ExecError::Integrity {
                     message: "`contains()` expects one argument (internal error)".to_string(),
                 });
             };
             eval_list_contains(ctx, base, needle)
-        } else {
-            eval_scalar_method(&base, name, &arg_vals, span).map(Val::Scalar)
         }
+        _ if methods::method(method).is_scalar_method() => {
+            eval_scalar_method(method, name, &base, &eval_args(args, ctx)?, span).map(Val::Scalar)
+        }
+        _ => Err(ExecError::Integrity {
+            message: format!("unknown method `{name}` (internal error)"),
+        }),
     };
 
     Ok(rewrap_optional(opt_depth, result?))
+}
+
+fn eval_args(args: &[TypedMethodArg], ctx: &mut EvalCtx<'_>) -> Result<Vec<Val>, ExecError> {
+    args.iter()
+        .map(|arg| eval(&arg.expr, ctx))
+        .collect::<Result<Vec<_>, _>>()
 }
 
 fn method_arg<'a>(args: &'a [Val], method: &str, index: usize) -> Result<&'a Val, ExecError> {

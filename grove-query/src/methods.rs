@@ -155,7 +155,7 @@ impl ReceiverSpec {
 }
 
 impl MethodDef {
-    pub fn arg_types(&self, receiver: &QueryType) -> Vec<QueryType> {
+    pub fn fixed_arg_types(&self, receiver: &QueryType) -> Vec<QueryType> {
         match &self.args {
             ArgSpec::Fixed(args) => args
                 .iter()
@@ -180,6 +180,14 @@ impl MethodDef {
                 .unwrap_or(QueryType::Unknown)
                 .wrap_optional(),
         }
+    }
+
+    pub fn is_scalar_method(&self) -> bool {
+        matches!(self.receiver, ReceiverSpec::Scalar(_))
+    }
+
+    pub fn is_scoped(&self) -> bool {
+        !matches!(self.scope, ScopeSpec::None)
     }
 }
 

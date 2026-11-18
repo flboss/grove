@@ -1,4 +1,5 @@
 use chrono::{DateTime, Datelike, SecondsFormat, Timelike, Utc};
+use grove_query::methods::MethodId;
 use grove_types::Span;
 use rust_decimal::{Decimal, RoundingStrategy};
 
@@ -34,60 +35,124 @@ fn duration_as(total_nanos: Decimal, divisor: i64) -> Scalar {
 }
 
 pub(super) fn eval_scalar_method(
-    base: &Val,
+    method: MethodId,
     name: &str,
+    base: &Val,
     args: &[Val],
     span: Span,
 ) -> Result<Scalar, ExecError> {
     let Val::Scalar(base) = base else {
         return Err(ExecError::Integrity {
-            message: format!("method `{}` on unsupported value (internal error)", name),
+            message: format!("method `{name}` on unsupported value (internal error)"),
         });
     };
-    match (base, name) {
-        (Scalar::String(s), "contains") => {
+    match method {
+        MethodId::StringContains => {
+            let Scalar::String(s) = base else {
+                return scalar_method_integrity(method, name, base);
+            };
             Ok(Scalar::Bool(s.contains(method_string_arg(args, name)?)))
         }
-        (Scalar::String(s), "starts_with") => {
+        MethodId::StringStartsWith => {
+            let Scalar::String(s) = base else {
+                return scalar_method_integrity(method, name, base);
+            };
             Ok(Scalar::Bool(s.starts_with(method_string_arg(args, name)?)))
         }
-        (Scalar::String(s), "ends_with") => {
+        MethodId::StringEndsWith => {
+            let Scalar::String(s) = base else {
+                return scalar_method_integrity(method, name, base);
+            };
             Ok(Scalar::Bool(s.ends_with(method_string_arg(args, name)?)))
         }
-        (Scalar::String(s), "to_upper") => Ok(Scalar::String(s.to_uppercase())),
-        (Scalar::String(s), "to_lower") => Ok(Scalar::String(s.to_lowercase())),
-        (Scalar::String(s), "len") => Ok(Scalar::Int(s.chars().count() as i64)),
-        (Scalar::Bytes(bytes), "len") => Ok(Scalar::Int(bytes.len() as i64)),
-        (Scalar::Instant(t), "year") => Ok(Scalar::Int(t.year() as i64)),
-        (Scalar::Instant(t), "month") => Ok(Scalar::Int(t.month() as i64)),
-        (Scalar::Instant(t), "day") => Ok(Scalar::Int(t.day() as i64)),
-        (Scalar::Instant(t), "hour") => Ok(Scalar::Int(t.hour() as i64)),
-        (Scalar::Instant(t), "minute") => Ok(Scalar::Int(t.minute() as i64)),
-        (Scalar::Instant(t), "weekday") => {
+        MethodId::StringToUpper => {
+            let Scalar::String(s) = base else {
+                return scalar_method_integrity(method, name, base);
+            };
+            Ok(Scalar::String(s.to_uppercase()))
+        }
+        MethodId::StringToLower => {
+            let Scalar::String(s) = base else {
+                return scalar_method_integrity(method, name, base);
+            };
+            Ok(Scalar::String(s.to_lowercase()))
+        }
+        MethodId::StringLen => {
+            let Scalar::String(s) = base else {
+                return scalar_method_integrity(method, name, base);
+            };
+            Ok(Scalar::Int(s.chars().count() as i64))
+        }
+        MethodId::BytesLen => {
+            let Scalar::Bytes(bytes) = base else {
+                return scalar_method_integrity(method, name, base);
+            };
+            Ok(Scalar::Int(bytes.len() as i64))
+        }
+        MethodId::InstantYear => {
+            let Scalar::Instant(t) = base else {
+                return scalar_method_integrity(method, name, base);
+            };
+            Ok(Scalar::Int(t.year() as i64))
+        }
+        MethodId::InstantMonth => {
+            let Scalar::Instant(t) = base else {
+                return scalar_method_integrity(method, name, base);
+            };
+            Ok(Scalar::Int(t.month() as i64))
+        }
+        MethodId::InstantDay => {
+            let Scalar::Instant(t) = base else {
+                return scalar_method_integrity(method, name, base);
+            };
+            Ok(Scalar::Int(t.day() as i64))
+        }
+        MethodId::InstantHour => {
+            let Scalar::Instant(t) = base else {
+                return scalar_method_integrity(method, name, base);
+            };
+            Ok(Scalar::Int(t.hour() as i64))
+        }
+        MethodId::InstantMinute => {
+            let Scalar::Instant(t) = base else {
+                return scalar_method_integrity(method, name, base);
+            };
+            Ok(Scalar::Int(t.minute() as i64))
+        }
+        MethodId::InstantWeekday => {
+            let Scalar::Instant(t) = base else {
+                return scalar_method_integrity(method, name, base);
+            };
             Ok(Scalar::Int(t.weekday().num_days_from_sunday() as i64))
         }
-        (Scalar::Instant(t), "second") => Ok(Scalar::Dec(second_dec(t))),
-        (Scalar::Instant(t), "epoch") => Ok(Scalar::Dec(epoch_dec(t))),
-        (Scalar::Instant(t), "to_rfc3339") => Ok(Scalar::String(
-            t.to_rfc3339_opts(SecondsFormat::AutoSi, true),
-        )),
-        (Scalar::Duration(d), "as_seconds") => Ok(duration_as(
-            Decimal::from_i128_with_scale(total_nanos(d), 0),
-            NANOS_PER_SEC as i64,
-        )),
-        (Scalar::Duration(d), "as_minutes") => Ok(duration_as(
-            Decimal::from_i128_with_scale(total_nanos(d), 0),
-            NANOS_PER_MIN as i64,
-        )),
-        (Scalar::Duration(d), "as_hours") => Ok(duration_as(
-            Decimal::from_i128_with_scale(total_nanos(d), 0),
-            NANOS_PER_HOUR as i64,
-        )),
-        (Scalar::Duration(d), "as_days") => Ok(duration_as(
-            Decimal::from_i128_with_scale(total_nanos(d), 0),
-            NANOS_PER_DAY as i64,
-        )),
-        (Scalar::Dec(d), "round_dp") => {
+        MethodId::InstantSecond => {
+            let Scalar::Instant(t) = base else {
+                return scalar_method_integrity(method, name, base);
+            };
+            Ok(Scalar::Dec(second_dec(t)))
+        }
+        MethodId::InstantEpoch => {
+            let Scalar::Instant(t) = base else {
+                return scalar_method_integrity(method, name, base);
+            };
+            Ok(Scalar::Dec(epoch_dec(t)))
+        }
+        MethodId::InstantToRfc3339 => {
+            let Scalar::Instant(t) = base else {
+                return scalar_method_integrity(method, name, base);
+            };
+            Ok(Scalar::String(
+                t.to_rfc3339_opts(SecondsFormat::AutoSi, true),
+            ))
+        }
+        MethodId::DurationAsSeconds => duration_method(method, name, base, NANOS_PER_SEC as i64),
+        MethodId::DurationAsMinutes => duration_method(method, name, base, NANOS_PER_MIN as i64),
+        MethodId::DurationAsHours => duration_method(method, name, base, NANOS_PER_HOUR as i64),
+        MethodId::DurationAsDays => duration_method(method, name, base, NANOS_PER_DAY as i64),
+        MethodId::DecRoundDp => {
+            let Scalar::Dec(d) = base else {
+                return scalar_method_integrity(method, name, base);
+            };
             let n = method_int_arg(args, name)?;
             if n < 0 {
                 return Err(ExecError::Abort {
@@ -104,24 +169,59 @@ pub(super) fn eval_scalar_method(
                 ))
             }
         }
-        (scalar, "to_string")
-            if matches!(
-                scalar,
-                Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool(_) | Scalar::Dec(_)
-            ) =>
-        {
-            Ok(Scalar::String(scalar.to_string()))
+        MethodId::DecToString
+        | MethodId::IntToString
+        | MethodId::FloatToString
+        | MethodId::BoolToString => match base {
+            Scalar::Dec(_) | Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool(_) => {
+                Ok(Scalar::String(base.to_string()))
+            }
+            _ => scalar_method_integrity(method, name, base),
+        },
+        MethodId::FloatRound => {
+            let Scalar::Float(x) = base else {
+                return scalar_method_integrity(method, name, base);
+            };
+            Ok(Scalar::Float(x.round()))
         }
-        (Scalar::Float(x), "round") => Ok(Scalar::Float(x.round())),
-        (Scalar::Float(x), "floor") => Ok(Scalar::Float(x.floor())),
-        (Scalar::Float(x), "ceil") => Ok(Scalar::Float(x.ceil())),
-        _ => Err(ExecError::Integrity {
-            message: format!(
-                "unknown method `{name}` for {} (internal error)",
-                base.kind_str(),
-            ),
-        }),
+        MethodId::FloatFloor => {
+            let Scalar::Float(x) = base else {
+                return scalar_method_integrity(method, name, base);
+            };
+            Ok(Scalar::Float(x.floor()))
+        }
+        MethodId::FloatCeil => {
+            let Scalar::Float(x) = base else {
+                return scalar_method_integrity(method, name, base);
+            };
+            Ok(Scalar::Float(x.ceil()))
+        }
+        _ => scalar_method_integrity(method, name, base),
     }
+}
+
+fn duration_method(
+    method: MethodId,
+    name: &str,
+    base: &Scalar,
+    divisor: i64,
+) -> Result<Scalar, ExecError> {
+    let Scalar::Duration(d) = base else {
+        return scalar_method_integrity(method, name, base);
+    };
+    Ok(duration_as(
+        Decimal::from_i128_with_scale(total_nanos(d), 0),
+        divisor,
+    ))
+}
+
+fn scalar_method_integrity<T>(method: MethodId, name: &str, base: &Scalar) -> Result<T, ExecError> {
+    Err(ExecError::Integrity {
+        message: format!(
+            "unknown method `{name}` ({method:?}) for {} (internal error)",
+            base.kind_str(),
+        ),
+    })
 }
 
 #[cfg(test)]

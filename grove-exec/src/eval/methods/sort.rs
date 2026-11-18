@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use std::fmt;
 
 use grove_query::ast::SortDir;
+use grove_query::methods::MethodId;
 use grove_query::typecheck::types::TypedMethodArg;
 use grove_types::Span;
 
@@ -22,12 +23,12 @@ pub(super) enum SortKind {
 }
 
 impl SortKind {
-    pub(super) fn from_str(name: &str) -> Option<SortKind> {
-        Some(match name {
-            "sort" | "sort_asc" => SortKind::Asc,
-            "sort_desc" => SortKind::Desc,
-            "sort_over" | "sort_asc_over" => SortKind::AscKeyed,
-            "sort_desc_over" => SortKind::DescKeyed,
+    pub(super) fn from_method(method: MethodId) -> Option<SortKind> {
+        Some(match method {
+            MethodId::ListSortAsc => SortKind::Asc,
+            MethodId::ListSortDesc => SortKind::Desc,
+            MethodId::ListSortAscOver => SortKind::AscKeyed,
+            MethodId::ListSortDescOver => SortKind::DescKeyed,
             _ => return None,
         })
     }
