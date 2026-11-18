@@ -343,7 +343,7 @@ impl fmt::Display for Scalar {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Scalar::Int(n) => write!(f, "{n}"),
-            Scalar::Float(x) => write!(f, "{x:?}"),
+            Scalar::Float(x) => write!(f, "{x:?}f"),
             Scalar::Dec(d) => write!(f, "{d}{}", if d.scale() == 0 { ".0" } else { "" }),
             Scalar::String(s) => write!(f, "{s:?}"),
             Scalar::Bytes(bytes) => {
@@ -519,8 +519,8 @@ mod tests {
     #[test]
     fn scalar_display() {
         assert_eq!(Scalar::Int(-7).to_string(), "-7");
-        assert_eq!(Scalar::Float(1.0).to_string(), "1.0");
-        assert_eq!(Scalar::Float(1.5).to_string(), "1.5");
+        assert_eq!(Scalar::Float(1.0).to_string(), "1.0f");
+        assert_eq!(Scalar::Float(1.5).to_string(), "1.5f");
         assert_eq!(Scalar::Bool(true).to_string(), "true");
         assert_eq!(Scalar::String("a\"b".to_string()).to_string(), "\"a\\\"b\"");
         assert_eq!(Scalar::Dec(dec!(30.00)).to_string(), "30.00");

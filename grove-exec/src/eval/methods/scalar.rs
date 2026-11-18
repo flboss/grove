@@ -343,8 +343,8 @@ mod tests {
     fn eval_scalar_to_string() {
         for (src, expected) in [
             ("42.to_string()", str("42")),
-            ("3.14f.to_string()", str("3.14")),
-            ("1.0f.to_string()", str("1.0")),
+            ("3.14f.to_string()", str("3.14f")),
+            ("1.0f.to_string()", str("1.0f")),
             ("true.to_string()", str("true")),
         ] {
             assert_eq!(run_src(src), Ok(expected), "{src}");
