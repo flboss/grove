@@ -14,9 +14,10 @@ use grove_query::typecheck::types::{TypedExpr, TypedExprKind, TypedMethodArg};
 
 use self::filter::eval_filter;
 use self::list::{
-    eval_list_compact, eval_list_contains, eval_list_extend, eval_list_flatten,
-    eval_list_is_unique, eval_list_join, eval_list_len, eval_list_reverse, eval_list_slice,
-    eval_list_transpose, eval_list_unique, eval_list_unique_over,
+    eval_list_all, eval_list_any, eval_list_compact, eval_list_contains, eval_list_extend,
+    eval_list_find, eval_list_flatten, eval_list_is_unique, eval_list_join, eval_list_len,
+    eval_list_reverse, eval_list_slice, eval_list_transpose, eval_list_unique,
+    eval_list_unique_over,
 };
 use self::map::{eval_list_map, eval_optional_map};
 use self::optional::{OptMethodKind, eval_optional, eval_optional_flatten};
@@ -88,6 +89,9 @@ pub(super) fn eval_method(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val
         MethodId::ListCompact => eval_list_compact(base),
         MethodId::ListTranspose => eval_list_transpose(base),
         MethodId::ListReverse => eval_list_reverse(base),
+        MethodId::ListAny => eval_list_any(base, args, ctx),
+        MethodId::ListAll => eval_list_all(base, args, ctx),
+        MethodId::ListFind => eval_list_find(base, args, ctx),
         MethodId::ListSum | MethodId::ListAvg | MethodId::ListMax | MethodId::ListMin => {
             eval_reduce(
                 ReduceKind::from_method(method).expect("reduce method id has a reduce kind"),

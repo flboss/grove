@@ -280,6 +280,94 @@ pub(super) fn eval_list_reverse(base: Val) -> Result<Val, ExecError> {
     Ok(Val::List(items))
 }
 
+pub(super) fn eval_list_any(
+    base: Val,
+    args: &[TypedMethodArg],
+    ctx: &mut EvalCtx<'_>,
+) -> Result<Val, ExecError> {
+    let items = predicate_items("any", base, args, ctx)?;
+    let [arg] = args else {
+        unreachable!("predicate_items validates the argument count");
+    };
+    for item in items {
+        if eval_scoped_predicate(ctx, arg, &item)? {
+            return Ok(Val::Scalar(Scalar::Bool(true)));
+        }
+    }
+    Ok(Val::Scalar(Scalar::Bool(false)))
+}
+
+pub(super) fn eval_list_all(
+    base: Val,
+    args: &[TypedMethodArg],
+    ctx: &mut EvalCtx<'_>,
+) -> Result<Val, ExecError> {
+    let items = predicate_items("all", base, args, ctx)?;
+    let [arg] = args else {
+        unreachable!("predicate_items validates the argument count");
+    };
+    for item in items {
+        if !eval_scoped_predicate(ctx, arg, &item)? {
+            return Ok(Val::Scalar(Scalar::Bool(false)));
+        }
+    }
+    Ok(Val::Scalar(Scalar::Bool(true)))
+}
+
+pub(super) fn eval_list_find(
+    base: Val,
+    args: &[TypedMethodArg],
+    ctx: &mut EvalCtx<'_>,
+) -> Result<Val, ExecError> {
+    let items = predicate_items("find", base, args, ctx)?;
+    let [arg] = args else {
+        unreachable!("predicate_items validates the argument count");
+    };
+    for item in items {
+        if eval_scoped_predicate(ctx, arg, &item)? {
+            return Ok(Val::Some(Box::new(item)));
+        }
+    }
+    Ok(Val::None)
+}
+
+fn predicate_items(
+    method: &str,
+    base: Val,
+    args: &[TypedMethodArg],
+    ctx: &mut EvalCtx<'_>,
+) -> Result<Vec<Val>, ExecError> {
+    let Val::List(mut items) = base else {
+        return Err(ExecError::Integrity {
+            message: format!("`{method}()` on non-list value: {base} (internal error)"),
+        });
+    };
+    let [arg] = args else {
+        return Err(ExecError::Integrity {
+            message: format!("`{method}()` expects one argument (internal error)"),
+        });
+    };
+    let fields = owning_refs_in(&arg.expr, ctx.schema, ctx.plan.prefetch_skip());
+    prefetch_owning(ctx, &mut items, &fields)?;
+    Ok(items)
+}
+
+fn eval_scoped_predicate(
+    ctx: &mut EvalCtx<'_>,
+    arg: &TypedMethodArg,
+    item: &Val,
+) -> Result<bool, ExecError> {
+    let map_element = push_element_scope(ctx, item);
+    let pred = eval(&arg.expr, ctx);
+    pop_element_scope(ctx, map_element);
+    match pred? {
+        Val::Scalar(Scalar::Bool(value)) => Ok(value),
+        other => Err(ExecError::Integrity {
+            message: format!("predicate evaluated to non-Bool: {other} (internal error)"),
+        }),
+    }
+}
+
 pub(super) fn eval_list_flatten(base: Val) -> Result<Val, ExecError> {
     let Val::List(items) = base else {
         return Err(ExecError::Integrity {
@@ -532,6 +620,25 @@ mod tests {
             Ok(Val::List(vec![int(3), int(2), int(1)]))
         );
         assert_eq!(run_src("[1, 2, 3].last() == some(3)"), Ok(bool(true)));
+    }
+
+    #[test]
+    fn method_any_all_find() {
+        assert_eq!(run_src("[1, 2, 3].any($ > 2)"), Ok(bool(true)));
+        assert_eq!(run_src("[1, 2, 3].all($ > 2)"), Ok(bool(false)));
+        assert_eq!(run_src("[1, 2, 3].all($ > 0)"), Ok(bool(true)));
+        assert_eq!(run_src("[1, 2, 3].find($ > 1)"), Ok(some(int(2))));
+        assert_eq!(run_src("[1, 2, 3].find($ > 9)"), Ok(Val::None));
+        assert_eq!(run_src("[1].skip(1).any($ > 0)"), Ok(bool(false)));
+        assert_eq!(run_src("[1].skip(1).all($ > 0)"), Ok(bool(true)));
+        assert_eq!(run_src("[1].skip(1).find($ > 0)"), Ok(Val::None));
+        assert_eq!(run_seeded("users.any(active)"), Ok(bool(true)));
+        assert_eq!(run_seeded("users.all(active)"), Ok(bool(false)));
+        assert_eq!(
+            run_seeded("users.find(name == \"Cyd\")?.name"),
+            Ok(some(str("Cyd")))
+        );
+        assert_eq!(run_seeded("users.find(name == \"Nobody\")"), Ok(Val::None));
     }
 
     #[test]

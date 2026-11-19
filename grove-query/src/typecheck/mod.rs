@@ -2698,6 +2698,18 @@ mod tests {
     }
 
     #[test]
+    fn list_predicate_methods() {
+        assert_eq!(
+            infer_ok("[1, 2].any($ > 0)", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Bool)
+        );
+        assert_eq!(
+            infer_ok("[1, 2].find($ > 0)", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Int).wrap_optional()
+        );
+    }
+
+    #[test]
     fn string_split_and_scalar_casts() {
         assert_eq!(
             infer_ok(r#""a,b".split(",")"#, &test_schema()).ty,

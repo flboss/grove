@@ -12,9 +12,8 @@ pub(crate) fn base_need(method: MethodId) -> BaseNeed {
 
     match method {
         ListMap | ListSumOver | ListAvgOver | ListMaxBy | ListMinBy | ListSum | ListAvg
-        | ListMax | ListMin | ListLen | StringLen | BytesLen | OptionalIsSome | OptionalIsNone => {
-            BaseNeed::Narrow
-        }
+        | ListMax | ListMin | ListLen | ListAny | ListAll | StringLen | BytesLen
+        | OptionalIsSome | OptionalIsNone => BaseNeed::Narrow,
         StringContains | ListContains | StringStartsWith | StringEndsWith | StringToUpper
         | StringToLower | StringConcat | StringSplit | StringTrim | StringTrimLeft
         | StringTrimRight | InstantYear | InstantMonth | InstantDay | InstantHour
@@ -23,9 +22,11 @@ pub(crate) fn base_need(method: MethodId) -> BaseNeed {
         | IntAbs | FloatAbs | DecAbs | DurationAbs | FloatIsNan | FloatIsFinite | FloatRound
         | FloatFloor | FloatCeil | ListJoin | ListUnique | ListIsUnique => BaseNeed::Whole,
         ListFilter | ListSortAsc | ListSortDesc | ListSortAscOver | ListSortDescOver | ListTake
-        | ListSkip | ListFirst | ListNth | ListLast | ListReverse | ListTakeBack | ListSkipBack
-        | ListFlatten | ListExtend | ListCompact | ListTranspose | ListUniqueOver
-        | OptionalUnwrap | OptionalUnwrapOr | OptionalMap | OptionalFlatten => BaseNeed::Output,
+        | ListSkip | ListFirst | ListNth | ListLast | ListReverse | ListFind | ListTakeBack
+        | ListSkipBack | ListFlatten | ListExtend | ListCompact | ListTranspose
+        | ListUniqueOver | OptionalUnwrap | OptionalUnwrapOr | OptionalMap | OptionalFlatten => {
+            BaseNeed::Output
+        }
     }
 }
 
@@ -43,6 +44,7 @@ pub(crate) fn is_element_preserving(method: MethodId) -> bool {
             | ListSkip
             | ListLast
             | ListReverse
+            | ListFind
             | ListTakeBack
             | ListSkipBack
             | ListFlatten
