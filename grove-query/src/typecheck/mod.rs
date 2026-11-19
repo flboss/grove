@@ -423,7 +423,7 @@ fn infer_cast(
     env: &mut TypeEnv,
 ) -> Result<TypedExpr, TypeError> {
     let mut typed_expr = infer(expr, env)?;
-    let span = Span::new(typed_expr.span.start, target.span.end);
+    let span = typed_expr.span.merge(target.span);
     let mut target_ty = resolve_type_expr(target, env.schema())?;
     // target_ty can never contain QueryType::Unknown, so it won't get
     // mutated in types_compatible() or check(); no clone necessary
@@ -470,10 +470,7 @@ fn infer_cast(
     Ok(env.typed(
         TypedExprKind::Cast {
             expr: Box::new(typed_expr),
-            ty: Spanned {
-                span: target.span,
-                value: target_name,
-            },
+            ty: Spanned::new(target.span, target_name),
         },
         target_ty,
         span,
@@ -514,7 +511,7 @@ fn infer_type_constant(
     };
 
     let result_ty = QueryType::Scalar(scalar_ty);
-    let span = Span::new(type_name.span.start, name.span.end);
+    let span = type_name.span.merge(name.span);
 
     Ok(env.typed(
         TypedExprKind::TypeConstant {
@@ -614,10 +611,7 @@ fn infer_projection(
         seen_names.insert(name.as_str(), name.span);
 
         typed_items.push(TypedProjectionItem {
-            alias: Spanned {
-                value: name.to_string(),
-                span: item.value.span(),
-            },
+            alias: Spanned::new(item.value.span(), name.to_string()),
             value: typed_value,
         });
     }
@@ -627,10 +621,7 @@ fn infer_projection(
             if seen_names.contains_key(field_name.as_str()) {
                 continue;
             }
-            let alias = Spanned {
-                value: field_name,
-                span: spread_span,
-            };
+            let alias = Spanned::new(spread_span, field_name);
             let value = Expr::Ident(alias);
             let typed_value = infer(&value, env)?;
             let Expr::Ident(alias) = value else {
@@ -720,7 +711,7 @@ fn infer_field(
     }
     let field_ty = field_ty.wrap_optional_depth(opt_depth);
 
-    let span = Span::new(base.span.start, name.span.end);
+    let span = base.span.merge(name.span);
     Ok(env.typed(
         TypedExprKind::Field {
             base: Box::new(base),
@@ -760,7 +751,7 @@ fn infer_tuple_access(
         });
     }
     let elem_ty = elems[pos].clone().wrap_optional_depth(opt_depth);
-    let span = Span::new(base.span.start, index.span.end);
+    let span = base.span.merge(index.span);
     Ok(env.typed(
         TypedExprKind::TupleAccess {
             base: Box::new(base),
@@ -911,7 +902,7 @@ fn infer_method(
         .return_type(resolve_ty, typed_args.first().map(|arg| &arg.expr.ty))
         .wrap_optional_depth(opt_depth);
 
-    let span = Span::new(base.span.start, name.span.end);
+    let span = base.span.merge(name.span);
     Ok(env.typed(
         TypedExprKind::Method {
             method: def.id,
@@ -933,7 +924,7 @@ fn infer_binary(
 ) -> Result<TypedExpr, TypeError> {
     let mut typed_lhs = infer(lhs, env)?;
     let mut typed_rhs = infer(rhs, env)?;
-    let span = Span::new(typed_lhs.span.start, typed_rhs.span.end);
+    let span = typed_lhs.span.merge(typed_rhs.span);
 
     let result_ty = match op.value {
         BinaryOp::In => infer_binary_in(&mut typed_lhs.ty, &mut typed_rhs.ty, span, env.schema())?,
@@ -1118,7 +1109,7 @@ fn infer_unary(
     env: &mut TypeEnv,
 ) -> Result<TypedExpr, TypeError> {
     let typed_expr = infer(expr, env)?;
-    let span = Span::new(op.span.start, typed_expr.span.end);
+    let span = op.span.merge(typed_expr.span);
 
     let result_ty = match op.value {
         UnaryOp::Neg => match &typed_expr.ty {
@@ -1562,10 +1553,7 @@ fn validate_insert(
         if is_optional {
             let schema_ty = QueryType::from(schema_field);
             let none_expr = env.typed(
-                TypedExprKind::Literal(Spanned {
-                    span: typed_arg.span,
-                    value: Literal::None,
-                }),
+                TypedExprKind::Literal(Spanned::new(typed_arg.span, Literal::None)),
                 schema_ty.clone(),
                 typed_arg.span,
             );
@@ -1579,10 +1567,7 @@ fn validate_insert(
                 TypedExprKind::Projection {
                     base: Box::new(env.typed(prev_arg_kind, cloned_ty, typed_arg.span)),
                     items: vec![TypedProjectionItem {
-                        alias: Spanned {
-                            value: expected_name.clone(),
-                            span: typed_arg.span,
-                        },
+                        alias: Spanned::new(typed_arg.span, expected_name.clone()),
                         value: none_expr,
                     }],
                 },

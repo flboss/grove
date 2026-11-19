@@ -52,10 +52,7 @@ impl<'src> Parser<'src> {
             match self.peek().value {
                 TokenKind::RBrace => break self.advance(),
                 TokenKind::Eof => {
-                    let span = Span {
-                        start: name.span.start,
-                        end: self.peek().span.start,
-                    };
+                    let span = Span::new(name.span.start, self.peek().span.start);
                     self.emit_error(SchemaParseError::UnclosedEnum { span });
                     return Err(());
                 }
@@ -69,10 +66,7 @@ impl<'src> Parser<'src> {
             }
         };
 
-        let span = Span {
-            start: name.span.start,
-            end: rbrace.span.end,
-        };
+        let span = name.span.merge(rbrace.span);
         if variants.is_empty() && self.diagnostics.len() == diagnostics_before {
             self.emit_error(SchemaParseError::EmptyEnum {
                 span,
@@ -80,10 +74,7 @@ impl<'src> Parser<'src> {
             });
         }
 
-        Ok(Spanned {
-            span,
-            value: EnumDef { name, variants },
-        })
+        Ok(Spanned::new(span, EnumDef { name, variants }))
     }
 
     fn parse_enum_variant(
@@ -175,10 +166,7 @@ impl<'src> Parser<'src> {
         value_spans.push((value.clone(), value_span));
         variants.push(EnumVariantDef {
             name,
-            value: Spanned {
-                span: value_span,
-                value,
-            },
+            value: Spanned::new(value_span, value),
         });
 
         match self.peek().value {

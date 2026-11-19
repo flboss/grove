@@ -216,10 +216,7 @@ impl<'src> Parser<'src> {
     fn expect_ident(&mut self) -> Result<Spanned<String>, Token> {
         let token = self.advance();
         match token.value {
-            TokenKind::Ident(s) => Ok(Spanned {
-                span: token.span,
-                value: s,
-            }),
+            TokenKind::Ident(s) => Ok(Spanned::new(token.span, s)),
             _ => Err(token),
         }
     }
@@ -235,7 +232,7 @@ impl<'src> Parser<'src> {
                     TokenKind::Ident(s) => s,
                     _ => unreachable!(),
                 };
-                Ok(Spanned { span, value: ident })
+                Ok(Spanned::new(span, ident))
             }
             _ => {
                 self.emit_error(err(span));
@@ -280,8 +277,8 @@ mod tests {
     fn duplicate_config_block() {
         let (_, diags) = parse_schema("config { } config { }");
         assert_eq!(codes(&diags), vec!["SP0011"]);
-        assert_eq!(diags[0].labels[0].span, Span { start: 11, end: 21 });
-        assert_eq!(diags[0].labels[1].span, Span { start: 0, end: 10 });
+        assert_eq!(diags[0].labels[0].span, Span::new(11, 21));
+        assert_eq!(diags[0].labels[1].span, Span::new(0, 10));
     }
 
     #[test]
@@ -289,7 +286,7 @@ mod tests {
         let (_, diags) = parse_schema("root users: U; root users: V;");
         assert_eq!(codes(&diags), vec!["SP0017"]);
         assert_eq!(diags[0].labels.len(), 2);
-        assert_eq!(diags[0].labels[0].span, Span { start: 15, end: 29 });
-        assert_eq!(diags[0].labels[1].span, Span { start: 0, end: 14 });
+        assert_eq!(diags[0].labels[0].span, Span::new(15, 29));
+        assert_eq!(diags[0].labels[1].span, Span::new(0, 14));
     }
 }

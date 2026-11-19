@@ -739,10 +739,7 @@ mod tests {
         let span = Span::new(0, 0);
         let expr = TypedExpr {
             kind: TypedExprKind::Ident {
-                name: Spanned {
-                    span,
-                    value: "xs".to_string(),
-                },
+                name: Spanned::new(span, "xs".to_string()),
                 binding: IdentBinding::Let,
                 depth: 0,
             },

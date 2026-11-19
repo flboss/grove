@@ -1041,7 +1041,7 @@ impl<'src> Lexer<'src> {
                 .chars()
                 .next()
                 .map_or(start, |ch| start + ch.len_utf8());
-            Span { start, end }
+            Span::new(start, end)
         };
 
         let error = match err {
@@ -1056,10 +1056,7 @@ impl<'src> Lexer<'src> {
                 }
             }
             BytesDecodeError::OddHexDigits => QueryLexError::BytesHexOddDigitCount {
-                span: Span {
-                    start: content_start,
-                    end: content_end,
-                },
+                span: Span::new(content_start, content_end),
             },
             BytesDecodeError::InvalidBase64Char { offset } => {
                 let ch = self.source[content_start + offset..]
@@ -1302,38 +1299,20 @@ impl<'src> Lexer<'src> {
     }
 
     fn span_from(&self, start: usize) -> Span {
-        Span {
-            start,
-            end: self.pos,
-        }
+        Span::new(start, self.pos)
     }
 
     fn span_current(&self) -> Span {
         let len = self.peek_char().map(char::len_utf8).unwrap_or(0);
-        Span {
-            start: self.pos,
-            end: self.pos + len,
-        }
+        Span::new(self.pos, self.pos + len)
     }
 
     fn make_eof(&self) -> Token {
-        Spanned {
-            span: Span {
-                start: self.pos,
-                end: self.pos,
-            },
-            value: TokenKind::Eof,
-        }
+        Spanned::new(Span::new(self.pos, self.pos), TokenKind::Eof)
     }
 
     fn make_token(&self, start: usize, kind: TokenKind) -> Token {
-        Spanned {
-            span: Span {
-                start,
-                end: self.pos,
-            },
-            value: kind,
-        }
+        Spanned::new(Span::new(start, self.pos), kind)
     }
 
     fn emit_error(&mut self, err: QueryLexError) {

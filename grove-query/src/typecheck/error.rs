@@ -1,5 +1,4 @@
-use crate::error::error_simple;
-use grove_types::{Diagnostic, Label, LabelStyle, Span};
+use grove_types::{Diagnostic, Span};
 
 #[rustfmt::skip]
 #[derive(Debug, Clone)]
@@ -42,7 +41,7 @@ pub enum TypeError {
 impl From<TypeError> for Diagnostic {
     fn from(err: TypeError) -> Self {
         match err {
-            TypeError::UnknownIdentifier { name, span } => error_simple(
+            TypeError::UnknownIdentifier { name, span } => Diagnostic::error(
                 "QT0001",
                 format!("unknown identifier `{name}`"),
                 span,
@@ -52,7 +51,7 @@ impl From<TypeError> for Diagnostic {
                 field,
                 base_ty,
                 span,
-            } => error_simple(
+            } => Diagnostic::error(
                 "QT0002",
                 format!("unknown field `{field}` on `{base_ty}`"),
                 span,
@@ -62,7 +61,7 @@ impl From<TypeError> for Diagnostic {
                 method,
                 base_ty,
                 span,
-            } => error_simple(
+            } => Diagnostic::error(
                 "QT0003",
                 format!("unknown method `{method}` on `{base_ty}`"),
                 span,
@@ -73,7 +72,7 @@ impl From<TypeError> for Diagnostic {
                 expected,
                 got,
                 span,
-            } => error_simple(
+            } => Diagnostic::error(
                 "QT0004",
                 format!("`{method}` expects {expected} argument(s), got {got}"),
                 span,
@@ -84,13 +83,13 @@ impl From<TypeError> for Diagnostic {
                 expected,
                 got,
                 span,
-            } => error_simple(
+            } => Diagnostic::error(
                 "QT0005",
                 format!("`{method}` argument type mismatch: expected {expected}, got {got}"),
                 span,
                 "type mismatch",
             ),
-            TypeError::AmbiguousType { span } => error_simple(
+            TypeError::AmbiguousType { span } => Diagnostic::error(
                 "QT0006",
                 "ambiguous type: cannot infer type without context",
                 span,
@@ -101,25 +100,25 @@ impl From<TypeError> for Diagnostic {
                 op,
                 right,
                 span,
-            } => error_simple(
+            } => Diagnostic::error(
                 "QT0007",
                 format!("invalid binary operation: cannot apply `{op}` to `{left}` and `{right}`"),
                 span,
                 "type mismatch",
             ),
-            TypeError::UnaryOpTypeMismatch { op, operand, span } => error_simple(
+            TypeError::UnaryOpTypeMismatch { op, operand, span } => Diagnostic::error(
                 "QT0008",
                 format!("invalid unary operation: cannot apply `{op}` to `{operand}`"),
                 span,
                 "type mismatch",
             ),
-            TypeError::InRequiresTuple { span } => error_simple(
+            TypeError::InRequiresTuple { span } => Diagnostic::error(
                 "QT0009",
                 "`in` requires a tuple on the right-hand side",
                 span,
                 "expected tuple",
             ),
-            TypeError::IfConditionNotBool { span } => error_simple(
+            TypeError::IfConditionNotBool { span } => Diagnostic::error(
                 "QT0011",
                 "`if` condition must be `Bool`",
                 span,
@@ -129,13 +128,13 @@ impl From<TypeError> for Diagnostic {
                 expected,
                 got,
                 span,
-            } => error_simple(
+            } => Diagnostic::error(
                 "QT0012",
                 format!("if branch type mismatch: expected `{expected}`, got `{got}`"),
                 span,
                 "type mismatch",
             ),
-            TypeError::InvalidCast { from, to, span } => error_simple(
+            TypeError::InvalidCast { from, to, span } => Diagnostic::error(
                 "QT0013",
                 format!("invalid cast: `{from}` cannot be cast to `{to}`"),
                 span,
@@ -145,7 +144,7 @@ impl From<TypeError> for Diagnostic {
                 expected,
                 got,
                 span,
-            } => error_simple(
+            } => Diagnostic::error(
                 "QT0014",
                 format!("array element type mismatch: expected `{expected}`, got `{got}`"),
                 span,
@@ -155,50 +154,46 @@ impl From<TypeError> for Diagnostic {
                 name,
                 span,
                 previous,
-            } => error_simple(
+            } => Diagnostic::error(
                 "QT0015",
                 format!("duplicate projection field name `{name}`"),
                 span,
                 "duplicate field",
             )
-            .with_label(Label {
-                span: previous,
-                message: "first defined here".into(),
-                style: LabelStyle::Secondary,
-            }),
-            TypeError::UnnamedComputedField { span } => error_simple(
+            .with_secondary_label(previous, "first defined here"),
+            TypeError::UnnamedComputedField { span } => Diagnostic::error(
                 "QT0016",
                 "computed projection field requires an explicit alias",
                 span,
                 "missing alias",
             ),
-            TypeError::ProjectionBaseNotRecord { got, span } => error_simple(
+            TypeError::ProjectionBaseNotRecord { got, span } => Diagnostic::error(
                 "QT0017",
                 format!("projection requires a Record or List<Record>, got `{got}`"),
                 span,
                 "expected record",
             ),
-            TypeError::EmptyProjection { span } => error_simple(
+            TypeError::EmptyProjection { span } => Diagnostic::error(
                 "QT0018",
                 "empty projection `{}` is not allowed",
                 span,
                 "empty projection",
             )
             .with_help("omit the projection to keep all fields"),
-            TypeError::MutationOnProjection { span } => error_simple(
+            TypeError::MutationOnProjection { span } => Diagnostic::error(
                 "QT0019",
                 "cannot mutate a projection",
                 span,
                 "mutation on projection",
             )
             .with_note("only materialized collections can be mutated"),
-            TypeError::MutationOnNonList { got, span } => error_simple(
+            TypeError::MutationOnNonList { got, span } => Diagnostic::error(
                 "QT0020",
                 format!("mutation base type incompatible, got `{got}`"),
                 span,
                 "expected list of records",
             ),
-            TypeError::InsertOnNonRoot { got, span } => error_simple(
+            TypeError::InsertOnNonRoot { got, span } => Diagnostic::error(
                 "QT0021",
                 format!("insert base must be a root collection, got `{got}`"),
                 span,
@@ -208,7 +203,7 @@ impl From<TypeError> for Diagnostic {
                 field,
                 struct_name,
                 span,
-            } => error_simple(
+            } => Diagnostic::error(
                 "QT0022",
                 format!("field `{field}` does not exist in struct `{struct_name}`"),
                 span,
@@ -218,7 +213,7 @@ impl From<TypeError> for Diagnostic {
                 field,
                 struct_name,
                 span,
-            } => error_simple(
+            } => Diagnostic::error(
                 "QT0023",
                 format!("missing required field `{field}` in struct `{struct_name}`"),
                 span,
@@ -230,13 +225,13 @@ impl From<TypeError> for Diagnostic {
                 expected,
                 got,
                 span,
-            } => error_simple(
+            } => Diagnostic::error(
                 "QT0024",
                 format!("type mismatch for field `{field}` in struct `{struct_name}`"),
                 span,
                 format!("expected `{expected}`, got `{got}`"),
             ),
-            TypeError::DuplicateStructField { name, span } => error_simple(
+            TypeError::DuplicateStructField { name, span } => Diagnostic::error(
                 "QT0025",
                 format!("duplicate field name `{name}` in struct literal"),
                 span,
@@ -246,7 +241,7 @@ impl From<TypeError> for Diagnostic {
                 field,
                 struct_name,
                 span,
-            } => error_simple(
+            } => Diagnostic::error(
                 "QT0026",
                 format!("field `{field}` in struct `{struct_name}` not supported in mutation"),
                 span,
@@ -259,25 +254,25 @@ impl From<TypeError> for Diagnostic {
                 expected,
                 got,
                 span,
-            } => error_simple(
+            } => Diagnostic::error(
                 "QT0027",
                 format!("type mismatch: expected {expected}, found {got}"),
                 span,
                 format!("expected {expected}"),
             ),
-            TypeError::TupleAccessOnNonTuple { base_ty, span } => error_simple(
+            TypeError::TupleAccessOnNonTuple { base_ty, span } => Diagnostic::error(
                 "QT0028",
                 format!("tuple index access on `{base_ty}`"),
                 span,
                 "only tuples support `.N` access",
             ),
-            TypeError::TupleIndexOutOfRange { index, len, span } => error_simple(
+            TypeError::TupleIndexOutOfRange { index, len, span } => Diagnostic::error(
                 "QT0029",
                 format!("tuple index `.{index}` out of range for tuple of length {len}"),
                 span,
                 format!("valid indices are .0 through .{}", len - 1),
             ),
-            TypeError::UnknownEnum { name, span } => error_simple(
+            TypeError::UnknownEnum { name, span } => Diagnostic::error(
                 "QT0030",
                 format!("unknown enum `{name}`"),
                 span,
@@ -287,25 +282,25 @@ impl From<TypeError> for Diagnostic {
                 enum_name,
                 variant,
                 span,
-            } => error_simple(
+            } => Diagnostic::error(
                 "QT0031",
                 format!("enum `{enum_name}` has no variant `{variant}`"),
                 span,
                 "no such variant",
             ),
-            TypeError::OptionalDepthMismatch { depth, ty, span } => error_simple(
+            TypeError::OptionalDepthMismatch { depth, ty, span } => Diagnostic::error(
                 "QT0032",
                 format!("optional chaining depth {depth} exceeds the optional layers in `{ty}`"),
                 span,
                 format!("needs {depth} optional layer(s)"),
             ),
-            TypeError::UnknownTypeName { name, span } => error_simple(
+            TypeError::UnknownTypeName { name, span } => Diagnostic::error(
                 "QT0033",
                 format!("unknown type `{name}`"),
                 span,
                 "no such type",
             ),
-            TypeError::AmbiguousCast { from, to, span } => error_simple(
+            TypeError::AmbiguousCast { from, to, span } => Diagnostic::error(
                 "QT0034",
                 format!("cannot disambiguate `{from}` as `{to}`"),
                 span,

@@ -74,10 +74,7 @@ impl<'src> Lexer<'src> {
                 '`' => self.scan_backtick_ident(start),
                 _ => {
                     self.emit_error(SchemaParseError::UnexpectedChar {
-                        span: Span {
-                            start,
-                            end: self.pos,
-                        },
+                        span: Span::new(start, self.pos),
                         ch,
                     });
                     continue; // try again from next char
@@ -160,10 +157,7 @@ impl<'src> Lexer<'src> {
 
         // Lone '-' is an error
         self.emit_error(SchemaParseError::UnexpectedChar {
-            span: Span {
-                start,
-                end: self.pos,
-            },
+            span: Span::new(start, self.pos),
             ch: '-',
         });
         self.advance()
@@ -182,10 +176,7 @@ impl<'src> Lexer<'src> {
             Ok(value) => self.make_token(start, TokenKind::IntLit(value)),
             Err(_) => {
                 self.emit_error(SchemaParseError::IntLiteralOverflow {
-                    span: Span {
-                        start,
-                        end: self.pos,
-                    },
+                    span: Span::new(start, self.pos),
                 });
                 self.advance()
             }
@@ -210,10 +201,7 @@ impl<'src> Lexer<'src> {
         }
 
         self.emit_error(SchemaParseError::UnclosedString {
-            span: Span {
-                start,
-                end: self.pos,
-            },
+            span: Span::new(start, self.pos),
         });
         let content = self.source[content_start..self.pos].to_string();
         self.make_token(start, TokenKind::StringLit(content))
@@ -237,10 +225,7 @@ impl<'src> Lexer<'src> {
         }
 
         self.emit_error(SchemaParseError::UnclosedBacktickIdent {
-            span: Span {
-                start,
-                end: self.pos,
-            },
+            span: Span::new(start, self.pos),
         });
         let content = self.source[content_start..self.pos].to_string();
         self.make_token(start, TokenKind::Ident(content))
@@ -269,23 +254,11 @@ impl<'src> Lexer<'src> {
     }
 
     fn make_eof(&self) -> Token {
-        Spanned {
-            span: Span {
-                start: self.pos,
-                end: self.pos,
-            },
-            value: TokenKind::Eof,
-        }
+        Spanned::new(Span::new(self.pos, self.pos), TokenKind::Eof)
     }
 
     fn make_token(&self, start: usize, kind: TokenKind) -> Token {
-        Spanned {
-            span: Span {
-                start,
-                end: self.pos,
-            },
-            value: kind,
-        }
+        Spanned::new(Span::new(start, self.pos), kind)
     }
 
     fn emit_error(&mut self, err: SchemaParseError) {

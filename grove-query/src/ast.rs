@@ -151,10 +151,7 @@ impl Expr {
             Expr::Literal(lit) => lit.span,
             Expr::Ident(name) => name.span,
             Expr::EnumVariant { span, .. } => *span,
-            Expr::TypeConstant { ty, name } => Span {
-                start: ty.span.start,
-                end: name.span.end,
-            },
+            Expr::TypeConstant { ty, name } => ty.span.merge(name.span),
             Expr::Array { span, .. }
             | Expr::Tuple { span, .. }
             | Expr::Some { span, .. }

@@ -32,10 +32,7 @@ impl<'src> Parser<'src> {
             match self.peek().value {
                 TokenKind::RBrace => break self.advance(),
                 TokenKind::Eof => {
-                    let struct_span = Span {
-                        start: name.span.start,
-                        end: self.peek().span.start,
-                    };
+                    let struct_span = Span::new(name.span.start, self.peek().span.start);
                     self.emit_error(SchemaParseError::UnclosedStruct { span: struct_span });
                     return Err(());
                 }
@@ -43,13 +40,10 @@ impl<'src> Parser<'src> {
             }
         };
 
-        Ok(Spanned {
-            span: Span {
-                start: name.span.start,
-                end: rbrace.span.end,
-            },
-            value: StructDef { name, fields },
-        })
+        Ok(Spanned::new(
+            name.span.merge(rbrace.span),
+            StructDef { name, fields },
+        ))
     }
 
     fn parse_field(
@@ -203,10 +197,7 @@ impl<'src> Parser<'src> {
         if self.peek().value == TokenKind::Question {
             let question = self.advance();
             let inner = self.parse_base_type_expr(skip_via)?;
-            let span = Span {
-                start: question.span.start,
-                end: inner.span().end,
-            };
+            let span = question.span.merge(inner.span());
             Ok(TypeExpr::Optional {
                 inner: Box::new(inner),
                 span,
@@ -245,10 +236,7 @@ impl<'src> Parser<'src> {
                 let TokenKind::Ident(s) = tok.value else {
                     unreachable!()
                 };
-                Ok(TypeExpr::Named(Spanned {
-                    span: tok.span,
-                    value: s,
-                }))
+                Ok(TypeExpr::Named(Spanned::new(tok.span, s)))
             }
             TokenKind::List => self.parse_list_type(skip_via),
             TokenKind::LParen => self.parse_paren_tuple(),
@@ -284,10 +272,7 @@ impl<'src> Parser<'src> {
         Ok(TypeExpr::List {
             element,
             via,
-            span: Span {
-                start: kw_tok.span.start,
-                end: rangle.span.end,
-            },
+            span: kw_tok.span.merge(rangle.span),
         })
     }
 
@@ -350,10 +335,7 @@ impl<'src> Parser<'src> {
         };
         Ok(TypeExpr::Tuple {
             elements,
-            span: Span {
-                start: kw_tok.span.start,
-                end: rparen.span.end,
-            },
+            span: kw_tok.span.merge(rparen.span),
         })
     }
 

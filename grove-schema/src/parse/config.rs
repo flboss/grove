@@ -31,10 +31,7 @@ impl<'src> Parser<'src> {
             match self.peek().value {
                 TokenKind::RBrace => break self.advance(),
                 TokenKind::Eof => {
-                    let block_span = Span {
-                        start: lbrace.span.start,
-                        end: self.peek().span.start,
-                    };
+                    let block_span = Span::new(lbrace.span.start, self.peek().span.start);
                     self.emit_error(SchemaParseError::UnclosedConfig { span: block_span });
                     return Err(());
                 }
@@ -44,13 +41,7 @@ impl<'src> Parser<'src> {
 
         // TODO: warning if empty block
 
-        Ok(Spanned {
-            span: Span {
-                start: lbrace.span.start,
-                end: rbrace.span.end,
-            },
-            value: block,
-        })
+        Ok(Spanned::new(lbrace.span.merge(rbrace.span), block))
     }
 
     fn parse_config_entry(&mut self, block: &mut ConfigBlock) -> PResult<()> {
@@ -235,10 +226,7 @@ impl<'src> Parser<'src> {
                 previous: previous.span,
             });
         } else {
-            *slot = Some(Spanned {
-                span: tok.span,
-                value,
-            });
+            *slot = Some(Spanned::new(tok.span, value));
         }
     }
 
@@ -454,7 +442,7 @@ mod tests {
     fn invalid_int_arithmetic_value() {
         let (_, diags) = parse_schema(r#"config { int_arithmetic = "bogus" }"#);
         assert_eq!(codes(&diags), vec!["SP0007"]);
-        assert_eq!(diags[0].labels[0].span, Span { start: 26, end: 33 });
+        assert_eq!(diags[0].labels[0].span, Span::new(26, 33));
     }
 
     #[test]

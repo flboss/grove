@@ -1,7 +1,7 @@
 use crate::ast::RootCollection;
 use crate::error::SchemaParseError;
 use crate::token::TokenKind;
-use grove_types::{Span, Spanned};
+use grove_types::Spanned;
 
 use super::{PResult, Parser};
 
@@ -59,17 +59,14 @@ impl<'src> Parser<'src> {
             }
         };
 
-        Ok(Spanned {
-            span: Span {
-                start: name.span.start,
-                end: semicolon.span.end,
-            },
-            value: RootCollection {
+        Ok(Spanned::new(
+            name.span.merge(semicolon.span),
+            RootCollection {
                 name,
                 table,
                 struct_name,
             },
-        })
+        ))
     }
 }
 

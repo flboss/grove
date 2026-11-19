@@ -53,16 +53,5 @@ pub fn print(source: &str, name: &str, diagnostics: &[Diagnostic]) {
 }
 
 pub fn abort(message: String, span: Span) -> Diagnostic {
-    Diagnostic {
-        severity: Severity::Error,
-        code: "R0001".into(),
-        message: message.into(),
-        labels: vec![grove_types::Label {
-            span,
-            message: "query aborted here".into(),
-            style: LabelStyle::Primary,
-        }],
-        notes: Vec::new(),
-        help: Vec::new(),
-    }
+    Diagnostic::error("R0001", message, span, "query aborted here")
 }

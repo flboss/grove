@@ -14,6 +14,18 @@ impl Span {
     pub fn range(&self) -> Range<usize> {
         self.start..self.end
     }
+
+    pub fn merge(self, other: Span) -> Span {
+        Span::new(self.start.min(other.start), self.end.max(other.end))
+    }
+
+    pub fn len(self) -> usize {
+        self.end.saturating_sub(self.start)
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.len() == 0
+    }
 }
 
 impl From<Range<usize>> for Span {
@@ -33,6 +45,10 @@ pub struct Spanned<T> {
 }
 
 impl<T> Spanned<T> {
+    pub fn new(span: Span, value: T) -> Spanned<T> {
+        Spanned { span, value }
+    }
+
     pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Spanned<U> {
         Spanned {
             span: self.span,
@@ -88,6 +104,54 @@ pub struct Diagnostic {
 }
 
 impl Diagnostic {
+    pub fn error(
+        code: impl Into<DiagStr>,
+        message: impl Into<DiagStr>,
+        span: Span,
+        label: impl Into<DiagStr>,
+    ) -> Self {
+        Diagnostic {
+            severity: Severity::Error,
+            code: code.into(),
+            message: message.into(),
+            labels: vec![Label {
+                span,
+                message: label.into(),
+                style: LabelStyle::Primary,
+            }],
+            notes: Vec::new(),
+            help: Vec::new(),
+        }
+    }
+
+    pub fn warning(
+        code: impl Into<DiagStr>,
+        message: impl Into<DiagStr>,
+        span: Span,
+        label: impl Into<DiagStr>,
+    ) -> Self {
+        Diagnostic {
+            severity: Severity::Warning,
+            code: code.into(),
+            message: message.into(),
+            labels: vec![Label {
+                span,
+                message: label.into(),
+                style: LabelStyle::Primary,
+            }],
+            notes: Vec::new(),
+            help: Vec::new(),
+        }
+    }
+
+    pub fn with_secondary_label(self, span: Span, message: impl Into<DiagStr>) -> Self {
+        self.with_label(Label {
+            span,
+            message: message.into(),
+            style: LabelStyle::Secondary,
+        })
+    }
+
     pub fn with_label(mut self, label: Label) -> Self {
         self.labels.push(label);
         self
@@ -101,5 +165,20 @@ impl Diagnostic {
     pub fn with_help(mut self, help: impl Into<DiagStr>) -> Self {
         self.help.push(help.into());
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn span_helpers() {
+        let a = Span::new(2, 5);
+        let b = Span::new(7, 9);
+        assert_eq!(a.merge(b), Span::new(2, 9));
+        assert_eq!(a.len(), 3);
+        assert!(!a.is_empty());
+        assert!(Span::new(2, 2).is_empty());
     }
 }

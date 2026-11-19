@@ -1,6 +1,4 @@
-use grove_types::{Diagnostic, Label, LabelStyle, Span};
-
-use crate::error::error_simple;
+use grove_types::{Diagnostic, Span};
 
 #[derive(Debug, Clone)]
 pub enum SchemaValidationError {
@@ -131,18 +129,14 @@ impl From<SchemaValidationError> for Diagnostic {
                 let (first, rest) = occurrences
                     .split_first()
                     .expect("an unknown type reference always has at least one occurrence");
-                let mut diag = error_simple(
+                let mut diag = Diagnostic::error(
                     "SV0001",
                     format!("unknown type reference `{name}`"),
                     *first,
                     "unknown type",
                 );
                 for span in rest {
-                    diag = diag.with_label(Label {
-                        span: *span,
-                        message: "also referenced here".into(),
-                        style: LabelStyle::Secondary,
-                    });
+                    diag = diag.with_secondary_label(*span, "also referenced here");
                 }
                 diag
             }
@@ -150,7 +144,7 @@ impl From<SchemaValidationError> for Diagnostic {
                 let (first, rest) = occurrences
                     .split_first()
                     .expect("an invalid reference always has at least one occurrence");
-                let mut diag = error_simple(
+                let mut diag = Diagnostic::error(
                     "SV0025",
                     format!("enum `{name}` cannot be used as a struct"),
                     *first,
@@ -158,22 +152,18 @@ impl From<SchemaValidationError> for Diagnostic {
                 )
                 .with_help("roots and relation endpoints must name structs, not enums");
                 for span in rest {
-                    diag = diag.with_label(Label {
-                        span: *span,
-                        message: "also used as a struct here".into(),
-                        style: LabelStyle::Secondary,
-                    });
+                    diag = diag.with_secondary_label(*span, "also used as a struct here");
                 }
                 diag
             }
-            TableMismatch { span, name, tables } => error_simple(
+            TableMismatch { span, name, tables } => Diagnostic::error(
                 "SV0003",
                 format!("struct `{name}` maps to multiple tables"),
                 span,
                 "conflicting table mappings",
             )
             .with_note(format!("candidate tables: {}", tables.join(", "))),
-            StructNoTable { span, name } => error_simple(
+            StructNoTable { span, name } => Diagnostic::error(
                 "SV0004",
                 format!("struct `{name}` has no underlying table"),
                 span,
@@ -184,39 +174,31 @@ impl From<SchemaValidationError> for Diagnostic {
                 span,
                 name,
                 previous,
-            } => error_simple(
+            } => Diagnostic::error(
                 "SV0005",
                 format!("duplicate table `{name}`"),
                 span,
                 "table already declared",
             )
-            .with_label(Label {
-                span: previous,
-                message: "first declared here".into(),
-                style: LabelStyle::Secondary,
-            }),
+            .with_secondary_label(previous, "first declared here"),
             DuplicateColumn {
                 table,
                 name,
                 span,
                 previous,
-            } => error_simple(
+            } => Diagnostic::error(
                 "SV0006",
                 format!("duplicate column `{table}.{name}`"),
                 span,
                 "column already declared",
             )
-            .with_label(Label {
-                span: previous,
-                message: "first declared here".into(),
-                style: LabelStyle::Secondary,
-            }),
+            .with_secondary_label(previous, "first declared here"),
             NestedStructRef {
                 span,
                 struct_name,
                 field,
                 nested,
-            } => error_simple(
+            } => Diagnostic::error(
                 "SV0007",
                 format!(
                     "field `{struct_name}.{field}` nests a struct reference inside a value type"
@@ -224,11 +206,7 @@ impl From<SchemaValidationError> for Diagnostic {
                 span,
                 "struct in a value position",
             )
-            .with_label(Label {
-                span: nested,
-                message: "nested struct reference".into(),
-                style: LabelStyle::Secondary,
-            })
+            .with_secondary_label(nested, "nested struct reference")
             .with_help(
                 "struct references are only valid as a standalone `S`, `?S`, or `List<S>` field",
             ),
@@ -236,7 +214,7 @@ impl From<SchemaValidationError> for Diagnostic {
                 span,
                 struct_name,
                 field,
-            } => error_simple(
+            } => Diagnostic::error(
                 "SV0008",
                 format!(
                     "field `{struct_name}.{field}` attaches a `via` storage table to a list of \
@@ -253,7 +231,7 @@ impl From<SchemaValidationError> for Diagnostic {
                 field,
                 declared,
                 expected,
-            } => error_simple(
+            } => Diagnostic::error(
                 "SV0009",
                 format!(
                     "field `{struct_name}.{field}` maps {declared} column(s) but its type needs \
@@ -262,11 +240,7 @@ impl From<SchemaValidationError> for Diagnostic {
                 span,
                 format!("type needs {expected} column(s)"),
             )
-            .with_label(Label {
-                span: columns,
-                message: format!("{declared} column(s) provided").into(),
-                style: LabelStyle::Secondary,
-            }),
+            .with_secondary_label(columns, format!("{declared} column(s) provided")),
             ViaArityMismatch {
                 span,
                 columns,
@@ -274,7 +248,7 @@ impl From<SchemaValidationError> for Diagnostic {
                 field,
                 declared,
                 expected,
-            } => error_simple(
+            } => Diagnostic::error(
                 "SV0010",
                 format!(
                     "field `{struct_name}.{field}` lists {declared} value column(s) in its \
@@ -283,16 +257,12 @@ impl From<SchemaValidationError> for Diagnostic {
                 span,
                 format!("type needs {expected} column(s)"),
             )
-            .with_label(Label {
-                span: columns,
-                message: format!("{declared} column(s) provided").into(),
-                style: LabelStyle::Secondary,
-            }),
+            .with_secondary_label(columns, format!("{declared} column(s) provided")),
             NoViaScalarList {
                 span,
                 struct_name,
                 field,
-            } => error_simple(
+            } => Diagnostic::error(
                 "SV0011",
                 format!(
                     "field `{struct_name}.{field}` is a list of values without a `via` storage \
@@ -306,7 +276,7 @@ impl From<SchemaValidationError> for Diagnostic {
                 span,
                 struct_name,
                 field,
-            } => error_simple(
+            } => Diagnostic::error(
                 "SV0012",
                 format!(
                     "field `{struct_name}.{field}` is a struct reference that cannot be \
@@ -320,7 +290,7 @@ impl From<SchemaValidationError> for Diagnostic {
                 span,
                 struct_name,
                 field,
-            } => error_simple(
+            } => Diagnostic::error(
                 "SV0013",
                 format!("relation endpoint `{struct_name}.{field}` is not declared as a field"),
                 span,
@@ -331,7 +301,7 @@ impl From<SchemaValidationError> for Diagnostic {
                 span,
                 struct_name,
                 field,
-            } => error_simple(
+            } => Diagnostic::error(
                 "SV0014",
                 format!(
                     "endpoint field `{struct_name}.{field}` doesn't match this relation's shape \
@@ -349,7 +319,7 @@ impl From<SchemaValidationError> for Diagnostic {
                 field,
                 actual,
                 expected,
-            } => error_simple(
+            } => Diagnostic::error(
                 "SV0016",
                 format!(
                     "endpoint field `{struct_name}.{field}` points at `{actual}`, but this \
@@ -358,14 +328,14 @@ impl From<SchemaValidationError> for Diagnostic {
                 span,
                 "wrong reference target",
             ),
-            ViaOnOwning { span } => error_simple(
+            ViaOnOwning { span } => Diagnostic::error(
                 "SV0017",
                 "`via` mapping on owning relation",
                 span,
                 "relation type doesn't support `via`",
             )
             .with_note("an owning or OneToMany relation requires a direct mapping, not `via`"),
-            DirectOnManyToMany { span } => error_simple(
+            DirectOnManyToMany { span } => Diagnostic::error(
                 "SV0018",
                 "direct mapping on M:N relation",
                 span,
@@ -376,7 +346,7 @@ impl From<SchemaValidationError> for Diagnostic {
                 span,
                 struct_name,
                 field,
-            } => error_simple(
+            } => Diagnostic::error(
                 "SV0019",
                 format!("field `{struct_name}.{field}` is already an endpoint of another relation"),
                 span,
@@ -386,7 +356,7 @@ impl From<SchemaValidationError> for Diagnostic {
                 span,
                 root,
                 struct_name,
-            } => error_simple(
+            } => Diagnostic::error(
                 "SV0020",
                 format!(
                     "root `{root}` exposes `{struct_name}`, which is already owned by a relation"
@@ -402,7 +372,7 @@ impl From<SchemaValidationError> for Diagnostic {
                 span,
                 struct_name,
                 field,
-            } => error_simple(
+            } => Diagnostic::error(
                 "SV0021",
                 format!(
                     "field `{struct_name}.{field}` is marked `&` but is not a struct reference"
@@ -411,7 +381,7 @@ impl From<SchemaValidationError> for Diagnostic {
                 "`&` on a non-reference",
             )
             .with_note("`&` is only valid on a struct reference: `S`, `?S`, or `List<S>`"),
-            UnrootedOwnership { span, struct_name } => error_simple(
+            UnrootedOwnership { span, struct_name } => Diagnostic::error(
                 "SV0022",
                 format!(
                     "struct `{struct_name}` is owned \
@@ -428,7 +398,7 @@ impl From<SchemaValidationError> for Diagnostic {
                 span,
                 struct_name,
                 parents,
-            } => error_simple(
+            } => Diagnostic::error(
                 "SV0023",
                 format!(
                     "struct `{struct_name}` is owned by more than one struct ({})",
@@ -441,7 +411,7 @@ impl From<SchemaValidationError> for Diagnostic {
                 "every struct must either be owned by exactly one other struct \
                  through a relation or be declared as a root",
             ),
-            UnownedNonRoot { span, struct_name } => error_simple(
+            UnownedNonRoot { span, struct_name } => Diagnostic::error(
                 "SV0024",
                 format!("struct `{struct_name}` has no owner and is not declared as a root"),
                 span,

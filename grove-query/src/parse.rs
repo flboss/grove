@@ -98,10 +98,7 @@ impl<'src> Parser<'src> {
     }
 
     fn span_from(&self, start: usize) -> Span {
-        Span {
-            start,
-            end: self.current.span.end,
-        }
+        Span::new(start, self.current.span.end)
     }
 
     fn sync_to(&mut self, targets: &[TokenKind]) {
@@ -246,10 +243,7 @@ impl<'src> Parser<'src> {
             let rhs = self.parse_binary(prec + 1, allow_projection_braces)?;
             let span = self.span_from(lhs.span().start);
             lhs = Expr::Binary {
-                op: Spanned {
-                    span: op_tok.span,
-                    value: op,
-                },
+                op: Spanned::new(op_tok.span, op),
                 lhs: Box::new(lhs),
                 rhs: Box::new(rhs),
                 span,
@@ -265,10 +259,7 @@ impl<'src> Parser<'src> {
                 let expr = self.parse_unary(allow_projection_braces)?;
                 let span = self.span_from(op_tok.span.start);
                 Ok(Expr::Unary {
-                    op: Spanned {
-                        span: op_tok.span,
-                        value: UnaryOp::Neg,
-                    },
+                    op: Spanned::new(op_tok.span, UnaryOp::Neg),
                     expr: Box::new(expr),
                     span,
                 })
@@ -278,10 +269,7 @@ impl<'src> Parser<'src> {
                 let expr = self.parse_unary(allow_projection_braces)?;
                 let span = self.span_from(op_tok.span.start);
                 Ok(Expr::Unary {
-                    op: Spanned {
-                        span: op_tok.span,
-                        value: UnaryOp::Not,
-                    },
+                    op: Spanned::new(op_tok.span, UnaryOp::Not),
                     expr: Box::new(expr),
                     span,
                 })
@@ -305,16 +293,10 @@ impl<'src> Parser<'src> {
                     if let TokenKind::IntLit(n) = &self.current.value {
                         let (n, index_span) = (*n, self.current.span);
                         self.bump();
-                        let span = Span {
-                            start: expr.span().start,
-                            end: index_span.end,
-                        };
+                        let span = expr.span().merge(index_span);
                         expr = Expr::TupleAccess {
                             base: Box::new(expr),
-                            index: Spanned {
-                                span: index_span,
-                                value: n,
-                            },
+                            index: Spanned::new(index_span, n),
                             opt_depth,
                             span,
                         };
@@ -336,10 +318,7 @@ impl<'src> Parser<'src> {
                                 span,
                             };
                         } else {
-                            let span = Span {
-                                start: expr.span().start,
-                                end: name.span.end,
-                            };
+                            let span = expr.span().merge(name.span);
                             expr = Expr::Field {
                                 base: Box::new(expr),
                                 name,
@@ -356,10 +335,7 @@ impl<'src> Parser<'src> {
                         |k| matches!(k, TokenKind::RBracket),
                         |span| QueryParseError::ExpectedFilterRBracket { span },
                     )?;
-                    let filter_name = Spanned {
-                        span: lbracket.span,
-                        value: "filter".to_string(),
-                    };
+                    let filter_name = Spanned::new(lbracket.span, "filter".to_string());
                     let span = self.span_from(expr.span().start);
                     expr = Expr::Method {
                         base: Box::new(expr),
@@ -390,10 +366,7 @@ impl<'src> Parser<'src> {
                 TokenKind::As => {
                     self.bump();
                     let ty = self.parse_type_expr()?;
-                    let span = Span {
-                        start: expr.span().start,
-                        end: ty.span.end,
-                    };
+                    let span = expr.span().merge(ty.span);
                     expr = Expr::Cast {
                         expr: Box::new(expr),
                         ty,
@@ -415,17 +388,11 @@ impl<'src> Parser<'src> {
             let direction = match self.current.value {
                 TokenKind::Asc => {
                     let span = self.bump().span;
-                    Some(Spanned {
-                        span,
-                        value: SortDir::Asc,
-                    })
+                    Some(Spanned::new(span, SortDir::Asc))
                 }
                 TokenKind::Desc => {
                     let span = self.bump().span;
-                    Some(Spanned {
-                        span,
-                        value: SortDir::Desc,
-                    })
+                    Some(Spanned::new(span, SortDir::Desc))
                 }
                 _ => None,
             };
@@ -545,16 +512,10 @@ impl<'src> Parser<'src> {
             if let TokenKind::IntLit(n) = &self.current.value {
                 let (n, index_span) = (*n, self.current.span);
                 self.bump();
-                let span = Span {
-                    start: expr.span().start,
-                    end: index_span.end,
-                };
+                let span = expr.span().merge(index_span);
                 expr = Expr::TupleAccess {
                     base: Box::new(expr),
-                    index: Spanned {
-                        span: index_span,
-                        value: n,
-                    },
+                    index: Spanned::new(index_span, n),
                     opt_depth,
                     span,
                 };
@@ -584,91 +545,55 @@ impl<'src> Parser<'src> {
         match &self.current.value {
             &TokenKind::IntLit(i) => {
                 self.bump();
-                Ok(Expr::Literal(Spanned {
-                    span,
-                    value: Literal::Int(i),
-                }))
+                Ok(Expr::Literal(Spanned::new(span, Literal::Int(i))))
             }
             &TokenKind::FloatLit(f) => {
                 self.bump();
-                Ok(Expr::Literal(Spanned {
-                    span,
-                    value: Literal::Float(f),
-                }))
+                Ok(Expr::Literal(Spanned::new(span, Literal::Float(f))))
             }
             &TokenKind::DecLit(d) => {
                 self.bump();
-                Ok(Expr::Literal(Spanned {
-                    span,
-                    value: Literal::Dec(d),
-                }))
+                Ok(Expr::Literal(Spanned::new(span, Literal::Dec(d))))
             }
             TokenKind::StringLit(_) => {
                 let TokenKind::StringLit(s) = self.bump().value else {
                     unreachable!()
                 };
-                Ok(Expr::Literal(Spanned {
-                    span,
-                    value: Literal::String(s),
-                }))
+                Ok(Expr::Literal(Spanned::new(span, Literal::String(s))))
             }
             TokenKind::BytesLit(_) => {
                 let TokenKind::BytesLit(bytes) = self.bump().value else {
                     unreachable!()
                 };
-                Ok(Expr::Literal(Spanned {
-                    span,
-                    value: Literal::Bytes(bytes),
-                }))
+                Ok(Expr::Literal(Spanned::new(span, Literal::Bytes(bytes))))
             }
             TokenKind::True => {
                 self.bump();
-                Ok(Expr::Literal(Spanned {
-                    span,
-                    value: Literal::Bool(true),
-                }))
+                Ok(Expr::Literal(Spanned::new(span, Literal::Bool(true))))
             }
             TokenKind::False => {
                 self.bump();
-                Ok(Expr::Literal(Spanned {
-                    span,
-                    value: Literal::Bool(false),
-                }))
+                Ok(Expr::Literal(Spanned::new(span, Literal::Bool(false))))
             }
             TokenKind::None => {
                 self.bump();
-                Ok(Expr::Literal(Spanned {
-                    span,
-                    value: Literal::None,
-                }))
+                Ok(Expr::Literal(Spanned::new(span, Literal::None)))
             }
             &TokenKind::InstantLit(dt) => {
                 self.bump();
-                Ok(Expr::Literal(Spanned {
-                    span,
-                    value: Literal::Instant(dt),
-                }))
+                Ok(Expr::Literal(Spanned::new(span, Literal::Instant(dt))))
             }
             TokenKind::Now => {
                 self.bump();
-                Ok(Expr::Literal(Spanned {
-                    span,
-                    value: Literal::Now,
-                }))
+                Ok(Expr::Literal(Spanned::new(span, Literal::Now)))
             }
             &TokenKind::Today(t) => {
                 self.bump();
-                Ok(Expr::Literal(Spanned {
-                    span,
-                    value: Literal::Today(t),
-                }))
+                Ok(Expr::Literal(Spanned::new(span, Literal::Today(t))))
             }
             &TokenKind::DurationLit(d) => {
                 self.bump();
-                Ok(Expr::Literal(Spanned {
-                    span,
-                    value: Literal::Duration(d),
-                }))
+                Ok(Expr::Literal(Spanned::new(span, Literal::Duration(d))))
             }
             TokenKind::Ident(_) => {
                 let name = self.expect_ident()?;
@@ -682,10 +607,7 @@ impl<'src> Parser<'src> {
                             return Err(());
                         }
                     };
-                    let span = Span {
-                        start: name.span.start,
-                        end: variant.span.end,
-                    };
+                    let span = name.span.merge(variant.span);
                     Ok(Expr::EnumVariant {
                         enum_name: name,
                         variant,
@@ -697,17 +619,11 @@ impl<'src> Parser<'src> {
             }
             TokenKind::Prev => {
                 self.bump();
-                Ok(Expr::Ident(Spanned {
-                    span,
-                    value: "prev".to_string(),
-                }))
+                Ok(Expr::Ident(Spanned::new(span, "prev".to_string())))
             }
             &TokenKind::Dollar(count) => {
                 self.bump();
-                Ok(Expr::Ident(Spanned {
-                    span,
-                    value: "$".repeat(count),
-                }))
+                Ok(Expr::Ident(Spanned::new(span, "$".repeat(count))))
             }
             TokenKind::LParen => self.parse_tuple_or_group(),
             TokenKind::LBracket => self.parse_array(),
@@ -811,10 +727,7 @@ impl<'src> Parser<'src> {
         )?;
         Ok(Expr::Some {
             value: Box::new(value),
-            span: Span {
-                start: kw.span.start,
-                end: rparen.span.end,
-            },
+            span: kw.span.merge(rparen.span),
         })
     }
 
@@ -850,10 +763,7 @@ impl<'src> Parser<'src> {
 
         Ok(Expr::TypeConstant {
             ty,
-            name: Spanned {
-                span: self.current.span,
-                value: constant,
-            },
+            name: Spanned::new(self.current.span, constant),
         })
     }
 
@@ -924,7 +834,7 @@ impl<'src> Parser<'src> {
 
         let Some(default) = default else {
             self.emit_error(QueryParseError::MissingElse {
-                span: Span { start, end },
+                span: Span::new(start, end),
             });
             return Err(());
         };
@@ -932,7 +842,7 @@ impl<'src> Parser<'src> {
         Ok(Expr::If {
             arms,
             default,
-            span: Span { start, end },
+            span: Span::new(start, end),
         })
     }
 
@@ -943,10 +853,7 @@ impl<'src> Parser<'src> {
         loop {
             let Token { span, value } = &self.current;
             let name = match value {
-                TokenKind::Ident(n) => Spanned {
-                    span: *span,
-                    value: n.clone(),
-                },
+                TokenKind::Ident(n) => Spanned::new(*span, n.clone()),
                 _ => {
                     self.emit_error(QueryParseError::StructFieldNameExpected { span: *span });
                     return Err(());
@@ -980,10 +887,7 @@ impl<'src> Parser<'src> {
         )?;
         Ok(Expr::Struct {
             fields,
-            span: Span {
-                start: lbrace.span.start,
-                end: rbrace.span.end,
-            },
+            span: lbrace.span.merge(rbrace.span),
         })
     }
 
@@ -1013,10 +917,7 @@ impl<'src> Parser<'src> {
                 return Err(tok);
             }
         };
-        Ok(Spanned {
-            span: tok.span,
-            value,
-        })
+        Ok(Spanned::new(tok.span, value))
     }
 
     fn parse_type_expr(&mut self) -> Result<Spanned<TypeExpr>, ()> {
@@ -1025,13 +926,13 @@ impl<'src> Parser<'src> {
             let mut ty = self.parse_type_expr()?;
             let span = Span::new(question.span.start, ty.span.end);
             for _ in 0..depth {
-                ty = Spanned {
+                ty = Spanned::new(
                     span,
-                    value: TypeExpr::Optional {
+                    TypeExpr::Optional {
                         inner: Box::new(ty),
                         span,
                     },
-                };
+                );
             }
             return Ok(ty);
         }
@@ -1056,10 +957,7 @@ impl<'src> Parser<'src> {
                 let TokenKind::Ident(name) = tok.value else {
                     unreachable!()
                 };
-                Ok(Spanned {
-                    span: tok.span,
-                    value: TypeExpr::Named(name),
-                })
+                Ok(Spanned::new(tok.span, TypeExpr::Named(name)))
             }
             _ => {
                 let span = self.current.span;
@@ -1071,10 +969,7 @@ impl<'src> Parser<'src> {
 
     fn scalar_type(&mut self, ty: TypeName) -> Spanned<TypeExpr> {
         let tok = self.bump();
-        Spanned {
-            span: tok.span,
-            value: TypeExpr::Scalar(ty),
-        }
+        Spanned::new(tok.span, TypeExpr::Scalar(ty))
     }
 
     fn parse_list_type(&mut self) -> Result<Spanned<TypeExpr>, ()> {
@@ -1094,13 +989,13 @@ impl<'src> Parser<'src> {
         }
         let rangle = self.bump();
         let span = Span::new(list.span.start, rangle.span.end);
-        Ok(Spanned {
+        Ok(Spanned::new(
             span,
-            value: TypeExpr::List {
+            TypeExpr::List {
                 element: Box::new(element),
                 span,
             },
-        })
+        ))
     }
 
     fn parse_tuple_type(&mut self) -> Result<Spanned<TypeExpr>, ()> {
@@ -1125,14 +1020,8 @@ impl<'src> Parser<'src> {
             elements.push(self.parse_type_expr()?);
         };
 
-        let span = Span {
-            start: lparen.span.start,
-            end: rparen.span.end,
-        };
-        Ok(Spanned {
-            span,
-            value: TypeExpr::Tuple { elements, span },
-        })
+        let span = lparen.span.merge(rparen.span);
+        Ok(Spanned::new(span, TypeExpr::Tuple { elements, span }))
     }
 
     fn parse_record_type(&mut self) -> Result<Spanned<TypeExpr>, ()> {
@@ -1181,19 +1070,12 @@ impl<'src> Parser<'src> {
             }
         };
 
-        let span = Span {
-            start: lbrace.span.start,
-            end: rbrace.span.end,
-        };
+        let span = lbrace.span.merge(rbrace.span);
         if fields.is_empty() {
-            let span = Span::new(lbrace.span.start, rbrace.span.end);
             self.emit_error(QueryParseError::EmptyRecordType { span });
             return Err(());
         }
-        Ok(Spanned {
-            span,
-            value: TypeExpr::Record { fields, span },
-        })
+        Ok(Spanned::new(span, TypeExpr::Record { fields, span }))
     }
 
     fn emit_error(&mut self, err: QueryParseError) {
@@ -1263,10 +1145,7 @@ fn reclassify_mutation(expr: Expr) -> MutationStmt {
     };
 
     MutationStmt {
-        kind: Spanned {
-            span: name.span,
-            value: kind,
-        },
+        kind: Spanned::new(name.span, kind),
         base: *base,
         arg,
     }
