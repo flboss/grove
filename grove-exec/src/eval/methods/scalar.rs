@@ -203,6 +203,18 @@ pub(super) fn eval_scalar_method(
             };
             Ok(Scalar::Duration(d.abs()))
         }
+        MethodId::FloatIsNan => {
+            let Scalar::Float(x) = base else {
+                return scalar_method_integrity(method, name, base);
+            };
+            Ok(Scalar::Bool(x.is_nan()))
+        }
+        MethodId::FloatIsFinite => {
+            let Scalar::Float(x) = base else {
+                return scalar_method_integrity(method, name, base);
+            };
+            Ok(Scalar::Bool(x.is_finite()))
+        }
         MethodId::FloatRound => {
             let Scalar::Float(x) = base else {
                 return scalar_method_integrity(method, name, base);
@@ -378,6 +390,25 @@ mod tests {
         assert_eq!(run_src_config("Int::MIN.abs()", sat), Ok(int(i64::MAX)));
         let wrap = r#"config { int_arithmetic = "wrapping" }"#;
         assert_eq!(run_src_config("Int::MIN.abs()", wrap), Ok(int(i64::MIN)));
+    }
+
+    #[test]
+    fn eval_float_predicates() {
+        assert_eq!(run_src("1.0f.is_nan()"), Ok(bool(false)));
+        assert_eq!(run_src("1.0f.is_finite()"), Ok(bool(true)));
+        let off = r#"config { float_checks = false }"#;
+        assert_eq!(
+            run_src_config("(0.0f / 0.0f).is_nan()", off),
+            Ok(bool(true))
+        );
+        assert_eq!(
+            run_src_config("(0.0f / 0.0f).is_finite()", off),
+            Ok(bool(false))
+        );
+        assert_eq!(
+            run_src_config("(1.0f / 0.0f).is_finite()", off),
+            Ok(bool(false))
+        );
     }
 
     #[test]
