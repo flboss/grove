@@ -15,8 +15,8 @@ use grove_query::typecheck::types::{TypedExpr, TypedExprKind, TypedMethodArg};
 use self::filter::eval_filter;
 use self::list::{
     eval_list_compact, eval_list_contains, eval_list_extend, eval_list_flatten,
-    eval_list_is_unique, eval_list_join, eval_list_len, eval_list_slice, eval_list_transpose,
-    eval_list_unique, eval_list_unique_over,
+    eval_list_is_unique, eval_list_join, eval_list_len, eval_list_reverse, eval_list_slice,
+    eval_list_transpose, eval_list_unique, eval_list_unique_over,
 };
 use self::map::{eval_list_map, eval_optional_map};
 use self::optional::{OptMethodKind, eval_optional, eval_optional_flatten};
@@ -87,6 +87,7 @@ pub(super) fn eval_method(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val
         MethodId::ListJoin => eval_list_join(base, &eval_args(args, ctx)?),
         MethodId::ListCompact => eval_list_compact(base),
         MethodId::ListTranspose => eval_list_transpose(base),
+        MethodId::ListReverse => eval_list_reverse(base),
         MethodId::ListSum | MethodId::ListAvg | MethodId::ListMax | MethodId::ListMin => {
             eval_reduce(
                 ReduceKind::from_method(method).expect("reduce method id has a reduce kind"),
@@ -119,9 +120,11 @@ pub(super) fn eval_method(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val
         MethodId::OptionalFlatten => eval_optional_flatten(base),
         MethodId::ListFlatten => eval_list_flatten(base),
         MethodId::ListExtend => eval_list_extend(base, eval_args(args, ctx)?),
-        MethodId::ListTake | MethodId::ListSkip | MethodId::ListFirst | MethodId::ListNth => {
-            eval_list_slice(method, base, &eval_args(args, ctx)?, span)
-        }
+        MethodId::ListTake
+        | MethodId::ListSkip
+        | MethodId::ListFirst
+        | MethodId::ListNth
+        | MethodId::ListLast => eval_list_slice(method, base, &eval_args(args, ctx)?, span),
         MethodId::ListLen => eval_list_len(base),
         MethodId::ListContains => {
             let mut arg_vals = eval_args(args, ctx)?;

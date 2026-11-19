@@ -58,6 +58,10 @@ pub(super) fn eval_list_slice(
             }
             Val::List(items)
         }
+        MethodId::ListLast => match items.pop() {
+            Some(last) => Val::Some(Box::new(last)),
+            None => Val::None,
+        },
         MethodId::ListFirst => match items.into_iter().next() {
             Some(head) => Val::Some(Box::new(head)),
             None => Val::None,
@@ -248,6 +252,16 @@ pub(super) fn eval_list_is_unique(base: Val) -> Result<Val, ExecError> {
         }
     }
     Ok(Val::Scalar(Scalar::Bool(true)))
+}
+
+pub(super) fn eval_list_reverse(base: Val) -> Result<Val, ExecError> {
+    let Val::List(mut items) = base else {
+        return Err(ExecError::Integrity {
+            message: format!("`reverse()` on non-list value: {base} (internal error)"),
+        });
+    };
+    items.reverse();
+    Ok(Val::List(items))
 }
 
 pub(super) fn eval_list_flatten(base: Val) -> Result<Val, ExecError> {
@@ -491,6 +505,17 @@ mod tests {
         assert_eq!(run_src("[1, 2, 3].is_unique()"), Ok(bool(true)));
         assert_eq!(run_src("[1, 2, 1].is_unique()"), Ok(bool(false)));
         assert_eq!(run_src("[1].skip(1).is_unique()"), Ok(bool(true)));
+    }
+
+    #[test]
+    fn method_last_and_reverse() {
+        assert_eq!(run_src("[1, 2, 3].last()"), Ok(some(int(3))));
+        assert_eq!(run_src("[1].skip(1).last()"), Ok(Val::None));
+        assert_eq!(
+            run_src("[1, 2, 3].reverse()"),
+            Ok(Val::List(vec![int(3), int(2), int(1)]))
+        );
+        assert_eq!(run_src("[1, 2, 3].last() == some(3)"), Ok(bool(true)));
     }
 
     #[test]
