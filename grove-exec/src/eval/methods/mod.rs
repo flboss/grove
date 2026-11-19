@@ -27,7 +27,7 @@ use self::sort::{SortKind, eval_sort};
 use crate::error::ExecError;
 use crate::eval::data::resolve_base_link;
 use crate::eval::{EvalCtx, eval};
-use crate::pushdown::CapRewrite;
+use crate::pushdown::RuntimeRewrite;
 use crate::value::{Scalar, Val, rewrap_optional, unwrap_optional_depth};
 
 pub(super) fn eval_method(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
@@ -52,14 +52,14 @@ pub(super) fn eval_method(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val
     if peeled < opt_depth {
         return Ok(rewrap_optional(peeled, Val::None));
     }
-    if let Some(cap) = ctx.plan.cap_plan(node)
-        && ctx.applied_triggers.contains(&cap.trigger)
+    if let Some(rewrite) = ctx.plan.rewrite_plan(node)
+        && ctx.applied_triggers.contains(&rewrite.trigger)
     {
-        match (cap.rewrite, method) {
-            (CapRewrite::Skip, MethodId::ListTake | MethodId::ListSkip) => {
+        match rewrite.rewrite {
+            RuntimeRewrite::Skip if matches!(method, MethodId::ListTake | MethodId::ListSkip) => {
                 return Ok(rewrap_optional(opt_depth, base));
             }
-            (CapRewrite::First, MethodId::ListNth) => {
+            RuntimeRewrite::First if matches!(method, MethodId::ListNth) => {
                 return Ok(rewrap_optional(
                     opt_depth,
                     eval_list_slice(MethodId::ListFirst, base, &[], span)?,

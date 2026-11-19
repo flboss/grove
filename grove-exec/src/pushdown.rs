@@ -95,17 +95,23 @@ pub enum StringOp {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CapRewrite {
-    /// take/skip already folded into SQL LIMIT/OFFSET
+pub enum RuntimeRewrite {
+    /// Operation already folded into fetch constraints
     Skip,
-    /// nth already folded; evaluate as `first`
+    /// nth/find already folded; evaluate as `first`
     First,
+    /// Reverse the fetched window (at final list-producing operation)
+    ReverseOutput,
+    /// any() folded to filtered LIMIT 1 fetch
+    NonEmpty,
+    /// all() folded to NOT-filtered LIMIT 1 fetch
+    Empty,
 }
 
-/// Folded cap node rewrite mode, trigger fetch which applied it
+/// Runtime rewrite annotation, with the fetch trigger which applied it
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CapPlan {
-    pub rewrite: CapRewrite,
+pub struct RewritePlan {
+    pub rewrite: RuntimeRewrite,
     pub trigger: NodeId,
 }
 
@@ -114,7 +120,7 @@ pub struct CapPlan {
 pub struct PushdownPlan {
     fetches: HashMap<NodeId, FetchConstraints>,
     fields: HashMap<StructId, Vec<FieldId>>,
-    caps: HashMap<NodeId, CapPlan>,
+    rewrites: HashMap<NodeId, RewritePlan>,
     prefetch_skip: HashSet<FieldId>,
     enabled: bool,
 }
@@ -133,7 +139,7 @@ impl PushdownPlan {
             chains: HashMap::new(),
             ref_sites: HashMap::new(),
             usage: HashMap::new(),
-            caps: HashMap::new(),
+            rewrites: HashMap::new(),
         };
         for statement in &file.statements {
             match statement {
@@ -158,7 +164,7 @@ impl PushdownPlan {
         PushdownPlan {
             fetches: HashMap::new(),
             fields: all_struct_fields(schema),
-            caps: HashMap::new(),
+            rewrites: HashMap::new(),
             prefetch_skip: HashSet::new(),
             enabled: false,
         }
@@ -179,12 +185,12 @@ impl PushdownPlan {
             .unwrap_or(&[])
     }
 
-    pub fn cap_rewrite(&self, node: NodeId) -> Option<CapRewrite> {
-        self.caps.get(&node).map(|cap| cap.rewrite)
+    pub fn runtime_rewrite(&self, node: NodeId) -> Option<RuntimeRewrite> {
+        self.rewrites.get(&node).map(|n| n.rewrite)
     }
 
-    pub fn cap_plan(&self, node: NodeId) -> Option<CapPlan> {
-        self.caps.get(&node).copied()
+    pub fn rewrite_plan(&self, node: NodeId) -> Option<RewritePlan> {
+        self.rewrites.get(&node).copied()
     }
 
     pub fn prefetch_skip(&self) -> &HashSet<FieldId> {
@@ -261,7 +267,7 @@ struct PlanBuilder<'a> {
     chains: HashMap<NodeId, ChainState>,
     ref_sites: HashMap<NodeId, FieldId>,
     usage: HashMap<StructId, FieldPlan>,
-    caps: HashMap<NodeId, CapPlan>,
+    rewrites: HashMap<NodeId, RewritePlan>,
 }
 
 impl<'a> PlanBuilder<'a> {
@@ -271,7 +277,7 @@ impl<'a> PlanBuilder<'a> {
             chains,
             ref_sites,
             mut usage,
-            caps,
+            rewrites,
             ..
         } = self;
         expand_whole(schema, &mut usage);
@@ -308,7 +314,7 @@ impl<'a> PlanBuilder<'a> {
         PushdownPlan {
             fetches,
             fields,
-            caps,
+            rewrites,
             prefetch_skip,
             enabled: true,
         }
@@ -561,10 +567,10 @@ impl<'a> PlanBuilder<'a> {
                 } else {
                     apply_skip(state, bound);
                 }
-                self.caps.insert(
+                self.rewrites.insert(
                     node,
-                    CapPlan {
-                        rewrite: CapRewrite::Skip,
+                    RewritePlan {
+                        rewrite: RuntimeRewrite::Skip,
                         trigger: chain.site,
                     },
                 );
@@ -603,10 +609,10 @@ impl<'a> PlanBuilder<'a> {
                 }
                 apply_skip(state, index);
                 apply_take(state, 1);
-                self.caps.insert(
+                self.rewrites.insert(
                     node,
-                    CapPlan {
-                        rewrite: CapRewrite::First,
+                    RewritePlan {
+                        rewrite: RuntimeRewrite::First,
                         trigger: chain.site,
                     },
                 );
@@ -1204,7 +1210,7 @@ mod tests {
         let (file, plan, _schema) = typed_and_plan("users.first()?.orders?.take(1)");
         let takes = method_nodes(&file, "take");
         assert_eq!(takes.len(), 1);
-        assert_eq!(plan.cap_rewrite(takes[0]), None);
+        assert_eq!(plan.runtime_rewrite(takes[0]), None);
     }
 
     #[test]
@@ -1254,7 +1260,7 @@ mod tests {
         assert_eq!(constraints.limit, None);
         let take = method_nodes(&file, "take");
         assert_eq!(take.len(), 1);
-        assert_eq!(plan.cap_rewrite(take[0]), None);
+        assert_eq!(plan.runtime_rewrite(take[0]), None);
     }
 
     #[test]
@@ -1323,8 +1329,8 @@ mod tests {
             for name in ["take", "skip"] {
                 for node in method_nodes(&file, name) {
                     assert_eq!(
-                        plan.cap_rewrite(node),
-                        Some(CapRewrite::Skip),
+                        plan.runtime_rewrite(node),
+                        Some(RuntimeRewrite::Skip),
                         "{source}: {name} should be folded"
                     );
                 }
@@ -1338,17 +1344,17 @@ mod tests {
         let constraints = root_constraints(&plan, &file);
         assert_eq!((constraints.offset, constraints.limit), (0, Some(1)));
         for node in method_nodes(&file, "first") {
-            assert_eq!(plan.cap_rewrite(node), None);
+            assert_eq!(plan.runtime_rewrite(node), None);
         }
 
         let (file, plan, _schema) = typed_and_plan("users.skip(2).nth(3)");
         let constraints = root_constraints(&plan, &file);
         assert_eq!((constraints.offset, constraints.limit), (5, Some(1)));
         for node in method_nodes(&file, "skip") {
-            assert_eq!(plan.cap_rewrite(node), Some(CapRewrite::Skip));
+            assert_eq!(plan.runtime_rewrite(node), Some(RuntimeRewrite::Skip));
         }
         for node in method_nodes(&file, "nth") {
-            assert_eq!(plan.cap_rewrite(node), Some(CapRewrite::First));
+            assert_eq!(plan.runtime_rewrite(node), Some(RuntimeRewrite::First));
         }
 
         let (file, plan, _schema) = typed_and_plan("users.take(10).nth(3)");
@@ -1359,12 +1365,12 @@ mod tests {
         let constraints = root_constraints(&plan, &file);
         assert_eq!((constraints.offset, constraints.limit), (0, None));
         for node in method_nodes(&file, "nth") {
-            assert_eq!(plan.cap_rewrite(node), None);
+            assert_eq!(plan.runtime_rewrite(node), None);
         }
     }
 
     #[test]
-    fn caps_composition() {
+    fn rewrites_composition() {
         let (file, plan, _schema) = typed_and_plan("users[id > 2].sort_over(name).take(3)");
         let constraints = root_constraints(&plan, &file);
         assert_eq!(constraints.filters.len(), 1);
@@ -1374,7 +1380,7 @@ mod tests {
         assert_eq!(roots.len(), 1);
         for take in method_nodes(&file, "take") {
             assert_eq!(
-                plan.cap_plan(take).expect("take cap planned").trigger,
+                plan.rewrite_plan(take).expect("take planned").trigger,
                 roots[0]
             );
         }
@@ -1423,9 +1429,9 @@ mod tests {
         let take = method_nodes(&file, "take");
         assert_eq!(take.len(), 1);
         assert_eq!(
-            plan.cap_plan(take[0]),
-            Some(CapPlan {
-                rewrite: CapRewrite::Skip,
+            plan.rewrite_plan(take[0]),
+            Some(RewritePlan {
+                rewrite: RuntimeRewrite::Skip,
                 trigger: orders_sites[0],
             })
         );
@@ -1459,8 +1465,8 @@ mod tests {
         assert!(plan.prefetch_skip.contains(&orders));
         assert!(plan.prefetch_skip.contains(&roles));
         for take in method_nodes(&file, "take") {
-            let cap = plan.cap_plan(take).expect("take cap planned");
-            assert_eq!(cap.rewrite, CapRewrite::Skip);
+            let rewrite = plan.rewrite_plan(take).expect("take planned");
+            assert_eq!(rewrite.rewrite, RuntimeRewrite::Skip);
         }
     }
 
@@ -1477,7 +1483,7 @@ mod tests {
         assert!(!plan.prefetch_skip.contains(&orders));
         let len = method_nodes(&file, "len");
         assert_eq!(len.len(), 1);
-        assert_eq!(plan.cap_plan(len[0]), None);
+        assert_eq!(plan.rewrite_plan(len[0]), None);
     }
 
     #[test]
@@ -1486,10 +1492,10 @@ mod tests {
         let orders = testdata::field_id(&schema, testdata::struct_id(&schema, "User"), "orders");
         let take = method_nodes(&file, "take");
         assert_eq!(take.len(), 1);
-        let cap = plan.cap_plan(take[0]).expect("take cap planned");
-        assert_eq!(cap.rewrite, CapRewrite::Skip);
+        let rewrite = plan.rewrite_plan(take[0]).expect("take planned");
+        assert_eq!(rewrite.rewrite, RuntimeRewrite::Skip);
         let constraints = plan
-            .constraints_for(cap.trigger)
+            .constraints_for(rewrite.trigger)
             .expect("field trigger constraints");
         assert_eq!(constraints.limit, Some(2));
         assert!(plan.prefetch_skip.contains(&orders));
@@ -1497,9 +1503,9 @@ mod tests {
         let (file, plan, _schema) = typed_and_plan("users.map($.roles.skip(1).len())");
         let skip = method_nodes(&file, "skip");
         assert_eq!(skip.len(), 1);
-        let cap = plan.cap_plan(skip[0]).expect("take cap planned");
+        let rewrite = plan.rewrite_plan(skip[0]).expect("take planned");
         assert_eq!(
-            plan.constraints_for(cap.trigger)
+            plan.constraints_for(rewrite.trigger)
                 .expect("field trigger constraints")
                 .offset,
             1
@@ -1513,7 +1519,7 @@ mod tests {
         let (file, plan, _schema) = typed_and_plan("users.orders.take(2).len()");
         let take = method_nodes(&file, "take");
         assert_eq!(take.len(), 1);
-        assert_eq!(plan.cap_plan(take[0]), None);
+        assert_eq!(plan.rewrite_plan(take[0]), None);
         assert!(plan.prefetch_skip.is_empty());
     }
 
@@ -1524,7 +1530,7 @@ mod tests {
         assert_eq!(constraints.filters.len(), 1);
         assert_eq!((constraints.offset, constraints.limit), (0, Some(3)));
         for node in method_nodes(&file, "take") {
-            assert_eq!(plan.cap_rewrite(node), Some(CapRewrite::Skip));
+            assert_eq!(plan.runtime_rewrite(node), Some(RuntimeRewrite::Skip));
         }
     }
 
@@ -1681,7 +1687,7 @@ mod tests {
         let plan = PushdownPlan::disabled(&schema);
         assert!(!plan.is_enabled());
         assert!(plan.fetches.is_empty());
-        assert!(plan.caps.is_empty());
+        assert!(plan.rewrites.is_empty());
         assert!(plan.prefetch_skip.is_empty());
         for struct_def in &schema.structs {
             let struct_id = testdata::struct_id(&schema, &struct_def.name);
