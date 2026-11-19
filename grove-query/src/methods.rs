@@ -51,6 +51,8 @@ pub enum MethodId {
     ListExtend,
     ListContains,
     ListJoin,
+    ListCompact,
+    ListTranspose,
     ListUnique,
     ListUniqueOver,
     ListIsUnique,
@@ -89,6 +91,7 @@ pub enum ReceiverSpec {
     OptionalOfOptional,
     List,
     ListOfScalar(ScalarType),
+    ListOfOptional,
     ListOfList,
     ListOfSummable,
     ListOfAverageable,
@@ -131,6 +134,8 @@ pub enum ReturnSpec {
     Inner,
     OptionalInner,
     ListOfInner,
+    ListOfUnwrappedInner,
+    OptionalListOfUnwrappedInner,
     OptionalArgument,
     ListOfArgument,
 }
@@ -146,6 +151,9 @@ impl ReceiverSpec {
             (ReceiverSpec::List, QueryType::List(_)) => true,
             (ReceiverSpec::ListOfScalar(expected), QueryType::List(inner)) => {
                 matches!(inner.as_ref(), QueryType::Scalar(actual) if expected == *actual)
+            }
+            (ReceiverSpec::ListOfOptional, QueryType::List(inner)) => {
+                matches!(inner.as_ref(), QueryType::Optional(_))
             }
             (ReceiverSpec::ListOfList, QueryType::List(inner)) => {
                 matches!(inner.as_ref(), QueryType::List(_))
@@ -170,6 +178,7 @@ impl ReceiverSpec {
             ReceiverSpec::OptionalOfOptional => Optional(Box::new(Optional(Box::new(Scalar(Int))))),
             ReceiverSpec::List => List(Box::new(Scalar(Int))),
             ReceiverSpec::ListOfScalar(scalar) => List(Box::new(Scalar(scalar))),
+            ReceiverSpec::ListOfOptional => List(Box::new(Optional(Box::new(Scalar(Int))))),
             ReceiverSpec::ListOfList => List(Box::new(List(Box::new(Scalar(Int))))),
             ReceiverSpec::ListOfSummable
             | ReceiverSpec::ListOfOrdered
@@ -199,6 +208,12 @@ impl MethodDef {
             ReturnSpec::Inner => receiver_inner(receiver).clone(),
             ReturnSpec::OptionalInner => receiver_inner(receiver).clone().wrap_optional(),
             ReturnSpec::ListOfInner => QueryType::List(Box::new(receiver_inner(receiver).clone())),
+            ReturnSpec::ListOfUnwrappedInner => {
+                QueryType::List(Box::new(receiver_unwrapped_inner(receiver).clone()))
+            }
+            ReturnSpec::OptionalListOfUnwrappedInner => QueryType::Optional(Box::new(
+                QueryType::List(Box::new(receiver_unwrapped_inner(receiver).clone())),
+            )),
             ReturnSpec::ListOfArgument => {
                 QueryType::List(Box::new(first_arg.cloned().unwrap_or(QueryType::Unknown)))
             }
@@ -241,6 +256,14 @@ fn receiver_inner_opt(ty: &QueryType) -> Option<&QueryType> {
     }
 }
 
+fn receiver_unwrapped_inner(ty: &QueryType) -> &QueryType {
+    match receiver_inner_opt(ty) {
+        Some(QueryType::Optional(inner)) => inner,
+        Some(inner) => inner,
+        None => ty,
+    }
+}
+
 fn is_bool(ty: &QueryType) -> bool {
     ty.is_bool()
 }
@@ -266,12 +289,14 @@ use ArgSpec::{Fixed, Scoped};
 use ArgType::{Inner, ListOfInner, Scalar as ScalarArg};
 use MethodId::*;
 use ReceiverSpec::{
-    List, ListOfAverageable, ListOfList, ListOfOrdered, ListOfScalar, ListOfSummable, Optional,
-    OptionalOfOptional, Scalar,
+    List, ListOfAverageable, ListOfList, ListOfOptional, ListOfOrdered, ListOfScalar,
+    ListOfSummable, Optional, OptionalOfOptional, Scalar,
 };
 use ReturnSpec::{
     Inner as InnerReturn, ListOfArgument, ListOfInner as ListOfInnerReturn,
-    ListOfScalar as ListOfScalarReturn, OptionalArgument, OptionalInner, Scalar as ScalarReturn,
+    ListOfScalar as ListOfScalarReturn, ListOfUnwrappedInner as ListOfUnwrappedInnerReturn,
+    OptionalArgument, OptionalInner,
+    OptionalListOfUnwrappedInner as OptionalListOfUnwrappedInnerReturn, Scalar as ScalarReturn,
 };
 use ScalarType::{Bool, Bytes, Dec, Duration, Float, Instant, Int, String};
 use ScopeSpec::{ElementOfReceiver, FieldsOrElement, None as NoScope};
@@ -663,6 +688,22 @@ static METHODS: &[MethodDef] = &[
         args: Fixed(&[ScalarArg(String)]),
         scope: NoScope,
         returns: ScalarReturn(String),
+    },
+    MethodDef {
+        id: ListCompact,
+        names: &["compact"],
+        receiver: ListOfOptional,
+        args: Fixed(&[]),
+        scope: NoScope,
+        returns: ListOfUnwrappedInnerReturn,
+    },
+    MethodDef {
+        id: ListTranspose,
+        names: &["transpose"],
+        receiver: ListOfOptional,
+        args: Fixed(&[]),
+        scope: NoScope,
+        returns: OptionalListOfUnwrappedInnerReturn,
     },
     MethodDef {
         id: ListUnique,

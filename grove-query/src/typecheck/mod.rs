@@ -2674,6 +2674,18 @@ mod tests {
     }
 
     #[test]
+    fn optional_list_methods() {
+        assert_eq!(
+            infer_ok("[some(1), none].compact()", &test_schema()).ty,
+            QueryType::List(Box::new(QueryType::Scalar(ScalarType::Int)))
+        );
+        assert_eq!(
+            infer_ok("[some(1), none].transpose()", &test_schema()).ty,
+            QueryType::List(Box::new(QueryType::Scalar(ScalarType::Int))).wrap_optional()
+        );
+    }
+
+    #[test]
     fn string_split_and_scalar_casts() {
         assert_eq!(
             infer_ok(r#""a,b".split(",")"#, &test_schema()).ty,

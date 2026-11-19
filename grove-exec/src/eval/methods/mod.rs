@@ -85,6 +85,8 @@ pub(super) fn eval_method(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val
         MethodId::ListUniqueOver => eval_list_unique_over(base, args, ctx),
         MethodId::ListIsUnique => eval_list_is_unique(base),
         MethodId::ListJoin => eval_list_join(base, &eval_args(args, ctx)?),
+        MethodId::ListCompact => eval_list_compact(base),
+        MethodId::ListTranspose => eval_list_transpose(base),
         MethodId::ListSum | MethodId::ListAvg | MethodId::ListMax | MethodId::ListMin => {
             eval_reduce(
                 ReduceKind::from_method(method).expect("reduce method id has a reduce kind"),

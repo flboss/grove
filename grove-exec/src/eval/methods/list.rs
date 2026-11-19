@@ -138,13 +138,61 @@ pub(super) fn eval_list_join(base: Val, args: &[Val]) -> Result<Val, ExecError> 
     Ok(Val::Scalar(Scalar::String(parts.join(separator))))
 }
 
+/// Drop `none` values from a List<?T>
+pub(super) fn eval_list_compact(base: Val) -> Result<Val, ExecError> {
+    let Val::List(items) = base else {
+        return Err(ExecError::Integrity {
+            message: format!("`compact()` on non-list value: {base} (internal error)"),
+        });
+    };
+    let mut compacted = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            Val::Some(value) => compacted.push(*value),
+            Val::None => {}
+            other => {
+                return Err(ExecError::Integrity {
+                    message: format!(
+                        "`compact()` over non-optional element: {other} (internal error)"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(Val::List(compacted))
+}
+
+/// Turn List<?T> into ?List<T>
+pub(super) fn eval_list_transpose(base: Val) -> Result<Val, ExecError> {
+    let Val::List(items) = base else {
+        return Err(ExecError::Integrity {
+            message: format!("`transpose()` on non-list value: {base} (internal error)"),
+        });
+    };
+    let mut transposed = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            Val::Some(value) => transposed.push(*value),
+            Val::None => return Ok(Val::None),
+            other => {
+                return Err(ExecError::Integrity {
+                    message: format!(
+                        "`transpose()` over non-optional element: {other} (internal error)"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(Val::Some(Box::new(Val::List(transposed))))
+}
+
 pub(super) fn eval_list_unique(base: Val) -> Result<Val, ExecError> {
     let Val::List(items) = base else {
         return Err(ExecError::Integrity {
             message: format!("`unique()` on non-list value: {base} (internal error)"),
         });
     };
-    let mut unique: Vec<Val> = Vec::new();
+    let mut unique: Vec<Val> = Vec::with_capacity(items.len());
     for item in items {
         if !unique.iter().any(|seen| seen.eq(&item) == Some(true)) {
             unique.push(item);
@@ -170,8 +218,8 @@ pub(super) fn eval_list_unique_over(
     };
     let fields = owning_refs_in(&arg.expr, ctx.schema, ctx.plan.prefetch_skip());
     prefetch_owning(ctx, &mut items, &fields)?;
-    let mut unique: Vec<Val> = Vec::new();
-    let mut keys: Vec<Val> = Vec::new();
+    let mut unique: Vec<Val> = Vec::with_capacity(items.len());
+    let mut keys: Vec<Val> = Vec::with_capacity(items.len());
     for item in items {
         let map_element = push_element_scope(ctx, &item);
         let key = eval(&arg.expr, ctx);
@@ -400,6 +448,27 @@ mod tests {
     fn method_join() {
         assert_eq!(run_src(r#"["a", "b", "c"].join("-")"#), Ok(str("a-b-c")));
         assert_eq!(run_src(r#"["x"].skip(1).join(",")"#), Ok(str("")));
+    }
+
+    #[test]
+    fn method_compact_and_transpose() {
+        assert_eq!(
+            run_src("[some(1), none, some(3)].compact()"),
+            Ok(Val::List(vec![int(1), int(3)]))
+        );
+        assert_eq!(run_src("[some(1), none].transpose()"), Ok(Val::None));
+        assert_eq!(
+            run_src("[some(1), some(2)].transpose()"),
+            Ok(some(Val::List(vec![int(1), int(2)])))
+        );
+        assert_eq!(
+            run_src("[some(1)].skip(1).transpose()"),
+            Ok(some(Val::List(Vec::new())))
+        );
+        assert_eq!(
+            run_src("[some(some(1)), some(none)].transpose()"),
+            Ok(some(Val::List(vec![some(int(1)), Val::None])))
+        );
     }
 
     #[test]
