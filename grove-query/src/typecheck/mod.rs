@@ -2648,15 +2648,15 @@ mod tests {
     #[test]
     fn optional_depth_mismatch() {
         let schema = test_schema();
-        let (file, _diags) = crate::parse_query("1?.to_string()");
+        let (file, _diags) = crate::parse_query("1?.abs()");
         let (typed, diags) = typecheck(file.unwrap(), &schema);
         assert!(typed.is_none());
         assert_eq!(diags[0].code.as_ref(), "QT0032");
-        let (file, _diags) = crate::parse_query("some(some(2))???.to_string()");
+        let (file, _diags) = crate::parse_query("some(some(2))???.abs()");
         let (typed, diags) = typecheck(file.unwrap(), &schema);
         assert!(typed.is_none());
         assert_eq!(diags[0].code.as_ref(), "QT0032");
-        let (file, _diags) = crate::parse_query("some(some(3))?.to_string()");
+        let (file, _diags) = crate::parse_query("some(some(3))?.abs()");
         let (typed, diags) = typecheck(file.unwrap(), &schema);
         assert!(typed.is_none());
         assert_eq!(diags[0].code.as_ref(), "QT0003");

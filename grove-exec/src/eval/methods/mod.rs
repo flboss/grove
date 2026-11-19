@@ -121,7 +121,9 @@ pub(super) fn eval_method(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val
             eval_list_contains(ctx, base, needle)
         }
         _ if methods::method(method).is_scalar_method() => {
-            eval_scalar_method(method, name, &base, &eval_args(args, ctx)?, span).map(Val::Scalar)
+            let arg_vals = eval_args(args, ctx)?;
+            eval_scalar_method(method, name, &base, &arg_vals, &ctx.schema.config, span)
+                .map(Val::Scalar)
         }
         _ => Err(ExecError::Integrity {
             message: format!("unknown method `{name}` (internal error)"),

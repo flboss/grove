@@ -1,5 +1,6 @@
 use chrono::{DateTime, Datelike, SecondsFormat, Timelike, Utc};
 use grove_query::methods::MethodId;
+use grove_schema::validated::{Config, IntArithmetic};
 use grove_types::Span;
 use rust_decimal::{Decimal, RoundingStrategy};
 
@@ -39,6 +40,7 @@ pub(super) fn eval_scalar_method(
     name: &str,
     base: &Val,
     args: &[Val],
+    config: &Config,
     span: Span,
 ) -> Result<Scalar, ExecError> {
     let Val::Scalar(base) = base else {
@@ -168,6 +170,38 @@ pub(super) fn eval_scalar_method(
                         .normalize(),
                 ))
             }
+        }
+        MethodId::IntAbs => {
+            let Scalar::Int(n) = base else {
+                return scalar_method_integrity(method, name, base);
+            };
+            let value = match config.int_arithmetic {
+                IntArithmetic::Checked => n.checked_abs().ok_or_else(|| ExecError::Abort {
+                    message: format!("integer overflow: abs({n})"),
+                    span,
+                })?,
+                IntArithmetic::Saturating => n.saturating_abs(),
+                IntArithmetic::Wrapping => n.wrapping_abs(),
+            };
+            Ok(Scalar::Int(value))
+        }
+        MethodId::FloatAbs => {
+            let Scalar::Float(x) = base else {
+                return scalar_method_integrity(method, name, base);
+            };
+            Ok(Scalar::Float(x.abs()))
+        }
+        MethodId::DecAbs => {
+            let Scalar::Dec(d) = base else {
+                return scalar_method_integrity(method, name, base);
+            };
+            Ok(Scalar::Dec(d.abs().normalize()))
+        }
+        MethodId::DurationAbs => {
+            let Scalar::Duration(d) = base else {
+                return scalar_method_integrity(method, name, base);
+            };
+            Ok(Scalar::Duration(d.abs()))
         }
         MethodId::FloatRound => {
             let Scalar::Float(x) = base else {
@@ -325,6 +359,25 @@ mod tests {
         }
         let err = run_src("2.5.round_dp(-1)").unwrap_err();
         assert!(err.to_string().contains("round_dp"), "{err}");
+    }
+
+    #[test]
+    fn eval_abs() {
+        assert_eq!(run_src("(-5000).abs()"), Ok(int(5000)));
+        assert_eq!(run_src("(-12.5f).abs()"), Ok(float(12.5)));
+        assert_eq!(run_src("(-2.5e-24).abs()"), Ok(dec(dec!(2.5e-24))));
+        assert_eq!(run_src("(-#10d5s).abs() == #10d5s"), Ok(bool(true)));
+        assert_eq!(run_src("(789.0).abs()"), Ok(dec(dec!(789.0))));
+        assert!(
+            run_src("Int::MIN.abs()")
+                .unwrap_err()
+                .to_string()
+                .contains("integer overflow")
+        );
+        let sat = r#"config { int_arithmetic = "saturating" }"#;
+        assert_eq!(run_src_config("Int::MIN.abs()", sat), Ok(int(i64::MAX)));
+        let wrap = r#"config { int_arithmetic = "wrapping" }"#;
+        assert_eq!(run_src_config("Int::MIN.abs()", wrap), Ok(int(i64::MIN)));
     }
 
     #[test]

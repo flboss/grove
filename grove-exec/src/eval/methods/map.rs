@@ -105,7 +105,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            run_map("users.map($.id.to_string())"),
+            run_map("users.map($.id as String)"),
             [str("1"), str("2"), str("3"), str("4"), str("5")]
         );
         assert_eq!(
