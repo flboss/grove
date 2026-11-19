@@ -237,31 +237,269 @@ struct FieldPlan {
 }
 
 #[derive(Debug, Default)]
-struct ChainState {
-    filters: Vec<PushExpr>,
-    sort: Vec<SortKey>,
+struct Order {
+    keys: Vec<SortKey>,
     tie_desc: bool,
+}
+
+impl Order {
+    fn reverse(&mut self) {
+        for key in &mut self.keys {
+            key.desc = !key.desc;
+        }
+        self.tie_desc = !self.tie_desc;
+    }
+
+    fn prepend(&mut self, keys: Vec<SortKey>) {
+        self.keys.splice(0..0, keys);
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct Window {
     offset: u64,
     end: Option<u64>,
-    cap_seen: bool,
-    front_cap_seen: bool,
-    back_op_seen: bool,
-    reverse_output: bool,
-    reverse_owner: Option<NodeId>,
-    cap_closed: bool,
-    unpushed_filter_seen: bool,
-    unpushed_sort_seen: bool,
+}
+
+impl Window {
+    fn take(&mut self, bound: u64) {
+        let end = self.offset.saturating_add(bound);
+        self.end = Some(self.end.map_or(end, |current| current.min(end)));
+    }
+
+    fn skip(&mut self, bound: u64) {
+        let offset = self.offset.saturating_add(bound);
+        self.offset = self.end.map_or(offset, |end| offset.min(end));
+    }
+
+    fn is_full(self) -> bool {
+        self.offset == 0 && self.end.is_none()
+    }
+
+    fn as_limit(self) -> Option<u64> {
+        self.end.map(|end| end.saturating_sub(self.offset))
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct Barriers {
+    unpushed_filter: bool,
+    unpushed_sort: bool,
+}
+
+impl Barriers {
+    fn any(self) -> bool {
+        self.unpushed_filter || self.unpushed_sort
+    }
+
+    fn blocks_window(self) -> bool {
+        self.any()
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    #[default]
+    Open,
+    Front,
+    Back {
+        reverse_at: NodeId,
+    },
+    Closed {
+        reverse_at: Option<NodeId>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortOutcome {
+    Pushed,
+    Deferred,
+    Closed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackOutcome {
+    Applied { previous_owner: Option<NodeId> },
+    Closed,
+}
+
+#[derive(Debug, Default)]
+struct ChainState {
+    filters: Vec<PushExpr>,
+    order: Order,
+    window: Window,
+    stage: Stage,
+    barriers: Barriers,
 }
 
 impl ChainState {
     fn into_constraints(self) -> FetchConstraints {
         FetchConstraints {
             filters: self.filters,
-            sort: self.sort,
-            tie_desc: self.tie_desc,
-            offset: self.offset,
-            limit: self.end.map(|end| end.saturating_sub(self.offset)),
+            sort: self.order.keys,
+            tie_desc: self.order.tie_desc,
+            offset: self.window.offset,
+            limit: self.window.as_limit(),
         }
+    }
+
+    fn close(&mut self) {
+        let reverse_at = match self.stage {
+            Stage::Back { reverse_at } => Some(reverse_at),
+            Stage::Closed { reverse_at } => reverse_at,
+            Stage::Open | Stage::Front => None,
+        };
+        self.stage = Stage::Closed { reverse_at };
+    }
+
+    fn apply_filter(&mut self, predicate: Option<PushExpr>) -> bool {
+        if !matches!(self.stage, Stage::Open) {
+            self.close();
+            return false;
+        }
+        match predicate {
+            Some(predicate) => self.filters.push(predicate),
+            None => self.barriers.unpushed_filter = true,
+        }
+        true
+    }
+
+    fn apply_sort(&mut self, keys: Option<Vec<SortKey>>) -> SortOutcome {
+        if !matches!(self.stage, Stage::Open) {
+            self.close();
+            return SortOutcome::Closed;
+        }
+        if self.barriers.unpushed_sort {
+            return SortOutcome::Deferred;
+        }
+        match keys {
+            Some(keys) => {
+                self.order.prepend(keys);
+                SortOutcome::Pushed
+            }
+            None => {
+                self.barriers.unpushed_sort = true;
+                SortOutcome::Deferred
+            }
+        }
+    }
+
+    fn apply_front_take(&mut self, bound: Option<u64>) -> bool {
+        if !matches!(self.stage, Stage::Open | Stage::Front) {
+            self.close();
+            return false;
+        }
+        let Some(bound) = bound else {
+            self.close();
+            return false;
+        };
+        if self.barriers.blocks_window() {
+            self.close();
+            return false;
+        }
+        self.window.take(bound);
+        self.stage = Stage::Front;
+        true
+    }
+
+    fn apply_front_skip(&mut self, bound: Option<u64>) -> bool {
+        if !matches!(self.stage, Stage::Open | Stage::Front) {
+            self.close();
+            return false;
+        }
+        let Some(bound) = bound else {
+            self.close();
+            return false;
+        };
+        if self.barriers.blocks_window() {
+            self.close();
+            return false;
+        }
+        self.window.skip(bound);
+        self.stage = Stage::Front;
+        true
+    }
+
+    fn apply_front_nth(&mut self, index: Option<u64>) -> bool {
+        if !matches!(self.stage, Stage::Open | Stage::Front) {
+            self.close();
+            return false;
+        }
+        let Some(index) = index else {
+            self.close();
+            return false;
+        };
+        if self.barriers.blocks_window() {
+            self.close();
+            return false;
+        }
+        self.window.skip(index);
+        self.window.take(1);
+        self.stage = Stage::Front;
+        true
+    }
+
+    fn apply_last(&mut self) -> bool {
+        if !matches!(self.stage, Stage::Open) || self.barriers.blocks_window() {
+            self.close();
+            return false;
+        }
+        self.order.reverse();
+        self.window.take(1);
+        self.stage = Stage::Front;
+        true
+    }
+
+    fn apply_reverse(&mut self) -> bool {
+        if !matches!(self.stage, Stage::Open) || self.barriers.any() {
+            self.close();
+            return false;
+        }
+        self.order.reverse();
+        true
+    }
+
+    fn apply_back(&mut self, node: NodeId, bound: Option<u64>, take: bool) -> BackOutcome {
+        if !matches!(self.stage, Stage::Open | Stage::Back { .. }) || self.barriers.blocks_window()
+        {
+            self.close();
+            return BackOutcome::Closed;
+        }
+        let Some(bound) = bound else {
+            self.close();
+            return BackOutcome::Closed;
+        };
+        let previous_owner = match self.stage {
+            Stage::Back { reverse_at } => Some(reverse_at),
+            _ => None,
+        };
+        if matches!(self.stage, Stage::Open) {
+            debug_assert!(self.window.is_full());
+            self.order.reverse();
+        }
+        if take {
+            self.window.take(bound);
+        } else {
+            self.window.skip(bound);
+        }
+        self.stage = Stage::Back { reverse_at: node };
+        BackOutcome::Applied { previous_owner }
+    }
+
+    fn can_scan(&self, method: MethodId) -> bool {
+        matches!(self.stage, Stage::Open)
+            && !self.barriers.unpushed_filter
+            && !(method == MethodId::ListFind && self.barriers.unpushed_sort)
+    }
+
+    fn apply_scan(&mut self, predicate: PushExpr, method: MethodId) {
+        match method {
+            MethodId::ListAny | MethodId::ListFind => self.filters.push(predicate),
+            MethodId::ListAll => self.filters.push(PushExpr::Not(Box::new(predicate))),
+            _ => unreachable!("apply_scan called with a non-scan method"),
+        }
+        self.window.take(1);
+        self.stage = Stage::Closed { reverse_at: None };
     }
 }
 
@@ -511,13 +749,8 @@ impl<'a> PlanBuilder<'a> {
                 };
                 let predicate = self.translate_expr(&arg.expr, chain.struct_id);
                 let state = self.chains.get_mut(&chain.site)?;
-                if state.cap_seen {
-                    state.cap_closed = true;
+                if !state.apply_filter(predicate) {
                     return None;
-                }
-                match predicate {
-                    Some(predicate) => state.filters.push(predicate),
-                    None => state.unpushed_filter_seen = true,
                 }
                 Some(chain)
             }
@@ -536,17 +769,9 @@ impl<'a> PlanBuilder<'a> {
                 } else {
                     None
                 };
-                let state = self.chains.get_mut(&chain.site)?;
-                if state.cap_seen {
-                    state.cap_closed = true;
-                    return None;
-                }
-                if state.unpushed_sort_seen {
-                    return Some(chain);
-                }
-                match keys {
-                    Some(keys) => {
-                        state.sort.splice(0..0, keys);
+                let outcome = self.chains.get_mut(&chain.site)?.apply_sort(keys);
+                match outcome {
+                    SortOutcome::Pushed => {
                         self.rewrites.insert(
                             node,
                             RewritePlan {
@@ -554,36 +779,24 @@ impl<'a> PlanBuilder<'a> {
                                 trigger: chain.site,
                             },
                         );
+                        Some(chain)
                     }
-                    None => state.unpushed_sort_seen = true,
+                    SortOutcome::Deferred => Some(chain),
+                    SortOutcome::Closed => None,
                 }
-                Some(chain)
             }
             MethodId::ListTake | MethodId::ListSkip => {
-                let state = self.chains.get_mut(&chain.site)?;
-                if state.back_op_seen {
-                    state.cap_seen = true;
-                    state.front_cap_seen = true;
-                    state.cap_closed = true;
-                    return None;
-                }
-                state.cap_seen = true;
-                state.front_cap_seen = true;
-                let Some(bound) = const_int_arg(args) else {
-                    state.cap_closed = true;
-                    return None;
+                let bound = const_int_arg(args);
+                let applied = {
+                    let state = self.chains.get_mut(&chain.site)?;
+                    if method == MethodId::ListTake {
+                        state.apply_front_take(bound)
+                    } else {
+                        state.apply_front_skip(bound)
+                    }
                 };
-                if state.cap_closed {
+                if !applied {
                     return None;
-                }
-                if state.unpushed_filter_seen || state.unpushed_sort_seen {
-                    state.cap_closed = true;
-                    return None;
-                }
-                if method == MethodId::ListTake {
-                    apply_take(state, bound);
-                } else {
-                    apply_skip(state, bound);
                 }
                 self.rewrites.insert(
                     node,
@@ -595,52 +808,18 @@ impl<'a> PlanBuilder<'a> {
                 Some(chain)
             }
             MethodId::ListFirst => {
-                let state = self.chains.get_mut(&chain.site)?;
-                if state.back_op_seen {
-                    state.cap_seen = true;
-                    state.front_cap_seen = true;
-                    state.cap_closed = true;
-                    return None;
-                }
-                state.cap_seen = true;
-                state.front_cap_seen = true;
                 if !args.is_empty() {
-                    state.cap_closed = true;
+                    self.chains.get_mut(&chain.site)?.close();
                     return None;
                 }
-                if state.cap_closed {
-                    return None;
-                }
-                if state.unpushed_filter_seen || state.unpushed_sort_seen {
-                    state.cap_closed = true;
-                    return None;
-                }
-                apply_take(state, 1);
-                Some(chain)
+                let state = self.chains.get_mut(&chain.site)?;
+                state.apply_front_take(Some(1)).then_some(chain)
             }
             MethodId::ListNth => {
-                let state = self.chains.get_mut(&chain.site)?;
-                if state.back_op_seen {
-                    state.cap_seen = true;
-                    state.front_cap_seen = true;
-                    state.cap_closed = true;
+                let index = const_int_arg(args);
+                if !self.chains.get_mut(&chain.site)?.apply_front_nth(index) {
                     return None;
                 }
-                state.cap_seen = true;
-                state.front_cap_seen = true;
-                let Some(index) = const_int_arg(args) else {
-                    state.cap_closed = true;
-                    return None;
-                };
-                if state.cap_closed {
-                    return None;
-                }
-                if !state.cap_seen && (state.unpushed_filter_seen || state.unpushed_sort_seen) {
-                    state.cap_closed = true;
-                    return None;
-                }
-                apply_skip(state, index);
-                apply_take(state, 1);
                 self.rewrites.insert(
                     node,
                     RewritePlan {
@@ -651,34 +830,17 @@ impl<'a> PlanBuilder<'a> {
                 Some(chain)
             }
             MethodId::ListLast => {
-                let state = self.chains.get_mut(&chain.site)?;
-                if state.cap_seen
-                    || state.cap_closed
-                    || state.reverse_output
-                    || state.unpushed_filter_seen
-                    || state.unpushed_sort_seen
-                    || !args.is_empty()
-                {
-                    state.cap_closed = true;
+                if !args.is_empty() {
+                    self.chains.get_mut(&chain.site)?.close();
                     return None;
                 }
-                state.cap_seen = true;
-                state.front_cap_seen = true;
-                flip_order(state);
-                apply_take(state, 1);
-                Some(chain)
+                let state = self.chains.get_mut(&chain.site)?;
+                state.apply_last().then_some(chain)
             }
             MethodId::ListReverse => {
-                let state = self.chains.get_mut(&chain.site)?;
-                if state.cap_seen
-                    || state.cap_closed
-                    || state.unpushed_filter_seen
-                    || state.unpushed_sort_seen
-                {
-                    state.cap_closed = true;
+                if !self.chains.get_mut(&chain.site)?.apply_reverse() {
                     return None;
                 }
-                flip_order(state);
                 self.rewrites.insert(
                     node,
                     RewritePlan {
@@ -689,39 +851,15 @@ impl<'a> PlanBuilder<'a> {
                 Some(chain)
             }
             MethodId::ListTakeBack | MethodId::ListSkipBack => {
-                let Some(bound) = const_int_arg(args) else {
+                let bound = const_int_arg(args);
+                let outcome = {
                     let state = self.chains.get_mut(&chain.site)?;
-                    state.cap_closed = true;
+                    state.apply_back(node, bound, method == MethodId::ListTakeBack)
+                };
+                let BackOutcome::Applied { previous_owner } = outcome else {
                     return None;
                 };
-                let old_owner = {
-                    let state = self.chains.get_mut(&chain.site)?;
-                    if state.front_cap_seen
-                        || state.cap_closed
-                        || state.unpushed_filter_seen
-                        || state.unpushed_sort_seen
-                    {
-                        state.cap_closed = true;
-                        return None;
-                    }
-                    state.cap_seen = true;
-                    state.back_op_seen = true;
-                    if !state.reverse_output {
-                        flip_order(state);
-                        state.reverse_output = true;
-                        state.offset = 0;
-                        state.end = None;
-                    }
-                    if method == MethodId::ListTakeBack {
-                        let end = state.offset.saturating_add(bound);
-                        state.end = Some(state.end.map_or(end, |current| current.min(end)));
-                    } else {
-                        let offset = state.offset.saturating_add(bound);
-                        state.offset = state.end.map_or(offset, |end| offset.min(end));
-                    }
-                    state.reverse_owner.replace(node)
-                };
-                if let Some(old) = old_owner {
+                if let Some(old) = previous_owner {
                     self.rewrites.insert(
                         old,
                         RewritePlan {
@@ -740,27 +878,16 @@ impl<'a> PlanBuilder<'a> {
                 Some(chain)
             }
             MethodId::ListAny | MethodId::ListAll | MethodId::ListFind => {
-                let state = self.chains.get(&chain.site)?;
-                if state.cap_seen
-                    || state.cap_closed
-                    || state.unpushed_filter_seen
-                    || (method == MethodId::ListFind && state.unpushed_sort_seen)
-                {
+                if !self.chains.get(&chain.site)?.can_scan(method) {
                     return None;
                 }
                 let [arg] = args else {
                     return None;
                 };
                 let predicate = self.translate_expr(&arg.expr, chain.struct_id)?;
-                let state = self.chains.get_mut(&chain.site)?;
-                match method {
-                    MethodId::ListAny | MethodId::ListFind => state.filters.push(predicate),
-                    MethodId::ListAll => state.filters.push(PushExpr::Not(Box::new(predicate))),
-                    _ => unreachable!(),
-                }
-                state.cap_seen = true;
-                state.front_cap_seen = true;
-                apply_take(state, 1);
+                self.chains
+                    .get_mut(&chain.site)?
+                    .apply_scan(predicate, method);
                 let rewrite = match method {
                     MethodId::ListAny => RuntimeRewrite::NonEmpty,
                     MethodId::ListAll => RuntimeRewrite::Empty,
@@ -1019,23 +1146,6 @@ fn const_int_arg(args: &[TypedMethodArg]) -> Option<u64> {
         },
         _ => None,
     }
-}
-
-fn flip_order(state: &mut ChainState) {
-    for key in &mut state.sort {
-        key.desc = !key.desc;
-    }
-    state.tie_desc = !state.tie_desc;
-}
-
-fn apply_take(state: &mut ChainState, bound: u64) {
-    let end = state.offset.saturating_add(bound);
-    state.end = Some(state.end.map_or(end, |current| current.min(end)));
-}
-
-fn apply_skip(state: &mut ChainState, bound: u64) {
-    let offset = state.offset.saturating_add(bound);
-    state.offset = state.end.map_or(offset, |end| offset.min(end));
 }
 
 #[cfg(test)]
