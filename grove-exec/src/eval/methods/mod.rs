@@ -56,13 +56,41 @@ pub(super) fn eval_method(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val
         && ctx.applied_triggers.contains(&rewrite.trigger)
     {
         match rewrite.rewrite {
-            RuntimeRewrite::Skip if matches!(method, MethodId::ListTake | MethodId::ListSkip) => {
+            RuntimeRewrite::Skip
+                if matches!(
+                    method,
+                    MethodId::ListTake
+                        | MethodId::ListSkip
+                        | MethodId::ListSortAsc
+                        | MethodId::ListSortDesc
+                        | MethodId::ListSortAscOver
+                        | MethodId::ListSortDescOver
+                        | MethodId::ListReverse
+                        | MethodId::ListTakeBack
+                        | MethodId::ListSkipBack
+                ) =>
+            {
                 return Ok(rewrap_optional(opt_depth, base));
             }
-            RuntimeRewrite::First if matches!(method, MethodId::ListNth) => {
+            RuntimeRewrite::First if matches!(method, MethodId::ListNth | MethodId::ListFind) => {
                 return Ok(rewrap_optional(
                     opt_depth,
                     eval_list_slice(MethodId::ListFirst, base, &[], span)?,
+                ));
+            }
+            RuntimeRewrite::ReverseOutput => {
+                return Ok(rewrap_optional(opt_depth, eval_list_reverse(base)?));
+            }
+            RuntimeRewrite::NonEmpty if method == MethodId::ListAny => {
+                return Ok(rewrap_optional(
+                    opt_depth,
+                    Val::Scalar(Scalar::Bool(!list_is_empty(&base)?)),
+                ));
+            }
+            RuntimeRewrite::Empty if method == MethodId::ListAll => {
+                return Ok(rewrap_optional(
+                    opt_depth,
+                    Val::Scalar(Scalar::Bool(list_is_empty(&base)?)),
                 ));
             }
             _ => {}
@@ -159,6 +187,15 @@ fn eval_args(args: &[TypedMethodArg], ctx: &mut EvalCtx<'_>) -> Result<Vec<Val>,
     args.iter()
         .map(|arg| eval(&arg.expr, ctx))
         .collect::<Result<Vec<_>, _>>()
+}
+
+fn list_is_empty(base: &Val) -> Result<bool, ExecError> {
+    match base {
+        Val::List(items) => Ok(items.is_empty()),
+        other => Err(ExecError::Integrity {
+            message: format!("list rewrite applied to non-list value: {other} (internal error)"),
+        }),
+    }
 }
 
 fn method_arg<'a>(args: &'a [Val], method: &str, index: usize) -> Result<&'a Val, ExecError> {

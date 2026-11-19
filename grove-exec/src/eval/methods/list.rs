@@ -680,6 +680,97 @@ mod tests {
     }
 
     #[test]
+    fn method_pushdown_composition() {
+        let names = |src: &str| match run_seeded(src) {
+            Ok(Val::List(values)) => values,
+            got => panic!("expected names for {src}, got {got:?}"),
+        };
+        assert_eq!(run_seeded("users.last()?.name"), Ok(some(str("Eli"))));
+        assert_eq!(
+            names("users.reverse().name"),
+            vec![str("Eli"), str("Dan"), str("Cyd"), str("Bob"), str("Ada")]
+        );
+        assert_eq!(
+            names("users.sort_over(id).reverse().name"),
+            vec![str("Eli"), str("Dan"), str("Cyd"), str("Bob"), str("Ada")]
+        );
+        assert_eq!(
+            names("users.reverse().sort_over(name).name"),
+            vec![str("Ada"), str("Bob"), str("Cyd"), str("Dan"), str("Eli")]
+        );
+        assert_eq!(
+            run_seeded("users.sort_desc_over(id).last()?.name"),
+            Ok(some(str("Ada")))
+        );
+        assert_eq!(
+            names("users.take_back(2).name"),
+            vec![str("Dan"), str("Eli")]
+        );
+        assert_eq!(
+            names("users.skip_back(2).name"),
+            vec![str("Ada"), str("Bob"), str("Cyd")]
+        );
+        assert_eq!(
+            names("users.take_back(3).take_back(2).name"),
+            vec![str("Dan"), str("Eli")]
+        );
+        assert_eq!(
+            names("users.take_back(3).skip_back(1).name"),
+            vec![str("Cyd"), str("Dan")]
+        );
+        assert_eq!(
+            names("users.reverse().take(2).name"),
+            vec![str("Eli"), str("Dan")]
+        );
+        assert_eq!(
+            names("users.take(2).reverse().name"),
+            vec![str("Bob"), str("Ada")]
+        );
+        assert_eq!(
+            run_seeded("users.take(2).last()?.name"),
+            Ok(some(str("Bob")))
+        );
+        assert_eq!(
+            run_seeded("users.skip(2).last()?.name"),
+            Ok(some(str("Eli")))
+        );
+        assert_eq!(
+            run_seeded("users.reverse().last()?.name"),
+            Ok(some(str("Ada")))
+        );
+        assert_eq!(
+            run_seeded("users.take_back(2).last()?.name"),
+            Ok(some(str("Eli")))
+        );
+        assert_eq!(
+            run_seeded("users.skip(2).any(name == \"Bob\")"),
+            Ok(bool(false))
+        );
+        assert_eq!(run_seeded("users.take(0).any(active)"), Ok(bool(false)));
+        assert_eq!(run_seeded("users.take(0).all(active)"), Ok(bool(true)));
+        assert_eq!(
+            run_seeded("users.take(1).find(name == \"Ada\")?.name"),
+            Ok(some(str("Ada")))
+        );
+        assert_eq!(
+            run_seeded("users.reverse().find(active)?.name"),
+            Ok(some(str("Dan")))
+        );
+        assert_eq!(
+            run_seeded("users[active].any(name == \"Ada\")"),
+            Ok(bool(true))
+        );
+        assert_eq!(
+            run_seeded("users[active].find(name == \"Cyd\")"),
+            Ok(Val::None)
+        );
+        assert_eq!(
+            run_seeded("users.first()?.orders?.reverse()?.amount"),
+            Ok(some(Val::List(vec![int(200), int(100)])))
+        );
+    }
+
+    #[test]
     fn method_contains() {
         for src in [
             "[1, 2, 3].contains(2)",

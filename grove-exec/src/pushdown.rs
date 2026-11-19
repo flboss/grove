@@ -244,6 +244,10 @@ struct ChainState {
     offset: u64,
     end: Option<u64>,
     cap_seen: bool,
+    front_cap_seen: bool,
+    back_op_seen: bool,
+    reverse_output: bool,
+    reverse_owner: Option<NodeId>,
     cap_closed: bool,
     unpushed_filter_seen: bool,
     unpushed_sort_seen: bool,
@@ -543,6 +547,13 @@ impl<'a> PlanBuilder<'a> {
                 match keys {
                     Some(keys) => {
                         state.sort.splice(0..0, keys);
+                        self.rewrites.insert(
+                            node,
+                            RewritePlan {
+                                rewrite: RuntimeRewrite::Skip,
+                                trigger: chain.site,
+                            },
+                        );
                     }
                     None => state.unpushed_sort_seen = true,
                 }
@@ -550,7 +561,14 @@ impl<'a> PlanBuilder<'a> {
             }
             MethodId::ListTake | MethodId::ListSkip => {
                 let state = self.chains.get_mut(&chain.site)?;
+                if state.back_op_seen {
+                    state.cap_seen = true;
+                    state.front_cap_seen = true;
+                    state.cap_closed = true;
+                    return None;
+                }
                 state.cap_seen = true;
+                state.front_cap_seen = true;
                 let Some(bound) = const_int_arg(args) else {
                     state.cap_closed = true;
                     return None;
@@ -578,7 +596,14 @@ impl<'a> PlanBuilder<'a> {
             }
             MethodId::ListFirst => {
                 let state = self.chains.get_mut(&chain.site)?;
+                if state.back_op_seen {
+                    state.cap_seen = true;
+                    state.front_cap_seen = true;
+                    state.cap_closed = true;
+                    return None;
+                }
                 state.cap_seen = true;
+                state.front_cap_seen = true;
                 if !args.is_empty() {
                     state.cap_closed = true;
                     return None;
@@ -595,7 +620,14 @@ impl<'a> PlanBuilder<'a> {
             }
             MethodId::ListNth => {
                 let state = self.chains.get_mut(&chain.site)?;
+                if state.back_op_seen {
+                    state.cap_seen = true;
+                    state.front_cap_seen = true;
+                    state.cap_closed = true;
+                    return None;
+                }
                 state.cap_seen = true;
+                state.front_cap_seen = true;
                 let Some(index) = const_int_arg(args) else {
                     state.cap_closed = true;
                     return None;
@@ -617,6 +649,132 @@ impl<'a> PlanBuilder<'a> {
                     },
                 );
                 Some(chain)
+            }
+            MethodId::ListLast => {
+                let state = self.chains.get_mut(&chain.site)?;
+                if state.cap_seen
+                    || state.cap_closed
+                    || state.reverse_output
+                    || state.unpushed_filter_seen
+                    || state.unpushed_sort_seen
+                    || !args.is_empty()
+                {
+                    state.cap_closed = true;
+                    return None;
+                }
+                state.cap_seen = true;
+                state.front_cap_seen = true;
+                flip_order(state);
+                apply_take(state, 1);
+                Some(chain)
+            }
+            MethodId::ListReverse => {
+                let state = self.chains.get_mut(&chain.site)?;
+                if state.cap_seen
+                    || state.cap_closed
+                    || state.unpushed_filter_seen
+                    || state.unpushed_sort_seen
+                {
+                    state.cap_closed = true;
+                    return None;
+                }
+                flip_order(state);
+                self.rewrites.insert(
+                    node,
+                    RewritePlan {
+                        rewrite: RuntimeRewrite::Skip,
+                        trigger: chain.site,
+                    },
+                );
+                Some(chain)
+            }
+            MethodId::ListTakeBack | MethodId::ListSkipBack => {
+                let Some(bound) = const_int_arg(args) else {
+                    let state = self.chains.get_mut(&chain.site)?;
+                    state.cap_closed = true;
+                    return None;
+                };
+                let old_owner = {
+                    let state = self.chains.get_mut(&chain.site)?;
+                    if state.front_cap_seen
+                        || state.cap_closed
+                        || state.unpushed_filter_seen
+                        || state.unpushed_sort_seen
+                    {
+                        state.cap_closed = true;
+                        return None;
+                    }
+                    state.cap_seen = true;
+                    state.back_op_seen = true;
+                    if !state.reverse_output {
+                        flip_order(state);
+                        state.reverse_output = true;
+                        state.offset = 0;
+                        state.end = None;
+                    }
+                    if method == MethodId::ListTakeBack {
+                        let end = state.offset.saturating_add(bound);
+                        state.end = Some(state.end.map_or(end, |current| current.min(end)));
+                    } else {
+                        let offset = state.offset.saturating_add(bound);
+                        state.offset = state.end.map_or(offset, |end| offset.min(end));
+                    }
+                    state.reverse_owner.replace(node)
+                };
+                if let Some(old) = old_owner {
+                    self.rewrites.insert(
+                        old,
+                        RewritePlan {
+                            rewrite: RuntimeRewrite::Skip,
+                            trigger: chain.site,
+                        },
+                    );
+                }
+                self.rewrites.insert(
+                    node,
+                    RewritePlan {
+                        rewrite: RuntimeRewrite::ReverseOutput,
+                        trigger: chain.site,
+                    },
+                );
+                Some(chain)
+            }
+            MethodId::ListAny | MethodId::ListAll | MethodId::ListFind => {
+                let state = self.chains.get(&chain.site)?;
+                if state.cap_seen
+                    || state.cap_closed
+                    || state.unpushed_filter_seen
+                    || (method == MethodId::ListFind && state.unpushed_sort_seen)
+                {
+                    return None;
+                }
+                let [arg] = args else {
+                    return None;
+                };
+                let predicate = self.translate_expr(&arg.expr, chain.struct_id)?;
+                let state = self.chains.get_mut(&chain.site)?;
+                match method {
+                    MethodId::ListAny | MethodId::ListFind => state.filters.push(predicate),
+                    MethodId::ListAll => state.filters.push(PushExpr::Not(Box::new(predicate))),
+                    _ => unreachable!(),
+                }
+                state.cap_seen = true;
+                state.front_cap_seen = true;
+                apply_take(state, 1);
+                let rewrite = match method {
+                    MethodId::ListAny => RuntimeRewrite::NonEmpty,
+                    MethodId::ListAll => RuntimeRewrite::Empty,
+                    MethodId::ListFind => RuntimeRewrite::First,
+                    _ => unreachable!(),
+                };
+                self.rewrites.insert(
+                    node,
+                    RewritePlan {
+                        rewrite,
+                        trigger: chain.site,
+                    },
+                );
+                None
             }
             _ => None,
         }
@@ -861,6 +1019,13 @@ fn const_int_arg(args: &[TypedMethodArg]) -> Option<u64> {
         },
         _ => None,
     }
+}
+
+fn flip_order(state: &mut ChainState) {
+    for key in &mut state.sort {
+        key.desc = !key.desc;
+    }
+    state.tie_desc = !state.tie_desc;
 }
 
 fn apply_take(state: &mut ChainState, bound: u64) {
@@ -1400,6 +1565,131 @@ mod tests {
         let constraints = root_constraints(&plan, &file);
         assert!(constraints.filters.is_empty());
         assert_eq!((constraints.offset, constraints.limit), (0, Some(10)));
+    }
+
+    #[test]
+    fn pushdown_window_and_predicate_methods() {
+        let (file, plan, _schema) = typed_and_plan("users.last()");
+        let constraints = root_constraints(&plan, &file);
+        assert!(constraints.sort.is_empty());
+        assert!(constraints.tie_desc);
+        assert_eq!(constraints.limit, Some(1));
+        assert_eq!(plan.runtime_rewrite(method_nodes(&file, "last")[0]), None);
+
+        let (file, plan, schema) = typed_and_plan("users.sort_over(id).reverse()");
+        let constraints = root_constraints(&plan, &file);
+        assert_eq!(
+            constraints.sort,
+            vec![SortKey {
+                field: field(&schema, "User", "id"),
+                desc: true,
+            }]
+        );
+        assert!(constraints.tie_desc);
+        assert_eq!(
+            plan.runtime_rewrite(method_nodes(&file, "sort_over")[0]),
+            Some(RuntimeRewrite::Skip)
+        );
+        assert_eq!(
+            plan.runtime_rewrite(method_nodes(&file, "reverse")[0]),
+            Some(RuntimeRewrite::Skip)
+        );
+
+        let (file, plan, _) = typed_and_plan("users.take_back(2)");
+        let constraints = root_constraints(&plan, &file);
+        assert!(constraints.tie_desc);
+        assert_eq!(constraints.limit, Some(2));
+        assert_eq!(
+            plan.runtime_rewrite(method_nodes(&file, "take_back")[0]),
+            Some(RuntimeRewrite::ReverseOutput)
+        );
+
+        let (file, plan, _) = typed_and_plan("users.skip_back(2)");
+        let constraints = root_constraints(&plan, &file);
+        assert!(constraints.tie_desc);
+        assert_eq!((constraints.offset, constraints.limit), (2, None));
+        assert_eq!(
+            plan.runtime_rewrite(method_nodes(&file, "skip_back")[0]),
+            Some(RuntimeRewrite::ReverseOutput)
+        );
+
+        let (file, plan, _) = typed_and_plan("users.take_back(3).take_back(2)");
+        let constraints = root_constraints(&plan, &file);
+        assert_eq!(constraints.limit, Some(2));
+        let nodes = method_nodes(&file, "take_back");
+        assert_eq!(
+            plan.runtime_rewrite(nodes[0]),
+            Some(RuntimeRewrite::ReverseOutput)
+        );
+        assert_eq!(plan.runtime_rewrite(nodes[1]), Some(RuntimeRewrite::Skip));
+
+        let (file, plan, _) = typed_and_plan("users.take_back(5).skip_back(1)");
+        let constraints = root_constraints(&plan, &file);
+        assert_eq!((constraints.offset, constraints.limit), (1, Some(4)));
+        let take_back = method_nodes(&file, "take_back");
+        let skip_back = method_nodes(&file, "skip_back");
+        assert_eq!(
+            plan.runtime_rewrite(take_back[0]),
+            Some(RuntimeRewrite::Skip)
+        );
+        assert_eq!(
+            plan.runtime_rewrite(skip_back[0]),
+            Some(RuntimeRewrite::ReverseOutput)
+        );
+
+        let (file, plan, schema) = typed_and_plan("users.any(active)");
+        let constraints = root_constraints(&plan, &file);
+        assert_eq!(
+            constraints.filters,
+            vec![PushExpr::Field(field(&schema, "User", "active"))]
+        );
+        assert_eq!(constraints.limit, Some(1));
+        assert_eq!(
+            plan.runtime_rewrite(method_nodes(&file, "any")[0]),
+            Some(RuntimeRewrite::NonEmpty)
+        );
+
+        let (file, plan, schema) = typed_and_plan("users.all(active)");
+        let constraints = root_constraints(&plan, &file);
+        assert_eq!(
+            constraints.filters,
+            vec![PushExpr::Not(Box::new(PushExpr::Field(field(
+                &schema, "User", "active"
+            ))))]
+        );
+        assert_eq!(constraints.limit, Some(1));
+        assert_eq!(
+            plan.runtime_rewrite(method_nodes(&file, "all")[0]),
+            Some(RuntimeRewrite::Empty)
+        );
+
+        let (file, plan, schema) = typed_and_plan("users.find(name == \"Dan\")");
+        let constraints = root_constraints(&plan, &file);
+        assert_eq!(
+            constraints.filters,
+            vec![PushExpr::Cmp {
+                op: CmpOp::Eq,
+                lhs: Box::new(PushExpr::Field(field(&schema, "User", "name"))),
+                rhs: Box::new(PushExpr::Literal(Scalar::String("Dan".to_string()))),
+            }]
+        );
+        assert_eq!(constraints.limit, Some(1));
+        assert_eq!(
+            plan.runtime_rewrite(method_nodes(&file, "find")[0]),
+            Some(RuntimeRewrite::First)
+        );
+
+        let (file, plan, _) = typed_and_plan("users.take(1).any(name == \"Bob\")");
+        let constraints = root_constraints(&plan, &file);
+        assert!(constraints.filters.is_empty());
+        assert_eq!(constraints.limit, Some(1));
+        assert_eq!(plan.runtime_rewrite(method_nodes(&file, "any")[0]), None);
+
+        let (file, plan, _) = typed_and_plan("users.take(0).any(active)");
+        let constraints = root_constraints(&plan, &file);
+        assert!(constraints.filters.is_empty());
+        assert_eq!(constraints.limit, Some(0));
+        assert_eq!(plan.runtime_rewrite(method_nodes(&file, "any")[0]), None);
     }
 
     #[test]
