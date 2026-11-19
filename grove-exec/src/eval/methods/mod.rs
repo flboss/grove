@@ -13,7 +13,10 @@ use grove_query::methods::{self, MethodId};
 use grove_query::typecheck::types::{TypedExpr, TypedExprKind, TypedMethodArg};
 
 use self::filter::eval_filter;
-use self::list::{eval_extend, eval_flatten, eval_list_contains, eval_list_len, eval_slice};
+use self::list::{
+    eval_extend, eval_flatten, eval_list_contains, eval_list_is_unique, eval_list_join,
+    eval_list_len, eval_list_unique, eval_list_unique_over, eval_slice,
+};
 use self::map::eval_map;
 use self::optional::{OptMethodKind, eval_optional};
 use self::reduce::{KeyedReduceKind, ReduceKind, eval_reduce, eval_reduce_over};
@@ -77,6 +80,10 @@ pub(super) fn eval_method(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val
         ),
         MethodId::ListFilter => eval_filter(base, args, ctx),
         MethodId::ListMap => eval_map(base, args, ctx),
+        MethodId::ListUnique => eval_list_unique(base),
+        MethodId::ListUniqueOver => eval_list_unique_over(base, args, ctx),
+        MethodId::ListIsUnique => eval_list_is_unique(base),
+        MethodId::ListJoin => eval_list_join(base, &eval_args(args, ctx)?),
         MethodId::ListSum | MethodId::ListAvg | MethodId::ListMax | MethodId::ListMin => {
             eval_reduce(
                 ReduceKind::from_method(method).expect("reduce method id has a reduce kind"),

@@ -21,10 +21,10 @@ pub(crate) fn base_need(method: MethodId) -> BaseNeed {
         | InstantMinute | InstantWeekday | InstantSecond | InstantEpoch | InstantToRfc3339
         | DurationAsSeconds | DurationAsMinutes | DurationAsHours | DurationAsDays | DecRoundDp
         | IntAbs | FloatAbs | DecAbs | DurationAbs | FloatIsNan | FloatIsFinite | FloatRound
-        | FloatFloor | FloatCeil => BaseNeed::Whole,
+        | FloatFloor | FloatCeil | ListJoin | ListUnique | ListIsUnique => BaseNeed::Whole,
         ListFilter | ListSortAsc | ListSortDesc | ListSortAscOver | ListSortDescOver | ListTake
-        | ListSkip | ListFirst | ListNth | ListFlatten | ListExtend | OptionalUnwrap
-        | OptionalUnwrapOr => BaseNeed::Output,
+        | ListSkip | ListFirst | ListNth | ListFlatten | ListExtend | ListUniqueOver
+        | OptionalUnwrap | OptionalUnwrapOr => BaseNeed::Output,
     }
 }
 
@@ -43,6 +43,8 @@ pub(crate) fn is_element_preserving(method: MethodId) -> bool {
             | ListFlatten
             | ListFirst
             | ListNth
+            | ListUnique
+            | ListUniqueOver
             | OptionalUnwrap
     )
 }

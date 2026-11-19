@@ -1,8 +1,11 @@
 use grove_query::methods::{self, MethodId};
+use grove_query::typecheck::types::TypedMethodArg;
 use grove_types::Span;
 
+use super::{pop_element_scope, push_element_scope};
 use crate::error::ExecError;
-use crate::eval::{EvalCtx, data::resolve_owning_values};
+use crate::eval::data::{owning_refs_in, prefetch_owning, resolve_owning_values};
+use crate::eval::{EvalCtx, eval};
 use crate::value::{Scalar, Val};
 
 pub(super) fn eval_slice(
@@ -108,6 +111,97 @@ pub(super) fn eval_list_contains(
     )))
 }
 
+/// Join a list of strings with a separator
+pub(super) fn eval_list_join(base: Val, args: &[Val]) -> Result<Val, ExecError> {
+    let Val::List(items) = base else {
+        return Err(ExecError::Integrity {
+            message: format!("`join()` on non-list value: {base} (internal error)"),
+        });
+    };
+    let separator = match args {
+        [Val::Scalar(Scalar::String(separator))] => separator,
+        _ => {
+            return Err(ExecError::Integrity {
+                message: "`join()` expects one String argument (internal error)".to_string(),
+            });
+        }
+    };
+    let mut parts = Vec::with_capacity(items.len());
+    for item in items {
+        let Val::Scalar(Scalar::String(part)) = item else {
+            return Err(ExecError::Integrity {
+                message: format!("`join()` over non-String element: {item} (internal error)"),
+            });
+        };
+        parts.push(part);
+    }
+    Ok(Val::Scalar(Scalar::String(parts.join(separator))))
+}
+
+pub(super) fn eval_list_unique(base: Val) -> Result<Val, ExecError> {
+    let Val::List(items) = base else {
+        return Err(ExecError::Integrity {
+            message: format!("`unique()` on non-list value: {base} (internal error)"),
+        });
+    };
+    let mut unique: Vec<Val> = Vec::new();
+    for item in items {
+        if !unique.iter().any(|seen| seen.eq(&item) == Some(true)) {
+            unique.push(item);
+        }
+    }
+    Ok(Val::List(unique))
+}
+
+pub(super) fn eval_list_unique_over(
+    base: Val,
+    args: &[TypedMethodArg],
+    ctx: &mut EvalCtx<'_>,
+) -> Result<Val, ExecError> {
+    let Val::List(mut items) = base else {
+        return Err(ExecError::Integrity {
+            message: format!("`unique_over()` on non-list value: {base} (internal error)"),
+        });
+    };
+    let [arg] = args else {
+        return Err(ExecError::Integrity {
+            message: "`unique_over()` expects one argument (internal error)".to_string(),
+        });
+    };
+    let fields = owning_refs_in(&arg.expr, ctx.schema, ctx.plan.prefetch_skip());
+    prefetch_owning(ctx, &mut items, &fields)?;
+    let mut unique: Vec<Val> = Vec::new();
+    let mut keys: Vec<Val> = Vec::new();
+    for item in items {
+        let map_element = push_element_scope(ctx, &item);
+        let key = eval(&arg.expr, ctx);
+        pop_element_scope(ctx, map_element);
+        let key = key?;
+        if !keys.iter().any(|seen| seen.eq(&key) == Some(true)) {
+            keys.push(key);
+            unique.push(item);
+        }
+    }
+    Ok(Val::List(unique))
+}
+
+pub(super) fn eval_list_is_unique(base: Val) -> Result<Val, ExecError> {
+    let Val::List(items) = base else {
+        return Err(ExecError::Integrity {
+            message: format!("`is_unique()` on non-list value: {base} (internal error)"),
+        });
+    };
+    for (index, item) in items.iter().enumerate() {
+        if items[index + 1..]
+            .iter()
+            .any(|other| item.eq(other) == Some(true))
+        {
+            return Ok(Val::Scalar(Scalar::Bool(false)));
+        }
+    }
+    Ok(Val::Scalar(Scalar::Bool(true)))
+}
+
 pub(super) fn eval_flatten(base: Val) -> Result<Val, ExecError> {
     let Val::List(items) = base else {
         return Err(ExecError::Integrity {
@@ -191,7 +285,6 @@ mod tests {
             Ok(bool(true)),
         );
     }
-
     #[test]
     fn method_take_skip() {
         let names = |src: &str| match run_seeded(src) {
@@ -300,6 +393,34 @@ mod tests {
         }
         assert_eq!(run_seeded("users.roles.len()"), Ok(int(5)));
         assert_eq!(run_seeded("users.roles.flatten().len()"), Ok(int(4)));
+    }
+
+    #[test]
+    fn method_join() {
+        assert_eq!(run_src(r#"["a", "b", "c"].join("-")"#), Ok(str("a-b-c")));
+        assert_eq!(run_src(r#"["x"].skip(1).join(",")"#), Ok(str("")));
+    }
+
+    #[test]
+    fn method_unique() {
+        assert_eq!(
+            run_src("[1, 2, 1, 3, 2].unique()"),
+            Ok(Val::List(vec![int(1), int(2), int(3)]))
+        );
+        assert_eq!(
+            run_src("[{ a = 1, b = 2 }, { a = 1, b = 3 }, { a = 2, b = 4 }].unique_over(a)"),
+            Ok(Val::List(vec![
+                rec(vec![("a", int(1)), ("b", int(2))]),
+                rec(vec![("a", int(2)), ("b", int(4))]),
+            ]))
+        );
+        assert_eq!(
+            run_src("[1, 2, 3, 4].unique_over($ mod 2)"),
+            Ok(Val::List(vec![int(1), int(2)]))
+        );
+        assert_eq!(run_src("[1, 2, 3].is_unique()"), Ok(bool(true)));
+        assert_eq!(run_src("[1, 2, 1].is_unique()"), Ok(bool(false)));
+        assert_eq!(run_src("[1].skip(1).is_unique()"), Ok(bool(true)));
     }
 
     #[test]

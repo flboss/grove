@@ -48,6 +48,10 @@ pub enum MethodId {
     ListFlatten,
     ListExtend,
     ListContains,
+    ListJoin,
+    ListUnique,
+    ListUniqueOver,
+    ListIsUnique,
     ListFilter,
     ListMap,
     ListSum,
@@ -81,6 +85,7 @@ pub enum ReceiverSpec {
     Scalar(ScalarType),
     Optional,
     List,
+    ListOfScalar(ScalarType),
     ListOfList,
     ListOfSummable,
     ListOfAverageable,
@@ -133,6 +138,9 @@ impl ReceiverSpec {
             (ReceiverSpec::Scalar(expected), QueryType::Scalar(actual)) => expected == *actual,
             (ReceiverSpec::Optional, QueryType::Optional(_)) => true,
             (ReceiverSpec::List, QueryType::List(_)) => true,
+            (ReceiverSpec::ListOfScalar(expected), QueryType::List(inner)) => {
+                matches!(inner.as_ref(), QueryType::Scalar(actual) if expected == *actual)
+            }
             (ReceiverSpec::ListOfList, QueryType::List(inner)) => {
                 matches!(inner.as_ref(), QueryType::List(_))
             }
@@ -154,6 +162,7 @@ impl ReceiverSpec {
             ReceiverSpec::Scalar(scalar) => Scalar(scalar),
             ReceiverSpec::Optional => Optional(Box::new(Scalar(Int))),
             ReceiverSpec::List => List(Box::new(Scalar(Int))),
+            ReceiverSpec::ListOfScalar(scalar) => List(Box::new(Scalar(scalar))),
             ReceiverSpec::ListOfList => List(Box::new(List(Box::new(Scalar(Int))))),
             ReceiverSpec::ListOfSummable
             | ReceiverSpec::ListOfOrdered
@@ -250,7 +259,8 @@ use ArgSpec::{Fixed, Scoped};
 use ArgType::{Inner, ListOfInner, Scalar as ScalarArg};
 use MethodId::*;
 use ReceiverSpec::{
-    List, ListOfAverageable, ListOfList, ListOfOrdered, ListOfSummable, Optional, Scalar,
+    List, ListOfAverageable, ListOfList, ListOfOrdered, ListOfScalar, ListOfSummable, Optional,
+    Scalar,
 };
 use ReturnSpec::{
     Inner as InnerReturn, ListOfArgument, ListOfInner as ListOfInnerReturn,
@@ -617,6 +627,41 @@ static METHODS: &[MethodDef] = &[
         names: &["contains"],
         receiver: List,
         args: Fixed(&[Inner]),
+        scope: NoScope,
+        returns: ScalarReturn(Bool),
+    },
+    MethodDef {
+        id: ListJoin,
+        names: &["join"],
+        receiver: ListOfScalar(String),
+        args: Fixed(&[ScalarArg(String)]),
+        scope: NoScope,
+        returns: ScalarReturn(String),
+    },
+    MethodDef {
+        id: ListUnique,
+        names: &["unique"],
+        receiver: List,
+        args: Fixed(&[]),
+        scope: NoScope,
+        returns: ListOfInnerReturn,
+    },
+    MethodDef {
+        id: ListUniqueOver,
+        names: &["unique_over"],
+        receiver: List,
+        args: Scoped {
+            count: Exact(1),
+            constraint: any_type,
+        },
+        scope: FieldsOrElement,
+        returns: ListOfInnerReturn,
+    },
+    MethodDef {
+        id: ListIsUnique,
+        names: &["is_unique"],
+        receiver: List,
+        args: Fixed(&[]),
         scope: NoScope,
         returns: ScalarReturn(Bool),
     },
