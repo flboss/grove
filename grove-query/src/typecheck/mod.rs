@@ -2686,6 +2686,18 @@ mod tests {
     }
 
     #[test]
+    fn list_boundary_methods() {
+        assert_eq!(
+            infer_ok("[1, 2].last()", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Int).wrap_optional()
+        );
+        assert_eq!(
+            infer_ok("[1, 2].take_back(1)", &test_schema()).ty,
+            QueryType::List(Box::new(QueryType::Scalar(ScalarType::Int)))
+        );
+    }
+
+    #[test]
     fn string_split_and_scalar_casts() {
         assert_eq!(
             infer_ok(r#""a,b".split(",")"#, &test_schema()).ty,

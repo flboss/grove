@@ -58,6 +58,22 @@ pub(super) fn eval_list_slice(
             }
             Val::List(items)
         }
+        MethodId::ListTakeBack | MethodId::ListSkipBack => {
+            let n = index_arg()?;
+            if n < 0 {
+                return Err(ExecError::Abort {
+                    message: format!("`{name}()` called with negative bound {n}"),
+                    span,
+                });
+            }
+            let n = (n as usize).min(items.len());
+            if id == MethodId::ListTakeBack {
+                items.drain(..items.len() - n);
+            } else {
+                items.truncate(items.len() - n);
+            }
+            Val::List(items)
+        }
         MethodId::ListLast => match items.pop() {
             Some(last) => Val::Some(Box::new(last)),
             None => Val::None,
@@ -516,6 +532,44 @@ mod tests {
             Ok(Val::List(vec![int(3), int(2), int(1)]))
         );
         assert_eq!(run_src("[1, 2, 3].last() == some(3)"), Ok(bool(true)));
+    }
+
+    #[test]
+    fn method_back_slices() {
+        assert_eq!(
+            run_src("[1, 2, 3].take_back(2)"),
+            Ok(Val::List(vec![int(2), int(3)]))
+        );
+        assert_eq!(run_src("[1, 2, 3].take_back(0)"), Ok(Val::List(vec![])));
+        assert_eq!(
+            run_src("[1, 2, 3].take_back(9)"),
+            Ok(Val::List(vec![int(1), int(2), int(3)]))
+        );
+        assert_eq!(
+            run_src("[1, 2, 3].skip_back(1)"),
+            Ok(Val::List(vec![int(1), int(2)]))
+        );
+        assert_eq!(
+            run_src("[1, 2, 3].skip_back(0)"),
+            Ok(Val::List(vec![int(1), int(2), int(3)]))
+        );
+        assert_eq!(run_src("[1, 2, 3].skip_back(9)"), Ok(Val::List(vec![])));
+        assert!(
+            run_src("[1].take_back(-1)")
+                .unwrap_err()
+                .to_string()
+                .contains("negative bound")
+        );
+        assert!(
+            run_src("[1].skip_back(-1)")
+                .unwrap_err()
+                .to_string()
+                .contains("negative bound")
+        );
+        assert_eq!(
+            run_src("[1, 2, 3].reverse().take_back(2)"),
+            Ok(Val::List(vec![int(2), int(1)]))
+        );
     }
 
     #[test]

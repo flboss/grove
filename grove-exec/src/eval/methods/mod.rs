@@ -124,7 +124,9 @@ pub(super) fn eval_method(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val
         | MethodId::ListSkip
         | MethodId::ListFirst
         | MethodId::ListNth
-        | MethodId::ListLast => eval_list_slice(method, base, &eval_args(args, ctx)?, span),
+        | MethodId::ListLast
+        | MethodId::ListTakeBack
+        | MethodId::ListSkipBack => eval_list_slice(method, base, &eval_args(args, ctx)?, span),
         MethodId::ListLen => eval_list_len(base),
         MethodId::ListContains => {
             let mut arg_vals = eval_args(args, ctx)?;
