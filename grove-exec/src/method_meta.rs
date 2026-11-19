@@ -18,10 +18,8 @@ pub(crate) fn base_need(method: MethodId) -> BaseNeed {
         StringContains | ListContains | StringStartsWith | StringEndsWith | StringToUpper
         | StringToLower | InstantYear | InstantMonth | InstantDay | InstantHour | InstantMinute
         | InstantWeekday | InstantSecond | InstantEpoch | InstantToRfc3339 | DurationAsSeconds
-        | DurationAsMinutes | DurationAsHours | DurationAsDays | DecRoundDp | DecToString
-        | IntToString | FloatToString | FloatRound | FloatFloor | FloatCeil | BoolToString => {
-            BaseNeed::Whole
-        }
+        | DurationAsMinutes | DurationAsHours | DurationAsDays | DecRoundDp | FloatRound
+        | FloatFloor | FloatCeil => BaseNeed::Whole,
         ListFilter | ListSortAsc | ListSortDesc | ListSortAscOver | ListSortDescOver | ListTake
         | ListSkip | ListFirst | ListNth | ListFlatten | ListExtend | OptionalUnwrap
         | OptionalUnwrapOr => BaseNeed::Output,

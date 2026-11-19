@@ -321,6 +321,12 @@ pub(super) fn eval_cast(
     schema: &ValidatedSchema,
 ) -> Result<Val, ExecError> {
     let scalar = match (value, target) {
+        (
+            Val::Scalar(
+                scalar @ (Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool(_) | Scalar::Dec(_)),
+            ),
+            TypeName::String,
+        ) => Scalar::String(scalar.to_string()),
         (Val::Scalar(Scalar::Int(n)), TypeName::Int) => Scalar::Int(n),
         (Val::Scalar(Scalar::Int(n)), TypeName::Float) => Scalar::Float(n as f64),
         (Val::Scalar(Scalar::Int(n)), TypeName::Dec) => {
@@ -626,6 +632,13 @@ mod tests {
             ("5.5 as Float", float(5.5)),
             ("true as Int", int(1)),
             ("false as Int", int(0)),
+            ("42 as String", str("42")),
+            ("3.14f as String", str("3.14f")),
+            ("1.0f as String", str("1.0f")),
+            ("true as String", str("true")),
+            ("30.00 as String", str("30.0")),
+            ("2.5 as String", str("2.5")),
+            ("(123456789 as Dec) as String", str("123456789.0")),
             (r#""hello" as Bytes"#, bytes(b"hello")),
             ("\"é\" as Bytes", bytes(&[0xc3, 0xa9])),
         ] {

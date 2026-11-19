@@ -481,6 +481,12 @@ fn cast_allowed(from: &QueryType, to: &QueryType, schema: &ValidatedSchema) -> b
     match (from, to) {
         _ if from.is_numeric() && to.is_numeric() => true,
         (QueryType::Scalar(ScalarType::Bool), QueryType::Scalar(ScalarType::Int)) => true,
+        (
+            QueryType::Scalar(
+                ScalarType::Int | ScalarType::Float | ScalarType::Bool | ScalarType::Dec,
+            ),
+            QueryType::Scalar(ScalarType::String),
+        ) => true,
         (QueryType::Scalar(ScalarType::String), QueryType::Scalar(ScalarType::Bytes)) => true,
         (QueryType::Enum(id), QueryType::Scalar(target))
             if schema

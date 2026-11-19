@@ -169,15 +169,6 @@ pub(super) fn eval_scalar_method(
                 ))
             }
         }
-        MethodId::DecToString
-        | MethodId::IntToString
-        | MethodId::FloatToString
-        | MethodId::BoolToString => match base {
-            Scalar::Dec(_) | Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool(_) => {
-                Ok(Scalar::String(base.to_string()))
-            }
-            _ => scalar_method_integrity(method, name, base),
-        },
         MethodId::FloatRound => {
             let Scalar::Float(x) = base else {
                 return scalar_method_integrity(method, name, base);
@@ -329,26 +320,11 @@ mod tests {
             ("2.665.round_dp(2)", dec(dec!(2.66))),
             ("2.567.round_dp(2)", dec(dec!(2.57))),
             ("1.5.round_dp(100)", dec(dec!(1.5))),
-            ("30.00.to_string()", str("30.0")),
-            ("2.5.to_string()", str("2.5")),
-            ("(123456789 as Dec).to_string()", str("123456789.0")),
         ] {
             assert_eq!(run_src(src), Ok(expected), "{src}");
         }
         let err = run_src("2.5.round_dp(-1)").unwrap_err();
         assert!(err.to_string().contains("round_dp"), "{err}");
-    }
-
-    #[test]
-    fn eval_scalar_to_string() {
-        for (src, expected) in [
-            ("42.to_string()", str("42")),
-            ("3.14f.to_string()", str("3.14f")),
-            ("1.0f.to_string()", str("1.0f")),
-            ("true.to_string()", str("true")),
-        ] {
-            assert_eq!(run_src(src), Ok(expected), "{src}");
-        }
     }
 
     #[test]
