@@ -16,11 +16,12 @@ pub(crate) fn base_need(method: MethodId) -> BaseNeed {
             BaseNeed::Narrow
         }
         StringContains | ListContains | StringStartsWith | StringEndsWith | StringToUpper
-        | StringToLower | InstantYear | InstantMonth | InstantDay | InstantHour | InstantMinute
-        | InstantWeekday | InstantSecond | InstantEpoch | InstantToRfc3339 | DurationAsSeconds
-        | DurationAsMinutes | DurationAsHours | DurationAsDays | DecRoundDp | IntAbs | FloatAbs
-        | DecAbs | DurationAbs | FloatIsNan | FloatIsFinite | FloatRound | FloatFloor
-        | FloatCeil => BaseNeed::Whole,
+        | StringToLower | StringConcat | StringSplit | StringTrim | StringTrimLeft
+        | StringTrimRight | InstantYear | InstantMonth | InstantDay | InstantHour
+        | InstantMinute | InstantWeekday | InstantSecond | InstantEpoch | InstantToRfc3339
+        | DurationAsSeconds | DurationAsMinutes | DurationAsHours | DurationAsDays | DecRoundDp
+        | IntAbs | FloatAbs | DecAbs | DurationAbs | FloatIsNan | FloatIsFinite | FloatRound
+        | FloatFloor | FloatCeil => BaseNeed::Whole,
         ListFilter | ListSortAsc | ListSortDesc | ListSortAscOver | ListSortDescOver | ListTake
         | ListSkip | ListFirst | ListNth | ListFlatten | ListExtend | OptionalUnwrap
         | OptionalUnwrapOr => BaseNeed::Output,

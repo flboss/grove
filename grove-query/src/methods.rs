@@ -8,6 +8,11 @@ pub enum MethodId {
     StringEndsWith,
     StringToUpper,
     StringToLower,
+    StringConcat,
+    StringSplit,
+    StringTrim,
+    StringTrimLeft,
+    StringTrimRight,
     StringLen,
     BytesLen,
     InstantYear,
@@ -114,6 +119,7 @@ pub enum ScopeSpec {
 #[derive(Debug, Clone, Copy)]
 pub enum ReturnSpec {
     Scalar(ScalarType),
+    ListOfScalar(ScalarType),
     Inner,
     OptionalInner,
     ListOfInner,
@@ -171,6 +177,9 @@ impl MethodDef {
     pub fn return_type(&self, receiver: &QueryType, first_arg: Option<&QueryType>) -> QueryType {
         match self.returns {
             ReturnSpec::Scalar(scalar) => QueryType::Scalar(scalar),
+            ReturnSpec::ListOfScalar(scalar) => {
+                QueryType::List(Box::new(QueryType::Scalar(scalar)))
+            }
             ReturnSpec::Inner => receiver_inner(receiver).clone(),
             ReturnSpec::OptionalInner => receiver_inner(receiver).clone().wrap_optional(),
             ReturnSpec::ListOfInner => QueryType::List(Box::new(receiver_inner(receiver).clone())),
@@ -244,8 +253,8 @@ use ReceiverSpec::{
     List, ListOfAverageable, ListOfList, ListOfOrdered, ListOfSummable, Optional, Scalar,
 };
 use ReturnSpec::{
-    Inner as InnerReturn, ListOfArgument, ListOfInner as ListOfInnerReturn, OptionalArgument,
-    OptionalInner, Scalar as ScalarReturn,
+    Inner as InnerReturn, ListOfArgument, ListOfInner as ListOfInnerReturn,
+    ListOfScalar as ListOfScalarReturn, OptionalArgument, OptionalInner, Scalar as ScalarReturn,
 };
 use ScalarType::{Bool, Bytes, Dec, Duration, Float, Instant, Int, String};
 use ScopeSpec::{ElementOfReceiver, FieldsOrElement, None as NoScope};
@@ -286,6 +295,46 @@ static METHODS: &[MethodDef] = &[
     MethodDef {
         id: StringToLower,
         names: &["to_lower"],
+        receiver: Scalar(String),
+        args: Fixed(&[]),
+        scope: NoScope,
+        returns: ScalarReturn(String),
+    },
+    MethodDef {
+        id: StringConcat,
+        names: &["concat"],
+        receiver: Scalar(String),
+        args: Fixed(&[ScalarArg(String)]),
+        scope: NoScope,
+        returns: ScalarReturn(String),
+    },
+    MethodDef {
+        id: StringSplit,
+        names: &["split"],
+        receiver: Scalar(String),
+        args: Fixed(&[ScalarArg(String)]),
+        scope: NoScope,
+        returns: ListOfScalarReturn(String),
+    },
+    MethodDef {
+        id: StringTrim,
+        names: &["trim"],
+        receiver: Scalar(String),
+        args: Fixed(&[]),
+        scope: NoScope,
+        returns: ScalarReturn(String),
+    },
+    MethodDef {
+        id: StringTrimLeft,
+        names: &["trim_left"],
+        receiver: Scalar(String),
+        args: Fixed(&[]),
+        scope: NoScope,
+        returns: ScalarReturn(String),
+    },
+    MethodDef {
+        id: StringTrimRight,
+        names: &["trim_right"],
         receiver: Scalar(String),
         args: Fixed(&[]),
         scope: NoScope,

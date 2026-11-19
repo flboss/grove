@@ -2646,6 +2646,18 @@ mod tests {
     }
 
     #[test]
+    fn string_split_and_scalar_casts() {
+        assert_eq!(
+            infer_ok(r#""a,b".split(",")"#, &test_schema()).ty,
+            QueryType::List(Box::new(QueryType::Scalar(ScalarType::String)))
+        );
+        assert_eq!(
+            infer_ok("42 as String", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::String)
+        );
+    }
+
+    #[test]
     fn optional_depth_mismatch() {
         let schema = test_schema();
         let (file, _diags) = crate::parse_query("1?.abs()");

@@ -35,6 +35,25 @@ fn duration_as(total_nanos: Decimal, divisor: i64) -> Scalar {
     )
 }
 
+pub(super) fn eval_string_split(base: &Val, args: &[Val]) -> Result<Val, ExecError> {
+    let Val::Scalar(Scalar::String(s)) = base else {
+        return Err(ExecError::Integrity {
+            message: format!("`split()` on non-String value: {base} (internal error)"),
+        });
+    };
+    let pattern = method_string_arg(args, "split")?;
+    let parts = if pattern.is_empty() {
+        s.chars()
+            .map(|c| Val::Scalar(Scalar::String(c.to_string())))
+            .collect()
+    } else {
+        s.split(pattern)
+            .map(|part| Val::Scalar(Scalar::String(part.to_string())))
+            .collect()
+    };
+    Ok(Val::List(parts))
+}
+
 pub(super) fn eval_scalar_method(
     method: MethodId,
     name: &str,
@@ -78,6 +97,33 @@ pub(super) fn eval_scalar_method(
                 return scalar_method_integrity(method, name, base);
             };
             Ok(Scalar::String(s.to_lowercase()))
+        }
+        MethodId::StringConcat => {
+            let Scalar::String(s) = base else {
+                return scalar_method_integrity(method, name, base);
+            };
+            Ok(Scalar::String(format!(
+                "{s}{}",
+                method_string_arg(args, name)?
+            )))
+        }
+        MethodId::StringTrim => {
+            let Scalar::String(s) = base else {
+                return scalar_method_integrity(method, name, base);
+            };
+            Ok(Scalar::String(s.trim().to_string()))
+        }
+        MethodId::StringTrimLeft => {
+            let Scalar::String(s) = base else {
+                return scalar_method_integrity(method, name, base);
+            };
+            Ok(Scalar::String(s.trim_start().to_string()))
+        }
+        MethodId::StringTrimRight => {
+            let Scalar::String(s) = base else {
+                return scalar_method_integrity(method, name, base);
+            };
+            Ok(Scalar::String(s.trim_end().to_string()))
         }
         MethodId::StringLen => {
             let Scalar::String(s) = base else {
@@ -267,6 +313,10 @@ mod tests {
     use crate::value::{Scalar, Val};
     use rust_decimal::dec;
 
+    fn list_str(parts: &[&str]) -> Val {
+        Val::List(parts.iter().map(|part| str(part)).collect())
+    }
+
     #[test]
     fn eval_string_methods() {
         for (src, expected) in [
@@ -282,6 +332,16 @@ mod tests {
             (r#""HeLLo".to_upper()"#, str("HELLO")),
             (r#""HeLLo".to_lower()"#, str("hello")),
             (r#""ß".to_upper()"#, str("SS")),
+            (r#""hello".concat(" world")"#, str("hello world")),
+            (r#""a,b,,c".split(",")"#, list_str(&["a", "b", "", "c"])),
+            (r#"",a,".split(",")"#, list_str(&["", "a", ""])),
+            (r#""abc".split("")"#, list_str(&["a", "b", "c"])),
+            (r#""".split("")"#, Val::List(vec![])),
+            (r#""".split(",")"#, list_str(&[""])),
+            (r#""abc".split("x")"#, list_str(&["abc"])),
+            (r#""  hi  ".trim()"#, str("hi")),
+            (r#""  hi  ".trim_left()"#, str("hi  ")),
+            (r#""  hi  ".trim_right()"#, str("  hi")),
             (r#""hello".len()"#, int(5)),
             (r#""".len()"#, int(0)),
             (r#""héllo".len()"#, int(5)),

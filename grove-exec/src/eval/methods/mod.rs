@@ -17,7 +17,7 @@ use self::list::{eval_extend, eval_flatten, eval_list_contains, eval_list_len, e
 use self::map::eval_map;
 use self::optional::{OptMethodKind, eval_optional};
 use self::reduce::{KeyedReduceKind, ReduceKind, eval_reduce, eval_reduce_over};
-use self::scalar::eval_scalar_method;
+use self::scalar::{eval_scalar_method, eval_string_split};
 use self::sort::{SortKind, eval_sort};
 use super::data::resolve_base_link;
 use super::{EvalCtx, eval};
@@ -120,6 +120,7 @@ pub(super) fn eval_method(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val
             };
             eval_list_contains(ctx, base, needle)
         }
+        MethodId::StringSplit => eval_string_split(&base, &eval_args(args, ctx)?),
         _ if methods::method(method).is_scalar_method() => {
             let arg_vals = eval_args(args, ctx)?;
             eval_scalar_method(method, name, &base, &arg_vals, &ctx.schema.config, span)
