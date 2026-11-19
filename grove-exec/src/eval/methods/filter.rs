@@ -1,9 +1,9 @@
 use grove_query::typecheck::types::TypedMethodArg;
 
-use super::super::data::{owning_refs_in, prefetch_owning, resolve_base_link};
-use super::super::{EvalCtx, eval};
 use super::{pop_element_scope, push_element_scope};
 use crate::error::ExecError;
+use crate::eval::data::{owning_refs_in, prefetch_owning, resolve_base_link};
+use crate::eval::{EvalCtx, eval};
 use crate::value::{Scalar, Val};
 
 pub(super) fn eval_filter(

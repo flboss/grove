@@ -14,17 +14,18 @@ use grove_query::typecheck::types::{TypedExpr, TypedExprKind, TypedMethodArg};
 
 use self::filter::eval_filter;
 use self::list::{
-    eval_extend, eval_flatten, eval_list_contains, eval_list_is_unique, eval_list_join,
-    eval_list_len, eval_list_unique, eval_list_unique_over, eval_slice,
+    eval_list_compact, eval_list_contains, eval_list_extend, eval_list_flatten,
+    eval_list_is_unique, eval_list_join, eval_list_len, eval_list_slice, eval_list_transpose,
+    eval_list_unique, eval_list_unique_over,
 };
-use self::map::eval_map;
-use self::optional::{OptMethodKind, eval_optional, eval_optional_flatten, eval_optional_map};
+use self::map::{eval_list_map, eval_optional_map};
+use self::optional::{OptMethodKind, eval_optional, eval_optional_flatten};
 use self::reduce::{KeyedReduceKind, ReduceKind, eval_reduce, eval_reduce_over};
 use self::scalar::{eval_scalar_method, eval_string_split};
 use self::sort::{SortKind, eval_sort};
-use super::data::resolve_base_link;
-use super::{EvalCtx, eval};
 use crate::error::ExecError;
+use crate::eval::data::resolve_base_link;
+use crate::eval::{EvalCtx, eval};
 use crate::pushdown::CapRewrite;
 use crate::value::{Scalar, Val, rewrap_optional, unwrap_optional_depth};
 
@@ -60,7 +61,7 @@ pub(super) fn eval_method(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val
             (CapRewrite::First, MethodId::ListNth) => {
                 return Ok(rewrap_optional(
                     opt_depth,
-                    eval_slice(MethodId::ListFirst, base, &[], span)?,
+                    eval_list_slice(MethodId::ListFirst, base, &[], span)?,
                 ));
             }
             _ => {}
@@ -79,7 +80,7 @@ pub(super) fn eval_method(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val
             span,
         ),
         MethodId::ListFilter => eval_filter(base, args, ctx),
-        MethodId::ListMap => eval_map(base, args, ctx),
+        MethodId::ListMap => eval_list_map(base, args, ctx),
         MethodId::ListUnique => eval_list_unique(base),
         MethodId::ListUniqueOver => eval_list_unique_over(base, args, ctx),
         MethodId::ListIsUnique => eval_list_is_unique(base),
@@ -114,10 +115,10 @@ pub(super) fn eval_method(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val
         ),
         MethodId::OptionalMap => eval_optional_map(base, args, ctx),
         MethodId::OptionalFlatten => eval_optional_flatten(base),
-        MethodId::ListFlatten => eval_flatten(base),
-        MethodId::ListExtend => eval_extend(base, eval_args(args, ctx)?),
+        MethodId::ListFlatten => eval_list_flatten(base),
+        MethodId::ListExtend => eval_list_extend(base, eval_args(args, ctx)?),
         MethodId::ListTake | MethodId::ListSkip | MethodId::ListFirst | MethodId::ListNth => {
-            eval_slice(method, base, &eval_args(args, ctx)?, span)
+            eval_list_slice(method, base, &eval_args(args, ctx)?, span)
         }
         MethodId::ListLen => eval_list_len(base),
         MethodId::ListContains => {

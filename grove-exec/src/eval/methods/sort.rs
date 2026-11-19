@@ -7,11 +7,10 @@ use grove_query::methods::MethodId;
 use grove_query::typecheck::types::TypedMethodArg;
 use grove_types::Span;
 
-use super::super::data::{prefetch_owning, resolve_base_link};
-use super::super::{EvalCtx, eval};
 use super::{pop_element_scope, push_element_scope};
 use crate::error::ExecError;
-use crate::eval::data::collect_owning_refs_in;
+use crate::eval::data::{collect_owning_refs_in, prefetch_owning, resolve_base_link};
+use crate::eval::{EvalCtx, eval};
 use crate::value::Val;
 
 #[derive(Debug, Clone, Copy)]

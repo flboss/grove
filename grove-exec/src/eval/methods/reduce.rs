@@ -7,11 +7,11 @@ use grove_schema::validated::Config;
 use grove_types::Span;
 use rust_decimal::Decimal;
 
-use super::super::arithmetic::{ArithOp, dec_arith, float_arith, int_arith, scale_duration};
-use super::super::data::{owning_refs_in, prefetch_owning, resolve_base_link};
-use super::super::{EvalCtx, eval};
 use super::{pop_element_scope, push_element_scope};
 use crate::error::ExecError;
+use crate::eval::arithmetic::{ArithOp, dec_arith, float_arith, int_arith, scale_duration};
+use crate::eval::data::{owning_refs_in, prefetch_owning, resolve_base_link};
+use crate::eval::{EvalCtx, eval};
 use crate::value::{Scalar, Val};
 
 #[derive(Debug, Clone, Copy, PartialEq)]

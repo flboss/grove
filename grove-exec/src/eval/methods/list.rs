@@ -8,7 +8,7 @@ use crate::eval::data::{owning_refs_in, prefetch_owning, resolve_owning_values};
 use crate::eval::{EvalCtx, eval};
 use crate::value::{Scalar, Val};
 
-pub(super) fn eval_slice(
+pub(super) fn eval_list_slice(
     id: MethodId,
     base: Val,
     args: &[Val],
@@ -202,7 +202,7 @@ pub(super) fn eval_list_is_unique(base: Val) -> Result<Val, ExecError> {
     Ok(Val::Scalar(Scalar::Bool(true)))
 }
 
-pub(super) fn eval_flatten(base: Val) -> Result<Val, ExecError> {
+pub(super) fn eval_list_flatten(base: Val) -> Result<Val, ExecError> {
     let Val::List(items) = base else {
         return Err(ExecError::Integrity {
             message: format!("`flatten()` on non-list value: {base} (internal error)"),
@@ -223,7 +223,7 @@ pub(super) fn eval_flatten(base: Val) -> Result<Val, ExecError> {
 }
 
 /// Concatenate two compatible lists
-pub(super) fn eval_extend(base: Val, mut args: Vec<Val>) -> Result<Val, ExecError> {
+pub(super) fn eval_list_extend(base: Val, mut args: Vec<Val>) -> Result<Val, ExecError> {
     let mut items = match base {
         Val::List(items) => items,
         other => {
@@ -285,6 +285,7 @@ mod tests {
             Ok(bool(true)),
         );
     }
+
     #[test]
     fn method_take_skip() {
         let names = |src: &str| match run_seeded(src) {
