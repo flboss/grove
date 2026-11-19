@@ -18,7 +18,7 @@ use self::list::{
     eval_list_len, eval_list_unique, eval_list_unique_over, eval_slice,
 };
 use self::map::eval_map;
-use self::optional::{OptMethodKind, eval_optional};
+use self::optional::{OptMethodKind, eval_optional, eval_optional_flatten, eval_optional_map};
 use self::reduce::{KeyedReduceKind, ReduceKind, eval_reduce, eval_reduce_over};
 use self::scalar::{eval_scalar_method, eval_string_split};
 use self::sort::{SortKind, eval_sort};
@@ -112,6 +112,8 @@ pub(super) fn eval_method(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val
             ctx,
             span,
         ),
+        MethodId::OptionalMap => eval_optional_map(base, args, ctx),
+        MethodId::OptionalFlatten => eval_optional_flatten(base),
         MethodId::ListFlatten => eval_flatten(base),
         MethodId::ListExtend => eval_extend(base, eval_args(args, ctx)?),
         MethodId::ListTake | MethodId::ListSkip | MethodId::ListFirst | MethodId::ListNth => {

@@ -2646,6 +2646,34 @@ mod tests {
     }
 
     #[test]
+    fn optional_map_types() {
+        assert_eq!(
+            infer_ok("some(1).map($ + 1)", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Int).wrap_optional()
+        );
+        assert_eq!(
+            infer_ok("some(some(1))?.map($ + 1)", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Int)
+                .wrap_optional()
+                .wrap_optional()
+        );
+    }
+
+    #[test]
+    fn optional_flatten_types() {
+        assert_eq!(
+            infer_ok("some(some(1)).flatten()", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Int).wrap_optional()
+        );
+        assert_eq!(
+            infer_ok("some(some(some(1))).flatten()", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Int)
+                .wrap_optional()
+                .wrap_optional()
+        );
+    }
+
+    #[test]
     fn string_split_and_scalar_casts() {
         assert_eq!(
             infer_ok(r#""a,b".split(",")"#, &test_schema()).ty,

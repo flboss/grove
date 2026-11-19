@@ -42,6 +42,8 @@ pub enum MethodId {
     OptionalIsNone,
     OptionalUnwrap,
     OptionalUnwrapOr,
+    OptionalMap,
+    OptionalFlatten,
     ListLen,
     ListFirst,
     ListNth,
@@ -84,6 +86,7 @@ pub struct MethodDef {
 pub enum ReceiverSpec {
     Scalar(ScalarType),
     Optional,
+    OptionalOfOptional,
     List,
     ListOfScalar(ScalarType),
     ListOfList,
@@ -137,6 +140,9 @@ impl ReceiverSpec {
         match (self, ty) {
             (ReceiverSpec::Scalar(expected), QueryType::Scalar(actual)) => expected == *actual,
             (ReceiverSpec::Optional, QueryType::Optional(_)) => true,
+            (ReceiverSpec::OptionalOfOptional, QueryType::Optional(inner)) => {
+                matches!(inner.as_ref(), QueryType::Optional(_))
+            }
             (ReceiverSpec::List, QueryType::List(_)) => true,
             (ReceiverSpec::ListOfScalar(expected), QueryType::List(inner)) => {
                 matches!(inner.as_ref(), QueryType::Scalar(actual) if expected == *actual)
@@ -161,6 +167,7 @@ impl ReceiverSpec {
         match self {
             ReceiverSpec::Scalar(scalar) => Scalar(scalar),
             ReceiverSpec::Optional => Optional(Box::new(Scalar(Int))),
+            ReceiverSpec::OptionalOfOptional => Optional(Box::new(Optional(Box::new(Scalar(Int))))),
             ReceiverSpec::List => List(Box::new(Scalar(Int))),
             ReceiverSpec::ListOfScalar(scalar) => List(Box::new(Scalar(scalar))),
             ReceiverSpec::ListOfList => List(Box::new(List(Box::new(Scalar(Int))))),
@@ -260,7 +267,7 @@ use ArgType::{Inner, ListOfInner, Scalar as ScalarArg};
 use MethodId::*;
 use ReceiverSpec::{
     List, ListOfAverageable, ListOfList, ListOfOrdered, ListOfScalar, ListOfSummable, Optional,
-    Scalar,
+    OptionalOfOptional, Scalar,
 };
 use ReturnSpec::{
     Inner as InnerReturn, ListOfArgument, ListOfInner as ListOfInnerReturn,
@@ -579,6 +586,25 @@ static METHODS: &[MethodDef] = &[
         names: &["unwrap_or"],
         receiver: Optional,
         args: Fixed(&[Inner]),
+        scope: NoScope,
+        returns: InnerReturn,
+    },
+    MethodDef {
+        id: OptionalMap,
+        names: &["map"],
+        receiver: Optional,
+        args: Scoped {
+            count: Exact(1),
+            constraint: any_type,
+        },
+        scope: ElementOfReceiver,
+        returns: OptionalArgument,
+    },
+    MethodDef {
+        id: OptionalFlatten,
+        names: &["flatten"],
+        receiver: OptionalOfOptional,
+        args: Fixed(&[]),
         scope: NoScope,
         returns: InnerReturn,
     },

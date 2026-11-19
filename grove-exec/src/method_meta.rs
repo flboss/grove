@@ -24,7 +24,7 @@ pub(crate) fn base_need(method: MethodId) -> BaseNeed {
         | FloatFloor | FloatCeil | ListJoin | ListUnique | ListIsUnique => BaseNeed::Whole,
         ListFilter | ListSortAsc | ListSortDesc | ListSortAscOver | ListSortDescOver | ListTake
         | ListSkip | ListFirst | ListNth | ListFlatten | ListExtend | ListUniqueOver
-        | OptionalUnwrap | OptionalUnwrapOr => BaseNeed::Output,
+        | OptionalUnwrap | OptionalUnwrapOr | OptionalMap | OptionalFlatten => BaseNeed::Output,
     }
 }
 
@@ -46,5 +46,6 @@ pub(crate) fn is_element_preserving(method: MethodId) -> bool {
             | ListUnique
             | ListUniqueOver
             | OptionalUnwrap
+            | OptionalFlatten
     )
 }

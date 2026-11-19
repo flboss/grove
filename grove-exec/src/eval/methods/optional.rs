@@ -4,8 +4,10 @@ use grove_query::methods::MethodId;
 use grove_query::typecheck::types::TypedMethodArg;
 use grove_types::Span;
 
-use super::super::{EvalCtx, eval};
+use super::{pop_map_scope, push_map_scope};
 use crate::error::ExecError;
+use crate::eval::data::{owning_refs_in, prefetch_owning};
+use crate::eval::{EvalCtx, eval};
 use crate::value::{Scalar, Val};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -98,6 +100,53 @@ fn eval_opt_absent(
     }
 }
 
+/// Apply an expression to the value inside an optional
+pub(super) fn eval_optional_map(
+    base: Val,
+    args: &[TypedMethodArg],
+    ctx: &mut EvalCtx<'_>,
+) -> Result<Val, ExecError> {
+    let [arg] = args else {
+        return Err(ExecError::Integrity {
+            message: "`map()` expects one argument (internal error)".to_string(),
+        });
+    };
+    let value = match base {
+        Val::None => return Ok(Val::None),
+        Val::Some(value) => *value,
+        other => {
+            return Err(ExecError::Integrity {
+                message: format!("`map()` called on non-optional value: {other} (internal error)"),
+            });
+        }
+    };
+    let mut values = [value];
+    let fields = owning_refs_in(&arg.expr, ctx.schema, ctx.plan.prefetch_skip());
+    prefetch_owning(ctx, &mut values, &fields)?;
+    let [value] = values;
+    push_map_scope(ctx, value);
+    let mapped = eval(&arg.expr, ctx);
+    pop_map_scope(ctx);
+    mapped.map(|value| Val::Some(Box::new(value)))
+}
+
+/// Remove one optional layer
+pub(super) fn eval_optional_flatten(base: Val) -> Result<Val, ExecError> {
+    match base {
+        Val::None => Ok(Val::None),
+        Val::Some(inner) => match *inner {
+            Val::None => Ok(Val::None),
+            Val::Some(value) => Ok(Val::Some(value)),
+            other => Err(ExecError::Integrity {
+                message: format!("`flatten()` over non-optional value: {other} (internal error)"),
+            }),
+        },
+        other => Err(ExecError::Integrity {
+            message: format!("`flatten()` on non-optional value: {other} (internal error)"),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::error::ExecError;
@@ -136,6 +185,36 @@ mod tests {
         assert_eq!(
             run_seeded("users.skip(5).first()?.nickname.is_some()"),
             Ok(bool(false))
+        );
+    }
+
+    #[test]
+    fn method_optional_map() {
+        assert_eq!(run_src("some(1).map($ + 1)"), Ok(some(int(2))));
+        assert_eq!(run_src("(none as ?Int).map(1 / 0)"), Ok(Val::None));
+        assert_eq!(run_src("some([1, 2]).map($.len())"), Ok(some(int(2))));
+        assert_eq!(
+            run_src("some([1, 2])?.map($ + 1)"),
+            Ok(some(Val::List(vec![int(2), int(3)])))
+        );
+        assert_eq!(run_src("some(some(1))?.map($ + 1)"), Ok(some(some(int(2)))));
+        assert_eq!(
+            run_src("some(some(1)).map($.unwrap_or(0))"),
+            Ok(some(int(1)))
+        );
+    }
+
+    #[test]
+    fn method_optional_flatten() {
+        assert_eq!(run_src("some(some(1)).flatten()"), Ok(some(int(1))));
+        assert_eq!(run_src("some(none as ?Int).flatten()"), Ok(Val::None));
+        assert_eq!(
+            run_src("some(some(some(1))).flatten()"),
+            Ok(some(some(int(1))))
+        );
+        assert_eq!(
+            run_src("some(some(some(1)))?.flatten()"),
+            Ok(some(some(int(1))))
         );
     }
 
