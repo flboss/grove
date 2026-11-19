@@ -8,11 +8,10 @@ use grove_schema::validated::{
     EnumId, EnumUnderlying, EnumValue, Field, FieldId, Relation, RelationId, ScalarType,
     StorageTable, StructId, ValidatedSchema, ValueType,
 };
-use rusqlite::Connection;
-use rusqlite::Statement;
 use rusqlite::config::DbConfig;
 use rusqlite::params_from_iter;
 use rusqlite::types::{Value, ValueRef};
+use rusqlite::{Connection, Statement};
 
 use crate::codec;
 use crate::error::ExecError;
@@ -1191,7 +1190,8 @@ impl Storage for SqliteBackend<'_> {
                     let direction = if key.desc { "DESC" } else { "ASC" };
                     sort.push(format!("{table}.{column} {direction}"));
                 }
-                sort.push("_rowid_ ASC".to_string());
+                let tie_direction = if constraints.tie_desc { "DESC" } else { "ASC" };
+                sort.push(format!("_rowid_ {tie_direction}"));
                 let mut sql = format!("SELECT {} FROM {table}", select.join(", "));
                 if !filters.is_empty() {
                     sql.push_str(" WHERE ");
@@ -1347,7 +1347,8 @@ impl Storage for SqliteBackend<'_> {
                     let direction = if key.desc { "DESC" } else { "ASC" };
                     sort.push(format!("g$f.{column} {direction}"));
                 }
-                sort.push("g$f._rowid_ ASC".to_string());
+                let tie_direction = if constraints.tie_desc { "DESC" } else { "ASC" };
+                sort.push(format!("g$f._rowid_ {tie_direction}"));
                 let mut where_clause = format!("g$k._rowid_ IN ({placeholders})");
                 if !filters.is_empty() {
                     where_clause.push_str(" AND ");
@@ -2385,6 +2386,7 @@ mod tests {
                 field: amount,
                 desc: true,
             }],
+            tie_desc: false,
             offset: 0,
             limit: None,
         };
@@ -2404,6 +2406,33 @@ mod tests {
     }
 
     #[test]
+    fn fetch_related_tie_desc() {
+        let schema = testdata::schema();
+        let backend = test_backend(&schema);
+        let amount = testdata::field_id(&schema, testdata::struct_id(&schema, "Order"), "amount");
+        let rel = rel_named(&schema, "Order", "user", "User", "orders");
+        let groups = backend
+            .fetch_related(
+                rel,
+                false,
+                &[Key(1), Key(2)],
+                &[amount],
+                &FetchConstraints {
+                    filters: vec![],
+                    sort: vec![],
+                    tie_desc: true,
+                    offset: 0,
+                    limit: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            firsts(&groups),
+            vec![vec![int(200), int(100)], vec![int(400)]]
+        );
+    }
+
+    #[test]
     fn fetch_related_caps_per_parent() {
         let schema = testdata::schema();
         let backend = test_backend(&schema);
@@ -2419,6 +2448,7 @@ mod tests {
                 &FetchConstraints {
                     filters: vec![],
                     sort: vec![],
+                    tie_desc: false,
                     offset: 0,
                     limit: Some(1),
                 },
@@ -2438,6 +2468,7 @@ mod tests {
                 &FetchConstraints {
                     filters: vec![],
                     sort: vec![],
+                    tie_desc: false,
                     offset: 1,
                     limit: Some(1),
                 },
@@ -2459,6 +2490,7 @@ mod tests {
                 PushExpr::Literal(Scalar::String("editor".to_string())),
             )],
             sort: vec![],
+            tie_desc: false,
             offset: 0,
             limit: Some(1),
         };
@@ -2489,6 +2521,7 @@ mod tests {
                         field: amount,
                         desc: false,
                     }],
+                    tie_desc: false,
                     offset: 1,
                     limit: None,
                 },
@@ -2506,6 +2539,7 @@ mod tests {
         let constraints = FetchConstraints {
             filters: vec![push_cmp(CmpOp::Gt, push_field(&schema, "id"), push_int(2))],
             sort: vec![],
+            tie_desc: false,
             offset: 0,
             limit: None,
         };
@@ -2541,6 +2575,7 @@ mod tests {
                 push_str("high"),
             )],
             sort: vec![],
+            tie_desc: false,
             offset: 0,
             limit: None,
         };
@@ -2561,6 +2596,7 @@ mod tests {
                 items: vec![push_int(2), push_int(-1)],
             }],
             sort: vec![],
+            tie_desc: false,
             offset: 0,
             limit: None,
         };
@@ -2590,6 +2626,7 @@ mod tests {
                 field: amount,
                 desc: true,
             }],
+            tie_desc: false,
             offset: 0,
             limit: Some(1),
         };
@@ -2820,6 +2857,18 @@ mod tests {
         offset: u64,
         limit: Option<u64>,
     ) -> Vec<String> {
+        user_names_with_tie(backend, schema, filters, sort, false, offset, limit)
+    }
+
+    fn user_names_with_tie(
+        backend: &SqliteBackend<'_>,
+        schema: &ValidatedSchema,
+        filters: Vec<PushExpr>,
+        sort: Vec<SortKey>,
+        tie_desc: bool,
+        offset: u64,
+        limit: Option<u64>,
+    ) -> Vec<String> {
         let sid = user_struct(schema);
         let rows = backend
             .fetch(
@@ -2828,6 +2877,7 @@ mod tests {
                 &FetchConstraints {
                     filters,
                     sort,
+                    tie_desc,
                     offset,
                     limit,
                 },
@@ -3076,6 +3126,7 @@ mod tests {
                 field: data,
                 desc: false,
             }],
+            tie_desc: false,
             offset: 0,
             limit: None,
         };
@@ -3180,6 +3231,20 @@ mod tests {
         assert_eq!(
             user_names(&backend, &schema, vec![], sort, 0, Some(2)),
             names(&["Eli", "Dan"])
+        );
+
+        assert_eq!(
+            user_names_with_tie(&backend, &schema, vec![], vec![], true, 0, None),
+            names(&["Eli", "Dan", "Cyd", "Bob", "Ada"])
+        );
+
+        let sort = vec![SortKey {
+            field: user_field(&schema, sid, "active"),
+            desc: true,
+        }];
+        assert_eq!(
+            user_names_with_tie(&backend, &schema, vec![], sort, true, 0, None),
+            names(&["Dan", "Bob", "Ada", "Eli", "Cyd"])
         );
     }
 
@@ -3324,6 +3389,7 @@ mod tests {
                 &FetchConstraints {
                     filters: vec![PushExpr::Field(amount)],
                     sort: vec![],
+                    tie_desc: false,
                     offset: 0,
                     limit: None,
                 },
@@ -3339,6 +3405,7 @@ mod tests {
                 &FetchConstraints {
                     filters: vec![PushExpr::Field(pos)],
                     sort: vec![],
+                    tie_desc: false,
                     offset: 0,
                     limit: None,
                 },
@@ -3356,6 +3423,7 @@ mod tests {
                         field: pos,
                         desc: false,
                     }],
+                    tie_desc: false,
                     offset: 0,
                     limit: None,
                 },

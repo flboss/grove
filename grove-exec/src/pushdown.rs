@@ -21,6 +21,8 @@ pub struct FetchConstraints {
     pub filters: Vec<PushExpr>,
     /// ORDER BY keys in priority order
     pub sort: Vec<SortKey>,
+    /// Reverse the implicit stable-order tie-breaker (rowid in SQLite)
+    pub tie_desc: bool,
     pub offset: u64,
     pub limit: Option<u64>,
 }
@@ -29,12 +31,17 @@ impl FetchConstraints {
     pub const EMPTY: FetchConstraints = FetchConstraints {
         filters: Vec::new(),
         sort: Vec::new(),
+        tie_desc: false,
         offset: 0,
         limit: None,
     };
 
     pub fn is_empty(&self) -> bool {
-        self.filters.is_empty() && self.sort.is_empty() && self.offset == 0 && self.limit.is_none()
+        self.filters.is_empty()
+            && self.sort.is_empty()
+            && !self.tie_desc
+            && self.offset == 0
+            && self.limit.is_none()
     }
 }
 
@@ -227,6 +234,7 @@ struct FieldPlan {
 struct ChainState {
     filters: Vec<PushExpr>,
     sort: Vec<SortKey>,
+    tie_desc: bool,
     offset: u64,
     end: Option<u64>,
     cap_seen: bool,
@@ -240,6 +248,7 @@ impl ChainState {
         FetchConstraints {
             filters: self.filters,
             sort: self.sort,
+            tie_desc: self.tie_desc,
             offset: self.offset,
             limit: self.end.map(|end| end.saturating_sub(self.offset)),
         }
@@ -1406,6 +1415,7 @@ mod tests {
             Some(&FetchConstraints {
                 filters: vec![],
                 sort: vec![],
+                tie_desc: false,
                 offset: 0,
                 limit: Some(2),
             })
