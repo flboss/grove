@@ -19,6 +19,7 @@ pub(super) fn eval_filter(
             });
         }
     };
+    let origin = items.origin;
     let [arg] = args else {
         return Err(ExecError::Integrity {
             message: "`filter()` expects one argument (internal error)".to_string(),
@@ -43,7 +44,7 @@ pub(super) fn eval_filter(
             }
         }
     }
-    Ok(Val::list(kept))
+    Ok(Val::list_with_origin(kept, origin))
 }
 
 #[cfg(test)]

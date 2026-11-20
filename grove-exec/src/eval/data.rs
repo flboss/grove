@@ -890,8 +890,18 @@ mod tests {
         sqlite::SqliteBackend,
         storage::Storage,
         testdata,
-        value::{CollectionOrigin, Scalar},
+        value::{CollectionOrigin, RowOrigin, Scalar},
     };
+
+    fn row_origins(value: &Val) -> Vec<RowOrigin> {
+        let Val::List(items) = value else {
+            panic!("expected list, got {value}");
+        };
+        items
+            .iter()
+            .map(|item| *item.row_origin().expect("row origin"))
+            .collect()
+    }
 
     #[test]
     fn root_owning_resolved() {
@@ -2056,5 +2066,62 @@ mod tests {
         let origin = value.row_origin().expect("user row origin");
         assert_eq!(origin.struct_id, user);
         assert!(origin.key.0 > 0);
+    }
+
+    #[test]
+    fn list_methods_origins_preserved() {
+        let user = testdata::struct_id(&testdata::schema(), "User");
+        let root_origin = CollectionOrigin::Root {
+            struct_id: user,
+            root_idx: 0,
+        };
+
+        for src in [
+            "users.filter(active).sort_over(name).take(2).reverse()",
+            "users.unique_over(id)",
+            "users.manager.compact()",
+        ] {
+            // run_seeded() asserts equal origin annotations regardless of pushdown
+            let value = run_seeded(src).expect("query");
+            assert_eq!(value.collection_origin(), Some(&root_origin), "{src}");
+            for origin in row_origins(&value) {
+                assert_eq!(origin.struct_id, user, "{src}");
+            }
+        }
+    }
+
+    #[test]
+    fn merged_and_constructed_values_origin_empty() {
+        let schema = testdata::schema();
+        let user = testdata::struct_id(&schema, "User");
+        let order = testdata::struct_id(&schema, "Order");
+
+        for src in ["users.map($)", "users.extend(users.take(0))"] {
+            let value = run_seeded(src).expect("query");
+            assert_eq!(value.collection_origin(), None, "{src}");
+            for origin in row_origins(&value) {
+                assert_eq!(origin.struct_id, user, "{src}");
+            }
+        }
+
+        let value = run_seeded("users.orders.flatten()").expect("query");
+        assert_eq!(value.collection_origin(), None);
+        for origin in row_origins(&value) {
+            assert_eq!(origin.struct_id, order);
+        }
+
+        let value = run_seeded("users { name }").expect("query");
+        assert_eq!(value.collection_origin(), None);
+        let Val::List(rows) = value else {
+            panic!("expected projection list");
+        };
+        assert!(rows.iter().all(|row| row.row_origin().is_none()));
+
+        let value = run_seeded("[{ a = 1 }]").expect("query");
+        assert_eq!(value.collection_origin(), None);
+        let Val::List(rows) = value else {
+            panic!("expected array list");
+        };
+        assert!(rows.iter().all(|row| row.row_origin().is_none()));
     }
 }

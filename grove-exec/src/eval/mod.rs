@@ -381,6 +381,11 @@ pub(crate) mod harness {
     }
 
     fn same_value(left: &Val, right: &Val) -> bool {
+        if left.row_origin() != right.row_origin()
+            || left.collection_origin() != right.collection_origin()
+        {
+            return false;
+        }
         match (left, right) {
             (Val::Scalar(Scalar::Float(a)), Val::Scalar(Scalar::Float(b))) => {
                 (a.is_nan() && b.is_nan()) || a == b

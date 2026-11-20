@@ -165,6 +165,7 @@ pub(super) fn eval_list_compact(base: Val) -> Result<Val, ExecError> {
             message: format!("`compact()` on non-list value: {base} (internal error)"),
         });
     };
+    let origin = items.origin;
     let mut compacted = Vec::with_capacity(items.len());
     for item in items {
         match item {
@@ -179,7 +180,7 @@ pub(super) fn eval_list_compact(base: Val) -> Result<Val, ExecError> {
             }
         }
     }
-    Ok(Val::list(compacted))
+    Ok(Val::list_with_origin(compacted, origin))
 }
 
 /// Turn List<?T> into ?List<T>
@@ -189,6 +190,7 @@ pub(super) fn eval_list_transpose(base: Val) -> Result<Val, ExecError> {
             message: format!("`transpose()` on non-list value: {base} (internal error)"),
         });
     };
+    let origin = items.origin;
     let mut transposed = Vec::with_capacity(items.len());
     for item in items {
         match item {
@@ -203,7 +205,9 @@ pub(super) fn eval_list_transpose(base: Val) -> Result<Val, ExecError> {
             }
         }
     }
-    Ok(Val::Some(Box::new(Val::list(transposed))))
+    Ok(Val::Some(Box::new(Val::list_with_origin(
+        transposed, origin,
+    ))))
 }
 
 pub(super) fn eval_list_unique(base: Val) -> Result<Val, ExecError> {
@@ -212,13 +216,14 @@ pub(super) fn eval_list_unique(base: Val) -> Result<Val, ExecError> {
             message: format!("`unique()` on non-list value: {base} (internal error)"),
         });
     };
+    let origin = items.origin;
     let mut unique: Vec<Val> = Vec::with_capacity(items.len());
     for item in items {
         if !unique.iter().any(|seen| seen.eq(&item) == Some(true)) {
             unique.push(item);
         }
     }
-    Ok(Val::list(unique))
+    Ok(Val::list_with_origin(unique, origin))
 }
 
 pub(super) fn eval_list_unique_over(
@@ -231,6 +236,7 @@ pub(super) fn eval_list_unique_over(
             message: format!("`unique_over()` on non-list value: {base} (internal error)"),
         });
     };
+    let origin = items.origin;
     let [arg] = args else {
         return Err(ExecError::Integrity {
             message: "`unique_over()` expects one argument (internal error)".to_string(),
@@ -250,7 +256,7 @@ pub(super) fn eval_list_unique_over(
             unique.push(item);
         }
     }
-    Ok(Val::list(unique))
+    Ok(Val::list_with_origin(unique, origin))
 }
 
 pub(super) fn eval_list_is_unique(base: Val) -> Result<Val, ExecError> {
@@ -404,7 +410,7 @@ pub(super) fn eval_list_extend(base: Val, mut args: Vec<Val>) -> Result<Val, Exe
         });
     };
     items.extend(other);
-    Ok(Val::List(items))
+    Ok(Val::list(items.items))
 }
 
 #[cfg(test)]
