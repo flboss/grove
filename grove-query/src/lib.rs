@@ -1,4 +1,5 @@
 pub mod ast;
+pub mod casts;
 pub mod error;
 pub mod lex;
 pub mod methods;

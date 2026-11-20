@@ -1,6 +1,7 @@
 use std::fmt;
 
 use crate::ast::{BinaryOp, ConstantName, Literal, SortDir, TypeName, UnaryOp};
+use crate::casts::CastKind;
 use crate::methods::MethodId;
 use grove_schema::validated::{
     EnumId, Field, FieldId, ScalarType, StructId, ValidatedSchema, ValueType,
@@ -110,7 +111,7 @@ pub enum TypedExprKind {
     },
     Cast {
         expr: Box<TypedExpr>,
-        ty: Spanned<TypeName>,
+        kind: CastKind,
     },
     If {
         arms: Vec<(TypedExpr, TypedExpr)>,

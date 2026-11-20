@@ -11,6 +11,7 @@ use crate::ast::{
     Arg, BinaryOp, Expr, Literal, MutationKind, MutationStmt, ProjectionItem, QueryFile, Statement,
     TypeExpr, TypeName, UnaryOp,
 };
+use crate::casts;
 use crate::methods::{self, ArgCount, ArgSpec, ScopeSpec};
 use crate::typecheck::error::TypeError;
 use crate::typecheck::types::*;
@@ -454,50 +455,22 @@ fn infer_cast(
         return Ok(typed_expr);
     }
 
-    if !cast_allowed(&typed_expr.ty, &target_ty, env.schema()) {
-        return Err(TypeError::InvalidCast {
+    let kind = casts::lookup(&typed_expr.ty, &target_ty, env.schema()).ok_or_else(|| {
+        TypeError::InvalidCast {
             from: typed_expr.ty.to_string(),
             to: target_ty.to_string(),
             span,
-        });
-    }
+        }
+    })?;
 
-    let target_name = if let QueryType::Scalar(scalar) = target_ty {
-        scalar.into()
-    } else {
-        unreachable!("allowed cast target must be scalar");
-    };
     Ok(env.typed(
         TypedExprKind::Cast {
             expr: Box::new(typed_expr),
-            ty: Spanned::new(target.span, target_name),
+            kind,
         },
-        target_ty,
+        kind.target(),
         span,
     ))
-}
-
-fn cast_allowed(from: &QueryType, to: &QueryType, schema: &ValidatedSchema) -> bool {
-    match (from, to) {
-        _ if from.is_numeric() && to.is_numeric() => true,
-        (QueryType::Scalar(ScalarType::Bool), QueryType::Scalar(ScalarType::Int)) => true,
-        (
-            QueryType::Scalar(
-                ScalarType::Int | ScalarType::Float | ScalarType::Bool | ScalarType::Dec,
-            ),
-            QueryType::Scalar(ScalarType::String),
-        ) => true,
-        (QueryType::Scalar(ScalarType::String), QueryType::Scalar(ScalarType::Bytes)) => true,
-        (QueryType::Enum(id), QueryType::Scalar(target))
-            if schema
-                .enums
-                .get(id.index())
-                .is_some_and(|def| def.underlying.scalar_type() == *target) =>
-        {
-            true
-        }
-        _ => false,
-    }
 }
 
 fn infer_type_constant(

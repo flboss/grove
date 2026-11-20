@@ -1,6 +1,7 @@
-use grove_query::ast::{BinaryOp, TypeName, UnaryOp};
+use grove_query::ast::{BinaryOp, UnaryOp};
+use grove_query::casts::CastKind;
 use grove_query::typecheck::types::TypedExpr;
-use grove_schema::validated::{EnumUnderlying, IntArithmetic, ValidatedSchema};
+use grove_schema::validated::{EnumId, EnumUnderlying, IntArithmetic, ValidatedSchema};
 use grove_types::{Span, Spanned};
 use num_traits::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
@@ -315,27 +316,25 @@ fn eval_logic(
 }
 
 pub(super) fn eval_cast(
+    kind: CastKind,
     value: Val,
-    target: TypeName,
     span: Span,
     schema: &ValidatedSchema,
 ) -> Result<Val, ExecError> {
-    let scalar = match (value, target) {
-        (
-            Val::Scalar(
-                scalar @ (Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool(_) | Scalar::Dec(_)),
-            ),
-            TypeName::String,
-        ) => Scalar::String(scalar.to_string()),
-        (Val::Scalar(Scalar::Int(n)), TypeName::Int) => Scalar::Int(n),
-        (Val::Scalar(Scalar::Int(n)), TypeName::Float) => Scalar::Float(n as f64),
-        (Val::Scalar(Scalar::Int(n)), TypeName::Dec) => {
+    let scalar = match (kind, value) {
+        (CastKind::IntToString, Val::Scalar(scalar @ Scalar::Int(_)))
+        | (CastKind::FloatToString, Val::Scalar(scalar @ Scalar::Float(_)))
+        | (CastKind::BoolToString, Val::Scalar(scalar @ Scalar::Bool(_)))
+        | (CastKind::DecToString, Val::Scalar(scalar @ Scalar::Dec(_))) => {
+            Scalar::String(scalar.to_string())
+        }
+        (CastKind::IntToFloat, Val::Scalar(Scalar::Int(n))) => Scalar::Float(n as f64),
+        (CastKind::IntToDec, Val::Scalar(Scalar::Int(n))) => {
             Scalar::Dec(Decimal::from_i64(n).expect("Decimal fits every i64"))
         }
         // Rust `as` semantics: truncate toward zero, saturate, NaN to zero
-        (Val::Scalar(Scalar::Float(x)), TypeName::Int) => Scalar::Int(x as i64),
-        (Val::Scalar(Scalar::Float(x)), TypeName::Float) => Scalar::Float(x),
-        (Val::Scalar(Scalar::Float(x)), TypeName::Dec) => match Decimal::from_f64(x) {
+        (CastKind::FloatToInt, Val::Scalar(Scalar::Float(x))) => Scalar::Int(x as i64),
+        (CastKind::FloatToDec, Val::Scalar(Scalar::Float(x))) => match Decimal::from_f64(x) {
             Some(d) => Scalar::Dec(d.normalize()),
             None if x.is_nan() => {
                 return Err(ExecError::Abort {
@@ -349,52 +348,59 @@ pub(super) fn eval_cast(
                 Decimal::MIN
             }),
         },
-        (Val::Scalar(Scalar::Dec(d)), TypeName::Int) => {
+        (CastKind::DecToInt, Val::Scalar(Scalar::Dec(d))) => {
             Scalar::Int(d.trunc().to_i64().unwrap_or(if d.is_sign_positive() {
                 i64::MAX
             } else {
                 i64::MIN
             }))
         }
-        (Val::Scalar(Scalar::Dec(d)), TypeName::Float) => {
+        (CastKind::DecToFloat, Val::Scalar(Scalar::Dec(d))) => {
             Scalar::Float(d.to_f64().expect("f64 has a wider range than Decimal"))
         }
-        (Val::Scalar(Scalar::Dec(d)), TypeName::Dec) => Scalar::Dec(d),
-        (Val::Scalar(Scalar::Bool(b)), TypeName::Int) => Scalar::Int(i64::from(b)),
-        (Val::Scalar(Scalar::String(s)), TypeName::Bytes) => Scalar::Bytes(s.into_bytes()),
-        (Val::Enum(id, index), target) => {
-            let enum_def = schema
-                .enums
-                .get(id.index())
-                .ok_or_else(|| ExecError::Integrity {
-                    message: format!("unknown enum id {} (internal error)", id.index()),
-                })?;
-            let expected = match enum_def.underlying {
-                EnumUnderlying::Int => TypeName::Int,
-                EnumUnderlying::String => TypeName::String,
-            };
-            if target != expected {
-                return Err(ExecError::Integrity {
-                    message: format!(
-                        "enum cast target {target} does not match enum `{}` (internal error)",
-                        enum_def.name
-                    ),
-                });
-            }
-            enum_variant_scalar(enum_def, index).ok_or_else(|| ExecError::Integrity {
-                message: format!(
-                    "unknown variant {index} for enum `{}` (internal error)",
-                    enum_def.name
-                ),
-            })?
+        (CastKind::BoolToInt, Val::Scalar(Scalar::Bool(b))) => Scalar::Int(i64::from(b)),
+        (CastKind::StringToBytes, Val::Scalar(Scalar::String(s))) => Scalar::Bytes(s.into_bytes()),
+        (CastKind::EnumToInt(enum_id), Val::Enum(id, index)) if id == enum_id => {
+            enum_cast_scalar(schema, id, index, EnumUnderlying::Int)?
         }
-        (value, target) => {
+        (CastKind::EnumToString(enum_id), Val::Enum(id, index)) if id == enum_id => {
+            enum_cast_scalar(schema, id, index, EnumUnderlying::String)?
+        }
+        (kind, value) => {
             return Err(ExecError::Integrity {
-                message: format!("mismatched cast operands: {value} as {target} (internal error)"),
+                message: format!("mismatched cast operands: {value} via {kind:?} (internal error)"),
             });
         }
     };
     Ok(Val::Scalar(scalar))
+}
+
+fn enum_cast_scalar(
+    schema: &ValidatedSchema,
+    id: EnumId,
+    index: usize,
+    expected: EnumUnderlying,
+) -> Result<Scalar, ExecError> {
+    let enum_def = schema
+        .enums
+        .get(id.index())
+        .ok_or_else(|| ExecError::Integrity {
+            message: format!("unknown enum id {} (internal error)", id.index()),
+        })?;
+    if enum_def.underlying != expected {
+        return Err(ExecError::Integrity {
+            message: format!(
+                "enum cast target does not match enum `{}` (internal error)",
+                enum_def.name
+            ),
+        });
+    }
+    enum_variant_scalar(enum_def, index).ok_or_else(|| ExecError::Integrity {
+        message: format!(
+            "unknown variant {index} for enum `{}` (internal error)",
+            enum_def.name
+        ),
+    })
 }
 
 #[cfg(test)]
