@@ -21,6 +21,7 @@ pub enum CastKind {
     BoolToInt,
     BoolToString,
     StringToBytes,
+    InstantToString,
     EnumToInt(EnumId),
     EnumToString(EnumId),
     FloatToIntStrict,
@@ -59,6 +60,7 @@ impl CastKind {
             | CastKind::StringToInt => QueryType::Scalar(ScalarType::Int),
             CastKind::StringToBytes => QueryType::Scalar(ScalarType::Bytes),
             CastKind::StringToBool | CastKind::IntToBool => QueryType::Scalar(ScalarType::Bool),
+            CastKind::StringToInstant => QueryType::Scalar(ScalarType::Instant),
             CastKind::EnumToInt(_) => QueryType::Scalar(ScalarType::Int),
             CastKind::EnumToString(_) => QueryType::Scalar(ScalarType::String),
         }
@@ -74,6 +76,7 @@ impl CastKind {
                 | CastKind::StringToFloat
                 | CastKind::StringToDec
                 | CastKind::StringToBool
+                | CastKind::StringToInstant
                 | CastKind::IntToBool
                 | CastKind::BytesToString
         )
@@ -165,6 +168,9 @@ fn lookup_fallible(from: &QueryType, to: &QueryType, schema: &ValidatedSchema) -
         }
         (QueryType::Scalar(ScalarType::String), QueryType::Scalar(ScalarType::Bool)) => {
             Some(CastKind::StringToBool)
+        }
+        (QueryType::Scalar(ScalarType::String), QueryType::Scalar(ScalarType::Instant)) => {
+            Some(CastKind::StringToInstant)
         }
         (QueryType::Scalar(ScalarType::Int), QueryType::Scalar(ScalarType::Bool)) => {
             Some(CastKind::IntToBool)
@@ -282,6 +288,7 @@ mod tests {
             (String, Float, CastKind::StringToFloat),
             (String, Dec, CastKind::StringToDec),
             (String, Bool, CastKind::StringToBool),
+            (String, Instant, CastKind::StringToInstant),
             (Int, Bool, CastKind::IntToBool),
             (Bytes, String, CastKind::BytesToString),
             (Float, Int, CastKind::FloatToIntStrict),

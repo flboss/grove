@@ -1,3 +1,4 @@
+use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use grove_query::ast::{BinaryOp, UnaryOp};
 use grove_query::casts::CastKind;
 use grove_query::typecheck::types::TypedExpr;
@@ -407,6 +408,9 @@ fn eval_fallible_cast(
                 None
             }
         }
+        (CastKind::StringToInstant, Val::Scalar(Scalar::String(s))) => {
+            parse_instant(&s).map(Scalar::Instant).map(Val::Scalar)
+        }
         (CastKind::IntToBool, Val::Scalar(Scalar::Int(0))) => Some(Scalar::Bool(false)),
         (CastKind::IntToBool, Val::Scalar(Scalar::Int(1))) => Some(Scalar::Bool(true)),
         (CastKind::IntToBool, Val::Scalar(Scalar::Int(_))) => None,
@@ -436,6 +440,28 @@ fn eval_fallible_cast(
         }
     };
     Ok(converted.map_or(Val::None, |scalar| Val::Some(Box::new(Val::Scalar(scalar)))))
+}
+
+fn parse_instant(value: &str) -> Option<DateTime<Utc>> {
+    if let Ok(datetime) = DateTime::parse_from_rfc3339(value) {
+        return Some(datetime.with_timezone(&Utc));
+    }
+    if let Some((date, time)) = value.split_once(' ') {
+        let normalized = format!("{date}T{time}");
+        if let Ok(datetime) = DateTime::parse_from_rfc3339(&normalized) {
+            return Some(datetime.with_timezone(&Utc));
+        }
+        for format in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%d %H:%M:%S"] {
+            if let Ok(naive) = NaiveDateTime::parse_from_str(value, format) {
+                return Some(DateTime::from_naive_utc_and_offset(naive, Utc));
+            }
+        }
+    }
+    let date = NaiveDate::parse_from_str(value, "%Y-%m-%d").ok()?;
+    Some(DateTime::from_naive_utc_and_offset(
+        date.and_hms_opt(0, 0, 0)?,
+        Utc,
+    ))
 }
 
 fn strict_float_to_int(x: f64) -> Option<Scalar> {
@@ -776,6 +802,44 @@ mod tests {
             run_src_config(r#""inf" as? Float"#, off),
             Ok(some(float(f64::INFINITY)))
         );
+    }
+
+    #[test]
+    fn eval_fallible_instant_casts() {
+        use chrono::{DateTime, Utc};
+
+        let instant = |rfc3339: &str| {
+            some(Val::Scalar(Scalar::Instant(
+                DateTime::parse_from_rfc3339(rfc3339)
+                    .unwrap()
+                    .with_timezone(&Utc),
+            )))
+        };
+        for src in [
+            ("2024-01-15T12:34:56Z"),
+            ("2024-01-15T12:34:56.123Z"),
+            ("2024-01-15T12:34:56+02:00"),
+            ("2024-01-15T12:34:56.123+02:00"),
+            ("2024-01-15 12:34:56"),
+            ("2024-01-15 12:34:56.123"),
+            ("2024-01-15 12:34:56Z"),
+            ("2024-01-15 12:34:56.123+02:00"),
+            ("2024-01-15"),
+        ] {
+            assert_eq!(
+                run_src(&format!("\"{src}\" as? Instant")),
+                Ok(instant(src)),
+                "{src}"
+            );
+        }
+        for src in [
+            r#""01/02/2024" as? Instant"#,
+            r#""2024-01-15 12:34" as? Instant"#,
+            r#""2024-01-15T12:34:56" as? Instant"#,
+            r#""yesterday" as? Instant"#,
+        ] {
+            assert_eq!(run_src(src), Ok(Val::None), "{src}");
+        }
     }
 
     #[test]
