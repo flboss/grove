@@ -11,7 +11,7 @@ use crate::ast::{
     Arg, BinaryOp, Expr, Literal, MutationKind, MutationStmt, ProjectionItem, QueryFile, Statement,
     TypeExpr, TypeName, UnaryOp,
 };
-use crate::casts;
+use crate::casts::{self, CastMode};
 use crate::methods::{self, ArgCount, ArgSpec, ScopeSpec};
 use crate::typecheck::error::TypeError;
 use crate::typecheck::types::*;
@@ -455,12 +455,16 @@ fn infer_cast(
         return Ok(typed_expr);
     }
 
-    let kind = casts::lookup(&typed_expr.ty, &target_ty, env.schema()).ok_or_else(|| {
-        TypeError::InvalidCast {
-            from: typed_expr.ty.to_string(),
-            to: target_ty.to_string(),
-            span,
-        }
+    let kind = casts::lookup(
+        &typed_expr.ty,
+        &target_ty,
+        CastMode::Infallible,
+        env.schema(),
+    )
+    .ok_or_else(|| TypeError::InvalidCast {
+        from: typed_expr.ty.to_string(),
+        to: target_ty.to_string(),
+        span,
     })?;
 
     Ok(env.typed(

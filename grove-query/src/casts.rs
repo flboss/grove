@@ -1,5 +1,12 @@
 use crate::typecheck::types::QueryType;
 use grove_schema::validated::{EnumId, ScalarType, ValidatedSchema};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CastMode {
+    Infallible,
+    Fallible,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CastKind {
     IntToFloat,
@@ -40,8 +47,12 @@ impl CastKind {
 pub fn lookup(
     from: &QueryType,
     to: &QueryType,
+    mode: CastMode,
     schema: &ValidatedSchema,
 ) -> Option<CastKind> {
+    if mode != CastMode::Infallible {
+        return None;
+    }
     match (from, to) {
         (QueryType::Scalar(ScalarType::Int), QueryType::Scalar(ScalarType::Float)) => {
             Some(CastKind::IntToFloat)
@@ -113,7 +124,7 @@ mod tests {
     }
 
     #[test]
-    fn scalar_casts_resolution() {
+    fn infallible_scalar_casts_resolution() {
         use ScalarType::*;
         for (from, to, expected) in [
             (Int, Float, CastKind::IntToFloat),
@@ -132,6 +143,7 @@ mod tests {
             let kind = lookup(
                 &QueryType::Scalar(from),
                 &QueryType::Scalar(to),
+                CastMode::Infallible,
                 &test_schema(),
             );
             assert_eq!(kind, Some(expected), "{from:?} -> {to:?}");
@@ -147,6 +159,7 @@ mod tests {
             lookup(
                 &QueryType::Enum(priority),
                 &QueryType::Scalar(ScalarType::String),
+                CastMode::Infallible,
                 &schema,
             ),
             Some(CastKind::EnumToString(priority))
@@ -155,6 +168,7 @@ mod tests {
             lookup(
                 &QueryType::Enum(level),
                 &QueryType::Scalar(ScalarType::Int),
+                CastMode::Infallible,
                 &schema,
             ),
             Some(CastKind::EnumToInt(level))
@@ -163,6 +177,7 @@ mod tests {
             lookup(
                 &QueryType::Enum(priority),
                 &QueryType::Scalar(ScalarType::Int),
+                CastMode::Infallible,
                 &schema,
             ),
             None
@@ -171,6 +186,48 @@ mod tests {
             lookup(
                 &QueryType::Enum(EnumId::new(99)),
                 &QueryType::Scalar(ScalarType::String),
+                CastMode::Infallible,
+                &schema,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn casts_mismatched_types_or_mode() {
+        let schema = test_schema();
+        assert_eq!(
+            lookup(
+                &QueryType::Scalar(ScalarType::String),
+                &QueryType::Scalar(ScalarType::Int),
+                CastMode::Infallible,
+                &schema,
+            ),
+            None
+        );
+        assert_eq!(
+            lookup(
+                &QueryType::Scalar(ScalarType::String),
+                &QueryType::Scalar(ScalarType::Int),
+                CastMode::Fallible,
+                &schema,
+            ),
+            None
+        );
+        assert_eq!(
+            lookup(
+                &QueryType::Optional(Box::new(QueryType::Scalar(ScalarType::String))),
+                &QueryType::Scalar(ScalarType::Int),
+                CastMode::Fallible,
+                &schema,
+            ),
+            None
+        );
+        assert_eq!(
+            lookup(
+                &QueryType::Scalar(ScalarType::String),
+                &QueryType::Optional(Box::new(QueryType::Scalar(ScalarType::Int))),
+                CastMode::Infallible,
                 &schema,
             ),
             None
