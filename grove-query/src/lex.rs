@@ -140,6 +140,10 @@ impl<'src> Lexer<'src> {
         }
 
         let word = &self.source[start..self.pos];
+        if word == "as" && self.peek_char() == Some('?') {
+            self.bump();
+            return self.make_token(start, TokenKind::AsQuestion);
+        }
         if self.peek_char() == Some('"') {
             match word {
                 "hex" => return self.scan_bytes_literal(start, BytesRadix::Hex),
@@ -1880,6 +1884,17 @@ mod tests {
         assert_eq!(lex.next_token().value, TokenKind::IntLit(0));
         assert_token!(lex, TokenKind::TripleDot);
         assert_eof!(lex);
+    }
+
+    #[test]
+    fn as_question() {
+        let mut lex = Lexer::new("as? as ?Int");
+        assert_token!(lex, TokenKind::AsQuestion);
+        assert_token!(lex, TokenKind::As);
+        assert_token!(lex, TokenKind::Question(1));
+        assert_token!(lex, TokenKind::Int);
+        assert_eof!(lex);
+        assert!(lex.take_diagnostics().is_empty());
     }
 
     #[test]

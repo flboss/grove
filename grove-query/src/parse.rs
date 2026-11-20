@@ -363,13 +363,15 @@ impl<'src> Parser<'src> {
                         span,
                     };
                 }
-                TokenKind::As => {
+                TokenKind::As | TokenKind::AsQuestion => {
+                    let fallible = matches!(self.current.value, TokenKind::AsQuestion);
                     self.bump();
                     let ty = self.parse_type_expr()?;
                     let span = expr.span().merge(ty.span);
                     expr = Expr::Cast {
                         expr: Box::new(expr),
                         ty,
+                        fallible,
                         span,
                     };
                 }
@@ -1676,6 +1678,50 @@ mod tests {
             Expr::Cast {
                 ty: Spanned {
                     value: TypeExpr::Scalar(TypeName::Bytes),
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn as_fallible_cast() {
+        let expr = parse_ok("1 as? Int");
+        assert!(matches!(
+            expr,
+            Expr::Cast {
+                fallible: true,
+                ty: Spanned {
+                    value: TypeExpr::Scalar(TypeName::Int),
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn as_fallible_cast_greedy_question() {
+        let expr = parse_ok("1 as??Int");
+        assert!(matches!(
+            expr,
+            Expr::Cast {
+                fallible: true,
+                ty: Spanned {
+                    value: TypeExpr::Optional { .. },
+                    ..
+                },
+                ..
+            }
+        ));
+        let expr = parse_ok("1 as ?Int");
+        assert!(matches!(
+            expr,
+            Expr::Cast {
+                fallible: false,
+                ty: Spanned {
+                    value: TypeExpr::Optional { .. },
                     ..
                 },
                 ..

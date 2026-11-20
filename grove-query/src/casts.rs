@@ -23,24 +23,38 @@ pub enum CastKind {
     StringToBytes,
     EnumToInt(EnumId),
     EnumToString(EnumId),
+    FloatToIntStrict,
+    DecToIntStrict,
+    FloatToDecStrict,
 }
 
 impl CastKind {
     pub fn target(self) -> QueryType {
         match self {
             CastKind::IntToFloat | CastKind::DecToFloat => QueryType::Scalar(ScalarType::Float),
-            CastKind::IntToDec | CastKind::FloatToDec => QueryType::Scalar(ScalarType::Dec),
+            CastKind::IntToDec | CastKind::FloatToDec | CastKind::FloatToDecStrict => {
+                QueryType::Scalar(ScalarType::Dec)
+            }
             CastKind::IntToString
             | CastKind::FloatToString
             | CastKind::DecToString
             | CastKind::BoolToString => QueryType::Scalar(ScalarType::String),
-            CastKind::FloatToInt | CastKind::DecToInt | CastKind::BoolToInt => {
-                QueryType::Scalar(ScalarType::Int)
-            }
+            CastKind::FloatToInt
+            | CastKind::DecToInt
+            | CastKind::BoolToInt
+            | CastKind::FloatToIntStrict
+            | CastKind::DecToIntStrict => QueryType::Scalar(ScalarType::Int),
             CastKind::StringToBytes => QueryType::Scalar(ScalarType::Bytes),
             CastKind::EnumToInt(_) => QueryType::Scalar(ScalarType::Int),
             CastKind::EnumToString(_) => QueryType::Scalar(ScalarType::String),
         }
+    }
+
+    pub fn is_fallible(&self) -> bool {
+        matches!(
+            self,
+            CastKind::FloatToIntStrict | CastKind::DecToIntStrict | CastKind::FloatToDecStrict
+        )
     }
 }
 
@@ -50,9 +64,17 @@ pub fn lookup(
     mode: CastMode,
     schema: &ValidatedSchema,
 ) -> Option<CastKind> {
-    if mode != CastMode::Infallible {
-        return None;
+    match mode {
+        CastMode::Infallible => lookup_infallible(from, to, schema),
+        CastMode::Fallible => lookup_fallible(from, to),
     }
+}
+
+fn lookup_infallible(
+    from: &QueryType,
+    to: &QueryType,
+    schema: &ValidatedSchema,
+) -> Option<CastKind> {
     match (from, to) {
         (QueryType::Scalar(ScalarType::Int), QueryType::Scalar(ScalarType::Float)) => {
             Some(CastKind::IntToFloat)
@@ -101,6 +123,21 @@ pub fn lookup(
             }
             _ => None,
         },
+        _ => None,
+    }
+}
+
+fn lookup_fallible(from: &QueryType, to: &QueryType, schema: &ValidatedSchema) -> Option<CastKind> {
+    match (from, to) {
+        (QueryType::Scalar(ScalarType::Float), QueryType::Scalar(ScalarType::Int)) => {
+            Some(CastKind::FloatToIntStrict)
+        }
+        (QueryType::Scalar(ScalarType::Dec), QueryType::Scalar(ScalarType::Int)) => {
+            Some(CastKind::DecToIntStrict)
+        }
+        (QueryType::Scalar(ScalarType::Float), QueryType::Scalar(ScalarType::Dec)) => {
+            Some(CastKind::FloatToDecStrict)
+        }
         _ => None,
     }
 }
@@ -191,6 +228,24 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn fallible_scalar_casts_resolution() {
+        use ScalarType::*;
+        for (from, to, expected) in [
+            (Float, Int, CastKind::FloatToIntStrict),
+            (Dec, Int, CastKind::DecToIntStrict),
+            (Float, Dec, CastKind::FloatToDecStrict),
+        ] {
+            let kind = lookup(
+                &QueryType::Scalar(from),
+                &QueryType::Scalar(to),
+                CastMode::Fallible,
+                &test_schema(),
+            );
+            assert_eq!(kind, Some(expected), "{from:?} -> {to:?}");
+        }
     }
 
     #[test]

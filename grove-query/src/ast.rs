@@ -116,6 +116,7 @@ pub enum Expr {
     Cast {
         expr: Box<Expr>,
         ty: Spanned<TypeExpr>,
+        fallible: bool,
         span: Span,
     },
     Field {

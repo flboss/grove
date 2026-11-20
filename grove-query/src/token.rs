@@ -14,6 +14,7 @@ pub enum TokenKind {
     Prev,
     In,
     As,
+    AsQuestion,
     If,
     Else,
     Mod,

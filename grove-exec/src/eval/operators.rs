@@ -366,6 +366,16 @@ pub(super) fn eval_cast(
         (CastKind::EnumToString(enum_id), Val::Enum(id, index)) if id == enum_id => {
             enum_cast_scalar(schema, id, index, EnumUnderlying::String)?
         }
+        (
+            kind @ (CastKind::FloatToIntStrict
+            | CastKind::DecToIntStrict
+            | CastKind::FloatToDecStrict),
+            _,
+        ) => {
+            return Err(ExecError::Unsupported {
+                message: format!("fallible cast {kind:?} is not yet implemented"),
+            });
+        }
         (kind, value) => {
             return Err(ExecError::Integrity {
                 message: format!("mismatched cast operands: {value} via {kind:?} (internal error)"),

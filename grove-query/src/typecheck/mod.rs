@@ -286,7 +286,9 @@ fn infer(expr: &Expr, env: &mut TypeEnv) -> Result<TypedExpr, TypeError> {
             default,
             span,
         } => infer_if(arms, default, *span, env),
-        Expr::Cast { expr, ty, .. } => infer_cast(expr, ty, env),
+        Expr::Cast {
+            expr, ty, fallible, ..
+        } => infer_cast(expr, ty, *fallible, env),
         Expr::Projection {
             base,
             items,
@@ -421,6 +423,7 @@ fn resolve_type_expr(
 fn infer_cast(
     expr: &Expr,
     target: &Spanned<TypeExpr>,
+    fallible: bool,
     env: &mut TypeEnv,
 ) -> Result<TypedExpr, TypeError> {
     let mut typed_expr = infer(expr, env)?;
@@ -429,6 +432,30 @@ fn infer_cast(
     // target_ty can never contain QueryType::Unknown, so it won't get
     // mutated in types_compatible() or check(); no clone necessary
     debug_assert!(!target_ty.is_unknown());
+
+    if fallible {
+        if typed_expr.ty.is_unknown() {
+            return Err(TypeError::AmbiguousCast {
+                from: typed_expr.ty.to_string(),
+                to: target_ty.to_string(),
+                span,
+            });
+        }
+        let kind = casts::lookup(&typed_expr.ty, &target_ty, CastMode::Fallible, env.schema())
+            .ok_or_else(|| TypeError::InvalidCast {
+                from: typed_expr.ty.to_string(),
+                to: target_ty.to_string(),
+                span,
+            })?;
+        return Ok(env.typed(
+            TypedExprKind::Cast {
+                expr: Box::new(typed_expr),
+                kind,
+            },
+            kind.target().wrap_optional(),
+            span,
+        ));
+    }
 
     if typed_expr.ty.is_unknown() {
         let mut refined = typed_expr.ty.clone();
@@ -3780,6 +3807,34 @@ mod tests {
             infer_ok("users.first().unwrap().age as Float + 1.0f", &test_schema()).ty,
             QueryType::Scalar(ScalarType::Float)
         );
+    }
+
+    #[test]
+    fn fallible_cast_optional_result() {
+        assert_eq!(
+            infer_ok(r#""42" as? Int"#, &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Int).wrap_optional()
+        );
+        assert_eq!(
+            infer_ok(r#""true" as? Bool"#, &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Bool).wrap_optional()
+        );
+    }
+
+    #[test]
+    fn fallible_cast_strict_rejection() {
+        for source in [
+            "1 as? Int",
+            "some(1) as? Float",
+            "1 as? ?Int",
+            "true as? Float",
+        ] {
+            assert_eq!(
+                error_codes(source, &test_schema()),
+                vec!["QT0013"],
+                "source: {source}"
+            );
+        }
     }
 
     #[test]
