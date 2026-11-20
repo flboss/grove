@@ -321,6 +321,9 @@ pub(super) fn eval_cast(
     span: Span,
     schema: &ValidatedSchema,
 ) -> Result<Val, ExecError> {
+    if kind.is_fallible() {
+        return eval_fallible_cast(kind, value, schema);
+    }
     let scalar = match (kind, value) {
         (CastKind::IntToString, Val::Scalar(scalar @ Scalar::Int(_)))
         | (CastKind::FloatToString, Val::Scalar(scalar @ Scalar::Float(_)))
@@ -366,23 +369,55 @@ pub(super) fn eval_cast(
         (CastKind::EnumToString(enum_id), Val::Enum(id, index)) if id == enum_id => {
             enum_cast_scalar(schema, id, index, EnumUnderlying::String)?
         }
-        (
-            kind @ (CastKind::FloatToIntStrict
-            | CastKind::DecToIntStrict
-            | CastKind::FloatToDecStrict),
-            _,
-        ) => {
-            return Err(ExecError::Unsupported {
-                message: format!("fallible cast {kind:?} is not yet implemented"),
-            });
-        }
         (kind, value) => {
             return Err(ExecError::Integrity {
-                message: format!("mismatched cast operands: {value} via {kind:?} (internal error)"),
+                message: format!(
+                    "mismatched infallible cast operands: {value} via {kind:?} (internal error)"
+                ),
             });
         }
     };
     Ok(Val::Scalar(scalar))
+}
+
+fn eval_fallible_cast(
+    kind: CastKind,
+    value: Val,
+    schema: &ValidatedSchema,
+) -> Result<Val, ExecError> {
+    let converted = match (kind, value) {
+        (CastKind::FloatToIntStrict, Val::Scalar(Scalar::Float(x))) => strict_float_to_int(x),
+        (CastKind::DecToIntStrict, Val::Scalar(Scalar::Dec(d))) => if d.fract().is_zero() {
+            d.to_i64()
+        } else {
+            None
+        }
+        .map(Scalar::Int),
+        (CastKind::FloatToDecStrict, Val::Scalar(Scalar::Float(x))) => {
+            if x.is_finite() {
+                Decimal::from_f64(x).map(|d| Scalar::Dec(d.normalize()))
+            } else {
+                None
+            }
+        }
+        (kind, value) => {
+            return Err(ExecError::Integrity {
+                message: format!(
+                    "mismatched fallible cast operands: {value} via {kind:?} (internal error)"
+                ),
+            });
+        }
+    };
+    Ok(converted.map_or(Val::None, |scalar| Val::Some(Box::new(Val::Scalar(scalar)))))
+}
+
+fn strict_float_to_int(x: f64) -> Option<Scalar> {
+    const MIN: f64 = i64::MIN as f64;
+    const MAX: f64 = i64::MAX as f64;
+    if !x.is_finite() || x.fract() != 0.0 || !(MIN..=MAX).contains(&x) {
+        return None;
+    }
+    Some(Scalar::Int(x as i64))
 }
 
 fn enum_cast_scalar(
@@ -627,7 +662,7 @@ mod tests {
     }
 
     #[test]
-    fn eval_casts() {
+    fn eval_infallible_casts() {
         for (src, expected) in [
             ("5 as Float", float(5.0)),
             ("5 as Dec", dec(dec!(5))),
@@ -657,6 +692,23 @@ mod tests {
             ("(123456789 as Dec) as String", str("123456789.0")),
             (r#""hello" as Bytes"#, bytes(b"hello")),
             ("\"é\" as Bytes", bytes(&[0xc3, 0xa9])),
+        ] {
+            assert_eq!(run_src(src), Ok(expected), "{src}");
+        }
+    }
+
+    #[test]
+    fn eval_fallible_casts() {
+        for (src, expected) in [
+            ("1.5f as? Int", Val::None),
+            ("(-1.0f) as? Int", some(int(-1))),
+            ("1e300f as? Int", Val::None),
+            ("3.5 as? Int", Val::None),
+            ("2.0 as? Int", some(int(2))),
+            ("Dec::MAX as? Int", Val::None),
+            ("1.54321f as? Dec", some(dec(dec!(1.54321)))),
+            ("1.2e-15 as? Dec", some(dec(dec!(1.2e-15)))),
+            ("1e300f as? Dec", Val::None),
         ] {
             assert_eq!(run_src(src), Ok(expected), "{src}");
         }
