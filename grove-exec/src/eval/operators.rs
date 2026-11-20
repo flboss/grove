@@ -386,6 +386,12 @@ fn eval_fallible_cast(
     schema: &ValidatedSchema,
 ) -> Result<Val, ExecError> {
     let converted = match (kind, value) {
+        (CastKind::IntToBool, Val::Scalar(Scalar::Int(0))) => Some(Scalar::Bool(false)),
+        (CastKind::IntToBool, Val::Scalar(Scalar::Int(1))) => Some(Scalar::Bool(true)),
+        (CastKind::IntToBool, Val::Scalar(Scalar::Int(_))) => None,
+        (CastKind::BytesToString, Val::Scalar(Scalar::Bytes(bytes))) => {
+            String::from_utf8(bytes).ok().map(Scalar::String)
+        }
         (CastKind::FloatToIntStrict, Val::Scalar(Scalar::Float(x))) => strict_float_to_int(x),
         (CastKind::DecToIntStrict, Val::Scalar(Scalar::Dec(d))) => if d.fract().is_zero() {
             d.to_i64()
@@ -700,6 +706,11 @@ mod tests {
     #[test]
     fn eval_fallible_casts() {
         for (src, expected) in [
+            ("0 as? Bool", some(bool(false))),
+            ("1 as? Bool", some(bool(true))),
+            ("2 as? Bool", Val::None),
+            (r#"hex"6869" as? String"#, some(str("hi"))),
+            (r#"hex"ff" as? String"#, Val::None),
             ("1.5f as? Int", Val::None),
             ("(-1.0f) as? Int", some(int(-1))),
             ("1e300f as? Int", Val::None),
