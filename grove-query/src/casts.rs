@@ -30,6 +30,7 @@ pub enum CastKind {
     StringToFloat,
     StringToDec,
     StringToBool,
+    StringToInstant,
     IntToBool,
     BytesToString,
 }
@@ -48,7 +49,8 @@ impl CastKind {
             | CastKind::FloatToString
             | CastKind::DecToString
             | CastKind::BoolToString
-            | CastKind::BytesToString => QueryType::Scalar(ScalarType::String),
+            | CastKind::BytesToString
+            | CastKind::InstantToString => QueryType::Scalar(ScalarType::String),
             CastKind::FloatToInt
             | CastKind::DecToInt
             | CastKind::BoolToInt
@@ -132,6 +134,9 @@ fn lookup_infallible(
         (QueryType::Scalar(ScalarType::String), QueryType::Scalar(ScalarType::Bytes)) => {
             Some(CastKind::StringToBytes)
         }
+        (QueryType::Scalar(ScalarType::Instant), QueryType::Scalar(ScalarType::String)) => {
+            Some(CastKind::InstantToString)
+        }
         (QueryType::Enum(id), QueryType::Scalar(target)) => match schema
             .enums
             .get(id.index())
@@ -214,6 +219,7 @@ mod tests {
             (Bool, Int, CastKind::BoolToInt),
             (Bool, String, CastKind::BoolToString),
             (String, Bytes, CastKind::StringToBytes),
+            (Instant, String, CastKind::InstantToString),
         ] {
             let kind = lookup(
                 &QueryType::Scalar(from),

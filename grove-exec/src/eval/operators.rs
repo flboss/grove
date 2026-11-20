@@ -328,7 +328,8 @@ pub(super) fn eval_cast(
         (CastKind::IntToString, Val::Scalar(scalar @ Scalar::Int(_)))
         | (CastKind::FloatToString, Val::Scalar(scalar @ Scalar::Float(_)))
         | (CastKind::BoolToString, Val::Scalar(scalar @ Scalar::Bool(_)))
-        | (CastKind::DecToString, Val::Scalar(scalar @ Scalar::Dec(_))) => {
+        | (CastKind::DecToString, Val::Scalar(scalar @ Scalar::Dec(_)))
+        | (CastKind::InstantToString, Val::Scalar(scalar @ Scalar::Instant(_))) => {
             Scalar::String(scalar.to_string())
         }
         (CastKind::IntToFloat, Val::Scalar(Scalar::Int(n))) => Scalar::Float(n as f64),
@@ -716,6 +717,10 @@ mod tests {
             ("30.00 as String", str("30.0")),
             ("2.5 as String", str("2.5")),
             ("(123456789 as Dec) as String", str("123456789.0")),
+            (
+                "@2026-10-20_14:30:45 as String",
+                str("2026-10-20T14:30:45Z"),
+            ),
             (r#""hello" as Bytes"#, bytes(b"hello")),
             ("\"é\" as Bytes", bytes(&[0xc3, 0xa9])),
         ] {
