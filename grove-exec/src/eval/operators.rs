@@ -386,6 +386,26 @@ fn eval_fallible_cast(
     schema: &ValidatedSchema,
 ) -> Result<Val, ExecError> {
     let converted = match (kind, value) {
+        (CastKind::StringToInt, Val::Scalar(Scalar::String(s))) => {
+            s.parse::<i64>().ok().map(Scalar::Int)
+        }
+        (CastKind::StringToFloat, Val::Scalar(Scalar::String(s))) => s
+            .parse::<f64>()
+            .ok()
+            .filter(|value| !schema.config.float_checks || value.is_finite())
+            .map(Scalar::Float),
+        (CastKind::StringToDec, Val::Scalar(Scalar::String(s))) => {
+            s.parse::<Decimal>().ok().map(Scalar::Dec)
+        }
+        (CastKind::StringToBool, Val::Scalar(Scalar::String(s))) => {
+            if s.eq_ignore_ascii_case("true") {
+                Some(Scalar::Bool(true))
+            } else if s.eq_ignore_ascii_case("false") {
+                Some(Scalar::Bool(false))
+            } else {
+                None
+            }
+        }
         (CastKind::IntToBool, Val::Scalar(Scalar::Int(0))) => Some(Scalar::Bool(false)),
         (CastKind::IntToBool, Val::Scalar(Scalar::Int(1))) => Some(Scalar::Bool(true)),
         (CastKind::IntToBool, Val::Scalar(Scalar::Int(_))) => None,
@@ -706,6 +726,21 @@ mod tests {
     #[test]
     fn eval_fallible_casts() {
         for (src, expected) in [
+            (r#""42" as? Int"#, some(int(42))),
+            (r#""-7" as? Int"#, some(int(-7))),
+            (r#""9223372036854775808" as? Int"#, Val::None),
+            (r#""oops" as? Int"#, Val::None),
+            (r#""1.5" as? Float"#, some(float(1.5))),
+            (r#""1.23e-45" as? Float"#, some(float(1.23e-45))),
+            (r#""NaN" as? Float"#, Val::None),
+            (r#""oops" as? Float"#, Val::None),
+            (r#""6.4" as? Dec"#, some(dec(dec!(6.4)))),
+            (r#""-5.43e21" as? Dec"#, some(dec(dec!(-5.43e21)))),
+            (r#""oops" as? Dec"#, Val::None),
+            (r#""TrUe" as? Bool"#, some(bool(true))),
+            (r#""FALSE" as? Bool"#, some(bool(false))),
+            (r#""1" as? Bool"#, Val::None),
+            (r#"" true" as? Bool"#, Val::None),
             ("0 as? Bool", some(bool(false))),
             ("1 as? Bool", some(bool(true))),
             ("2 as? Bool", Val::None),
@@ -718,11 +753,24 @@ mod tests {
             ("2.0 as? Int", some(int(2))),
             ("Dec::MAX as? Int", Val::None),
             ("1.54321f as? Dec", some(dec(dec!(1.54321)))),
-            ("1.2e-15 as? Dec", some(dec(dec!(1.2e-15)))),
+            ("1.2e-15f as? Dec", some(dec(dec!(1.2e-15)))),
             ("1e300f as? Dec", Val::None),
         ] {
             assert_eq!(run_src(src), Ok(expected), "{src}");
         }
+
+        let off = r#"config { float_checks = false }"#;
+        match run_src_config(r#""NaN" as? Float"#, off) {
+            Ok(Val::Some(inner)) => match inner.as_ref() {
+                Val::Scalar(Scalar::Float(value)) => assert!(value.is_nan()),
+                other => panic!("expected NaN, got {other:?}"),
+            },
+            other => panic!("expected some(NaN), got {other:?}"),
+        }
+        assert_eq!(
+            run_src_config(r#""inf" as? Float"#, off),
+            Ok(some(float(f64::INFINITY)))
+        );
     }
 
     #[test]

@@ -26,6 +26,10 @@ pub enum CastKind {
     FloatToIntStrict,
     DecToIntStrict,
     FloatToDecStrict,
+    StringToInt,
+    StringToFloat,
+    StringToDec,
+    StringToBool,
     IntToBool,
     BytesToString,
 }
@@ -33,10 +37,13 @@ pub enum CastKind {
 impl CastKind {
     pub fn target(self) -> QueryType {
         match self {
-            CastKind::IntToFloat | CastKind::DecToFloat => QueryType::Scalar(ScalarType::Float),
-            CastKind::IntToDec | CastKind::FloatToDec | CastKind::FloatToDecStrict => {
-                QueryType::Scalar(ScalarType::Dec)
+            CastKind::IntToFloat | CastKind::DecToFloat | CastKind::StringToFloat => {
+                QueryType::Scalar(ScalarType::Float)
             }
+            CastKind::IntToDec
+            | CastKind::FloatToDec
+            | CastKind::StringToDec
+            | CastKind::FloatToDecStrict => QueryType::Scalar(ScalarType::Dec),
             CastKind::IntToString
             | CastKind::FloatToString
             | CastKind::DecToString
@@ -46,9 +53,10 @@ impl CastKind {
             | CastKind::DecToInt
             | CastKind::BoolToInt
             | CastKind::FloatToIntStrict
-            | CastKind::DecToIntStrict => QueryType::Scalar(ScalarType::Int),
+            | CastKind::DecToIntStrict
+            | CastKind::StringToInt => QueryType::Scalar(ScalarType::Int),
             CastKind::StringToBytes => QueryType::Scalar(ScalarType::Bytes),
-            CastKind::IntToBool => QueryType::Scalar(ScalarType::Bool),
+            CastKind::StringToBool | CastKind::IntToBool => QueryType::Scalar(ScalarType::Bool),
             CastKind::EnumToInt(_) => QueryType::Scalar(ScalarType::Int),
             CastKind::EnumToString(_) => QueryType::Scalar(ScalarType::String),
         }
@@ -60,6 +68,10 @@ impl CastKind {
             CastKind::FloatToIntStrict
                 | CastKind::DecToIntStrict
                 | CastKind::FloatToDecStrict
+                | CastKind::StringToInt
+                | CastKind::StringToFloat
+                | CastKind::StringToDec
+                | CastKind::StringToBool
                 | CastKind::IntToBool
                 | CastKind::BytesToString
         )
@@ -137,6 +149,18 @@ fn lookup_infallible(
 
 fn lookup_fallible(from: &QueryType, to: &QueryType, schema: &ValidatedSchema) -> Option<CastKind> {
     match (from, to) {
+        (QueryType::Scalar(ScalarType::String), QueryType::Scalar(ScalarType::Int)) => {
+            Some(CastKind::StringToInt)
+        }
+        (QueryType::Scalar(ScalarType::String), QueryType::Scalar(ScalarType::Float)) => {
+            Some(CastKind::StringToFloat)
+        }
+        (QueryType::Scalar(ScalarType::String), QueryType::Scalar(ScalarType::Dec)) => {
+            Some(CastKind::StringToDec)
+        }
+        (QueryType::Scalar(ScalarType::String), QueryType::Scalar(ScalarType::Bool)) => {
+            Some(CastKind::StringToBool)
+        }
         (QueryType::Scalar(ScalarType::Int), QueryType::Scalar(ScalarType::Bool)) => {
             Some(CastKind::IntToBool)
         }
@@ -248,6 +272,10 @@ mod tests {
     fn fallible_scalar_casts_resolution() {
         use ScalarType::*;
         for (from, to, expected) in [
+            (String, Int, CastKind::StringToInt),
+            (String, Float, CastKind::StringToFloat),
+            (String, Dec, CastKind::StringToDec),
+            (String, Bool, CastKind::StringToBool),
             (Int, Bool, CastKind::IntToBool),
             (Bytes, String, CastKind::BytesToString),
             (Float, Int, CastKind::FloatToIntStrict),
@@ -280,7 +308,7 @@ mod tests {
             lookup(
                 &QueryType::Scalar(ScalarType::String),
                 &QueryType::Scalar(ScalarType::Int),
-                CastMode::Fallible,
+                CastMode::Infallible,
                 &schema,
             ),
             None
