@@ -11,7 +11,7 @@ use crate::eval::{EvalCtx, eval};
 use crate::method_meta;
 use crate::pushdown::FetchConstraints;
 use crate::storage::{Key, Row};
-use crate::value::{Val, rewrap_optional, unwrap_optional_depth};
+use crate::value::{CollectionOrigin, RowOrigin, Val, rewrap_optional, unwrap_optional_depth};
 
 /// Read root table into a List<Record> (owning Refs resolved)
 pub(crate) fn exec_root(
@@ -34,7 +34,14 @@ pub(crate) fn exec_root(
             .fetch(root.struct_id, &fields, &FetchConstraints::EMPTY)?
     };
     ctx.applied_triggers.insert(node);
-    materialize(ctx, root.struct_id, &fields, rows)
+    let mut value = materialize(ctx, root.struct_id, &fields, rows)?;
+    if let Val::List(list) = &mut value {
+        list.origin = Some(CollectionOrigin::Root {
+            struct_id: root.struct_id,
+            root_idx,
+        });
+    }
+    Ok(value)
 }
 
 /// Fetch a Ref field for a batch of parents
@@ -67,7 +74,16 @@ fn resolve_field(
     let mut resolved_pairs = Vec::with_capacity(parents.len());
     for (parent, group) in parents.iter().zip(groups) {
         // Recursion terminates: ownership chain ends at a root
-        let value = materialize(ctx, target, &fields, group)?;
+        let mut value = materialize(ctx, target, &fields, group)?;
+        if let Val::List(list) = &mut value {
+            list.origin = Some(CollectionOrigin::Ref {
+                field,
+                parent: RowOrigin {
+                    struct_id: field.struct_id(),
+                    key: *parent,
+                },
+            });
+        }
         let wrapped = wrap_fetched(value, field, *parent, ctx.schema)?;
         resolved_pairs.push(((field, *parent), wrapped));
     }
@@ -197,7 +213,13 @@ fn materialize(
                 message: "row has more values than fields (internal error)".to_string(),
             });
         }
-        items.push(Val::record(record));
+        items.push(Val::record_at(
+            record,
+            RowOrigin {
+                struct_id,
+                key: row.rowid,
+            },
+        ));
     }
     Ok(Val::list(items))
 }
@@ -583,6 +605,7 @@ pub(crate) fn exec_field(
             }
         }
         Val::List(items) => {
+            let origin = items.origin;
             let mut mapped = Vec::with_capacity(items.len());
             for item in items {
                 match item {
@@ -597,7 +620,7 @@ pub(crate) fn exec_field(
                     }
                 }
             }
-            Val::list(mapped)
+            Val::list_with_origin(mapped, origin)
         }
         _ => {
             return Err(ExecError::Integrity {
@@ -622,11 +645,12 @@ pub(crate) fn resolve_base_link(ctx: &mut EvalCtx, base: Val) -> Result<Val, Exe
             }
         }
         Val::List(items) => {
+            let origin = items.origin;
             let mut resolved_items = Vec::with_capacity(items.len());
             for item in items {
                 resolved_items.push(resolve_base_link(ctx, item)?);
             }
-            Ok(Val::list(resolved_items))
+            Ok(Val::list_with_origin(resolved_items, origin))
         }
         Val::Record(_)
         | Val::Some(_)
@@ -690,11 +714,12 @@ fn splice_refs(value: Val, resolved: &HashMap<(FieldId, Key), Val>) -> Result<Va
     match value {
         Val::Ref { field, parent } => lookup_ref(field, parent, resolved),
         Val::List(items) => {
+            let origin = items.origin;
             let spliced = items
                 .into_iter()
                 .map(|item| splice_refs(item, resolved))
                 .collect::<Result<_, _>>()?;
-            Ok(Val::list(spliced))
+            Ok(Val::list_with_origin(spliced, origin))
         }
         other => Ok(other),
     }
@@ -800,29 +825,32 @@ fn splice_projection_refs(
 ) -> Result<Val, ExecError> {
     match value {
         Val::Record(record) => {
+            let origin = record.origin;
             let spliced = record
                 .into_iter()
                 .map(|(name, item)| splice_item_refs(item, resolved).map(|val| (name, val)))
                 .collect::<Result<_, _>>()?;
-            Ok(Val::record(spliced))
+            Ok(Val::record_with_origin(spliced, origin))
         }
         Val::List(rows) => {
+            let origin = rows.origin;
             let spliced = rows
                 .into_iter()
                 .map(|row| match row {
                     Val::Record(record) => {
+                        let origin = record.origin;
                         let spliced = record
                             .into_iter()
                             .map(|(name, item)| {
                                 splice_item_refs(item, resolved).map(|val| (name, val))
                             })
                             .collect::<Result<_, _>>()?;
-                        Ok(Val::record(spliced))
+                        Ok(Val::record_with_origin(spliced, origin))
                     }
                     other => Ok(other),
                 })
                 .collect::<Result<_, _>>()?;
-            Ok(Val::list(spliced))
+            Ok(Val::list_with_origin(spliced, origin))
         }
         other => Ok(other),
     }
@@ -833,6 +861,7 @@ fn splice_item_refs(value: Val, resolved: &HashMap<(FieldId, Key), Val>) -> Resu
     match value {
         Val::Ref { field, parent } => lookup_ref(field, parent, resolved),
         Val::List(items) => {
+            let origin = items.origin;
             let spliced = items
                 .into_iter()
                 .map(|item| match item {
@@ -840,7 +869,7 @@ fn splice_item_refs(value: Val, resolved: &HashMap<(FieldId, Key), Val>) -> Resu
                     other => Ok(other),
                 })
                 .collect::<Result<_, _>>()?;
-            Ok(Val::list(spliced))
+            Ok(Val::list_with_origin(spliced, origin))
         }
         other => Ok(other),
     }
@@ -861,7 +890,7 @@ mod tests {
         sqlite::SqliteBackend,
         storage::Storage,
         testdata,
-        value::Scalar,
+        value::{CollectionOrigin, Scalar},
     };
 
     #[test]
@@ -1965,5 +1994,67 @@ mod tests {
                 rec(vec![("name", str("Bob"))]),
             ])
         );
+    }
+
+    #[test]
+    fn root_collection_and_row_origins() {
+        let user = testdata::struct_id(&testdata::schema(), "User");
+        let Ok(Val::List(users)) = run_seeded("users") else {
+            panic!("expected users list");
+        };
+        assert_eq!(
+            users.origin,
+            Some(CollectionOrigin::Root {
+                struct_id: user,
+                root_idx: 0,
+            })
+        );
+        assert_eq!(users.len(), 5);
+        for user_row in users.iter() {
+            let origin = user_row.row_origin().expect("root row origin");
+            assert_eq!(origin.struct_id, user);
+            assert!(origin.key.0 > 0);
+        }
+    }
+
+    #[test]
+    fn related_collection_and_row_origins() {
+        let schema = testdata::schema();
+        let user = testdata::struct_id(&schema, "User");
+        let order = testdata::struct_id(&schema, "Order");
+        let orders_field = testdata::field_id(&schema, user, "orders");
+
+        let Ok(user_value) = run_seeded("users.first().unwrap()") else {
+            panic!("expected first user");
+        };
+        let user_origin = *user_value.row_origin().expect("user row origin");
+
+        let Ok(Val::List(orders)) = run_seeded("users.first().unwrap().orders") else {
+            panic!("expected orders list");
+        };
+        assert_eq!(
+            orders.origin,
+            Some(CollectionOrigin::Ref {
+                field: orders_field,
+                parent: user_origin,
+            })
+        );
+        assert_eq!(orders.len(), 2);
+        for order_row in orders.iter() {
+            let origin = order_row.row_origin().expect("order row origin");
+            assert_eq!(origin.struct_id, order);
+            assert!(origin.key.0 > 0);
+        }
+    }
+
+    #[test]
+    fn lazy_non_owning_ref_record_origin() {
+        let user = testdata::struct_id(&testdata::schema(), "User");
+        let Ok(value) = run_seeded("users.first().unwrap().orders.first().unwrap().user") else {
+            panic!("expected user");
+        };
+        let origin = value.row_origin().expect("user row origin");
+        assert_eq!(origin.struct_id, user);
+        assert!(origin.key.0 > 0);
     }
 }
