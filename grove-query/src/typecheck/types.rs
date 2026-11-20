@@ -50,15 +50,18 @@ pub enum TypedMutationStmt {
     Insert {
         base: TypedExpr,
         arg: TypedExpr,
+        opt_depth: usize,
         span: Span,
     },
     Update {
         base: TypedExpr,
         arg: TypedExpr,
+        opt_depth: usize,
         span: Span,
     },
     Delete {
         base: TypedExpr,
+        opt_depth: usize,
         span: Span,
     },
 }

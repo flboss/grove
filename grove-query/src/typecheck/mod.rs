@@ -1372,20 +1372,20 @@ fn typecheck_mutation(
 ) -> Result<TypedStatement, TypeError> {
     let kind = mutation.kind.value;
 
-    if kind == MutationKind::Delete && mutation.arg.is_some() {
+    if kind == MutationKind::Delete && !mutation.args.is_empty() {
         return Err(TypeError::WrongArgCount {
             method: kind.to_string(),
             expected: 0,
-            got: 1,
+            got: mutation.args.len(),
             span: mutation.kind.span,
         });
     }
 
-    if matches!(kind, MutationKind::Insert | MutationKind::Update) && mutation.arg.is_none() {
+    if matches!(kind, MutationKind::Insert | MutationKind::Update) && mutation.args.len() != 1 {
         return Err(TypeError::WrongArgCount {
             method: kind.to_string(),
             expected: 1,
-            got: 0,
+            got: mutation.args.len(),
             span: mutation.kind.span,
         });
     }
@@ -1397,16 +1397,18 @@ fn typecheck_mutation(
             Ok(TypedStatement::Mutation(TypedMutationStmt::Delete {
                 span: mutation.kind.span,
                 base: typed_base,
+                opt_depth: mutation.opt_depth,
             }))
         }
         MutationKind::Insert => {
             let (typed_base, struct_id) = check_insert_base(&mutation.base, env)?;
-            let mut typed_arg = infer(mutation.arg.as_ref().expect("checked above"), env)?;
+            let mut typed_arg = infer(&mutation.args[0], env)?;
             validate_insert(struct_id, &mut typed_arg, env)?;
             Ok(TypedStatement::Mutation(TypedMutationStmt::Insert {
                 span: mutation.kind.span,
                 base: typed_base,
                 arg: typed_arg,
+                opt_depth: mutation.opt_depth,
             }))
         }
         MutationKind::Update => {
@@ -1418,13 +1420,14 @@ fn typecheck_mutation(
                 QueryType::Record(RecordSource::Schema(struct_id)),
                 IdentBinding::Prev { struct_id },
             );
-            let mut typed_arg = infer(mutation.arg.as_ref().expect("checked above"), env)?;
+            let mut typed_arg = infer(&mutation.args[0], env)?;
             env.pop_scope();
             validate_update(struct_id, &mut typed_arg, env.schema())?;
             Ok(TypedStatement::Mutation(TypedMutationStmt::Update {
                 span: mutation.kind.span,
                 base: typed_base,
                 arg: typed_arg,
+                opt_depth: mutation.opt_depth,
             }))
         }
     }
@@ -1794,6 +1797,14 @@ mod tests {
         let (file, parse_diags) = crate::parse_query(source);
         assert!(parse_diags.is_empty(), "parse diagnostics: {parse_diags:?}");
         infer(file.unwrap().output().unwrap(), &mut env).unwrap()
+    }
+
+    fn typecheck_ok(source: &str, schema: &ValidatedSchema) -> TypedQueryFile {
+        let (file, parse_diags) = crate::parse_query(source);
+        assert!(parse_diags.is_empty(), "parse diagnostics: {parse_diags:?}");
+        let (typed, diags) = typecheck(file.unwrap(), schema);
+        assert!(diags.is_empty(), "type diagnostics: {diags:?}");
+        typed.unwrap()
     }
 
     const ANNOTATION_SCHEMA_SRC: &str = r#"
@@ -4221,6 +4232,34 @@ mod tests {
         let (file, _diags) = crate::parse_query(r#"users[!active].delete("abc"); 0"#);
         let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn mutation_extra_args_error() {
+        let schema = test_schema();
+        for source in [
+            r#"users.insert({ name = "A" }, { name = "B" }); 0"#,
+            r#"users.update({ age = 1 }, { age = 2 }); 0"#,
+            r#"users.delete(1); 0"#,
+        ] {
+            assert_eq!(error_codes(source, &schema), ["QT0004"], "{source}");
+        }
+    }
+
+    #[test]
+    fn mutation_missing_insert_arg_error() {
+        assert_eq!(error_codes("users.insert(); 0", &test_schema()), ["QT0004"]);
+    }
+
+    #[test]
+    fn mutation_preserves_optional_depth() {
+        let typed = typecheck_ok("users?.delete(); 0", &test_schema());
+        let TypedStatement::Mutation(TypedMutationStmt::Delete { opt_depth, .. }) =
+            &typed.statements[0]
+        else {
+            panic!("expected delete mutation");
+        };
+        assert_eq!(*opt_depth, 1);
     }
 
     #[test]

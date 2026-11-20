@@ -1127,7 +1127,11 @@ fn is_mutation(expr: &Expr) -> bool {
 
 fn reclassify_mutation(expr: Expr) -> MutationStmt {
     let Expr::Method {
-        base, name, args, ..
+        base,
+        name,
+        args,
+        opt_depth,
+        ..
     } = expr
     else {
         unreachable!()
@@ -1140,16 +1144,11 @@ fn reclassify_mutation(expr: Expr) -> MutationStmt {
         _ => unreachable!(),
     };
 
-    let arg = if args.is_empty() {
-        None
-    } else {
-        Some(Box::new(args.into_iter().next().unwrap().expr))
-    };
-
     MutationStmt {
         kind: Spanned::new(name.span, kind),
         base: *base,
-        arg,
+        args: args.into_iter().map(|arg| arg.expr).collect(),
+        opt_depth,
     }
 }
 
@@ -2408,6 +2407,18 @@ mod tests {
                 .iter()
                 .all(|d| d.severity != grove_types::Severity::Warning)
         );
+    }
+
+    #[test]
+    fn mutation_all_args_preserved_opt_depth() {
+        let (file, diags) = parse_query("users?.insert({name = \"A\"}, {name = \"B\"}); 0");
+        let file = file.expect("should parse");
+        let Statement::Mutation(mutation) = &file.statements[0] else {
+            panic!("expected mutation");
+        };
+        assert_eq!(mutation.opt_depth, 1);
+        assert_eq!(mutation.args.len(), 2);
+        assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]

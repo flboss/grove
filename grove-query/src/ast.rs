@@ -42,7 +42,8 @@ pub enum Statement {
 pub struct MutationStmt {
     pub kind: Spanned<MutationKind>,
     pub base: Expr,
-    pub arg: Option<Box<Expr>>,
+    pub args: Vec<Expr>,
+    pub opt_depth: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
