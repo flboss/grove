@@ -12,7 +12,7 @@ use crate::ast::{
     TypeExpr, TypeName, UnaryOp,
 };
 use crate::casts::{self, CastMode};
-use crate::methods::{self, ArgCount, ArgSpec, ScopeSpec};
+use crate::methods::{self, ArgCount, ArgSpec, MethodId, ScopeSpec};
 use crate::typecheck::error::TypeError;
 use crate::typecheck::types::*;
 use grove_schema::validated::{Field, FieldId, ScalarType, StructId, ValidatedSchema, ValueType};
@@ -22,6 +22,7 @@ use grove_types::{Diagnostic, NodeId, Severity, Span, Spanned};
 struct ScopeEntry {
     ty: QueryType,
     binding: IdentBinding,
+    provenance: TargetProvenance,
 }
 
 struct TypeEnv<'s> {
@@ -43,7 +44,12 @@ impl<'s> TypeEnv<'s> {
         for (root_idx, root) in schema.roots.iter().enumerate() {
             let record_ty = QueryType::Record(RecordSource::Schema(root.struct_id));
             let list_ty = QueryType::List(Box::new(record_ty));
-            env.define(root.name.clone(), list_ty, IdentBinding::Root { root_idx });
+            env.define_with_provenance(
+                root.name.clone(),
+                list_ty,
+                IdentBinding::Root { root_idx },
+                TargetProvenance::root(root_idx),
+            );
         }
 
         env
@@ -64,10 +70,24 @@ impl<'s> TypeEnv<'s> {
     }
 
     fn define(&mut self, name: String, ty: QueryType, binding: IdentBinding) {
-        self.scopes
-            .last_mut()
-            .unwrap()
-            .insert(name, ScopeEntry { ty, binding });
+        self.define_with_provenance(name, ty, binding, TargetProvenance::NONE);
+    }
+
+    fn define_with_provenance(
+        &mut self,
+        name: String,
+        ty: QueryType,
+        binding: IdentBinding,
+        provenance: TargetProvenance,
+    ) {
+        self.scopes.last_mut().unwrap().insert(
+            name,
+            ScopeEntry {
+                ty,
+                binding,
+                provenance,
+            },
+        );
     }
 
     fn resolve(&self, name: &str) -> Option<(&ScopeEntry, usize)> {
@@ -84,9 +104,25 @@ impl<'s> TypeEnv<'s> {
     }
 
     fn typed(&mut self, kind: TypedExprKind, ty: QueryType, span: Span) -> TypedExpr {
+        self.typed_with_provenance(kind, ty, TargetProvenance::NONE, span)
+    }
+
+    fn typed_with_provenance(
+        &mut self,
+        kind: TypedExprKind,
+        ty: QueryType,
+        provenance: TargetProvenance,
+        span: Span,
+    ) -> TypedExpr {
         let id = NodeId(self.next_id);
         self.next_id += 1;
-        TypedExpr { kind, ty, span, id }
+        TypedExpr {
+            kind,
+            ty,
+            provenance,
+            span,
+            id,
+        }
     }
 
     fn push_record_fields(&mut self, ty: &QueryType) -> bool {
@@ -117,7 +153,12 @@ impl<'s> TypeEnv<'s> {
     fn push_schema_struct_fields(&mut self, struct_id: StructId) {
         let struct_ = &self.schema.structs[struct_id.index()];
         for (local_idx, field) in struct_.fields.iter().enumerate() {
-            let binding = IdentBinding::Field(FieldId::new(struct_id, local_idx));
+            let field_id = FieldId::new(struct_id, local_idx);
+            let binding = IdentBinding::Field(field_id);
+            let provenance = match field {
+                Field::Ref { .. } => TargetProvenance::ref_collection(field_id),
+                _ => TargetProvenance::NONE,
+            };
             let (name, ty) = match field {
                 Field::Value { name, ty, .. } => (name.clone(), ty.into()),
                 Field::Array { name, element, .. } => {
@@ -141,7 +182,7 @@ impl<'s> TypeEnv<'s> {
                     (name.clone(), ty)
                 }
             };
-            self.define(name, ty, binding);
+            self.define_with_provenance(name, ty, binding, provenance);
         }
     }
 }
@@ -160,6 +201,20 @@ fn record_field_by_name(
         }
         _ => None,
     }
+}
+
+fn record_field_provenance(
+    record: &QueryType,
+    name: &str,
+    schema: &ValidatedSchema,
+) -> TargetProvenance {
+    let QueryType::Record(RecordSource::Schema(struct_id)) = record else {
+        return TargetProvenance::NONE;
+    };
+    let Some((field_id, Field::Ref { .. })) = schema.struct_field(*struct_id, name) else {
+        return TargetProvenance::NONE;
+    };
+    TargetProvenance::ref_collection(field_id)
 }
 
 fn infer_literal(literal: &Literal) -> QueryType {
@@ -191,13 +246,17 @@ fn infer(expr: &Expr, env: &mut TypeEnv) -> Result<TypedExpr, TypeError> {
                     name: name.to_string(),
                     span: name.span,
                 })?;
-            Ok(env.typed(
+            let binding = entry.binding.clone();
+            let ty = entry.ty.clone();
+            let provenance = entry.provenance;
+            Ok(env.typed_with_provenance(
                 TypedExprKind::Ident {
                     name: name.clone(),
-                    binding: entry.binding.clone(),
+                    binding,
                     depth,
                 },
-                entry.ty.clone(),
+                ty,
+                provenance,
                 name.span,
             ))
         }
@@ -273,11 +332,13 @@ fn infer(expr: &Expr, env: &mut TypeEnv) -> Result<TypedExpr, TypeError> {
         Expr::Some { value, .. } => {
             let typed_value = infer(value, env)?;
             let ty = typed_value.ty.clone().wrap_optional();
-            Ok(env.typed(
+            let provenance = typed_value.provenance;
+            Ok(env.typed_with_provenance(
                 TypedExprKind::Some {
                     value: Box::new(typed_value),
                 },
                 ty,
+                provenance,
                 expr.span(),
             ))
         }
@@ -369,13 +430,18 @@ fn infer_if(
     }
 
     let ty = typed_default.ty.clone();
+    let mut provenance = typed_default.provenance;
+    for (_, body) in &typed_arms {
+        provenance = provenance.merge_branches(body.provenance);
+    }
 
-    Ok(env.typed(
+    Ok(env.typed_with_provenance(
         TypedExprKind::If {
             arms: typed_arms,
             default: Box::new(typed_default),
         },
         ty,
+        provenance,
         span,
     ))
 }
@@ -715,6 +781,7 @@ fn infer_field(
             base_ty: base.ty.to_string(),
             span: name.span,
         })?;
+    let provenance = record_field_provenance(inner, name, schema);
 
     if was_list {
         field_ty = QueryType::List(Box::new(field_ty));
@@ -722,13 +789,14 @@ fn infer_field(
     let field_ty = field_ty.wrap_optional_depth(opt_depth);
 
     let span = base.span.merge(name.span);
-    Ok(env.typed(
+    Ok(env.typed_with_provenance(
         TypedExprKind::Field {
             base: Box::new(base),
             name: name.clone(),
             opt_depth,
         },
         field_ty,
+        provenance,
         span,
     ))
 }
@@ -911,9 +979,10 @@ fn infer_method(
     let return_ty = def
         .return_type(resolve_ty, typed_args.first().map(|arg| &arg.expr.ty))
         .wrap_optional_depth(opt_depth);
+    let provenance = method_provenance(def.id, base.provenance, &typed_args);
 
     let span = base.span.merge(name.span);
-    Ok(env.typed(
+    Ok(env.typed_with_provenance(
         TypedExprKind::Method {
             method: def.id,
             base: Box::new(base),
@@ -922,8 +991,48 @@ fn infer_method(
             opt_depth,
         },
         return_ty,
+        provenance,
         span,
     ))
+}
+
+fn method_provenance(
+    method: MethodId,
+    base: TargetProvenance,
+    args: &[TypedMethodArg],
+) -> TargetProvenance {
+    match method {
+        MethodId::ListFilter
+        | MethodId::ListSortAsc
+        | MethodId::ListSortDesc
+        | MethodId::ListSortAscOver
+        | MethodId::ListSortDescOver
+        | MethodId::ListTake
+        | MethodId::ListSkip
+        | MethodId::ListTakeBack
+        | MethodId::ListSkipBack
+        | MethodId::ListReverse
+        | MethodId::ListUnique
+        | MethodId::ListUniqueOver
+        | MethodId::ListCompact
+        | MethodId::ListTranspose
+        | MethodId::OptionalUnwrap
+        | MethodId::OptionalFlatten => base,
+        MethodId::ListFirst
+        | MethodId::ListNth
+        | MethodId::ListLast
+        | MethodId::ListFind
+        | MethodId::ListMax
+        | MethodId::ListMin
+        | MethodId::ListMaxBy
+        | MethodId::ListMinBy
+        | MethodId::ListFlatten
+        | MethodId::ListExtend => base.rows_only(),
+        MethodId::OptionalUnwrapOr => args.first().map_or(TargetProvenance::NONE, |arg| {
+            base.merge_branches(arg.expr.provenance)
+        }),
+        _ => TargetProvenance::NONE,
+    }
 }
 
 fn infer_binary(
@@ -1493,13 +1602,14 @@ fn check_insert_base(base: &Expr, env: &mut TypeEnv) -> Result<(TypedExpr, Struc
         }
     };
     let span = base.span();
-    let typed_base = env.typed(
+    let typed_base = env.typed_with_provenance(
         TypedExprKind::Ident {
             name: base_ident.clone(),
             binding: IdentBinding::Root { root_idx },
             depth,
         },
         entry.ty.clone(),
+        TargetProvenance::root(root_idx),
         span,
     );
     Ok((typed_base, struct_id))
@@ -4260,6 +4370,71 @@ mod tests {
             panic!("expected delete mutation");
         };
         assert_eq!(*opt_depth, 1);
+    }
+
+    #[test]
+    fn mutation_target_provenance_tracked() {
+        let schema = test_schema();
+        let user = schema.roots[0].struct_id;
+        let profile_field = schema.struct_field(user, "profile").unwrap().0;
+
+        assert_eq!(
+            infer_ok("users", &schema).provenance,
+            TargetProvenance::root(0)
+        );
+        assert_eq!(
+            infer_ok("users.filter(active)", &schema).provenance,
+            TargetProvenance::root(0)
+        );
+        assert_eq!(
+            infer_ok("users.first().unwrap()", &schema).provenance,
+            TargetProvenance {
+                rows: true,
+                collection: None,
+            }
+        );
+        assert_eq!(
+            infer_ok("users.first().unwrap().profile", &schema).provenance,
+            TargetProvenance::ref_collection(profile_field)
+        );
+        assert_eq!(
+            infer_ok("users.profile", &schema).provenance,
+            TargetProvenance::ref_collection(profile_field)
+        );
+        assert_eq!(
+            infer_ok("users.name", &schema).provenance,
+            TargetProvenance::NONE
+        );
+
+        assert_eq!(
+            infer_ok("some(users)", &schema).provenance,
+            TargetProvenance::root(0)
+        );
+        assert_eq!(
+            infer_ok("if true { users } else { users }", &schema).provenance,
+            TargetProvenance::root(0)
+        );
+        assert_eq!(
+            infer_ok("users.extend(users.take(0))", &schema).provenance,
+            TargetProvenance {
+                rows: true,
+                collection: None,
+            }
+        );
+        assert_eq!(
+            infer_ok("users.map($)", &schema).provenance,
+            TargetProvenance::NONE
+        );
+        assert_eq!(
+            infer_ok("users { name }", &schema).provenance,
+            TargetProvenance::NONE
+        );
+    }
+
+    #[test]
+    fn mutation_target_provenance_not_propagated_through_let() {
+        let typed = typecheck_ok("let u = users; u", &test_schema());
+        assert_eq!(typed.result.unwrap().provenance, TargetProvenance::NONE);
     }
 
     #[test]

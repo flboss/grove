@@ -526,7 +526,7 @@ mod tests {
     use crate::value::Val;
     use grove_query::TypeBindings;
     use grove_query::typecheck::types::{
-        IdentBinding, QueryType, TypedExpr, TypedExprKind, TypedQueryFile,
+        IdentBinding, QueryType, TargetProvenance, TypedExpr, TypedExprKind, TypedQueryFile,
     };
     use grove_schema::validated::{ScalarType, ValidatedSchema};
     use grove_types::{Span, Spanned};
@@ -754,6 +754,7 @@ mod tests {
             ty: QueryType::List(Box::new(QueryType::Optional(Box::new(QueryType::Scalar(
                 ScalarType::Int,
             ))))),
+            provenance: TargetProvenance::NONE,
             span,
             id: grove_types::NodeId(0),
         };

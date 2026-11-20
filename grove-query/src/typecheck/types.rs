@@ -66,10 +66,56 @@ pub enum TypedMutationStmt {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollectionOriginKind {
+    Root(usize),
+    Ref(FieldId),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TargetProvenance {
+    /// records are expected to carry origin
+    pub rows: bool,
+    pub collection: Option<CollectionOriginKind>,
+}
+
+impl TargetProvenance {
+    pub const NONE: Self = Self {
+        rows: false,
+        collection: None,
+    };
+
+    pub fn root(root_idx: usize) -> Self {
+        Self {
+            rows: true,
+            collection: Some(CollectionOriginKind::Root(root_idx)),
+        }
+    }
+
+    pub fn ref_collection(field: FieldId) -> Self {
+        Self {
+            rows: true,
+            collection: Some(CollectionOriginKind::Ref(field)),
+        }
+    }
+
+    pub fn rows_only(self) -> Self {
+        Self {
+            rows: self.rows,
+            collection: None,
+        }
+    }
+
+    pub fn merge_branches(self, other: Self) -> Self {
+        if self == other { self } else { Self::NONE }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypedExpr {
     pub kind: TypedExprKind,
     pub ty: QueryType,
+    pub provenance: TargetProvenance,
     pub span: Span,
     pub id: NodeId,
 }
