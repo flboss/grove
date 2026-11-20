@@ -386,7 +386,10 @@ pub(crate) mod harness {
                 (a.is_nan() && b.is_nan()) || a == b
             }
             (Val::Some(a), Val::Some(b)) => same_value(a, b),
-            (Val::List(a), Val::List(b)) | (Val::Tuple(a), Val::Tuple(b)) => {
+            (Val::List(a), Val::List(b)) => {
+                a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same_value(a, b))
+            }
+            (Val::Tuple(a), Val::Tuple(b)) => {
                 a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same_value(a, b))
             }
             (Val::Record(a), Val::Record(b)) => {
@@ -495,7 +498,7 @@ pub(crate) mod harness {
     }
 
     pub(crate) fn rec(fields: Vec<(&str, Val)>) -> Val {
-        Val::Record(
+        Val::record(
             fields
                 .into_iter()
                 .map(|(name, value)| (Rc::from(name), value))
@@ -691,15 +694,15 @@ mod tests {
     fn eval_deep_optional_methods() {
         assert_eq!(
             run_src("some(some([1, 2]))??.map($ + 1)"),
-            Ok(some(some(Val::List(vec![int(2), int(3)]))))
+            Ok(some(some(Val::list(vec![int(2), int(3)]))))
         );
         assert_eq!(
             run_src("some(some([1, 2]))??.filter($ > 1)"),
-            Ok(some(some(Val::List(vec![int(2)]))))
+            Ok(some(some(Val::list(vec![int(2)]))))
         );
         assert_eq!(
             run_src("some(some([3, 1]))??.sort()"),
-            Ok(some(some(Val::List(vec![int(1), int(3)]))))
+            Ok(some(some(Val::list(vec![int(1), int(3)]))))
         );
         assert_eq!(
             run_src("some(some(\"hi\"))??.len()"),
@@ -732,7 +735,7 @@ mod tests {
     #[test]
     fn eval_env_depth_collections() {
         let mut env = Env::new();
-        env.define(Rc::from("xs"), Val::List(vec![int(1), Val::None]));
+        env.define(Rc::from("xs"), Val::list(vec![int(1), Val::None]));
         let schema = ValidatedSchema::default();
         let plan = PushdownPlan::disabled(&schema);
         let mut ctx = EvalCtx::new(&mut env, FIXED_NOW, &NoStorage, &schema, &plan);
@@ -751,7 +754,7 @@ mod tests {
         };
         assert_eq!(
             eval(&expr, &mut ctx),
-            Ok(Val::List(vec![int(1), Val::None]))
+            Ok(Val::list(vec![int(1), Val::None]))
         );
     }
 
@@ -795,7 +798,7 @@ mod tests {
         );
         assert_eq!(
             run_seeded("settings.first().unwrap().history"),
-            Ok(Val::List(vec![
+            Ok(Val::list(vec![
                 Val::Enum(priority, 0),
                 Val::Enum(priority, 2)
             ]))
@@ -809,11 +812,11 @@ mod tests {
         );
         assert_eq!(
             run_seeded("settings[priority == Priority::High] { name }"),
-            Ok(Val::List(vec![rec(vec![("name", str("alpha"))])]))
+            Ok(Val::list(vec![rec(vec![("name", str("alpha"))])]))
         );
         assert_eq!(
             run_seeded("settings[level in (Level::High, Level::Low)] { name }"),
-            Ok(Val::List(vec![
+            Ok(Val::list(vec![
                 rec(vec![("name", str("alpha"))]),
                 rec(vec![("name", str("beta"))]),
             ]))
@@ -826,7 +829,7 @@ mod tests {
         assert_eq!(run_seeded("let a = 1; let b = a + 2; b"), Ok(int(3)));
         assert_eq!(
             run_seeded("users { name, x = 1 / 0 }; roles { name }"),
-            Ok(Val::List(vec![
+            Ok(Val::list(vec![
                 rec(vec![("name", str("admin"))]),
                 rec(vec![("name", str("editor"))]),
             ]))
@@ -919,7 +922,7 @@ mod tests {
         let second = typed_session("[1, 2, 3].filter($ > min)", &schema, &types);
         assert_eq!(
             session.execute(&second, FIXED_NOW, ExecOptions::default()),
-            Ok(Some(Val::List(vec![int(2), int(3)])))
+            Ok(Some(Val::list(vec![int(2), int(3)])))
         );
     }
 

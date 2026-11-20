@@ -51,7 +51,7 @@ pub(super) fn eval_string_split(base: &Val, args: &[Val]) -> Result<Val, ExecErr
             .map(|part| Val::Scalar(Scalar::String(part.to_string())))
             .collect()
     };
-    Ok(Val::List(parts))
+    Ok(Val::list(parts))
 }
 
 pub(super) fn eval_scalar_method(
@@ -314,7 +314,7 @@ mod tests {
     use rust_decimal::dec;
 
     fn list_str(parts: &[&str]) -> Val {
-        Val::List(parts.iter().map(|part| str(part)).collect())
+        Val::list(parts.iter().map(|part| str(part)).collect())
     }
 
     #[test]
@@ -336,7 +336,7 @@ mod tests {
             (r#""a,b,,c".split(",")"#, list_str(&["a", "b", "", "c"])),
             (r#"",a,".split(",")"#, list_str(&["", "a", ""])),
             (r#""abc".split("")"#, list_str(&["a", "b", "c"])),
-            (r#""".split("")"#, Val::List(vec![])),
+            (r#""".split("")"#, Val::list(vec![])),
             (r#""".split(",")"#, list_str(&[""])),
             (r#""abc".split("x")"#, list_str(&["abc"])),
             (r#""  hi  ".trim()"#, str("hi")),

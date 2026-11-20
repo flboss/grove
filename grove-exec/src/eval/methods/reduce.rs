@@ -84,7 +84,7 @@ pub(super) fn eval_reduce(
     span: Span,
 ) -> Result<Val, ExecError> {
     let items = match base {
-        Val::List(items) => items,
+        Val::List(items) => items.items,
         other => {
             return Err(ExecError::Integrity {
                 message: format!("`{kind}()` called on non-list value: {other} (internal error)"),
@@ -478,7 +478,7 @@ mod tests {
 
         assert_eq!(
             run_seeded("users { t = orders.sum_over(amount) }.t"),
-            Ok(Val::List(vec![
+            Ok(Val::list(vec![
                 some(int(300)),
                 some(int(400)),
                 Val::None,
@@ -488,7 +488,7 @@ mod tests {
         );
         assert_eq!(
             run_seeded("users.orders.map($.avg_over(amount))"),
-            Ok(Val::List(vec![
+            Ok(Val::list(vec![
                 some(int(150)),
                 some(int(400)),
                 Val::None,
@@ -498,7 +498,7 @@ mod tests {
         );
         assert_eq!(
             run_seeded("users { t = orders.sum_over(amount + id) }.t"),
-            Ok(Val::List(vec![
+            Ok(Val::list(vec![
                 some(int(302)),
                 some(int(402)),
                 Val::None,
@@ -508,7 +508,7 @@ mod tests {
         );
         assert_eq!(
             run_seeded("users { m = orders.max_by(amount)?.amount }.m"),
-            Ok(Val::List(vec![
+            Ok(Val::list(vec![
                 some(int(200)),
                 some(int(400)),
                 Val::None,

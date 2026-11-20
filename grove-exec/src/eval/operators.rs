@@ -658,11 +658,11 @@ mod tests {
     fn eval_equality_structural() {
         assert_eq!(Val::None.eq(&Val::None), Some(true));
         assert_eq!(
-            Val::List(vec![int(1), Val::None]).eq(&Val::List(vec![int(1), Val::None])),
+            Val::list(vec![int(1), Val::None]).eq(&Val::list(vec![int(1), Val::None])),
             Some(true)
         );
         assert_eq!(
-            Val::List(vec![int(1)]).eq(&Val::List(vec![int(1), int(2)])),
+            Val::list(vec![int(1)]).eq(&Val::list(vec![int(1), int(2)])),
             Some(false)
         );
         assert_eq!(
@@ -907,7 +907,7 @@ mod tests {
     fn eval_type_annotations() {
         assert_eq!(
             run_src("([] as List<Int>).extend([1, 2, 3])"),
-            Ok(Val::List(vec![int(1), int(2), int(3)]))
+            Ok(Val::list(vec![int(1), int(2), int(3)]))
         );
         assert_eq!(run_src("none as ?String"), Ok(Val::None));
         assert_eq!(
@@ -916,7 +916,7 @@ mod tests {
         );
         assert_eq!(
             run_src("[] as List<(?Int, List<Duration>, ??String, {a: Instant, d: Dec})>"),
-            Ok(Val::List(Vec::new()))
+            Ok(Val::list(Vec::new()))
         );
     }
 
@@ -924,11 +924,11 @@ mod tests {
     fn eval_bytes_sort_filter_extrema() {
         assert_eq!(
             run_src(r#"[hex"02", hex"01"].sort()"#),
-            Ok(Val::List(vec![bytes(&[0x01]), bytes(&[0x02])]))
+            Ok(Val::list(vec![bytes(&[0x01]), bytes(&[0x02])]))
         );
         assert_eq!(
             run_src(r#"[hex"02", hex"01"].sort_desc()"#),
-            Ok(Val::List(vec![bytes(&[0x02]), bytes(&[0x01])]))
+            Ok(Val::list(vec![bytes(&[0x02]), bytes(&[0x01])]))
         );
         assert_eq!(
             run_src(r#"[hex"02", hex"01"].min()"#),
@@ -940,7 +940,7 @@ mod tests {
         );
         assert_eq!(
             run_src(r#"[hex"00", hex"01"][$ >= hex"01"]"#),
-            Ok(Val::List(vec![bytes(&[0x01])]))
+            Ok(Val::list(vec![bytes(&[0x01])]))
         );
     }
 

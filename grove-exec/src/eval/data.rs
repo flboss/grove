@@ -103,7 +103,7 @@ fn wrap_fetched(
         return match value {
             Val::List(mut items) => match items.len() {
                 0 => Ok(Val::None),
-                1 => Ok(Val::Some(Box::new(items.pop().unwrap()))),
+                1 => Ok(Val::Some(Box::new(items.items.pop().unwrap()))),
                 n => Err(ExecError::Integrity {
                     message: format!(
                         "optional Ref `{field_name}` resolved to {n} rows (for parent key {})",
@@ -118,7 +118,7 @@ fn wrap_fetched(
     }
     match value {
         Val::List(mut items) => match items.len() {
-            1 => Ok(items.pop().unwrap()),
+            1 => Ok(items.items.pop().unwrap()),
             n => Err(ExecError::Integrity {
                 message: format!(
                     "required Ref `{field_name}` resolved to {n} rows (for parent key {})",
@@ -197,9 +197,9 @@ fn materialize(
                 message: "row has more values than fields (internal error)".to_string(),
             });
         }
-        items.push(Val::Record(record));
+        items.push(Val::record(record));
     }
-    Ok(Val::List(items))
+    Ok(Val::list(items))
 }
 
 type ResolvedLink = ((FieldId, Key), Val);
@@ -242,7 +242,13 @@ fn collect_owning_refs(
             }
             Ok(())
         }
-        Val::List(items) | Val::Tuple(items) => {
+        Val::List(items) => {
+            for item in items {
+                collect_owning_refs(item, filter, by_field, order, schema)?;
+            }
+            Ok(())
+        }
+        Val::Tuple(items) => {
             for item in items {
                 collect_owning_refs(item, filter, by_field, order, schema)?;
             }
@@ -274,7 +280,13 @@ fn splice_owning_refs(
             }
             Ok(())
         }
-        Val::List(items) | Val::Tuple(items) => {
+        Val::List(items) => {
+            for item in items {
+                splice_owning_refs(item, resolved, filter, schema)?;
+            }
+            Ok(())
+        }
+        Val::Tuple(items) => {
             for item in items {
                 splice_owning_refs(item, resolved, filter, schema)?;
             }
@@ -585,7 +597,7 @@ pub(crate) fn exec_field(
                     }
                 }
             }
-            Val::List(mapped)
+            Val::list(mapped)
         }
         _ => {
             return Err(ExecError::Integrity {
@@ -614,7 +626,7 @@ pub(crate) fn resolve_base_link(ctx: &mut EvalCtx, base: Val) -> Result<Val, Exe
             for item in items {
                 resolved_items.push(resolve_base_link(ctx, item)?);
             }
-            Ok(Val::List(resolved_items))
+            Ok(Val::list(resolved_items))
         }
         Val::Record(_)
         | Val::Some(_)
@@ -682,7 +694,7 @@ fn splice_refs(value: Val, resolved: &HashMap<(FieldId, Key), Val>) -> Result<Va
                 .into_iter()
                 .map(|item| splice_refs(item, resolved))
                 .collect::<Result<_, _>>()?;
-            Ok(Val::List(spliced))
+            Ok(Val::list(spliced))
         }
         other => Ok(other),
     }
@@ -792,7 +804,7 @@ fn splice_projection_refs(
                 .into_iter()
                 .map(|(name, item)| splice_item_refs(item, resolved).map(|val| (name, val)))
                 .collect::<Result<_, _>>()?;
-            Ok(Val::Record(spliced))
+            Ok(Val::record(spliced))
         }
         Val::List(rows) => {
             let spliced = rows
@@ -805,12 +817,12 @@ fn splice_projection_refs(
                                 splice_item_refs(item, resolved).map(|val| (name, val))
                             })
                             .collect::<Result<_, _>>()?;
-                        Ok(Val::Record(spliced))
+                        Ok(Val::record(spliced))
                     }
                     other => Ok(other),
                 })
                 .collect::<Result<_, _>>()?;
-            Ok(Val::List(spliced))
+            Ok(Val::list(spliced))
         }
         other => Ok(other),
     }
@@ -828,7 +840,7 @@ fn splice_item_refs(value: Val, resolved: &HashMap<(FieldId, Key), Val>) -> Resu
                     other => Ok(other),
                 })
                 .collect::<Result<_, _>>()?;
-            Ok(Val::List(spliced))
+            Ok(Val::list(spliced))
         }
         other => Ok(other),
     }
@@ -1167,7 +1179,7 @@ mod tests {
         assert_eq!(groups.len(), 4);
         assert_eq!(groups[0].len(), 1);
         assert_eq!(groups[3].len(), 1);
-        let empty: Val = Val::List(Vec::new());
+        let empty: Val = Val::list(Vec::new());
         match wrap_fetched(empty, user_field, Key(2), &schema) {
             Err(ExecError::Integrity { message }) => assert!(
                 message.contains("resolved to 0 rows"),
@@ -1416,23 +1428,23 @@ mod tests {
     fn pushed_root_operations_correctness() {
         assert_eq!(
             run_seeded("users.sort_desc_over(name).take(2).name"),
-            Ok(Val::List(vec![str("Eli"), str("Dan")]))
+            Ok(Val::list(vec![str("Eli"), str("Dan")]))
         );
         assert_eq!(
             run_seeded("users.skip(1).take(2).name"),
-            Ok(Val::List(vec![str("Bob"), str("Cyd")]))
+            Ok(Val::list(vec![str("Bob"), str("Cyd")]))
         );
         assert_eq!(
             run_seeded("users.take(2).sort_desc_over(name).name"),
-            Ok(Val::List(vec![str("Bob"), str("Ada")]))
+            Ok(Val::list(vec![str("Bob"), str("Ada")]))
         );
         assert_eq!(
             run_seeded("users.sort_over(name).take(10).skip(2).take(2).name"),
-            Ok(Val::List(vec![str("Cyd"), str("Dan")]))
+            Ok(Val::list(vec![str("Cyd"), str("Dan")]))
         );
         assert_eq!(
             run_seeded("users[id > 2][orders.len() > 1].map($.name)"),
-            Ok(Val::List(Vec::new()))
+            Ok(Val::list(Vec::new()))
         );
         assert_eq!(run_seeded("users.first()?.name"), Ok(some(str("Ada"))));
         assert_eq!(run_seeded("users.nth(-1)?.name"), Ok(some(str("Eli"))));
@@ -1450,15 +1462,15 @@ mod tests {
     fn bytes_root_pushdown_parity() {
         assert_eq!(
             run_seeded(r#"blobs[data == hex"0001"].id"#),
-            Ok(Val::List(vec![int(1)]))
+            Ok(Val::list(vec![int(1)]))
         );
         assert_eq!(
             run_seeded(r#"blobs[data in (hex"0001", hex"00ff")].id"#),
-            Ok(Val::List(vec![int(1), int(3)]))
+            Ok(Val::list(vec![int(1), int(3)]))
         );
         assert_eq!(
             run_seeded("blobs.sort_over(data).id"),
-            Ok(Val::List(vec![int(2), int(1), int(3)]))
+            Ok(Val::list(vec![int(2), int(1), int(3)]))
         );
         assert_eq!(
             run_seeded(r#"blobs.first().unwrap().maybe"#),
@@ -1466,15 +1478,15 @@ mod tests {
         );
         assert_eq!(
             run_seeded("blobs.first().unwrap().chunks"),
-            Ok(Val::List(vec![bytes(&[0x01]), bytes(&[0x01, 0x00])]))
+            Ok(Val::list(vec![bytes(&[0x01]), bytes(&[0x01, 0x00])]))
         );
         assert_eq!(
             run_seeded("blobs[data.len() > 1].id"),
-            Ok(Val::List(vec![int(1), int(3)]))
+            Ok(Val::list(vec![int(1), int(3)]))
         );
         assert_eq!(
             run_seeded(r#"blobs[("x" as Bytes) == data].id"#),
-            Ok(Val::List(Vec::new()))
+            Ok(Val::list(Vec::new()))
         );
     }
 
@@ -1513,7 +1525,7 @@ mod tests {
                     parent: Key(1),
                 },
             )])),
-            Val::List(vec![Val::Tuple(vec![Val::Ref {
+            Val::list(vec![Val::Tuple(vec![Val::Ref {
                 field: orders_field,
                 parent: Key(1),
             }])]),
@@ -1875,7 +1887,7 @@ mod tests {
             &[5, 3],
             "expected batched User.orders then Order.items fetches: {counts:?}"
         );
-        assert_eq!(result, Val::List(vec![rec(vec![("name", str("Bob"))])]));
+        assert_eq!(result, Val::list(vec![rec(vec![("name", str("Bob"))])]));
     }
 
     #[test]
@@ -1915,7 +1927,7 @@ mod tests {
             assert_eq!(constraints.offset, 0);
             assert_eq!(constraints.limit, Some(1));
         }
-        assert_eq!(result, Val::List(vec![int(1), int(1)]));
+        assert_eq!(result, Val::list(vec![int(1), int(1)]));
     }
 
     #[test]
@@ -1931,7 +1943,7 @@ mod tests {
             assert_eq!(constraints.offset, 0);
             assert_eq!(constraints.limit, Some(1));
         }
-        assert_eq!(result, Val::List(vec![int(1), int(0)]));
+        assert_eq!(result, Val::list(vec![int(1), int(0)]));
     }
 
     #[test]
@@ -1948,7 +1960,7 @@ mod tests {
         }
         assert_eq!(
             result,
-            Val::List(vec![
+            Val::list(vec![
                 rec(vec![("name", str("Ada"))]),
                 rec(vec![("name", str("Bob"))]),
             ])

@@ -5,7 +5,7 @@ use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 use chrono::{DateTime, TimeDelta, Utc};
-use grove_schema::validated::{Enum, EnumId, EnumValue, Field, FieldId, ValidatedSchema};
+use grove_schema::validated::{Enum, EnumId, EnumValue, Field, FieldId, StructId, ValidatedSchema};
 use grove_types::Span;
 use rust_decimal::Decimal;
 
@@ -86,6 +86,213 @@ impl Hash for Scalar {
     }
 }
 
+/// The storage row a value was materialized from
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RowOrigin {
+    pub struct_id: StructId,
+    pub key: Key,
+}
+
+/// The storage collection a list was materialized from
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CollectionOrigin {
+    Root {
+        struct_id: StructId,
+        root_idx: usize,
+    },
+    Ref {
+        field: FieldId,
+        parent: RowOrigin,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct RecordVal {
+    pub fields: Vec<(Rc<str>, Val)>,
+    pub origin: Option<RowOrigin>,
+}
+
+impl RecordVal {
+    pub fn new(fields: Vec<(Rc<str>, Val)>) -> Self {
+        RecordVal {
+            fields,
+            origin: None,
+        }
+    }
+
+    pub fn with_origin(fields: Vec<(Rc<str>, Val)>, origin: RowOrigin) -> Self {
+        RecordVal {
+            fields,
+            origin: Some(origin),
+        }
+    }
+}
+
+impl PartialEq for RecordVal {
+    fn eq(&self, other: &Self) -> bool {
+        self.fields == other.fields
+    }
+}
+impl PartialEq<Vec<(Rc<str>, Val)>> for RecordVal {
+    fn eq(&self, other: &Vec<(Rc<str>, Val)>) -> bool {
+        &self.fields == other
+    }
+}
+impl PartialEq<[(Rc<str>, Val)]> for RecordVal {
+    fn eq(&self, other: &[(Rc<str>, Val)]) -> bool {
+        self.fields == other
+    }
+}
+
+impl std::ops::Deref for RecordVal {
+    type Target = [(Rc<str>, Val)];
+
+    fn deref(&self) -> &Self::Target {
+        &self.fields
+    }
+}
+impl std::ops::DerefMut for RecordVal {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.fields
+    }
+}
+
+impl IntoIterator for RecordVal {
+    type Item = (Rc<str>, Val);
+    type IntoIter = std::vec::IntoIter<(Rc<str>, Val)>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.fields.into_iter()
+    }
+}
+impl<'a> IntoIterator for &'a RecordVal {
+    type Item = &'a (Rc<str>, Val);
+    type IntoIter = std::slice::Iter<'a, (Rc<str>, Val)>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.fields.iter()
+    }
+}
+impl<'a> IntoIterator for &'a mut RecordVal {
+    type Item = &'a mut (Rc<str>, Val);
+    type IntoIter = std::slice::IterMut<'a, (Rc<str>, Val)>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.fields.iter_mut()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ListVal {
+    pub items: Vec<Val>,
+    pub origin: Option<CollectionOrigin>,
+}
+
+impl ListVal {
+    pub fn new(items: Vec<Val>) -> Self {
+        ListVal {
+            items,
+            origin: None,
+        }
+    }
+
+    pub fn with_origin(items: Vec<Val>, origin: CollectionOrigin) -> Self {
+        ListVal {
+            items,
+            origin: Some(origin),
+        }
+    }
+
+    pub fn push(&mut self, value: Val) {
+        self.items.push(value);
+    }
+
+    pub fn pop(&mut self) -> Option<Val> {
+        self.items.pop()
+    }
+
+    pub fn truncate(&mut self, len: usize) {
+        self.items.truncate(len);
+    }
+
+    pub fn drain<R>(&mut self, range: R) -> std::vec::Drain<'_, Val>
+    where
+        R: std::ops::RangeBounds<usize>,
+    {
+        self.items.drain(range)
+    }
+
+    pub fn swap_remove(&mut self, index: usize) -> Val {
+        self.items.swap_remove(index)
+    }
+
+    pub fn extend<I>(&mut self, iter: I)
+    where
+        I: IntoIterator<Item = Val>,
+    {
+        self.items.extend(iter);
+    }
+}
+
+impl PartialEq for ListVal {
+    fn eq(&self, other: &Self) -> bool {
+        self.items == other.items
+    }
+}
+impl PartialEq<Vec<Val>> for ListVal {
+    fn eq(&self, other: &Vec<Val>) -> bool {
+        &self.items == other
+    }
+}
+impl PartialEq<[Val]> for ListVal {
+    fn eq(&self, other: &[Val]) -> bool {
+        self.items == other
+    }
+}
+impl<const N: usize> PartialEq<[Val; N]> for ListVal {
+    fn eq(&self, other: &[Val; N]) -> bool {
+        self.items == other
+    }
+}
+
+impl std::ops::Deref for ListVal {
+    type Target = [Val];
+
+    fn deref(&self) -> &Self::Target {
+        &self.items
+    }
+}
+impl std::ops::DerefMut for ListVal {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.items
+    }
+}
+
+impl IntoIterator for ListVal {
+    type Item = Val;
+    type IntoIter = std::vec::IntoIter<Val>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.items.into_iter()
+    }
+}
+impl<'a> IntoIterator for &'a ListVal {
+    type Item = &'a Val;
+    type IntoIter = std::slice::Iter<'a, Val>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.items.iter()
+    }
+}
+impl<'a> IntoIterator for &'a mut ListVal {
+    type Item = &'a mut Val;
+    type IntoIter = std::slice::IterMut<'a, Val>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.items.iter_mut()
+    }
+}
+
 /// A Grove value
 #[derive(Debug, Clone, PartialEq)]
 pub enum Val {
@@ -93,9 +300,9 @@ pub enum Val {
     Some(Box<Val>),
     Scalar(Scalar),
     Enum(EnumId, usize),
-    List(Vec<Val>),
+    List(ListVal),
     Tuple(Vec<Val>),
-    Record(Vec<(Rc<str>, Val)>),
+    Record(RecordVal),
     /// Unresolved navigation link of the `parent` row
     Ref {
         field: FieldId,
@@ -104,6 +311,44 @@ pub enum Val {
 }
 
 impl Val {
+    pub fn record(fields: Vec<(Rc<str>, Val)>) -> Self {
+        Val::Record(RecordVal::new(fields))
+    }
+
+    pub fn record_with_origin(fields: Vec<(Rc<str>, Val)>, origin: Option<RowOrigin>) -> Self {
+        Val::Record(RecordVal { fields, origin })
+    }
+
+    pub fn record_at(fields: Vec<(Rc<str>, Val)>, origin: RowOrigin) -> Self {
+        Val::Record(RecordVal::with_origin(fields, origin))
+    }
+
+    pub fn list(items: Vec<Val>) -> Self {
+        Val::List(ListVal::new(items))
+    }
+
+    pub fn list_with_origin(items: Vec<Val>, origin: Option<CollectionOrigin>) -> Self {
+        Val::List(ListVal { items, origin })
+    }
+
+    pub fn list_at(items: Vec<Val>, origin: CollectionOrigin) -> Self {
+        Val::List(ListVal::with_origin(items, origin))
+    }
+
+    pub fn row_origin(&self) -> Option<&RowOrigin> {
+        match self {
+            Val::Record(record) => record.origin.as_ref(),
+            _ => None,
+        }
+    }
+
+    pub fn collection_origin(&self) -> Option<&CollectionOrigin> {
+        match self {
+            Val::List(list) => list.origin.as_ref(),
+            _ => None,
+        }
+    }
+
     pub fn cmp(&self, other: &Val, span: Span) -> Result<std::cmp::Ordering, ExecError> {
         match (self, other) {
             (Val::Scalar(x), Val::Scalar(y)) => x.cmp(y, span),
@@ -173,7 +418,8 @@ impl Val {
     pub fn contains_ref(&self) -> bool {
         match self {
             Val::Some(val) => val.contains_ref(),
-            Val::List(vals) | Val::Tuple(vals) => vals.iter().any(Val::contains_ref),
+            Val::List(vals) => vals.iter().any(Val::contains_ref),
+            Val::Tuple(vals) => vals.iter().any(Val::contains_ref),
             Val::Record(items) => items.iter().any(|(_, val)| val.contains_ref()),
             Val::Ref { .. } => true,
             _ => false,
@@ -724,11 +970,11 @@ mod tests {
         let schema = testdata::schema();
         let priority = testdata::enum_id(&schema, "Priority");
         let user = testdata::struct_id(&schema, "User");
-        let value = Val::Record(vec![
+        let value = Val::record(vec![
             ("p".into(), Val::Some(Box::new(Val::Enum(priority, 2)))),
             (
                 "m".into(),
-                Val::List(vec![Val::Ref {
+                Val::list(vec![Val::Ref {
                     field: crate::testdata::field_id(&schema, user, "manager"),
                     parent: Key(7),
                 }]),
@@ -749,15 +995,38 @@ mod tests {
         assert!(Rc::ptr_eq(&x, &interner.intern("x")));
         assert!(!Rc::ptr_eq(&x, &y));
         assert_eq!(interner.len(), 2);
-        let list = Val::List(vec![Val::Scalar(Scalar::Int(1)), Val::None]);
+        let list = Val::list(vec![Val::Scalar(Scalar::Int(1)), Val::None]);
         assert_eq!(list.to_string(), "[1, none]");
         let tuple = Val::Tuple(vec![
             Val::Scalar(Scalar::String("a".to_string())),
             Val::Scalar(Scalar::Int(1)),
         ]);
         assert_eq!(tuple.to_string(), "(\"a\", 1)");
-        let record = Val::Record(vec![(x, Val::Scalar(Scalar::Int(1))), (y, list)]);
+        let record = Val::record(vec![(x, Val::Scalar(Scalar::Int(1))), (y, list)]);
         assert_eq!(record.to_string(), "{x: 1, y: [1, none]}");
-        assert_eq!(Val::List(vec![]).to_string(), "[]");
+        assert_eq!(Val::list(vec![]).to_string(), "[]");
+    }
+
+    #[test]
+    fn value_equality_unaffected_by_origin() {
+        let schema = testdata::schema();
+        let user = testdata::struct_id(&schema, "User");
+        let orders = testdata::field_id(&schema, user, "orders");
+        let fields = vec![(Rc::from("x"), Val::Scalar(Scalar::Int(1)))];
+        let origin = RowOrigin {
+            struct_id: user,
+            key: Key(7),
+        };
+        assert_eq!(Val::record_at(fields.clone(), origin), Val::record(fields));
+        assert_eq!(
+            Val::list_at(
+                vec![int(1)],
+                CollectionOrigin::Ref {
+                    field: orders,
+                    parent: origin,
+                },
+            ),
+            Val::list(vec![int(1)])
+        );
     }
 }

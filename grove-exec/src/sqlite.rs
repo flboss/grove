@@ -625,7 +625,7 @@ fn semi(
         }
         ElemPlan::Link(node) => {
             if matches!(cells[0], ValueRef::Null) {
-                Ok((SemiVal::Done(Val::List(Vec::new())), 1))
+                Ok((SemiVal::Done(Val::list(Vec::new())), 1))
             } else {
                 Ok((
                     SemiVal::Deep {
@@ -647,7 +647,7 @@ fn finalize(semi: SemiVal, groups: &HashMap<usize, HashMap<LinkKey, Vec<Val>>>) 
             Val::Tuple(items.into_iter().map(|s| finalize(s, groups)).collect())
         }
         SemiVal::Some(inner) => Val::Some(Box::new(finalize(*inner, groups))),
-        SemiVal::Deep { node, key } => Val::List(
+        SemiVal::Deep { node, key } => Val::list(
             groups
                 .get(&node)
                 .and_then(|g| g.get(&key))
@@ -696,7 +696,7 @@ fn splice(tree: SemiVal, resolved: &mut HashMap<usize, Val>) -> Val {
             Val::Tuple(items.into_iter().map(|s| splice(s, resolved)).collect())
         }
         SemiVal::Some(inner) => Val::Some(Box::new(splice(*inner, resolved))),
-        SemiVal::Deep { node, .. } => resolved.remove(&node).unwrap_or(Val::List(Vec::new())),
+        SemiVal::Deep { node, .. } => resolved.remove(&node).unwrap_or(Val::list(Vec::new())),
     }
 }
 
@@ -1116,7 +1116,7 @@ impl SqliteBackend<'_> {
                             ctx,
                         )?;
                     }
-                    values.push(Val::List(items));
+                    values.push(Val::list(items));
                 }
                 Slot::ValueArray(slot) => {
                     let mut cells = Vec::with_capacity(slot.len);
@@ -1139,7 +1139,7 @@ impl SqliteBackend<'_> {
                                 &slot.label,
                                 ctx,
                             )?;
-                            resolved.insert(*root, Val::List(items));
+                            resolved.insert(*root, Val::list(items));
                         }
                     }
                     values.push(splice(tree, &mut resolved));
@@ -1850,7 +1850,7 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 5);
         let str_list = |ss: &[&str]| {
-            Val::List(
+            Val::list(
                 ss.iter()
                     .map(|s| Val::Scalar(Scalar::String(s.to_string())))
                     .collect(),
@@ -1861,11 +1861,11 @@ mod tests {
             vec![
                 int(1),
                 str_list(&["a1", "a2"]),
-                Val::List(vec![
+                Val::list(vec![
                     Val::Tuple(vec![int(1), Val::Scalar(Scalar::String("one".to_string()))]),
                     Val::Tuple(vec![int(2), Val::Scalar(Scalar::String("two".to_string()))]),
                 ]),
-                Val::List(vec![some(int(5)), Val::None]),
+                Val::list(vec![some(int(5)), Val::None]),
             ]
         );
         assert_eq!(
@@ -1873,29 +1873,29 @@ mod tests {
             vec![
                 int(2),
                 str_list(&["b2", "b1"]),
-                Val::List(vec![]),
-                Val::List(vec![]),
+                Val::list(vec![]),
+                Val::list(vec![]),
             ]
         );
         assert_eq!(
             rows[2].values,
             vec![
                 int(3),
-                Val::List(vec![]),
-                Val::List(vec![]),
-                Val::List(vec![])
+                Val::list(vec![]),
+                Val::list(vec![]),
+                Val::list(vec![])
             ]
         );
         assert_eq!(
             rows[3].values,
             vec![
                 int(4),
-                Val::List(vec![]),
-                Val::List(vec![Val::Tuple(vec![
+                Val::list(vec![]),
+                Val::list(vec![Val::Tuple(vec![
                     int(3),
                     Val::Scalar(Scalar::String("three".to_string()))
                 ])]),
-                Val::List(vec![]),
+                Val::list(vec![]),
             ]
         );
         assert_eq!(
@@ -1903,8 +1903,8 @@ mod tests {
             vec![
                 int(5),
                 str_list(&["a1", "a2"]),
-                Val::List(vec![]),
-                Val::List(vec![]),
+                Val::list(vec![]),
+                Val::list(vec![]),
             ]
         );
     }
@@ -2149,13 +2149,13 @@ mod tests {
         assert_eq!(rows.len(), 5);
         assert_eq!(
             rows[0].values,
-            vec![Val::List(vec![
-                Val::List(vec![int(1), int(2)]),
-                Val::List(vec![]),
+            vec![Val::list(vec![
+                Val::list(vec![int(1), int(2)]),
+                Val::list(vec![]),
             ])]
         );
         for row in &rows[1..] {
-            assert_eq!(row.values, vec![Val::List(vec![])]);
+            assert_eq!(row.values, vec![Val::list(vec![])]);
         }
     }
 
@@ -2187,15 +2187,15 @@ mod tests {
             rows[0].values,
             vec![
                 int(1),
-                Val::List(vec![Val::Tuple(vec![
-                    Val::List(vec![Val::List(vec![int(1), int(2)]), Val::List(vec![])]),
-                    Val::List(vec![float(2.5)]),
+                Val::list(vec![Val::Tuple(vec![
+                    Val::list(vec![Val::list(vec![int(1), int(2)]), Val::list(vec![])]),
+                    Val::list(vec![float(2.5)]),
                     bool(true),
                 ])]),
             ]
         );
         for row in &rows[1..] {
-            assert_eq!(row.values[1], Val::List(vec![]));
+            assert_eq!(row.values[1], Val::list(vec![]));
         }
     }
 
@@ -2223,24 +2223,24 @@ mod tests {
             rows[0].values,
             vec![
                 int(1),
-                Val::Tuple(vec![int(1), Val::List(vec![str("x"), str("y")])]),
+                Val::Tuple(vec![int(1), Val::list(vec![str("x"), str("y")])]),
             ]
         );
         assert_eq!(
             rows[1].values,
-            vec![int(2), Val::Tuple(vec![int(3), Val::List(vec![])])]
+            vec![int(2), Val::Tuple(vec![int(3), Val::list(vec![])])]
         );
         assert_eq!(
             rows[2].values,
-            vec![int(3), Val::Tuple(vec![int(4), Val::List(vec![])])]
+            vec![int(3), Val::Tuple(vec![int(4), Val::list(vec![])])]
         );
         assert_eq!(
             rows[3].values,
-            vec![int(4), Val::Tuple(vec![int(2), Val::List(vec![str("z")])])]
+            vec![int(4), Val::Tuple(vec![int(2), Val::list(vec![str("z")])])]
         );
         assert_eq!(
             rows[4].values,
-            vec![int(5), Val::Tuple(vec![int(5), Val::List(vec![])])]
+            vec![int(5), Val::Tuple(vec![int(5), Val::list(vec![])])]
         );
     }
 
@@ -2264,14 +2264,14 @@ mod tests {
             rows[0].values,
             vec![
                 int(1),
-                some(Val::Tuple(vec![int(5), Val::List(vec![str("p")])])),
+                some(Val::Tuple(vec![int(5), Val::list(vec![str("p")])])),
             ]
         );
         assert_eq!(rows[1].values, vec![int(2), Val::None]);
         assert_eq!(rows[2].values, vec![int(3), Val::None]);
         assert_eq!(
             rows[3].values,
-            vec![int(4), some(Val::Tuple(vec![int(7), Val::List(vec![])]))]
+            vec![int(4), some(Val::Tuple(vec![int(7), Val::list(vec![])]))]
         );
         assert_eq!(rows[4].values, vec![int(5), Val::None]);
     }
@@ -2794,9 +2794,9 @@ mod tests {
         assert_eq!(groups.len(), 2);
         assert_eq!(
             groups[0][0].values,
-            vec![str("AdaBio"), Val::List(vec![str("a-note")])]
+            vec![str("AdaBio"), Val::list(vec![str("a-note")])]
         );
-        assert_eq!(groups[1][0].values, vec![str("CydBio"), Val::List(vec![])]);
+        assert_eq!(groups[1][0].values, vec![str("CydBio"), Val::list(vec![])]);
     }
 
     #[test]
@@ -3148,18 +3148,18 @@ mod tests {
             rows[0].values,
             vec![
                 some(Val::Scalar(Scalar::Bytes(vec![0xff]))),
-                Val::List(vec![
+                Val::list(vec![
                     Val::Scalar(Scalar::Bytes(vec![0x01])),
                     Val::Scalar(Scalar::Bytes(vec![0x01, 0x00])),
                 ]),
             ]
         );
-        assert_eq!(rows[1].values, vec![Val::None, Val::List(vec![])]);
+        assert_eq!(rows[1].values, vec![Val::None, Val::list(vec![])]);
         assert_eq!(
             rows[2].values,
             vec![
                 some(Val::Scalar(Scalar::Bytes(vec![0x00]))),
-                Val::List(vec![]),
+                Val::list(vec![]),
             ]
         );
     }
@@ -3273,7 +3273,7 @@ mod tests {
                 Val::Enum(priority, 2),
                 Val::Enum(level, 2),
                 some(Val::Enum(priority, 0)),
-                Val::List(vec![Val::Enum(priority, 0), Val::Enum(priority, 2)]),
+                Val::list(vec![Val::Enum(priority, 0), Val::Enum(priority, 2)]),
                 Val::Tuple(vec![Val::Enum(priority, 2), Val::Enum(level, 2)]),
             ]
         );
@@ -3284,7 +3284,7 @@ mod tests {
                 Val::Enum(priority, 0),
                 Val::Enum(level, 0),
                 Val::None,
-                Val::List(vec![Val::Enum(priority, 2)]),
+                Val::list(vec![Val::Enum(priority, 2)]),
                 Val::Tuple(vec![Val::Enum(priority, 0), Val::Enum(level, 0)]),
             ]
         );
@@ -3295,7 +3295,7 @@ mod tests {
                 Val::Enum(priority, 1),
                 Val::Enum(level, 1),
                 some(Val::Enum(priority, 1)),
-                Val::List(vec![]),
+                Val::list(vec![]),
                 Val::Tuple(vec![Val::Enum(priority, 1), Val::Enum(level, 1)]),
             ]
         );

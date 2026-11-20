@@ -33,7 +33,7 @@ pub(super) fn eval_list_map(
         pop_map_scope(ctx);
         mapped.push(value?);
     }
-    Ok(Val::List(mapped))
+    Ok(Val::list(mapped))
 }
 
 pub(super) fn eval_optional_map(
@@ -157,7 +157,7 @@ mod tests {
         );
         assert_eq!(
             run_seeded("users.skip(5).map($.id / 0)"),
-            Ok(Val::List(vec![]))
+            Ok(Val::list(vec![]))
         );
     }
 
@@ -169,34 +169,34 @@ mod tests {
         };
         assert_eq!(
             run_map("[[1, 2], [3]].map($.map($$ + 1))"),
-            vec![Val::List(vec![int(2), int(3)]), Val::List(vec![int(4)])]
+            vec![Val::list(vec![int(2), int(3)]), Val::list(vec![int(4)])]
         );
         assert_eq!(
             run_map("[[1, 2], [3]].map($.map($$ + $.len()))"),
-            vec![Val::List(vec![int(3), int(4)]), Val::List(vec![int(4)])]
+            vec![Val::list(vec![int(3), int(4)]), Val::list(vec![int(4)])]
         );
         assert_eq!(
             run_map("[[[1]], [[2, 3]]].map($.map($$.map($$$ + $$.len() + $.len())))"),
             vec![
-                Val::List(vec![Val::List(vec![int(3)])]),
-                Val::List(vec![Val::List(vec![int(5), int(6)])])
+                Val::list(vec![Val::list(vec![int(3)])]),
+                Val::list(vec![Val::list(vec![int(5), int(6)])])
             ]
         );
         assert_eq!(
             run_map("[1, 2].map(users[id > $].name)"),
             vec![
-                Val::List(vec![str("Bob"), str("Cyd"), str("Dan"), str("Eli")]),
-                Val::List(vec![str("Cyd"), str("Dan"), str("Eli")]),
+                Val::list(vec![str("Bob"), str("Cyd"), str("Dan"), str("Eli")]),
+                Val::list(vec![str("Cyd"), str("Dan"), str("Eli")]),
             ]
         );
         assert_eq!(
             run_map("users { o = orders.map($.amount + 5) }.o"),
             vec![
-                Val::List(vec![int(105), int(205)]),
-                Val::List(vec![int(405)]),
-                Val::List(vec![]),
-                Val::List(vec![]),
-                Val::List(vec![]),
+                Val::list(vec![int(105), int(205)]),
+                Val::list(vec![int(405)]),
+                Val::list(vec![]),
+                Val::list(vec![]),
+                Val::list(vec![]),
             ]
         );
     }
@@ -205,7 +205,7 @@ mod tests {
     fn method_list_map_optional() {
         assert_eq!(
             run_seeded("users.first()?.orders?.map($.amount/3)"),
-            Ok(some(Val::List(vec![int(33), int(66)])))
+            Ok(some(Val::list(vec![int(33), int(66)])))
         );
         assert_eq!(
             run_seeded("users.skip(5).first()?.orders?.map($.amount)"),
@@ -215,9 +215,9 @@ mod tests {
             run_seeded(
                 "some([some([1,11]), some([2,22,222]), none])?.map($?.map($$ * 2 - 3 * $?.len().unwrap_or(0)))"
             ),
-            Ok(some(Val::List(vec![
-                some(Val::List(vec![int(-4), int(16)])),
-                some(Val::List(vec![int(-5), int(35), int(435)])),
+            Ok(some(Val::list(vec![
+                some(Val::list(vec![int(-4), int(16)])),
+                some(Val::list(vec![int(-5), int(35), int(435)])),
                 Val::None
             ])))
         );
@@ -230,7 +230,7 @@ mod tests {
         assert_eq!(run_src("some([1, 2]).map($.len())"), Ok(some(int(2))));
         assert_eq!(
             run_src("some([1, 2])?.map($ + 1)"),
-            Ok(some(Val::List(vec![int(2), int(3)])))
+            Ok(some(Val::list(vec![int(2), int(3)])))
         );
         assert_eq!(run_src("some(some(1))?.map($ + 1)"), Ok(some(some(int(2)))));
         assert_eq!(

@@ -135,12 +135,16 @@ fn filter_refs(value: &mut Val) -> bool {
     match value {
         Val::Ref { .. } => true,
         Val::Some(inner) => filter_refs(inner),
-        Val::List(items) | Val::Tuple(items) => {
+        Val::List(items) => {
+            items.items.retain_mut(|item| !filter_refs(item));
+            false
+        }
+        Val::Tuple(items) => {
             items.retain_mut(|item| !filter_refs(item));
             false
         }
         Val::Record(fields) => {
-            fields.retain_mut(|(_, value)| !filter_refs(value));
+            fields.fields.retain_mut(|(_, value)| !filter_refs(value));
             false
         }
         _ => false,
@@ -495,7 +499,8 @@ fn cell_styled(ctx: &RenderCtx<'_>, value: &Val, depth: usize) -> Styled {
 fn expandable(value: &Val) -> bool {
     match value {
         Val::Record(fields) => !fields.is_empty(),
-        Val::Tuple(items) | Val::List(items) => !items.is_empty(),
+        Val::Tuple(items) => !items.is_empty(),
+        Val::List(items) => !items.is_empty(),
         Val::Some(inner) => expandable(inner),
         _ => false,
     }
@@ -1015,7 +1020,7 @@ mod tests {
     }
 
     fn user(name: &str, age: i64, active: bool) -> Val {
-        Val::Record(vec![
+        Val::record(vec![
             (Rc::from("name"), string(name)),
             (Rc::from("age"), int(age)),
             (Rc::from("active"), Val::Scalar(Scalar::Bool(active))),
@@ -1056,7 +1061,7 @@ mod tests {
 
     #[test]
     fn scalar_list_auto_inline() {
-        let value = Val::List(vec![int(1), int(2), int(3)]);
+        let value = Val::list(vec![int(1), int(2), int(3)]);
         let ty = QueryType::List(Box::new(QueryType::Scalar(ScalarType::Int)));
         assert_eq!(
             render_value(value, &ty, &options(Format::Auto)),
@@ -1086,7 +1091,7 @@ mod tests {
 
     #[test]
     fn single_field_record_dot() {
-        let value = Val::Record(vec![(Rc::from("name"), string("Alice"))]);
+        let value = Val::record(vec![(Rc::from("name"), string("Alice"))]);
         let output = render_value(value, &record_ty(), &options(Format::Vertical));
         assert_eq!(output, "· name: \"Alice\"");
     }
@@ -1115,7 +1120,7 @@ mod tests {
 
     #[test]
     fn record_field_some_vertical() {
-        let value = Val::Record(vec![(
+        let value = Val::record(vec![(
             Rc::from("profile"),
             Val::Some(Box::new(user("Alice", 30, true))),
         )]);
@@ -1135,7 +1140,7 @@ mod tests {
 
     #[test]
     fn record_nested_vertical_rails() {
-        let value = Val::List(vec![user("Alice", 30, true), user("Bob", 9, false)]);
+        let value = Val::list(vec![user("Alice", 30, true), user("Bob", 9, false)]);
         let output = render_value(value, &list_record_ty(), &options(Format::Vertical));
         assert!(output.contains("├─ ╭ name"), "{output}");
         assert!(output.contains("│  ┊ age"), "{output}");
@@ -1147,7 +1152,7 @@ mod tests {
 
     #[test]
     fn record_list_auto_table() {
-        let value = Val::List(vec![user("Alice", 30, true), user("Bob", 9, false)]);
+        let value = Val::list(vec![user("Alice", 30, true), user("Bob", 9, false)]);
         let output = render_value(value, &list_record_ty(), &options(Format::Auto));
         assert!(output.contains("┌"), "{output}");
         assert!(output.contains("name"), "{output}");
@@ -1159,7 +1164,7 @@ mod tests {
     #[test]
     fn empty_record_list_type_headers() {
         let output = render_value(
-            Val::List(Vec::new()),
+            Val::list(Vec::new()),
             &list_record_ty(),
             &options(Format::Auto),
         );
@@ -1170,7 +1175,7 @@ mod tests {
 
     #[test]
     fn wide_table_auto_vertical_fallback() {
-        let value = Val::List(vec![user("Alice", 30, true), user("Bob", 9, false)]);
+        let value = Val::list(vec![user("Alice", 30, true), user("Bob", 9, false)]);
         let mut options = options(Format::Auto);
         options.width = 20;
         let output = render_value(value, &list_record_ty(), &options);
@@ -1180,7 +1185,7 @@ mod tests {
 
     #[test]
     fn table_row_cap() {
-        let value = Val::List(vec![
+        let value = Val::list(vec![
             user("Alice", 30, true),
             user("Bob", 9, false),
             user("Cara", 41, true),
@@ -1200,7 +1205,7 @@ mod tests {
 
     #[test]
     fn scalar_list_row_cap() {
-        let value = Val::List(vec![int(1), int(2), int(3)]);
+        let value = Val::list(vec![int(1), int(2), int(3)]);
         let ty = QueryType::List(Box::new(QueryType::Scalar(ScalarType::Int)));
         let mut options = options(Format::Auto);
         options.max_rows = 2;
@@ -1235,7 +1240,7 @@ mod tests {
 
     #[test]
     fn table_cells_keep_part_styles() {
-        let value = Val::List(vec![Val::Tuple(vec![Val::Some(Box::new(int(3)))])]);
+        let value = Val::list(vec![Val::Tuple(vec![Val::Some(Box::new(int(3)))])]);
         let ty = QueryType::List(Box::new(QueryType::Tuple(vec![QueryType::Optional(
             Box::new(QueryType::Scalar(ScalarType::Int)),
         )])));
@@ -1252,7 +1257,7 @@ mod tests {
             field: FieldId::new(StructId::new(0), 0),
             parent: Key(7),
         };
-        let mut record = Val::Record(vec![
+        let mut record = Val::record(vec![
             (Rc::from("name"), string("Alice")),
             (Rc::from("link"), reference.clone()),
         ]);
@@ -1263,7 +1268,7 @@ mod tests {
         assert!(!output.contains("link"), "{output}");
         assert!(!output.contains("ref("), "{output}");
 
-        let mut list = Val::List(vec![reference, int(1)]);
+        let mut list = Val::list(vec![reference, int(1)]);
         let mut opts = options(Format::Auto);
         opts.hide_refs = true;
         let output = render(&mut list, None, &schema, &opts).unwrap();
@@ -1277,7 +1282,7 @@ mod tests {
             field: FieldId::new(StructId::new(0), 0),
             parent: Key(7),
         };
-        let mut value = Val::List(vec![Val::Record(vec![
+        let mut value = Val::list(vec![Val::record(vec![
             (Rc::from("name"), string("Alice")),
             (Rc::from("link"), reference),
         ])]);
@@ -1300,9 +1305,9 @@ mod tests {
 
     #[test]
     fn nested_list_auto_vertical_indentation() {
-        let value = Val::List(vec![
-            Val::List(vec![int(1), int(2)]),
-            Val::List(vec![int(3)]),
+        let value = Val::list(vec![
+            Val::list(vec![int(1), int(2)]),
+            Val::list(vec![int(3)]),
         ]);
         let ty = QueryType::List(Box::new(QueryType::List(Box::new(QueryType::Scalar(
             ScalarType::Int,

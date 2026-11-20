@@ -24,7 +24,7 @@ pub(crate) fn eval_array(elements: &[TypedExpr], ctx: &mut EvalCtx<'_>) -> Resul
     for element in elements {
         items.push(eval(element, ctx)?);
     }
-    Ok(Val::List(items))
+    Ok(Val::list(items))
 }
 
 pub(crate) fn eval_struct(
@@ -36,7 +36,7 @@ pub(crate) fn eval_struct(
         let value = eval(value, ctx)?;
         record.push((ctx.interner.intern(&name.value), value));
     }
-    resolve_projection_refs(ctx, Val::Record(record))
+    resolve_projection_refs(ctx, Val::record(record))
 }
 
 pub(crate) fn eval_projection(
@@ -76,7 +76,7 @@ pub(crate) fn eval_projection(
                     }
                 }
             }
-            resolve_projection_refs(ctx, Val::List(projected))
+            resolve_projection_refs(ctx, Val::list(projected))
         }
         other => Err(ExecError::Integrity {
             message: format!("projection over non-record value: {other} (internal error)"),
@@ -100,7 +100,7 @@ fn project_record(
         projected.push((ctx.interner.intern(&item.alias.value), value));
     }
     ctx.env.pop_scope();
-    Ok(Val::Record(projected))
+    Ok(Val::record(projected))
 }
 
 #[cfg(test)]
@@ -179,7 +179,7 @@ mod tests {
             Ok(Val::List(rows)) => {
                 assert_eq!(rows.len(), 5);
                 match &rows[0] {
-                    Val::Record(outer) => match outer.as_slice() {
+                    Val::Record(outer) => match outer.fields.as_slice() {
                         [(name, Val::Some(manager))] => {
                             assert_eq!(name.as_ref(), "m");
                             let Val::Record(manager) = manager.as_ref() else {
@@ -367,7 +367,7 @@ mod tests {
     fn projection_flat_fields() {
         assert_eq!(
             run_seeded("roles { name }"),
-            Ok(Val::List(vec![
+            Ok(Val::list(vec![
                 rec(vec![("name", str("admin"))]),
                 rec(vec![("name", str("editor"))]),
             ]))
@@ -390,7 +390,7 @@ mod tests {
         );
         assert_eq!(
             run_src("[{ a = 1, b = 2 }, { a = 3, b = 4 }] { a, ... }"),
-            Ok(Val::List(vec![
+            Ok(Val::list(vec![
                 rec(vec![("a", int(1)), ("b", int(2))]),
                 rec(vec![("a", int(3)), ("b", int(4))]),
             ]))
@@ -475,7 +475,7 @@ mod tests {
     fn projection_chained() {
         assert_eq!(
             run_seeded("users { name } { name }"),
-            Ok(Val::List(vec![
+            Ok(Val::list(vec![
                 rec(vec![("name", str("Ada"))]),
                 rec(vec![("name", str("Bob"))]),
                 rec(vec![("name", str("Cyd"))]),
@@ -497,7 +497,7 @@ mod tests {
     fn projection_let_field_access() {
         assert_eq!(
             run_seeded("let u = users; u.name"),
-            Ok(Val::List(vec![
+            Ok(Val::list(vec![
                 str("Ada"),
                 str("Bob"),
                 str("Cyd"),
@@ -507,7 +507,7 @@ mod tests {
         );
         assert_eq!(
             run_seeded("let r = roles { name }; r.name"),
-            Ok(Val::List(vec![str("admin"), str("editor")]))
+            Ok(Val::list(vec![str("admin"), str("editor")]))
         );
     }
 
@@ -535,19 +535,19 @@ mod tests {
     fn eval_array_literal() {
         assert_eq!(
             run_src("[1, 2, 3]"),
-            Ok(Val::List(vec![int(1), int(2), int(3)]))
+            Ok(Val::list(vec![int(1), int(2), int(3)]))
         );
         assert_eq!(
             run_src("[[1], [2]]"),
-            Ok(Val::List(vec![
-                Val::List(vec![int(1)]),
-                Val::List(vec![int(2)])
+            Ok(Val::list(vec![
+                Val::list(vec![int(1)]),
+                Val::list(vec![int(2)])
             ]))
         );
-        assert_eq!(run_src("[1 + 1, 3]"), Ok(Val::List(vec![int(2), int(3)])));
+        assert_eq!(run_src("[1 + 1, 3]"), Ok(Val::list(vec![int(2), int(3)])));
         assert_eq!(
             run_src("let x = 1; [x, x]"),
-            Ok(Val::List(vec![int(1), int(1)]))
+            Ok(Val::list(vec![int(1), int(1)]))
         );
     }
 
@@ -564,7 +564,7 @@ mod tests {
         );
         assert_eq!(
             run_src("{a = [1, 2]}"),
-            Ok(rec(vec![("a", Val::List(vec![int(1), int(2)]))]))
+            Ok(rec(vec![("a", Val::list(vec![int(1), int(2)]))]))
         );
     }
 }

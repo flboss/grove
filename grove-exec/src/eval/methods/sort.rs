@@ -81,7 +81,7 @@ pub(super) fn eval_sort(
             collect_owning_refs_in(&arg.expr, ctx.schema, ctx.plan.prefetch_skip(), &mut fields);
         }
         prefetch_owning(ctx, &mut items, &fields)?;
-        sort_by_keys(&mut items, kind, args, ctx, span)?;
+        sort_by_keys(&mut items.items, kind, args, ctx, span)?;
     } else if !args.is_empty() {
         return Err(ExecError::Integrity {
             message: format!("`{kind}()` takes no key arguments (internal error)"),
@@ -210,7 +210,7 @@ mod tests {
     fn method_sort_scalars() {
         let run_sort = |src: &str| -> Vec<Val> {
             match run_src(src) {
-                Ok(Val::List(elements)) => elements,
+                Ok(Val::List(elements)) => elements.items,
                 got => panic!("expected List, got: {got:?}"),
             }
         };

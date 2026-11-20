@@ -179,7 +179,7 @@ pub(super) fn eval_list_compact(base: Val) -> Result<Val, ExecError> {
             }
         }
     }
-    Ok(Val::List(compacted))
+    Ok(Val::list(compacted))
 }
 
 /// Turn List<?T> into ?List<T>
@@ -203,7 +203,7 @@ pub(super) fn eval_list_transpose(base: Val) -> Result<Val, ExecError> {
             }
         }
     }
-    Ok(Val::Some(Box::new(Val::List(transposed))))
+    Ok(Val::Some(Box::new(Val::list(transposed))))
 }
 
 pub(super) fn eval_list_unique(base: Val) -> Result<Val, ExecError> {
@@ -218,7 +218,7 @@ pub(super) fn eval_list_unique(base: Val) -> Result<Val, ExecError> {
             unique.push(item);
         }
     }
-    Ok(Val::List(unique))
+    Ok(Val::list(unique))
 }
 
 pub(super) fn eval_list_unique_over(
@@ -250,7 +250,7 @@ pub(super) fn eval_list_unique_over(
             unique.push(item);
         }
     }
-    Ok(Val::List(unique))
+    Ok(Val::list(unique))
 }
 
 pub(super) fn eval_list_is_unique(base: Val) -> Result<Val, ExecError> {
@@ -349,7 +349,7 @@ fn predicate_items(
     };
     let fields = owning_refs_in(&arg.expr, ctx.schema, ctx.plan.prefetch_skip());
     prefetch_owning(ctx, &mut items, &fields)?;
-    Ok(items)
+    Ok(items.items)
 }
 
 fn eval_scoped_predicate(
@@ -385,7 +385,7 @@ pub(super) fn eval_list_flatten(base: Val) -> Result<Val, ExecError> {
             }
         }
     }
-    Ok(Val::List(flat))
+    Ok(Val::list(flat))
 }
 
 /// Concatenate two compatible lists
@@ -439,12 +439,12 @@ mod tests {
     fn method_extend() {
         assert_eq!(
             run_src("[0, -2, 3].extend([4, -6])"),
-            Ok(Val::List(vec![int(0), int(-2), int(3), int(4), int(-6)])),
+            Ok(Val::list(vec![int(0), int(-2), int(3), int(4), int(-6)])),
         );
-        assert_eq!(run_src("[\"\"].skip(1).extend([])"), Ok(Val::List(vec![])),);
+        assert_eq!(run_src("[\"\"].skip(1).extend([])"), Ok(Val::list(vec![])),);
         assert_eq!(
             run_seeded("users.first()?.orders?.extend(users.nth(1)?.orders.unwrap_or([]))?.amount",),
-            Ok(some(Val::List(vec![int(100), int(200), int(400)]))),
+            Ok(some(Val::list(vec![int(100), int(200), int(400)]))),
         );
         assert_eq!(
             run_seeded("users.extend(users).len() == users.len() * 2"),
@@ -572,20 +572,20 @@ mod tests {
     fn method_compact_and_transpose() {
         assert_eq!(
             run_src("[some(1), none, some(3)].compact()"),
-            Ok(Val::List(vec![int(1), int(3)]))
+            Ok(Val::list(vec![int(1), int(3)]))
         );
         assert_eq!(run_src("[some(1), none].transpose()"), Ok(Val::None));
         assert_eq!(
             run_src("[some(1), some(2)].transpose()"),
-            Ok(some(Val::List(vec![int(1), int(2)])))
+            Ok(some(Val::list(vec![int(1), int(2)])))
         );
         assert_eq!(
             run_src("[some(1)].skip(1).transpose()"),
-            Ok(some(Val::List(Vec::new())))
+            Ok(some(Val::list(Vec::new())))
         );
         assert_eq!(
             run_src("[some(some(1)), some(none)].transpose()"),
-            Ok(some(Val::List(vec![some(int(1)), Val::None])))
+            Ok(some(Val::list(vec![some(int(1)), Val::None])))
         );
     }
 
@@ -593,18 +593,18 @@ mod tests {
     fn method_unique() {
         assert_eq!(
             run_src("[1, 2, 1, 3, 2].unique()"),
-            Ok(Val::List(vec![int(1), int(2), int(3)]))
+            Ok(Val::list(vec![int(1), int(2), int(3)]))
         );
         assert_eq!(
             run_src("[{ a = 1, b = 2 }, { a = 1, b = 3 }, { a = 2, b = 4 }].unique_over(a)"),
-            Ok(Val::List(vec![
+            Ok(Val::list(vec![
                 rec(vec![("a", int(1)), ("b", int(2))]),
                 rec(vec![("a", int(2)), ("b", int(4))]),
             ]))
         );
         assert_eq!(
             run_src("[1, 2, 3, 4].unique_over($ mod 2)"),
-            Ok(Val::List(vec![int(1), int(2)]))
+            Ok(Val::list(vec![int(1), int(2)]))
         );
         assert_eq!(run_src("[1, 2, 3].is_unique()"), Ok(bool(true)));
         assert_eq!(run_src("[1, 2, 1].is_unique()"), Ok(bool(false)));
@@ -617,7 +617,7 @@ mod tests {
         assert_eq!(run_src("[1].skip(1).last()"), Ok(Val::None));
         assert_eq!(
             run_src("[1, 2, 3].reverse()"),
-            Ok(Val::List(vec![int(3), int(2), int(1)]))
+            Ok(Val::list(vec![int(3), int(2), int(1)]))
         );
         assert_eq!(run_src("[1, 2, 3].last() == some(3)"), Ok(bool(true)));
     }
@@ -645,22 +645,22 @@ mod tests {
     fn method_back_slices() {
         assert_eq!(
             run_src("[1, 2, 3].take_back(2)"),
-            Ok(Val::List(vec![int(2), int(3)]))
+            Ok(Val::list(vec![int(2), int(3)]))
         );
-        assert_eq!(run_src("[1, 2, 3].take_back(0)"), Ok(Val::List(vec![])));
+        assert_eq!(run_src("[1, 2, 3].take_back(0)"), Ok(Val::list(vec![])));
         assert_eq!(
             run_src("[1, 2, 3].take_back(9)"),
-            Ok(Val::List(vec![int(1), int(2), int(3)]))
+            Ok(Val::list(vec![int(1), int(2), int(3)]))
         );
         assert_eq!(
             run_src("[1, 2, 3].skip_back(1)"),
-            Ok(Val::List(vec![int(1), int(2)]))
+            Ok(Val::list(vec![int(1), int(2)]))
         );
         assert_eq!(
             run_src("[1, 2, 3].skip_back(0)"),
-            Ok(Val::List(vec![int(1), int(2), int(3)]))
+            Ok(Val::list(vec![int(1), int(2), int(3)]))
         );
-        assert_eq!(run_src("[1, 2, 3].skip_back(9)"), Ok(Val::List(vec![])));
+        assert_eq!(run_src("[1, 2, 3].skip_back(9)"), Ok(Val::list(vec![])));
         assert!(
             run_src("[1].take_back(-1)")
                 .unwrap_err()
@@ -675,7 +675,7 @@ mod tests {
         );
         assert_eq!(
             run_src("[1, 2, 3].reverse().take_back(2)"),
-            Ok(Val::List(vec![int(2), int(1)]))
+            Ok(Val::list(vec![int(2), int(1)]))
         );
     }
 
@@ -766,7 +766,7 @@ mod tests {
         );
         assert_eq!(
             run_seeded("users.first()?.orders?.reverse()?.amount"),
-            Ok(some(Val::List(vec![int(200), int(100)])))
+            Ok(some(Val::list(vec![int(200), int(100)])))
         );
     }
 

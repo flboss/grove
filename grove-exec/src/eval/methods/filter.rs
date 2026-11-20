@@ -43,7 +43,7 @@ pub(super) fn eval_filter(
             }
         }
     }
-    Ok(Val::List(kept))
+    Ok(Val::list(kept))
 }
 
 #[cfg(test)]
@@ -112,7 +112,7 @@ mod tests {
         );
         assert_eq!(
             run_filter("[[1, 2], [5]][$[$$ > 2].len() > 0]"),
-            vec![Val::List(vec![int(5)])]
+            vec![Val::list(vec![int(5)])]
         );
         assert_eq!(run_filter("[1, 2, 3].filter($ > 10)"), Vec::new());
         assert_eq!(run_filter("[1][$ > 10][$ > 100]"), Vec::new());
