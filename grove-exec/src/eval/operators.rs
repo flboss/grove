@@ -2,7 +2,7 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use grove_query::ast::{BinaryOp, UnaryOp};
 use grove_query::casts::CastKind;
 use grove_query::typecheck::types::TypedExpr;
-use grove_schema::validated::{EnumId, EnumUnderlying, IntArithmetic, ValidatedSchema};
+use grove_schema::validated::{EnumId, EnumUnderlying, EnumValue, IntArithmetic, ValidatedSchema};
 use grove_types::{Span, Spanned};
 use num_traits::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
@@ -389,21 +389,22 @@ fn eval_fallible_cast(
 ) -> Result<Val, ExecError> {
     let converted = match (kind, value) {
         (CastKind::StringToInt, Val::Scalar(Scalar::String(s))) => {
-            s.parse::<i64>().ok().map(Scalar::Int)
+            s.parse::<i64>().ok().map(Scalar::Int).map(Val::Scalar)
         }
         (CastKind::StringToFloat, Val::Scalar(Scalar::String(s))) => s
             .parse::<f64>()
             .ok()
             .filter(|value| !schema.config.float_checks || value.is_finite())
-            .map(Scalar::Float),
+            .map(Scalar::Float)
+            .map(Val::Scalar),
         (CastKind::StringToDec, Val::Scalar(Scalar::String(s))) => {
-            s.parse::<Decimal>().ok().map(Scalar::Dec)
+            s.parse::<Decimal>().ok().map(Scalar::Dec).map(Val::Scalar)
         }
         (CastKind::StringToBool, Val::Scalar(Scalar::String(s))) => {
             if s.eq_ignore_ascii_case("true") {
-                Some(Scalar::Bool(true))
+                Some(Val::Scalar(Scalar::Bool(true)))
             } else if s.eq_ignore_ascii_case("false") {
-                Some(Scalar::Bool(false))
+                Some(Val::Scalar(Scalar::Bool(false)))
             } else {
                 None
             }
@@ -411,25 +412,41 @@ fn eval_fallible_cast(
         (CastKind::StringToInstant, Val::Scalar(Scalar::String(s))) => {
             parse_instant(&s).map(Scalar::Instant).map(Val::Scalar)
         }
-        (CastKind::IntToBool, Val::Scalar(Scalar::Int(0))) => Some(Scalar::Bool(false)),
-        (CastKind::IntToBool, Val::Scalar(Scalar::Int(1))) => Some(Scalar::Bool(true)),
+        (CastKind::IntToBool, Val::Scalar(Scalar::Int(0))) => {
+            Some(Val::Scalar(Scalar::Bool(false)))
+        }
+        (CastKind::IntToBool, Val::Scalar(Scalar::Int(1))) => Some(Val::Scalar(Scalar::Bool(true))),
         (CastKind::IntToBool, Val::Scalar(Scalar::Int(_))) => None,
-        (CastKind::BytesToString, Val::Scalar(Scalar::Bytes(bytes))) => {
-            String::from_utf8(bytes).ok().map(Scalar::String)
+        (CastKind::BytesToString, Val::Scalar(Scalar::Bytes(bytes))) => String::from_utf8(bytes)
+            .ok()
+            .map(Scalar::String)
+            .map(Val::Scalar),
+        (CastKind::FloatToIntStrict, Val::Scalar(Scalar::Float(x))) => {
+            strict_float_to_int(x).map(Val::Scalar)
         }
-        (CastKind::FloatToIntStrict, Val::Scalar(Scalar::Float(x))) => strict_float_to_int(x),
-        (CastKind::DecToIntStrict, Val::Scalar(Scalar::Dec(d))) => if d.fract().is_zero() {
-            d.to_i64()
-        } else {
-            None
-        }
-        .map(Scalar::Int),
-        (CastKind::FloatToDecStrict, Val::Scalar(Scalar::Float(x))) => {
-            if x.is_finite() {
-                Decimal::from_f64(x).map(|d| Scalar::Dec(d.normalize()))
+        (CastKind::DecToIntStrict, Val::Scalar(Scalar::Dec(d))) => {
+            if d.fract().is_zero() {
+                d.to_i64().map(Scalar::Int).map(Val::Scalar)
             } else {
                 None
             }
+        }
+        (CastKind::FloatToDecStrict, Val::Scalar(Scalar::Float(x))) => {
+            if x.is_finite() {
+                Decimal::from_f64(x)
+                    .map(|d| Scalar::Dec(d.normalize()))
+                    .map(Val::Scalar)
+            } else {
+                None
+            }
+        }
+        (CastKind::StringToEnum(enum_id), Val::Scalar(Scalar::String(s))) => {
+            enum_variant_index_by_value(schema, enum_id, EnumValue::String(s))?
+                .map(|index| Val::Enum(enum_id, index))
+        }
+        (CastKind::IntToEnum(enum_id), Val::Scalar(Scalar::Int(n))) => {
+            enum_variant_index_by_value(schema, enum_id, EnumValue::Int(n))?
+                .map(|index| Val::Enum(enum_id, index))
         }
         (kind, value) => {
             return Err(ExecError::Integrity {
@@ -439,7 +456,7 @@ fn eval_fallible_cast(
             });
         }
     };
-    Ok(converted.map_or(Val::None, |scalar| Val::Some(Box::new(Val::Scalar(scalar)))))
+    Ok(converted.map_or(Val::None, |value| Val::Some(Box::new(value))))
 }
 
 fn parse_instant(value: &str) -> Option<DateTime<Utc>> {
@@ -462,6 +479,28 @@ fn parse_instant(value: &str) -> Option<DateTime<Utc>> {
         date.and_hms_opt(0, 0, 0)?,
         Utc,
     ))
+}
+
+fn enum_variant_index_by_value(
+    schema: &ValidatedSchema,
+    id: EnumId,
+    value: EnumValue,
+) -> Result<Option<usize>, ExecError> {
+    let enum_def = schema
+        .enums
+        .get(id.index())
+        .ok_or_else(|| ExecError::Integrity {
+            message: format!("unknown enum id {} (internal error)", id.index()),
+        })?;
+    if enum_def.underlying != value.enum_underlying() {
+        return Err(ExecError::Integrity {
+            message: format!(
+                "enum cast source does not match enum `{}` (internal error)",
+                enum_def.name
+            ),
+        });
+    }
+    Ok(enum_def.variant_index_by_value(&value))
 }
 
 fn strict_float_to_int(x: f64) -> Option<Scalar> {
@@ -504,6 +543,7 @@ fn enum_cast_scalar(
 #[cfg(test)]
 mod tests {
     use crate::eval::harness::*;
+    use crate::testdata;
     use crate::value::{Scalar, Val};
     use grove_types::Span;
     use num_traits::ToPrimitive;
@@ -840,6 +880,24 @@ mod tests {
         ] {
             assert_eq!(run_src(src), Ok(Val::None), "{src}");
         }
+    }
+
+    #[test]
+    fn eval_fallible_enum_casts() {
+        let schema = testdata::schema();
+        let priority = testdata::enum_id(&schema, "Priority");
+        let level = testdata::enum_id(&schema, "Level");
+        assert_eq!(
+            run_seeded(r#""low" as? Priority"#),
+            Ok(some(Val::Enum(priority, 0)))
+        );
+        assert_eq!(
+            run_seeded(r#""high" as? Priority"#),
+            Ok(some(Val::Enum(priority, 2)))
+        );
+        assert_eq!(run_seeded(r#""High" as? Priority"#), Ok(Val::None));
+        assert_eq!(run_seeded("2 as? Level"), Ok(some(Val::Enum(level, 2))));
+        assert_eq!(run_seeded("3 as? Level"), Ok(Val::None));
     }
 
     #[test]

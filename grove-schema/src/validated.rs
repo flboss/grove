@@ -271,6 +271,15 @@ pub enum EnumValue {
     String(String),
 }
 
+impl EnumValue {
+    pub fn enum_underlying(&self) -> EnumUnderlying {
+        match self {
+            EnumValue::Int(_) => EnumUnderlying::Int,
+            EnumValue::String(_) => EnumUnderlying::String,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Field {
     Value {

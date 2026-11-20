@@ -1,5 +1,5 @@
 use crate::typecheck::types::QueryType;
-use grove_schema::validated::{EnumId, ScalarType, ValidatedSchema};
+use grove_schema::validated::{EnumId, EnumUnderlying, ScalarType, ValidatedSchema};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CastMode {
@@ -34,6 +34,8 @@ pub enum CastKind {
     StringToInstant,
     IntToBool,
     BytesToString,
+    StringToEnum(EnumId),
+    IntToEnum(EnumId),
 }
 
 impl CastKind {
@@ -63,6 +65,7 @@ impl CastKind {
             CastKind::StringToInstant => QueryType::Scalar(ScalarType::Instant),
             CastKind::EnumToInt(_) => QueryType::Scalar(ScalarType::Int),
             CastKind::EnumToString(_) => QueryType::Scalar(ScalarType::String),
+            CastKind::StringToEnum(id) | CastKind::IntToEnum(id) => QueryType::Enum(id),
         }
     }
 
@@ -79,6 +82,8 @@ impl CastKind {
                 | CastKind::StringToInstant
                 | CastKind::IntToBool
                 | CastKind::BytesToString
+                | CastKind::StringToEnum(_)
+                | CastKind::IntToEnum(_)
         )
     }
 }
@@ -91,7 +96,7 @@ pub fn lookup(
 ) -> Option<CastKind> {
     match mode {
         CastMode::Infallible => lookup_infallible(from, to, schema),
-        CastMode::Fallible => lookup_fallible(from, to),
+        CastMode::Fallible => lookup_fallible(from, to, schema),
     }
 }
 
@@ -187,6 +192,16 @@ fn lookup_fallible(from: &QueryType, to: &QueryType, schema: &ValidatedSchema) -
         (QueryType::Scalar(ScalarType::Float), QueryType::Scalar(ScalarType::Dec)) => {
             Some(CastKind::FloatToDecStrict)
         }
+        (QueryType::Scalar(ScalarType::String), QueryType::Enum(id)) => schema
+            .enums
+            .get(id.index())
+            .filter(|def| def.underlying == EnumUnderlying::String)
+            .map(|_| CastKind::StringToEnum(*id)),
+        (QueryType::Scalar(ScalarType::Int), QueryType::Enum(id)) => schema
+            .enums
+            .get(id.index())
+            .filter(|def| def.underlying == EnumUnderlying::Int)
+            .map(|_| CastKind::IntToEnum(*id)),
         _ => None,
     }
 }
@@ -303,6 +318,49 @@ mod tests {
             );
             assert_eq!(kind, Some(expected), "{from:?} -> {to:?}");
         }
+    }
+
+    #[test]
+    fn fallible_enum_casts_underlying_type_resolution() {
+        let schema = test_schema();
+        let priority = schema.enum_by_name("Priority").unwrap().0;
+        let level = schema.enum_by_name("Level").unwrap().0;
+        assert_eq!(
+            lookup(
+                &QueryType::Scalar(ScalarType::String),
+                &QueryType::Enum(priority),
+                CastMode::Fallible,
+                &schema,
+            ),
+            Some(CastKind::StringToEnum(priority))
+        );
+        assert_eq!(
+            lookup(
+                &QueryType::Scalar(ScalarType::Int),
+                &QueryType::Enum(level),
+                CastMode::Fallible,
+                &schema,
+            ),
+            Some(CastKind::IntToEnum(level))
+        );
+        assert_eq!(
+            lookup(
+                &QueryType::Scalar(ScalarType::Int),
+                &QueryType::Enum(priority),
+                CastMode::Fallible,
+                &schema,
+            ),
+            None
+        );
+        assert_eq!(
+            lookup(
+                &QueryType::Scalar(ScalarType::String),
+                &QueryType::Enum(level),
+                CastMode::Fallible,
+                &schema,
+            ),
+            None
+        );
     }
 
     #[test]

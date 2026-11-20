@@ -3838,6 +3838,13 @@ mod tests {
     }
 
     #[test]
+    fn fallible_enum_cast_matching_underlying_type_required() {
+        let schema = enum_schema();
+        assert_eq!(error_codes(r#""low" as? Level"#, &schema), vec!["QT0013"]);
+        assert_eq!(error_codes("2 as? Priority", &schema), vec!["QT0013"]);
+    }
+
+    #[test]
     fn some_basic() {
         assert_eq!(
             infer_ok(r#"some("hello")"#, &test_schema()).ty,
