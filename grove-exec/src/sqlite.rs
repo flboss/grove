@@ -1253,6 +1253,16 @@ impl SqliteWriteTxn<'_, '_> {
         Ok((columns, params))
     }
 
+    fn insert_rows_individually(
+        &mut self,
+        struct_id: StructId,
+        rows: &[Vec<(FieldId, Val)>],
+    ) -> Result<Vec<Key>, ExecError> {
+        rows.iter()
+            .map(|row| self.insert_row(struct_id, row))
+            .collect()
+    }
+
     fn txn(&self) -> Result<&Transaction<'_>, ExecError> {
         self.txn.as_ref().ok_or_else(|| ExecError::Integrity {
             message: "write transaction is already finished (internal error)".to_string(),
@@ -1382,6 +1392,67 @@ impl<'conn, 'schema> WriteTxn for SqliteWriteTxn<'conn, 'schema> {
         stmt.execute(params_from_iter(params.iter()))
             .map_err(|err| SqliteBackend::storage_error("insert row (execute)", err))?;
         Ok(Key(txn.last_insert_rowid()))
+    }
+
+    fn insert_rows(
+        &mut self,
+        struct_id: StructId,
+        rows: &[Vec<(FieldId, Val)>],
+    ) -> Result<Vec<Key>, ExecError> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let table = self.table_name(struct_id)?;
+        let mut columns: Option<Vec<String>> = None;
+        let mut encoded_rows = Vec::with_capacity(rows.len());
+        for row in rows {
+            let (row_columns, params) = self.encode_row(struct_id, row)?;
+            if let Some(existing) = &columns {
+                if existing != &row_columns {
+                    return self.insert_rows_individually(struct_id, rows);
+                }
+            } else {
+                columns = Some(row_columns);
+            }
+            encoded_rows.push(params);
+        }
+        let columns = columns.expect("rows is non-empty");
+        if columns.is_empty() {
+            return self.insert_rows_individually(struct_id, rows);
+        }
+
+        let width = columns.len();
+        let rows_per_chunk = (500 / width).max(1);
+        let row_placeholders = format!("({})", vec!["?"; width].join(", "));
+        let txn = self.txn()?;
+        let mut keys = Vec::with_capacity(rows.len());
+        for chunk in encoded_rows.chunks(rows_per_chunk) {
+            let values = vec![row_placeholders.as_str(); chunk.len()].join(", ");
+            let sql = format!(
+                "INSERT INTO {table} ({}) VALUES {values} RETURNING _rowid_",
+                columns.join(", ")
+            );
+            let mut params = Vec::with_capacity(chunk.len() * width);
+            for row in chunk {
+                params.extend(row.iter().cloned());
+            }
+            let mut stmt = txn
+                .prepare_cached(&sql)
+                .map_err(|err| SqliteBackend::storage_error("insert rows (prepare)", err))?;
+            let mut returned = stmt
+                .query(params_from_iter(params))
+                .map_err(|err| SqliteBackend::storage_error("insert rows (execute)", err))?;
+            while let Some(row) = returned
+                .next()
+                .map_err(|err| SqliteBackend::storage_error("insert rows (returning)", err))?
+            {
+                let rowid = row
+                    .get(0)
+                    .map_err(|err| SqliteBackend::storage_error("insert rows (rowid)", err))?;
+                keys.push(Key(rowid));
+            }
+        }
+        Ok(keys)
     }
 
     fn update_row(
