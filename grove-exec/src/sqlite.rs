@@ -1805,6 +1805,62 @@ impl<'conn, 'schema> WriteTxn for SqliteWriteTxn<'conn, 'schema> {
         Ok(())
     }
 
+    fn delete_join_rows(
+        &mut self,
+        rel: RelationId,
+        endpoint_is_first: bool,
+        keys: &[Key],
+    ) -> Result<(), ExecError> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let relation =
+            self.schema
+                .relations
+                .get(rel.index())
+                .ok_or_else(|| ExecError::Integrity {
+                    message: format!("unknown relation id {} (internal error)", rel.index()),
+                })?;
+        let Relation::ManyToMany {
+            join_table,
+            a_col,
+            a_pk,
+            b_col,
+            b_pk,
+            ..
+        } = relation
+        else {
+            return Err(ExecError::Integrity {
+                message: "join cleanup requires a many-to-many relation (internal error)"
+                    .to_string(),
+            });
+        };
+        let (join_col, pk) = if endpoint_is_first {
+            (*a_col, *a_pk)
+        } else {
+            (*b_col, *b_pk)
+        };
+        let join_table = quote(&self.schema.tables[join_table.index()].name);
+        let join_col = quote(self.schema.column_name(join_col));
+        let pk_table = quote(&self.schema.tables[pk.table_id().index()].name);
+        let pk = quote(self.schema.column_name(pk));
+        let txn = self.txn()?;
+        for chunk in keys.chunks(500) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!(
+                "DELETE FROM {join_table} WHERE {join_col} IN \
+                 (SELECT {pk} FROM {pk_table} WHERE _rowid_ IN ({placeholders}))"
+            );
+            let params = chunk.iter().map(|key| Value::Integer(key.0));
+            let mut stmt = txn
+                .prepare_cached(&sql)
+                .map_err(|err| SqliteBackend::storage_error("delete join rows (prepare)", err))?;
+            stmt.execute(params_from_iter(params))
+                .map_err(|err| SqliteBackend::storage_error("delete join rows (execute)", err))?;
+        }
+        Ok(())
+    }
+
     fn commit(&mut self) -> Result<(), ExecError> {
         let txn = self.txn.take().ok_or_else(|| ExecError::Integrity {
             message: "write transaction is already finished (internal error)".to_string(),

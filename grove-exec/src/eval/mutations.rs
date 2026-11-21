@@ -503,7 +503,7 @@ fn delete_owned_cascade(
     write.delete_rows(struct_id, &keys)
 }
 
-/// Clear non-owning FKs that reference deleted rows
+/// Clear non-owning FKs and many-to-many joins that reference deleted rows
 fn cleanup_non_owned_links(
     schema: &ValidatedSchema,
     struct_id: StructId,
@@ -521,10 +521,13 @@ fn cleanup_non_owned_links(
                     write.clear_foreign_keys(rel, keys)?;
                 }
             }
-            Relation::ManyToMany { .. } => {
-                return Err(ExecError::Unsupported {
-                    message: "ManyToMany FK cleanup is not yet implemented".to_string(),
-                });
+            Relation::ManyToMany { a_ref, b_ref, .. } => {
+                if a_ref.struct_id() == struct_id {
+                    write.delete_join_rows(rel, true, keys)?;
+                }
+                if b_ref.struct_id() == struct_id {
+                    write.delete_join_rows(rel, false, keys)?;
+                }
             }
         }
     }
@@ -1301,4 +1304,78 @@ mod tests {
         );
     }
 
+    fn many_to_many_schema() -> ValidatedSchema {
+        grove_schema::validate(
+            grove_schema::parse_schema(
+                r#"
+                root users: User;
+                root roles: Role;
+                struct User {
+                    id: Int,
+                    name: String,
+                    roles: &List<Role>,
+                }
+                struct Role {
+                    id: Int,
+                    name: String,
+                    users: &List<User>,
+                }
+                rel Role.users <<->> User.roles
+                    via user_roles[role_id -> roles.id, user_id -> users.id];
+                "#,
+            )
+            .0
+            .expect("invalid many-to-many schema"),
+        )
+        .0
+        .expect("invalid many-to-many schema")
+    }
+
+    fn many_to_many_backend(schema: &ValidatedSchema) -> SqliteBackend<'_> {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE users(id INTEGER, name TEXT);
+             CREATE TABLE roles(id INTEGER, name TEXT);
+             CREATE TABLE user_roles(role_id INTEGER, user_id INTEGER);
+             INSERT INTO users(id, name) VALUES (1, 'u1'), (2, 'u2');
+             INSERT INTO roles(id, name) VALUES (1, 'r1'), (2, 'r2');
+             INSERT INTO user_roles(role_id, user_id) VALUES (1, 1), (1, 2), (2, 1);",
+        )
+        .unwrap();
+        SqliteBackend::new(conn, schema).unwrap()
+    }
+
+    #[test]
+    fn delete_many_to_many_join_cleaned_for_user() {
+        let schema = many_to_many_schema();
+        let backend = many_to_many_backend(&schema);
+
+        let result = run(
+            r#"
+            users.first().unwrap().delete();
+            roles.map($.users.len())
+            "#,
+            &schema,
+            &backend,
+        );
+
+        assert_eq!(result, Some(Val::list(vec![int(1), int(0)])));
+    }
+
+    #[test]
+    fn delete_many_to_many_join_cleaned_for_role() {
+        let schema = many_to_many_schema();
+        let backend = many_to_many_backend(&schema);
+
+        let result = run(
+            r#"
+            roles.first().unwrap().delete();
+            users.map($.roles.len())
+            "#,
+            &schema,
+            &backend,
+        );
+
+        assert_eq!(result, Some(Val::list(vec![int(1), int(0)])));
+    }
 }
