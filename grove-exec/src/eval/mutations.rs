@@ -410,6 +410,8 @@ struct UpdateParts {
     base: FieldValues,
     /// ids of modified array fields (values in `base`)
     arrays: Vec<FieldId>,
+    /// ids and new values of modified owning ref fields
+    owned: Vec<(FieldId, Val)>,
 }
 
 /// Apply a prepared update after all argument values have been computed
@@ -419,13 +421,67 @@ fn apply_update(
     origin: RowOrigin,
     parts: UpdateParts,
 ) -> Result<(), ExecError> {
+    let mut seen = HashSet::new();
+    for (field_id, _) in &parts.owned {
+        delete_owned_children(ctx, write, *field_id, origin.key, &mut seen)?;
+    }
     for field_id in &parts.arrays {
         write.delete_array_field(*field_id, &[origin.key])?;
     }
     if !parts.base.is_empty() {
         write.update_row(origin.struct_id, origin.key, &parts.base)?;
     }
+    for (field_id, value) in parts.owned {
+        insert_owned_field(ctx.schema, field_id, value, origin.key, write)?;
+    }
     Ok(())
+}
+
+/// Delete existing children for a supplied owning ref field
+fn delete_owned_children(
+    ctx: &mut EvalCtx<'_>,
+    write: &mut dyn WriteTxn,
+    field_id: FieldId,
+    parent: Key,
+    seen: &mut HashSet<RowOrigin>,
+) -> Result<(), ExecError> {
+    let Some(Field::Ref {
+        target,
+        owning: true,
+        ..
+    }) = ctx.schema.field(field_id)
+    else {
+        return Err(ExecError::Integrity {
+            message: "update ref field is not an owning ref (internal error)".to_string(),
+        });
+    };
+    let relation = ctx
+        .schema
+        .relation_of_field(field_id)
+        .ok_or_else(|| ExecError::Integrity {
+            message: "update ref field has no relation (internal error)".to_string(),
+        })?;
+    let fetch_from_first = ctx.schema.relations[relation.index()].endpoints()[0] == field_id;
+    let groups = ctx.storage.fetch_related(
+        relation,
+        fetch_from_first,
+        &[parent],
+        &[],
+        &FetchConstraints::EMPTY,
+    )?;
+    let mut keys = Vec::new();
+    for group in groups {
+        for row in group {
+            let origin = RowOrigin {
+                struct_id: *target,
+                key: row.rowid,
+            };
+            if seen.insert(origin) {
+                keys.push(row.rowid);
+            }
+        }
+    }
+    delete_owned_cascade(ctx, write, *target, keys, seen)
 }
 
 /// Extract unique target row origins paired with their current record values
@@ -482,6 +538,7 @@ fn resolve_update_parts(
         })?;
     let mut base = Vec::new();
     let mut arrays = Vec::new();
+    let mut owned = Vec::new();
     for (local, field) in struct_def.fields.iter().enumerate() {
         let field_id = FieldId::new(struct_id, local);
         let Some(index) = record
@@ -501,9 +558,10 @@ fn resolve_update_parts(
                 arrays.push(field_id);
                 base.push((field_id, value));
             }
-            Field::Ref { .. } => {
+            Field::Ref { owning: true, .. } => owned.push((field_id, value)),
+            Field::Ref { owning: false, .. } => {
                 return Err(ExecError::Unsupported {
-                    message: "updating owning ref fields is not yet implemented".to_string(),
+                    message: "updating non-owning ref fields is not implemented".to_string(),
                 });
             }
         }
@@ -511,6 +569,7 @@ fn resolve_update_parts(
     Ok(UpdateParts {
         base,
         arrays,
+        owned,
     })
 }
 
@@ -1665,6 +1724,158 @@ mod tests {
                 ("nums", Val::list(vec![int(9)])),
                 ("matrix", Val::list(vec![Val::list(vec![int(5), int(6)])]),),
                 ("extra", Val::Tuple(vec![int(8), Val::list(vec![str("z")])]),),
+            ]))
+        );
+    }
+
+    #[test]
+    fn update_replace_owning_refs() {
+        let schema = ref_schema();
+        let backend = ref_backend(&schema);
+
+        let result = run(
+            r#"
+            users.insert({
+                id = 1,
+                name = "A",
+                orders = [
+                    { id = 10, total = 1 },
+                    { id = 11, total = 2 },
+                ],
+                profile = some({ bio = "old" }),
+            });
+            users.first().unwrap().update({
+                orders = [{ id = 20, total = 3 }],
+                profile = some({ bio = "new" }),
+            });
+            users.first().unwrap() {
+                orders = orders { id, total },
+                bio = profile?.bio,
+            }
+            "#,
+            &schema,
+            &backend,
+        );
+
+        assert_eq!(
+            result,
+            Some(rec(vec![
+                (
+                    "orders",
+                    Val::list(vec![rec(vec![("id", int(20)), ("total", int(3)),])])
+                ),
+                ("bio", some(str("new")))
+            ]))
+        );
+    }
+
+    #[test]
+    fn update_clear_optional_owning_single() {
+        let schema = ref_schema();
+        let backend = ref_backend(&schema);
+
+        let result = run(
+            r#"
+            users.insert({
+                id = 1,
+                name = "A",
+                orders = [],
+                profile = some({ bio = "old" }),
+            });
+            users.first().unwrap().update({ profile = none });
+            users.first().unwrap().profile
+            "#,
+            &schema,
+            &backend,
+        );
+
+        assert_eq!(result, Some(Val::None));
+    }
+
+    #[test]
+    fn update_replace_nested_owning_children() {
+        let schema = cascade_schema();
+        let backend = cascade_backend(&schema);
+
+        let result = run(
+            r#"
+            users.insert([{
+                id = 1,
+                name = "A",
+                orders = [{
+                    id = 10,
+                    total = 1,
+                    items = [{ id = 100 }],
+                }],
+            },
+            {
+                id = 2,
+                name = "B",
+                orders = [{
+                    id = 30,
+                    total = 3,
+                    items = [{ id = 300 }],
+                }],
+            }]);
+            users.first().unwrap().orders.first().unwrap().update({
+                items = [{ id = 200 }, { id = 201 }],
+            });
+            users.find(name=="B").unwrap().update({
+                orders = [{
+                    id = 40,
+                    total = 4,
+                    items = [],
+                },
+                {
+                    id = 30,
+                    total = 5,
+                    items = [{ id = 301 }, { id = 302 }],
+                }],
+            });
+            [users.find(id==1), users.find(id==2)].transpose().unwrap() { orders = orders { id, total, items = items { id } } }
+            "#,
+            &schema,
+            &backend,
+        );
+
+        assert_eq!(
+            result,
+            Some(Val::list(vec![
+                rec(vec![(
+                    "orders",
+                    Val::list(vec![rec(vec![
+                        ("id", int(10)),
+                        ("total", int(1)),
+                        (
+                            "items",
+                            Val::list(vec![
+                                rec(vec![("id", int(200))]),
+                                rec(vec![("id", int(201))])
+                            ])
+                        )
+                    ])])
+                )]),
+                rec(vec![(
+                    "orders",
+                    Val::list(vec![
+                        rec(vec![
+                            ("id", int(40)),
+                            ("total", int(4)),
+                            ("items", Val::list(vec![]))
+                        ]),
+                        rec(vec![
+                            ("id", int(30)),
+                            ("total", int(5)),
+                            (
+                                "items",
+                                Val::list(vec![
+                                    rec(vec![("id", int(301))]),
+                                    rec(vec![("id", int(302))])
+                                ])
+                            )
+                        ])
+                    ])
+                )])
             ]))
         );
     }
