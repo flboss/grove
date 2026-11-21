@@ -415,8 +415,16 @@ mod tests {
     }
 
     fn run(source: &str, schema: &ValidatedSchema, backend: &SqliteBackend<'_>) -> Option<Val> {
+        run_result(source, schema, backend).unwrap()
+    }
+
+    fn run_result(
+        source: &str,
+        schema: &ValidatedSchema,
+        backend: &SqliteBackend<'_>,
+    ) -> Result<Option<Val>, ExecError> {
         let file = typed(source, schema);
-        exec_file_with_options(&file, backend, schema, Utc::now(), ExecOptions::default()).unwrap()
+        exec_file_with_options(&file, backend, schema, Utc::now(), ExecOptions::default())
     }
 
     fn fields(schema: &ValidatedSchema) -> (StructId, Vec<FieldId>) {
@@ -659,5 +667,167 @@ mod tests {
         );
 
         assert_eq!(result, Some(Val::list(vec![int(1), int(2), int(0)])));
+    }
+
+    fn array_schema() -> ValidatedSchema {
+        grove_schema::validate(
+            grove_schema::parse_schema(
+                r#"
+                root rows: Row;
+                struct Row {
+                    id: Int,
+                    tags: List<String>@tags_ref via row_tags[row_key, tag],
+                    nums: List<Int>@nums_ref via row_nums[row_key, num],
+                    matrix: List<List<Int> via inner_nums[inner_key, val]>@matrix_ref
+                        via outer_nums[outer_key, inner_key],
+                    extra: (Int, List<String> via extra_tags[ekey, eval])@(eid, elink),
+                }
+                "#,
+            )
+            .0
+            .expect("invalid array mutation schema"),
+        )
+        .0
+        .expect("invalid array mutation schema")
+    }
+
+    fn array_backend(schema: &ValidatedSchema) -> SqliteBackend<'_> {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE rows(id INTEGER, tags_ref INTEGER, nums_ref INTEGER,
+                 matrix_ref INTEGER, eid INTEGER, elink INTEGER);
+             CREATE TABLE row_tags(row_key INTEGER, tag TEXT);
+             CREATE TABLE row_nums(row_key INTEGER, num INTEGER);
+             CREATE TABLE outer_nums(outer_key INTEGER, inner_key INTEGER);
+             CREATE TABLE inner_nums(inner_key INTEGER, val INTEGER);
+             CREATE TABLE extra_tags(ekey INTEGER, eval TEXT);",
+        )
+        .unwrap();
+        SqliteBackend::new(conn, schema).unwrap()
+    }
+
+    #[test]
+    fn insert_array_fields_and_nested_value_arrays() {
+        let schema = array_schema();
+        let backend = array_backend(&schema);
+
+        let result = run(
+            r#"
+            rows.insert({
+                id = 1,
+                tags = ["a", "b"],
+                nums = [1, 2, 3],
+                matrix = [[1, 2], [3]],
+                extra = (7, ["x", "y"]),
+            });
+            rows.first().unwrap() { tags, nums, matrix, extra }
+            "#,
+            &schema,
+            &backend,
+        );
+
+        assert_eq!(
+            result,
+            Some(rec(vec![
+                ("tags", Val::list(vec![str("a"), str("b")]),),
+                ("nums", Val::list(vec![int(1), int(2), int(3)])),
+                (
+                    "matrix",
+                    Val::list(vec![
+                        Val::list(vec![int(1), int(2)]),
+                        Val::list(vec![int(3)]),
+                    ]),
+                ),
+                (
+                    "extra",
+                    Val::Tuple(vec![int(7), Val::list(vec![str("x"), str("y")])]),
+                ),
+            ]))
+        );
+    }
+
+    #[test]
+    fn insert_empty_and_multiple_array_rows() {
+        let schema = array_schema();
+        let backend = array_backend(&schema);
+
+        let result = run(
+            r#"
+            rows.insert([
+                { id = 1, tags = [], nums = [1], matrix = [], extra = (1, []) },
+                { id = 2, tags = ["z"], nums = [2, 3], matrix = [[4]], extra = (2, ["q"]) },
+            ]);
+            rows { id, tags, nums, matrix, extra }
+            "#,
+            &schema,
+            &backend,
+        );
+
+        let Some(Val::List(rows)) = result else {
+            panic!("expected rows list");
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0],
+            rec(vec![
+                ("id", int(1)),
+                ("tags", Val::list(vec![])),
+                ("nums", Val::list(vec![int(1)])),
+                ("matrix", Val::list(vec![])),
+                ("extra", Val::Tuple(vec![int(1), Val::list(vec![])])),
+            ])
+        );
+        assert_eq!(
+            rows[1],
+            rec(vec![
+                ("id", int(2)),
+                ("tags", Val::list(vec![str("z")])),
+                ("nums", Val::list(vec![int(2), int(3)])),
+                ("matrix", Val::list(vec![Val::list(vec![int(4)])])),
+                ("extra", Val::Tuple(vec![int(2), Val::list(vec![str("q")])]),),
+            ])
+        );
+    }
+
+    #[test]
+    fn insert_optional_none_target_noop() {
+        let schema = ref_schema();
+        let backend = ref_backend(&schema);
+
+        let result = run(
+            r#"
+            users.first()?.orders?.insert({ id = 1, total = 1 });
+            users.len()
+            "#,
+            &schema,
+            &backend,
+        );
+
+        assert_eq!(result, Some(int(0)));
+    }
+
+    #[test]
+    fn insert_nested_target_missing_parent_key_error() {
+        let schema = ref_schema();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE users(id INTEGER, name TEXT);
+             CREATE TABLE orders(id INTEGER, total INTEGER, user_id INTEGER);
+             CREATE TABLE profiles(bio TEXT, user_id INTEGER);
+             INSERT INTO users(id, name) VALUES (NULL, 'A');",
+        )
+        .unwrap();
+        let backend = SqliteBackend::new(conn, &schema).unwrap();
+
+        let err = run_result(
+            "users.first()?.orders?.insert({ id = 1, total = 1 }); 0",
+            &schema,
+            &backend,
+        )
+        .unwrap_err();
+        let ExecError::Integrity { message } = err else {
+            panic!("expected integrity error, got {err:?}");
+        };
+        assert!(message.contains("no join key"), "{message}");
     }
 }

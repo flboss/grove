@@ -1167,10 +1167,13 @@ impl SqliteWriteTxn<'_, '_> {
         Ok(quote(&self.schema.tables[struct_def.table.index()].name))
     }
 
+    /// Encode field values into quoted columns and parameters,
+    /// optionally writing array storage rows
     fn encode_row(
-        &self,
+        &mut self,
         struct_id: StructId,
         values: &[(FieldId, Val)],
+        allow_arrays: bool,
     ) -> Result<(Vec<String>, Vec<Value>), ExecError> {
         let struct_def =
             self.schema
@@ -1213,14 +1216,8 @@ impl SqliteWriteTxn<'_, '_> {
                     columns: field_columns,
                     ..
                 } => {
-                    if ty.has_array() {
-                        return Err(ExecError::Unsupported {
-                            message: "writing array-valued fields is not yet implemented"
-                                .to_string(),
-                        });
-                    }
                     let mut encoded = Vec::new();
-                    encode_value(ty, value, self.schema, &mut encoded)?;
+                    self.encode_value_write(ty, value, &mut encoded, allow_arrays)?;
                     if encoded.len() != field_columns.len() {
                         return Err(ExecError::Integrity {
                             message: format!(
@@ -1235,10 +1232,30 @@ impl SqliteWriteTxn<'_, '_> {
                         params.push(value);
                     }
                 }
-                Field::Array { .. } => {
-                    return Err(ExecError::Unsupported {
-                        message: "writing array fields is not yet implemented".to_string(),
-                    });
+                Field::Array {
+                    link,
+                    element,
+                    storage,
+                    ..
+                } => {
+                    if !allow_arrays {
+                        return Err(ExecError::Unsupported {
+                            message: "writing array fields is not yet implemented".to_string(),
+                        });
+                    }
+                    let Val::List(list) = value else {
+                        return Err(ExecError::Integrity {
+                            message: format!("expected list value, got {value}"),
+                        });
+                    };
+                    columns.push(quote(self.schema.column_name(*link)));
+                    if list.is_empty() {
+                        params.push(Value::Null);
+                    } else {
+                        let key = self.next_link_key(storage)?;
+                        params.push(Value::Integer(key));
+                        self.write_array_rows(storage, key, element, list.iter().cloned())?;
+                    }
                 }
                 Field::Ref { name, .. } => {
                     return Err(ExecError::Integrity {
@@ -1253,6 +1270,120 @@ impl SqliteWriteTxn<'_, '_> {
         Ok((columns, params))
     }
 
+    /// Recursively encode a value, optionally allocating and writing array storage rows
+    fn encode_value_write(
+        &mut self,
+        ty: &ValueType,
+        value: &Val,
+        out: &mut Vec<Value>,
+        allow_arrays: bool,
+    ) -> Result<(), ExecError> {
+        match ty {
+            ValueType::Scalar(_) | ValueType::Enum(_) => encode_value(ty, value, self.schema, out),
+            ValueType::Optional(inner) => match value {
+                Val::None => {
+                    for _ in 0..value_write_width(inner) {
+                        out.push(Value::Null);
+                    }
+                    Ok(())
+                }
+                Val::Some(value) => self.encode_value_write(inner, value, out, allow_arrays),
+                other => Err(ExecError::Integrity {
+                    message: format!("expected optional value, got {other}"),
+                }),
+            },
+            ValueType::Tuple(elements) => {
+                let Val::Tuple(values) = value else {
+                    return Err(ExecError::Integrity {
+                        message: format!("expected tuple value, got {value}"),
+                    });
+                };
+                if values.len() != elements.len() {
+                    return Err(ExecError::Integrity {
+                        message: format!(
+                            "tuple has {} values for {} element types",
+                            values.len(),
+                            elements.len()
+                        ),
+                    });
+                }
+                for (element_ty, value) in elements.iter().zip(values) {
+                    self.encode_value_write(element_ty, value, out, allow_arrays)?;
+                }
+                Ok(())
+            }
+            ValueType::Array { element, storage } => {
+                if !allow_arrays {
+                    return Err(ExecError::Unsupported {
+                        message: "writing array values is not yet implemented".to_string(),
+                    });
+                }
+                let Val::List(list) = value else {
+                    return Err(ExecError::Integrity {
+                        message: format!("expected list value, got {value}"),
+                    });
+                };
+                if list.is_empty() {
+                    out.push(Value::Null);
+                } else {
+                    let key = self.next_link_key(storage)?;
+                    out.push(Value::Integer(key));
+                    self.write_array_rows(storage, key, element, list.iter().cloned())?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Allocate the next integer link key in a storage table
+    fn next_link_key(&self, storage: &StorageTable) -> Result<i64, ExecError> {
+        let table = quote(&self.schema.tables[storage.table.index()].name);
+        let key = quote(self.schema.column_name(storage.key));
+        let sql = format!("SELECT COALESCE(MAX({key}), 0) + 1 FROM {table}");
+        self.txn()?
+            .query_row(&sql, [], |row| row.get(0))
+            .map_err(|err| SqliteBackend::storage_error("allocate array link key", err))
+    }
+
+    /// Write all element rows for one array link key
+    fn write_array_rows(
+        &mut self,
+        storage: &StorageTable,
+        key: i64,
+        element: &ValueType,
+        values: impl Iterator<Item = Val>,
+    ) -> Result<(), ExecError> {
+        let table = quote(&self.schema.tables[storage.table.index()].name);
+        let mut columns = Vec::with_capacity(storage.value.len() + 1);
+        columns.push(quote(self.schema.column_name(storage.key)));
+        columns.extend(
+            storage
+                .value
+                .iter()
+                .map(|column| quote(self.schema.column_name(*column))),
+        );
+        let mut rows = Vec::new();
+        for value in values {
+            let mut cells = Vec::new();
+            self.encode_value_write(element, &value, &mut cells, true)?;
+            if cells.len() != storage.value.len() {
+                return Err(ExecError::Integrity {
+                    message: format!(
+                        "array element encoded to {} values for {} storage columns (internal error)",
+                        cells.len(),
+                        storage.value.len()
+                    ),
+                });
+            }
+            let mut row = Vec::with_capacity(cells.len() + 1);
+            row.push(Value::Integer(key));
+            row.append(&mut cells);
+            rows.push(row);
+        }
+        self.insert_encoded_rows(&table, &columns, &rows)?;
+        Ok(())
+    }
+
     fn insert_rows_individually(
         &mut self,
         struct_id: StructId,
@@ -1263,6 +1394,7 @@ impl SqliteWriteTxn<'_, '_> {
             .collect()
     }
 
+    /// Insert one encoded row and returns its rowid
     fn insert_encoded_row(
         &mut self,
         table: &str,
@@ -1287,6 +1419,7 @@ impl SqliteWriteTxn<'_, '_> {
         Ok(Key(txn.last_insert_rowid()))
     }
 
+    /// Insert encoded rows in parameter-chunked batches and return their rowids
     fn insert_encoded_rows(
         &mut self,
         table: &str,
@@ -1327,6 +1460,7 @@ impl SqliteWriteTxn<'_, '_> {
         Ok(keys)
     }
 
+    /// Return the child FK and parent PK columns for a writable direct relation
     fn relation_key_columns(&self, rel: RelationId) -> Result<(ColumnId, ColumnId), ExecError> {
         match self.schema.relations.get(rel.index()) {
             Some(Relation::OneToOne { fk, pk, .. } | Relation::ManyToOne { fk, pk, .. }) => {
@@ -1344,6 +1478,7 @@ impl SqliteWriteTxn<'_, '_> {
         }
     }
 
+    /// Read and validate a parent row's join-key value
     fn fetch_parent_key(&self, pk: ColumnId, parent: Key) -> Result<Value, ExecError> {
         let table = quote(&self.schema.tables[pk.table_id().index()].name);
         let column = quote(self.schema.column_name(pk));
@@ -1372,6 +1507,7 @@ impl SqliteWriteTxn<'_, '_> {
     }
 }
 
+/// Encodes a non-array value into SQLite values
 fn encode_value(
     ty: &ValueType,
     value: &Val,
@@ -1470,6 +1606,14 @@ fn encode_value(
     Ok(())
 }
 
+fn value_write_width(ty: &ValueType) -> usize {
+    match ty {
+        ValueType::Scalar(_) | ValueType::Enum(_) | ValueType::Array { .. } => 1,
+        ValueType::Tuple(elements) => elements.iter().map(value_write_width).sum(),
+        ValueType::Optional(inner) => value_write_width(inner),
+    }
+}
+
 impl<'conn, 'schema> WriteTxn for SqliteWriteTxn<'conn, 'schema> {
     fn insert_row(
         &mut self,
@@ -1477,7 +1621,7 @@ impl<'conn, 'schema> WriteTxn for SqliteWriteTxn<'conn, 'schema> {
         values: &[(FieldId, Val)],
     ) -> Result<Key, ExecError> {
         let table = self.table_name(struct_id)?;
-        let (columns, params) = self.encode_row(struct_id, values)?;
+        let (columns, params) = self.encode_row(struct_id, values, true)?;
         self.insert_encoded_row(&table, &columns, &params)
     }
 
@@ -1493,7 +1637,7 @@ impl<'conn, 'schema> WriteTxn for SqliteWriteTxn<'conn, 'schema> {
         let mut columns: Option<Vec<String>> = None;
         let mut encoded_rows = Vec::with_capacity(rows.len());
         for row in rows {
-            let (row_columns, params) = self.encode_row(struct_id, row)?;
+            let (row_columns, params) = self.encode_row(struct_id, row, true)?;
             if let Some(existing) = &columns {
                 if existing != &row_columns {
                     return self.insert_rows_individually(struct_id, rows);
@@ -1521,7 +1665,7 @@ impl<'conn, 'schema> WriteTxn for SqliteWriteTxn<'conn, 'schema> {
         let (fk, pk) = self.relation_key_columns(rel)?;
         let parent_key = self.fetch_parent_key(pk, parent)?;
         let table = self.table_name(struct_id)?;
-        let (mut columns, mut params) = self.encode_row(struct_id, values)?;
+        let (mut columns, mut params) = self.encode_row(struct_id, values, true)?;
         columns.push(quote(self.schema.column_name(fk)));
         params.push(parent_key);
         self.insert_encoded_row(&table, &columns, &params)
@@ -1545,7 +1689,7 @@ impl<'conn, 'schema> WriteTxn for SqliteWriteTxn<'conn, 'schema> {
         let mut columns: Option<Vec<String>> = None;
         let mut encoded_rows = Vec::with_capacity(rows.len());
         for row in rows {
-            let (mut row_columns, mut params) = self.encode_row(struct_id, row)?;
+            let (mut row_columns, mut params) = self.encode_row(struct_id, row, true)?;
             row_columns.push(fk_column.clone());
             params.push(parent_key.clone());
             if let Some(existing) = &columns {
@@ -1579,7 +1723,7 @@ impl<'conn, 'schema> WriteTxn for SqliteWriteTxn<'conn, 'schema> {
         values: &[(FieldId, Val)],
     ) -> Result<(), ExecError> {
         let table = self.table_name(struct_id)?;
-        let (columns, mut params) = self.encode_row(struct_id, values)?;
+        let (columns, mut params) = self.encode_row(struct_id, values, false)?;
         if columns.is_empty() {
             return Ok(());
         }
