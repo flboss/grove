@@ -31,9 +31,12 @@ pub(crate) fn exec_mutation(
         TypedMutationStmt::Delete {
             base, opt_depth, ..
         } => exec_delete(base, *opt_depth, ctx, write),
-        TypedMutationStmt::Update { .. } => Err(ExecError::Unsupported {
-            message: "update mutations are not yet implemented".to_string(),
-        }),
+        TypedMutationStmt::Update {
+            base,
+            arg,
+            opt_depth,
+            ..
+        } => exec_update(base, arg, *opt_depth, ctx, write),
     }
 }
 
@@ -363,6 +366,129 @@ fn insert_owned_field(
         records,
         write,
     )
+}
+
+fn exec_update(
+    base: &TypedExpr,
+    arg: &TypedExpr,
+    opt_depth: usize,
+    ctx: &mut EvalCtx<'_>,
+    write: &mut dyn WriteTxn,
+) -> Result<(), ExecError> {
+    let target = eval(base, ctx)?;
+    let target = if opt_depth > 0 {
+        let (target, peeled) = unwrap_optional_depth(target, opt_depth)?;
+        if peeled < opt_depth {
+            return Ok(());
+        }
+        target
+    } else {
+        target
+    };
+    let targets = collect_update_target_records(target)?;
+    if targets.is_empty() {
+        return Ok(());
+    }
+
+    let mut updates = Vec::with_capacity(targets.len());
+    for (origin, record) in targets {
+        ctx.push_binding_scope("prev", record);
+        let value = eval(arg, ctx);
+        ctx.env.pop_scope();
+        updates.push((origin, record_from_value(value?)?));
+    }
+
+    for (origin, record) in updates {
+        let values = resolve_update_values(ctx.schema, origin.struct_id, record)?;
+        if !values.is_empty() {
+            write.update_row(origin.struct_id, origin.key, &values)?;
+        }
+    }
+    Ok(())
+}
+
+/// Extract unique target row origins paired with their current record values
+fn collect_update_target_records(value: Val) -> Result<Vec<(RowOrigin, Val)>, ExecError> {
+    let mut seen = HashSet::new();
+    let mut targets = Vec::new();
+    match value {
+        Val::Record(record) => {
+            let origin = record.origin.ok_or_else(|| ExecError::Integrity {
+                message: "update target record has no row origin (internal error)".to_string(),
+            })?;
+            if seen.insert(origin) {
+                targets.push((origin, Val::Record(record)));
+            }
+        }
+        Val::List(list) => {
+            for item in list {
+                let Val::Record(record) = item else {
+                    return Err(ExecError::Integrity {
+                        message: "update target list contains non-record value (internal error)"
+                            .to_string(),
+                    });
+                };
+                let origin = record.origin.ok_or_else(|| ExecError::Integrity {
+                    message: "update target record has no row origin (internal error)".to_string(),
+                })?;
+                if seen.insert(origin) {
+                    targets.push((origin, Val::Record(record)));
+                }
+            }
+        }
+        other => {
+            return Err(ExecError::Integrity {
+                message: format!(
+                    "update target is not a record or list of records: {other} (internal error)"
+                ),
+            });
+        }
+    }
+    Ok(targets)
+}
+
+/// Convert a constructed update record into only the fields it supplies
+fn resolve_update_values(
+    schema: &ValidatedSchema,
+    struct_id: StructId,
+    mut record: RecordVal,
+) -> Result<Vec<(FieldId, Val)>, ExecError> {
+    let struct_def = schema
+        .structs
+        .get(struct_id.index())
+        .ok_or_else(|| ExecError::Integrity {
+            message: format!("unknown struct id {} (internal error)", struct_id.index()),
+        })?;
+    let mut values = Vec::new();
+    for (local, field) in struct_def.fields.iter().enumerate() {
+        let field_id = FieldId::new(struct_id, local);
+        let Some(index) = record
+            .iter()
+            .position(|(field_name, _)| field_name.as_ref() == field.name())
+        else {
+            continue;
+        };
+        let value = record.fields.swap_remove(index).1;
+        match field {
+            Field::Value { ty, .. } if ty.has_array() => {
+                return Err(ExecError::Unsupported {
+                    message: "updating array-valued fields is not yet implemented".to_string(),
+                });
+            }
+            Field::Value { .. } => values.push((field_id, value)),
+            Field::Array { .. } => {
+                return Err(ExecError::Unsupported {
+                    message: "updating array fields is not yet implemented".to_string(),
+                });
+            }
+            Field::Ref { .. } => {
+                return Err(ExecError::Unsupported {
+                    message: "updating owning ref fields is not yet implemented".to_string(),
+                });
+            }
+        }
+    }
+    Ok(values)
 }
 
 fn exec_delete(
@@ -1391,5 +1517,95 @@ mod tests {
         );
 
         assert_eq!(result, Some(Val::list(vec![int(1), int(0)])));
+    }
+
+    #[test]
+    fn update_record_fields_with_prev() {
+        let schema = test_schema();
+        let backend = test_backend(&schema);
+        let kind = schema.enum_by_name("Kind").unwrap().0;
+
+        let result = run(
+            r#"
+            items.insert({
+                id = 1,
+                name = "a",
+                active = true,
+                note = some("old"),
+                pos = (1.0f, 2.0f),
+                kind = Kind::A,
+                maybe_kind = some(Kind::B),
+            });
+            items.first().unwrap().update({
+                name = prev.name.concat("!"),
+                note = none,
+                pos = (3.0f, 4.0f),
+                kind = Kind::B,
+                maybe_kind = none,
+            });
+            items.first().unwrap() { id, name, active, note, pos, kind, maybe_kind }
+            "#,
+            &schema,
+            &backend,
+        );
+
+        assert_eq!(
+            result,
+            Some(rec(vec![
+                ("id", int(1)),
+                ("name", str("a!")),
+                ("active", bool(true)),
+                ("note", Val::None),
+                ("pos", Val::Tuple(vec![float(3.0), float(4.0)]),),
+                ("kind", Val::Enum(kind, 1)),
+                ("maybe_kind", Val::None),
+            ]))
+        );
+    }
+
+    #[test]
+    fn update_argument_values_precomputed() {
+        let schema = test_schema();
+        let backend = test_backend(&schema);
+
+        let result = run(
+            r#"
+            items.insert([
+                { id = 1, name = "a", active = true, pos = (0.0f, 0.0f), kind = Kind::A },
+                { id = 2, name = "b", active = true, pos = (0.0f, 0.0f), kind = Kind::A },
+            ]);
+            items.update({
+                name = items.first().unwrap().name.concat("x"),
+            });
+            items { name }
+            "#,
+            &schema,
+            &backend,
+        );
+
+        assert_eq!(
+            result,
+            Some(Val::list(vec![
+                rec(vec![("name", str("ax"))]),
+                rec(vec![("name", str("ax"))]),
+            ]))
+        );
+    }
+
+    #[test]
+    fn update_optional_none_target_noop() {
+        let schema = test_schema();
+        let backend = test_backend(&schema);
+
+        let result = run(
+            r#"
+            items.first()?.update({ name = "x" });
+            items.len()
+            "#,
+            &schema,
+            &backend,
+        );
+
+        assert_eq!(result, Some(int(0)));
     }
 }

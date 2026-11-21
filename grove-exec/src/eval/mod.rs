@@ -149,6 +149,15 @@ impl<'a> EvalCtx<'a> {
     }
 }
 
+impl EvalCtx<'_> {
+    pub(crate) fn push_binding_scope(&mut self, name: &str, value: Val) {
+        let interned = self.interner.intern(name);
+        let mut scope = HashMap::new();
+        scope.insert(interned, value);
+        self.env.push_scope(scope);
+    }
+}
+
 /// Evaluate an expression
 pub fn eval(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
     match &expr.kind {
@@ -157,45 +166,50 @@ pub fn eval(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
             name,
             binding,
             depth,
-        } => {
-            match binding {
-                IdentBinding::Let => {
-                    ctx.env
-                        .lookup(name, *depth)
-                        .cloned()
-                        .ok_or_else(|| ExecError::Integrity {
-                            message: format!("unbound variable `{}` (internal error)", name.value),
-                        })
-                }
-                IdentBinding::Root { root_idx } => exec_root(ctx, *root_idx, expr.id),
-                IdentBinding::Field(field) => {
-                    let value = ctx.env.lookup(name, *depth).cloned().ok_or_else(|| {
-                        ExecError::Integrity {
-                            message: format!("unbound field `{}` (internal error)", name.value),
-                        }
-                    })?;
-                    resolve_ident_value(ctx, expr.id, *field, value)
-                }
-                IdentBinding::ProjectedField { .. } => ctx
-                    .env
+        } => match binding {
+            IdentBinding::Let => {
+                ctx.env
                     .lookup(name, *depth)
                     .cloned()
                     .ok_or_else(|| ExecError::Integrity {
-                        message: format!("unbound field `{}` (internal error)", name.value),
-                    }),
-                IdentBinding::ListElement => {
+                        message: format!("unbound variable `{}` (internal error)", name.value),
+                    })
+            }
+            IdentBinding::Root { root_idx } => exec_root(ctx, *root_idx, expr.id),
+            IdentBinding::Field(field) => {
+                let value =
                     ctx.env
                         .lookup(name, *depth)
                         .cloned()
                         .ok_or_else(|| ExecError::Integrity {
-                            message: format!("unbound element `{}` (internal error)", name.value),
-                        })
-                }
-                IdentBinding::Prev { .. } => Err(ExecError::Unsupported {
-                    message: "`prev` with mutations is not implemented yet".to_string(),
-                }),
+                            message: format!("unbound field `{}` (internal error)", name.value),
+                        })?;
+                resolve_ident_value(ctx, expr.id, *field, value)
             }
-        }
+            IdentBinding::ProjectedField { .. } => ctx
+                .env
+                .lookup(name, *depth)
+                .cloned()
+                .ok_or_else(|| ExecError::Integrity {
+                    message: format!("unbound field `{}` (internal error)", name.value),
+                }),
+            IdentBinding::ListElement => {
+                ctx.env
+                    .lookup(name, *depth)
+                    .cloned()
+                    .ok_or_else(|| ExecError::Integrity {
+                        message: format!("unbound element `{}` (internal error)", name.value),
+                    })
+            }
+            IdentBinding::Prev { .. } => {
+                ctx.env
+                    .lookup(name, *depth)
+                    .cloned()
+                    .ok_or_else(|| ExecError::Integrity {
+                        message: format!("unbound `prev` (internal error) for `{}`", name.value),
+                    })
+            }
+        },
         TypedExprKind::EnumVariant { enum_id, variant } => Ok(Val::Enum(*enum_id, *variant)),
         TypedExprKind::Some { value } => eval(value, ctx).map(|v| Val::Some(Box::new(v))),
         TypedExprKind::TypeConstant { ty, name } => Ok(eval_type_constant(ty.value, name.value)),
