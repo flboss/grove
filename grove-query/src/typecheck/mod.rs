@@ -1513,7 +1513,7 @@ fn typecheck_mutation(
             let typed_base = infer(&mutation.base, env)?;
             let struct_id = check_insert_base(&typed_base, mutation.opt_depth, env.schema())?;
             let mut typed_arg = infer(&mutation.args[0], env)?;
-            validate_insert(struct_id, &mut typed_arg, env)?;
+            validate_insert(struct_id, &mut typed_arg, env.schema())?;
             Ok(TypedStatement::Mutation(TypedMutationStmt::Insert {
                 span: mutation.kind.span,
                 base: typed_base,
@@ -1728,16 +1728,16 @@ fn expect_constructed_record(
 fn validate_insert(
     sid: StructId,
     typed_arg: &mut TypedExpr,
-    env: &mut TypeEnv,
+    schema: &ValidatedSchema,
 ) -> Result<(), TypeError> {
-    let (record_ty, is_list) = match &mut typed_arg.ty {
-        QueryType::List(inner) => (inner.as_mut(), true),
-        ty => (ty, false),
+    let record_ty = match &mut typed_arg.ty {
+        QueryType::List(inner) => inner.as_mut(),
+        ty => ty,
     };
     let proj_fields = expect_constructed_record(record_ty, typed_arg.span, MutationKind::Insert)?;
 
-    let struct_fields = &env.schema().structs[sid.index()].fields;
-    let struct_name = &env.schema().structs[sid.index()].name;
+    let struct_fields = &schema.structs[sid.index()].fields;
+    let struct_name = &schema.structs[sid.index()].name;
     for schema_field in struct_fields {
         let (expected_name, is_optional) = match &schema_field {
             Field::Value {
@@ -1768,30 +1768,9 @@ fn validate_insert(
         }
 
         if is_optional {
-            let schema_ty = QueryType::from(schema_field);
-            let none_expr = env.typed(
-                TypedExprKind::Literal(Spanned::new(typed_arg.span, Literal::None)),
-                schema_ty.clone(),
-                typed_arg.span,
-            );
-            let mut cloned_ty = QueryType::Record(RecordSource::Projection(proj_fields.clone()));
-            if is_list {
-                cloned_ty = QueryType::List(Box::new(cloned_ty));
-            }
-            let prev_arg_kind = std::mem::replace(&mut typed_arg.kind, none_expr.kind.clone());
-            let _ = std::mem::replace(
-                &mut typed_arg.kind,
-                TypedExprKind::Projection {
-                    base: Box::new(env.typed(prev_arg_kind, cloned_ty, typed_arg.span)),
-                    items: vec![TypedProjectionItem {
-                        alias: Spanned::new(typed_arg.span, expected_name.clone()),
-                        value: none_expr,
-                    }],
-                },
-            );
             proj_fields.push(ProjectionField {
                 name: expected_name.clone(),
-                ty: schema_ty,
+                ty: QueryType::from(schema_field),
             });
         } else {
             return Err(TypeError::InsertMissingRequiredField {
@@ -1816,7 +1795,7 @@ fn validate_insert(
             });
         };
 
-        if !types_compatible(&mut schema_ty, &mut proj_field.ty, env.schema()) {
+        if !types_compatible(&mut schema_ty, &mut proj_field.ty, schema) {
             return Err(TypeError::StructFieldTypeMismatch {
                 field: proj_field.name.clone(),
                 struct_name: struct_name.clone(),

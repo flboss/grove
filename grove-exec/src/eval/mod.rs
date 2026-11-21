@@ -18,6 +18,7 @@ pub mod composite;
 pub mod data;
 pub(crate) mod literals;
 mod methods;
+mod mutations;
 mod operators;
 mod session;
 

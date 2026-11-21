@@ -7,7 +7,7 @@ use crate::pushdown::PushdownPlan;
 use crate::storage::{Storage, WriteTxn};
 use crate::value::Val;
 
-use super::{Env, EvalCtx, ExecOptions, eval, eval_let, resolve_owning_values};
+use crate::eval::{self, Env, EvalCtx, ExecOptions, mutations};
 
 /// Persistent executor state for a sequence of query turns
 pub struct ExecSession<'a> {
@@ -126,7 +126,7 @@ fn execute_inner<'s>(
     file: &TypedQueryFile,
     now: DateTime<Utc>,
     options: ExecOptions,
-    _write: Option<&mut (dyn WriteTxn + 's)>,
+    mut write: Option<&mut (dyn WriteTxn + 's)>,
 ) -> Result<Option<Val>, ExecError> {
     let plan = if options.pushdown {
         PushdownPlan::analyze(file, schema, now, options.materialize_lets)
@@ -136,19 +136,23 @@ fn execute_inner<'s>(
     let mut ctx = EvalCtx::new(env, now, storage, schema, &plan);
     for stmt in &file.statements {
         match stmt {
-            TypedStatement::Let(let_stmt) => eval_let(let_stmt, &mut ctx)?,
+            TypedStatement::Let(let_stmt) => eval::eval_let(let_stmt, &mut ctx)?,
             TypedStatement::Expr(_) => {}
-            TypedStatement::Mutation(_) => {
-                return Err(ExecError::Unsupported {
-                    message: "mutations are not yet implemented".to_string(),
-                });
+            TypedStatement::Mutation(mutation) => {
+                let Some(txn) = write.as_deref_mut() else {
+                    return Err(ExecError::Integrity {
+                        message: "mutation executed without a write transaction (internal error)"
+                            .to_string(),
+                    });
+                };
+                mutations::exec_mutation(mutation, &mut ctx, txn)?;
             }
         }
     }
 
     let result = if let Some(expr) = &file.result {
-        let mut result = eval(expr, &mut ctx)?;
-        resolve_owning_values(&mut ctx, std::slice::from_mut(&mut result), None)?;
+        let mut result = eval::eval(expr, &mut ctx)?;
+        eval::resolve_owning_values(&mut ctx, std::slice::from_mut(&mut result), None)?;
         Some(result)
     } else {
         None
