@@ -447,6 +447,7 @@ fn exec_run(
         pushdown: !no_pushdown,
         materialize_lets: false,
         read_only: false,
+        debug_rollback: false,
     };
     match grove_exec::eval::exec_file_with_options(
         &typed_file,

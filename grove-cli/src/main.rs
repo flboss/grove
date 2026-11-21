@@ -63,6 +63,7 @@ fn run_query(args: QueryArgs) -> CliResult<()> {
         pushdown: !args.no_pushdown,
         materialize_lets: false,
         read_only: spec.is_read_only(),
+        debug_rollback: false,
     };
     let render_options =
         render::RenderOptions::from_args(&args.output, args.output.output_color_enabled());

@@ -36,8 +36,12 @@ impl<'a> ExecSession<'a> {
             .statements
             .iter()
             .any(|stmt| matches!(stmt, TypedStatement::Mutation(_)));
-        let outcome =
-            run_in_write_transaction(self.storage, options.read_only, has_mutation, |write| {
+        let outcome = run_in_write_transaction(
+            self.storage,
+            options.read_only,
+            options.debug_rollback,
+            has_mutation,
+            |write| {
                 execute_inner(
                     &mut self.env,
                     self.storage,
@@ -47,10 +51,15 @@ impl<'a> ExecSession<'a> {
                     options,
                     write,
                 )
-            });
+            },
+        );
         match outcome {
             Ok(result) => {
-                self.env.commit_turn();
+                if options.debug_rollback {
+                    self.env.rollback_turn();
+                } else {
+                    self.env.commit_turn();
+                }
                 Ok(result)
             }
             Err(err) => {
@@ -83,6 +92,7 @@ impl<'a> ExecSession<'a> {
 fn run_in_write_transaction<'s, T>(
     storage: &'s dyn Storage,
     read_only: bool,
+    rollback: bool,
     needs_write: bool,
     f: impl FnOnce(Option<&mut (dyn WriteTxn + 's)>) -> Result<T, ExecError>,
 ) -> Result<T, ExecError>
@@ -106,7 +116,11 @@ where
     match outcome {
         Ok(result) => {
             if let Some(write) = write.as_mut() {
-                write.commit()?;
+                if rollback {
+                    write.rollback()?;
+                } else {
+                    write.commit()?;
+                }
             }
             Ok(result)
         }
@@ -226,7 +240,7 @@ mod tests {
         let backend = test_backend(&schema);
         let (item, id, name) = item_fields(&schema);
 
-        run_in_write_transaction(&backend, false, true, |write| {
+        run_in_write_transaction(&backend, false, false, true, |write| {
             let write = write.expect("write transaction");
             write.insert_row(item, &[(id, int(1)), (name, string("alpha"))])?;
             Ok(())
@@ -247,7 +261,7 @@ mod tests {
         let (item, id, name) = item_fields(&schema);
 
         let result: Result<(), ExecError> =
-            run_in_write_transaction(&backend, false, true, |write| {
+            run_in_write_transaction(&backend, false, false, true, |write| {
                 let write = write.expect("write transaction");
                 write.insert_row(item, &[(id, int(1)), (name, string("alpha"))])?;
                 Err(ExecError::Abort {
@@ -270,7 +284,7 @@ mod tests {
         let (item, id, name) = item_fields(&schema);
 
         let result: Result<(), ExecError> =
-            run_in_write_transaction(&backend, false, true, |write| {
+            run_in_write_transaction(&backend, false, false, true, |write| {
                 let write = write.expect("write transaction");
                 write.insert_row(item, &[(id, int(1)), (name, string("alpha"))])?;
                 write.insert_row(item, &[(id, int(2)), (name, string("beta"))])?;
@@ -291,9 +305,10 @@ mod tests {
     fn write_transaction_read_only_rejected_before_running() {
         let schema = test_schema();
         let backend = test_backend(&schema);
-        let result: Result<(), ExecError> = run_in_write_transaction(&backend, true, true, |_| {
-            panic!("closure must not run in read-only mode")
-        });
+        let result: Result<(), ExecError> =
+            run_in_write_transaction(&backend, true, false, true, |_| {
+                panic!("closure must not run in read-only mode")
+            });
         assert!(matches!(result, Err(ExecError::ReadOnly { .. })));
     }
 

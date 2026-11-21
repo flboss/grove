@@ -827,8 +827,31 @@ mod tests {
         schema: &ValidatedSchema,
         backend: &SqliteBackend<'_>,
     ) -> Result<Option<Val>, ExecError> {
+        let pushed = run_result_with_pushdown(source, schema, backend, true, true);
+        let unpushed = run_result_with_pushdown(source, schema, backend, false, false);
+        assert_pushdown_parity(source, &pushed, &unpushed);
+        unpushed
+    }
+
+    fn run_result_with_pushdown(
+        source: &str,
+        schema: &ValidatedSchema,
+        backend: &SqliteBackend<'_>,
+        pushdown: bool,
+        debug_rollback: bool,
+    ) -> Result<Option<Val>, ExecError> {
         let file = typed(source, schema);
-        exec_file_with_options(&file, backend, schema, Utc::now(), ExecOptions::default())
+        exec_file_with_options(
+            &file,
+            backend,
+            schema,
+            Utc::now(),
+            ExecOptions {
+                pushdown,
+                debug_rollback,
+                ..ExecOptions::default()
+            },
+        )
     }
 
     fn fields(schema: &ValidatedSchema) -> (StructId, Vec<FieldId>) {
@@ -1223,12 +1246,13 @@ mod tests {
         .unwrap();
         let backend = SqliteBackend::new(conn, &schema).unwrap();
 
-        let err = run_result(
+        let file = typed(
             "users.first()?.orders?.insert({ id = 1, total = 1 }); 0",
             &schema,
-            &backend,
-        )
-        .unwrap_err();
+        );
+        let err =
+            exec_file_with_options(&file, &backend, &schema, Utc::now(), ExecOptions::default())
+                .unwrap_err();
         let ExecError::Integrity { message } = err else {
             panic!("expected integrity error, got {err:?}");
         };
@@ -1900,5 +1924,36 @@ mod tests {
             result,
             Some(Val::list(vec![rec(vec![("name", str("a!"))])]))
         );
+    }
+
+    #[test]
+    fn debug_rollback_returns_result_without_committing() {
+        let schema = test_schema();
+        let backend = test_backend(&schema);
+        let (item, fields) = fields(&schema);
+
+        let result = run_result_with_pushdown(
+            r#"
+            items.insert({
+                id = 1,
+                name = "a",
+                active = true,
+                pos = (0.0f, 0.0f),
+                kind = Kind::A,
+            });
+            items.len()
+            "#,
+            &schema,
+            &backend,
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(result, Some(int(1)));
+
+        let rows = backend
+            .fetch(item, &fields, &FetchConstraints::EMPTY)
+            .unwrap();
+        assert!(rows.is_empty());
     }
 }

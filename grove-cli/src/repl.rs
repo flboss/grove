@@ -78,6 +78,7 @@ pub fn run(args: ReplArgs) -> CliResult<()> {
         pushdown: !no_pushdown,
         materialize_lets: true,
         read_only: spec.is_read_only(),
+        debug_rollback: false,
     };
 
     let result = repl_loop(
@@ -703,6 +704,7 @@ mod tests {
                 pushdown: true,
                 materialize_lets: true,
                 read_only: false,
+                debug_rollback: false,
             },
             turn,
         }

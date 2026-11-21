@@ -299,6 +299,8 @@ pub struct ExecOptions {
     pub materialize_lets: bool,
     /// Reject mutation statements before evaluation
     pub read_only: bool,
+    /// Run mutations against a transaction that is always rolled back
+    pub debug_rollback: bool,
 }
 
 impl Default for ExecOptions {
@@ -307,6 +309,7 @@ impl Default for ExecOptions {
             pushdown: true,
             materialize_lets: false,
             read_only: false,
+            debug_rollback: false,
         }
     }
 }
@@ -375,13 +378,14 @@ pub(crate) mod harness {
                 pushdown: false,
                 materialize_lets: false,
                 read_only: false,
+                debug_rollback: false,
             },
         );
         assert_pushdown_parity(src, &pushed, &unpushed);
         pushed.map(|value| value.expect("query produced no output"))
     }
 
-    fn assert_pushdown_parity(
+    pub fn assert_pushdown_parity(
         src: &str,
         pushed: &Result<Option<Val>, ExecError>,
         unpushed: &Result<Option<Val>, ExecError>,
