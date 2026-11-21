@@ -60,6 +60,13 @@ impl BackendArgs {
 }
 
 impl ConnectionSpec {
+    pub fn is_read_only(&self) -> bool {
+        match self {
+            ConnectionSpec::Sqlite { readonly, .. } => *readonly,
+            ConnectionSpec::Memory => false,
+        }
+    }
+
     pub fn description(&self) -> String {
         match self {
             ConnectionSpec::Sqlite { file, readonly } => {

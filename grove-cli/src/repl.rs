@@ -77,6 +77,7 @@ pub fn run(args: ReplArgs) -> CliResult<()> {
     let exec_options = ExecOptions {
         pushdown: !no_pushdown,
         materialize_lets: true,
+        read_only: spec.is_read_only(),
     };
 
     let result = repl_loop(
@@ -122,7 +123,10 @@ fn repl_loop(
                 exec: ExecSession::new(backend.as_ref(), schema),
                 types: TypeBindings::new(),
                 settings,
-                exec_options,
+                exec_options: ExecOptions {
+                    read_only: spec.is_read_only(),
+                    ..exec_options
+                },
                 turn,
             };
             session.run(editor)?
@@ -698,6 +702,7 @@ mod tests {
             exec_options: ExecOptions {
                 pushdown: true,
                 materialize_lets: true,
+                read_only: false,
             },
             turn,
         }

@@ -227,6 +227,30 @@ fn query_readonly_database() {
 }
 
 #[test]
+fn query_readonly_mutations_rejected() {
+    let dir = fixture("readonly-mutation");
+    let schema = write_schema(&dir);
+    let db = write_db(&dir);
+
+    let output = grove()
+        .arg("query")
+        .arg(&schema)
+        .arg("users.delete();")
+        .arg("--file")
+        .arg(&db)
+        .arg("--readonly")
+        .output()
+        .expect("run grove");
+
+    assert_ne!(status(&output), 0);
+    assert!(
+        stderr(&output).contains("read-only"),
+        "stderr: {}",
+        stderr(&output)
+    );
+}
+
+#[test]
 fn query_memory_backend() {
     let dir = fixture("memory");
     let schema = write_schema(&dir);

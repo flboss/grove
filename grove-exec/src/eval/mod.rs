@@ -282,6 +282,8 @@ pub struct ExecOptions {
     pub pushdown: bool,
     /// Materialize complete values for let bindings (for turn-based repl mode)
     pub materialize_lets: bool,
+    /// Reject mutation statements before evaluation
+    pub read_only: bool,
 }
 
 impl Default for ExecOptions {
@@ -289,6 +291,7 @@ impl Default for ExecOptions {
         ExecOptions {
             pushdown: true,
             materialize_lets: false,
+            read_only: false,
         }
     }
 }
@@ -356,6 +359,7 @@ pub(crate) mod harness {
             ExecOptions {
                 pushdown: false,
                 materialize_lets: false,
+                read_only: false,
             },
         );
         assert_pushdown_parity(src, &pushed, &unpushed);
@@ -933,7 +937,7 @@ mod tests {
     }
 
     #[test]
-    fn mutations_unsupported() {
+    fn mutations_writable_storage_required() {
         let schema = testdata::schema();
         let mut session = ExecSession::new(&NoStorage, &schema);
         let typed = typed_session("users.delete();", &schema, &TypeBindings::new());
@@ -941,7 +945,7 @@ mod tests {
         let err = session
             .execute(&typed, FIXED_NOW, ExecOptions::default())
             .unwrap_err();
-        assert!(matches!(err, ExecError::Unsupported { .. }));
+        assert!(matches!(err, ExecError::ReadOnly { .. }), "{err:?}");
         assert_eq!(session.bindings().count(), 0);
     }
 
