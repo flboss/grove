@@ -399,10 +399,31 @@ fn exec_update(
     }
 
     for (origin, record) in updates {
-        let values = resolve_update_values(ctx.schema, origin.struct_id, record)?;
-        if !values.is_empty() {
-            write.update_row(origin.struct_id, origin.key, &values)?;
-        }
+        let parts = resolve_update_parts(ctx.schema, origin.struct_id, record)?;
+        apply_update(ctx, write, origin, parts)?;
+    }
+    Ok(())
+}
+
+struct UpdateParts {
+    /// ids and new values of modified base and array fields
+    base: FieldValues,
+    /// ids of modified array fields (values in `base`)
+    arrays: Vec<FieldId>,
+}
+
+/// Apply a prepared update after all argument values have been computed
+fn apply_update(
+    ctx: &mut EvalCtx<'_>,
+    write: &mut dyn WriteTxn,
+    origin: RowOrigin,
+    parts: UpdateParts,
+) -> Result<(), ExecError> {
+    for field_id in &parts.arrays {
+        write.delete_array_field(*field_id, &[origin.key])?;
+    }
+    if !parts.base.is_empty() {
+        write.update_row(origin.struct_id, origin.key, &parts.base)?;
     }
     Ok(())
 }
@@ -448,18 +469,19 @@ fn collect_update_target_records(value: Val) -> Result<Vec<(RowOrigin, Val)>, Ex
 }
 
 /// Convert a constructed update record into only the fields it supplies
-fn resolve_update_values(
+fn resolve_update_parts(
     schema: &ValidatedSchema,
     struct_id: StructId,
     mut record: RecordVal,
-) -> Result<Vec<(FieldId, Val)>, ExecError> {
+) -> Result<UpdateParts, ExecError> {
     let struct_def = schema
         .structs
         .get(struct_id.index())
         .ok_or_else(|| ExecError::Integrity {
             message: format!("unknown struct id {} (internal error)", struct_id.index()),
         })?;
-    let mut values = Vec::new();
+    let mut base = Vec::new();
+    let mut arrays = Vec::new();
     for (local, field) in struct_def.fields.iter().enumerate() {
         let field_id = FieldId::new(struct_id, local);
         let Some(index) = record
@@ -471,15 +493,13 @@ fn resolve_update_values(
         let value = record.fields.swap_remove(index).1;
         match field {
             Field::Value { ty, .. } if ty.has_array() => {
-                return Err(ExecError::Unsupported {
-                    message: "updating array-valued fields is not yet implemented".to_string(),
-                });
+                arrays.push(field_id);
+                base.push((field_id, value));
             }
-            Field::Value { .. } => values.push((field_id, value)),
+            Field::Value { .. } => base.push((field_id, value)),
             Field::Array { .. } => {
-                return Err(ExecError::Unsupported {
-                    message: "updating array fields is not yet implemented".to_string(),
-                });
+                arrays.push(field_id);
+                base.push((field_id, value));
             }
             Field::Ref { .. } => {
                 return Err(ExecError::Unsupported {
@@ -488,7 +508,10 @@ fn resolve_update_values(
             }
         }
     }
-    Ok(values)
+    Ok(UpdateParts {
+        base,
+        arrays,
+    })
 }
 
 fn exec_delete(
@@ -636,7 +659,7 @@ fn delete_owned_cascade(
         })
         .collect();
     for field_id in array_fields {
-        write.delete_array_field(struct_id, field_id, &keys)?;
+        write.delete_array_field(field_id, &keys)?;
     }
 
     cleanup_non_owned_links(ctx.schema, struct_id, &keys, write)?;
@@ -1607,5 +1630,64 @@ mod tests {
         );
 
         assert_eq!(result, Some(int(0)));
+    }
+
+    #[test]
+    fn update_replace_array_fields() {
+        let schema = array_schema();
+        let backend = array_backend(&schema);
+
+        let result = run(
+            r#"
+            rows.insert({
+                id = 1,
+                tags = ["a", "b"],
+                nums = [1, 2],
+                matrix = [[1], [2, 3]],
+                extra = (7, ["x"]),
+            });
+            rows.first().unwrap().update({
+                tags = ["c"],
+                nums = [9],
+                matrix = [[5, 6]],
+                extra = (8, ["z"]),
+            });
+            rows.first().unwrap() { tags, nums, matrix, extra }
+            "#,
+            &schema,
+            &backend,
+        );
+
+        assert_eq!(
+            result,
+            Some(rec(vec![
+                ("tags", Val::list(vec![str("c")])),
+                ("nums", Val::list(vec![int(9)])),
+                ("matrix", Val::list(vec![Val::list(vec![int(5), int(6)])]),),
+                ("extra", Val::Tuple(vec![int(8), Val::list(vec![str("z")])]),),
+            ]))
+        );
+    }
+
+    #[test]
+    fn update_empty_and_duplicate_targets() {
+        let schema = test_schema();
+        let backend = test_backend(&schema);
+
+        let result = run(
+            r#"
+            items.update({ name = "x" });
+            items.insert({ id = 1, name = "a", active = true, pos = (0.0f, 0.0f), kind = Kind::A });
+            items.extend(items).update({ name = prev.name.concat("!") });
+            items { name }
+            "#,
+            &schema,
+            &backend,
+        );
+
+        assert_eq!(
+            result,
+            Some(Val::list(vec![rec(vec![("name", str("a!"))])]))
+        );
     }
 }
