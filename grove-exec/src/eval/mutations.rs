@@ -1,9 +1,12 @@
+use std::collections::{HashMap, HashSet};
+
 use grove_query::typecheck::types::{CollectionOriginKind, TypedExpr, TypedMutationStmt};
 use grove_schema::validated::{Field, FieldId, RelationId, StructId, ValidatedSchema, ValueType};
 
 use crate::error::ExecError;
+use crate::pushdown::FetchConstraints;
 use crate::storage::{Key, WriteTxn};
-use crate::value::{CollectionOrigin, RecordVal, Val, unwrap_optional_depth};
+use crate::value::{CollectionOrigin, RecordVal, RowOrigin, Val, unwrap_optional_depth};
 
 use super::{EvalCtx, eval};
 
@@ -23,11 +26,12 @@ pub(crate) fn exec_mutation(
             opt_depth,
             ..
         } => exec_insert(base, arg, *opt_depth, ctx, write),
-        TypedMutationStmt::Update { .. } | TypedMutationStmt::Delete { .. } => {
-            Err(ExecError::Unsupported {
-                message: "update/delete mutations are not yet implemented".to_string(),
-            })
-        }
+        TypedMutationStmt::Delete {
+            base, opt_depth, ..
+        } => exec_delete(base, *opt_depth, ctx, write),
+        TypedMutationStmt::Update { .. } => Err(ExecError::Unsupported {
+            message: "update mutations are not yet implemented".to_string(),
+        }),
     }
 }
 
@@ -357,6 +361,143 @@ fn insert_owned_field(
         records,
         write,
     )
+}
+
+fn exec_delete(
+    base: &TypedExpr,
+    opt_depth: usize,
+    ctx: &mut EvalCtx<'_>,
+    write: &mut dyn WriteTxn,
+) -> Result<(), ExecError> {
+    let target = eval(base, ctx)?;
+    let target = if opt_depth > 0 {
+        let (target, peeled) = unwrap_optional_depth(target, opt_depth)?;
+        if peeled < opt_depth {
+            return Ok(());
+        }
+        target
+    } else {
+        target
+    };
+    let mut origins = collect_delete_target_origins(target)?;
+    if origins.is_empty() {
+        return Ok(());
+    }
+
+    let mut groups: HashMap<StructId, Vec<Key>> = HashMap::new();
+    for origin in &origins {
+        groups.entry(origin.struct_id).or_default().push(origin.key);
+    }
+    for (struct_id, keys) in groups {
+        delete_owned_cascade(ctx, write, struct_id, keys, &mut origins)?;
+    }
+    Ok(())
+}
+
+/// Extract row origins from a record or list delete target
+fn collect_delete_target_origins(value: Val) -> Result<HashSet<RowOrigin>, ExecError> {
+    let mut seen = HashSet::new();
+    match value {
+        Val::Record(record) => {
+            seen.insert(record.origin.ok_or_else(|| ExecError::Integrity {
+                message: "delete target record has no row origin (internal error)".to_string(),
+            })?);
+        }
+        Val::List(list) => {
+            for item in list {
+                match item {
+                    Val::Record(record) => {
+                        seen.insert(record.origin.ok_or_else(|| {
+                            ExecError::Integrity {
+                                message: "delete target record has no row origin (internal error)"
+                                    .to_string(),
+                            }
+                        })?);
+                    }
+                    other => {
+                        return Err(ExecError::Integrity {
+                            message: format!(
+                                "delete target list contains non-record value {other} (internal error)"
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        other => {
+            return Err(ExecError::Integrity {
+                message: format!(
+                    "delete target is not a record or list of records: {other} (internal error)"
+                ),
+            });
+        }
+    }
+    Ok(seen)
+}
+
+/// Delete a batch of rows and recursively cascade their owning refs
+fn delete_owned_cascade(
+    ctx: &mut EvalCtx<'_>,
+    write: &mut dyn WriteTxn,
+    struct_id: StructId,
+    keys: Vec<Key>,
+    seen: &mut HashSet<RowOrigin>,
+) -> Result<(), ExecError> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let struct_def =
+        ctx.schema
+            .structs
+            .get(struct_id.index())
+            .ok_or_else(|| ExecError::Integrity {
+                message: format!("unknown struct id {} (internal error)", struct_id.index()),
+            })?;
+    let owned_fields: Vec<(FieldId, StructId)> = struct_def
+        .fields
+        .iter()
+        .enumerate()
+        .filter_map(|(local, field)| match field {
+            Field::Ref {
+                owning: true,
+                target,
+                ..
+            } => Some((FieldId::new(struct_id, local), *target)),
+            _ => None,
+        })
+        .collect();
+
+    for (field_id, target) in owned_fields {
+        let relation =
+            ctx.schema
+                .relation_of_field(field_id)
+                .ok_or_else(|| ExecError::Integrity {
+                    message: "owning delete field has no relation (internal error)".to_string(),
+                })?;
+        let fetch_from_first = ctx.schema.relations[relation.index()].endpoints()[0] == field_id;
+        let groups = ctx.storage.fetch_related(
+            relation,
+            fetch_from_first,
+            &keys,
+            &[],
+            &FetchConstraints::EMPTY,
+        )?;
+        let mut child_keys = Vec::new();
+        for group in groups {
+            for row in group {
+                let origin = RowOrigin {
+                    struct_id: target,
+                    key: row.rowid,
+                };
+                if seen.insert(origin) {
+                    child_keys.push(row.rowid);
+                }
+            }
+        }
+        delete_owned_cascade(ctx, write, target, child_keys, seen)?;
+    }
+
+    write.delete_rows(struct_id, &keys)
 }
 
 #[cfg(test)]
@@ -829,5 +970,185 @@ mod tests {
             panic!("expected integrity error, got {err:?}");
         };
         assert!(message.contains("no join key"), "{message}");
+    }
+
+    fn cascade_schema() -> ValidatedSchema {
+        grove_schema::validate(
+            grove_schema::parse_schema(
+                r#"
+                root users: User;
+                struct User {
+                    id: Int,
+                    name: String,
+                    orders: List<Order>,
+                }
+                struct Order {
+                    id: Int,
+                    total: Int,
+                    user: &User,
+                    items: List<Item>,
+                }
+                struct Item {
+                    id: Int,
+                    order: &Order,
+                }
+                rel Order.user <<-> User.orders (orders.user_id -> users.id);
+                rel Item.order <<-> Order.items (items.order_id -> orders.id);
+                "#,
+            )
+            .0
+            .expect("invalid cascade schema"),
+        )
+        .0
+        .expect("invalid cascade schema")
+    }
+
+    fn cascade_backend(schema: &ValidatedSchema) -> SqliteBackend<'_> {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE users(id INTEGER, name TEXT);
+             CREATE TABLE orders(id INTEGER, total INTEGER, user_id INTEGER);
+             CREATE TABLE items(id INTEGER, order_id INTEGER);",
+        )
+        .unwrap();
+        SqliteBackend::new(conn, schema).unwrap()
+    }
+
+    #[test]
+    fn delete_list_target_recursive_cascade() {
+        let schema = cascade_schema();
+        let backend = cascade_backend(&schema);
+        let user = schema.roots[0].struct_id;
+        let order = schema.struct_by_name("Order").unwrap().0;
+        let item = schema.struct_by_name("Item").unwrap().0;
+
+        let result = run(
+            r#"
+            users.insert([
+                {
+                    id = 1,
+                    name = "A",
+                    orders = [{
+                        id = 10,
+                        total = 1,
+                        items = [{ id = 100 }, { id = 101 }],
+                    }],
+                },
+                {
+                    id = 2,
+                    name = "B",
+                    orders = [{ id = 20, total = 2, items = [] }],
+                },
+            ]);
+            users[id == 1].delete();
+            users.len()
+            "#,
+            &schema,
+            &backend,
+        );
+
+        assert_eq!(result, Some(int(1)));
+        assert_eq!(
+            backend
+                .fetch(user, &[], &FetchConstraints::EMPTY)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            backend
+                .fetch(order, &[], &FetchConstraints::EMPTY)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            backend
+                .fetch(item, &[], &FetchConstraints::EMPTY)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn delete_record_target() {
+        let schema = cascade_schema();
+        let backend = cascade_backend(&schema);
+        let user = schema.roots[0].struct_id;
+        let order = schema.struct_by_name("Order").unwrap().0;
+
+        let result = run(
+            r#"
+            users.insert({
+                id = 1,
+                name = "A",
+                orders = [{ id = 10, total = 1, items = [] }],
+            });
+            users.find(name == "A").unwrap().delete();
+            users.len()
+            "#,
+            &schema,
+            &backend,
+        );
+
+        assert_eq!(result, Some(int(0)));
+        assert!(
+            backend
+                .fetch(user, &[], &FetchConstraints::EMPTY)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            backend
+                .fetch(order, &[], &FetchConstraints::EMPTY)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn delete_duplicate_targets_deduped() {
+        let schema = cascade_schema();
+        let backend = cascade_backend(&schema);
+        let user = schema.roots[0].struct_id;
+
+        let result = run(
+            r#"
+            users.insert({
+                id = 1,
+                name = "A",
+                orders = [{ id = 10, total = 1, items = [{ id = 100 }] }],
+            });
+            users.extend(users).delete();
+            users.len()
+            "#,
+            &schema,
+            &backend,
+        );
+
+        assert_eq!(result, Some(int(0)));
+        assert!(
+            backend
+                .fetch(user, &[], &FetchConstraints::EMPTY)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn delete_optional_none_target_noop() {
+        let schema = cascade_schema();
+        let backend = cascade_backend(&schema);
+
+        let result = run(
+            r#"
+            users.first()?.delete();
+            users.len()
+            "#,
+            &schema,
+            &backend,
+        );
+
+        assert_eq!(result, Some(int(0)));
     }
 }

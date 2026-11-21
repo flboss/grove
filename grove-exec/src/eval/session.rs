@@ -313,24 +313,4 @@ mod tests {
         );
         assert!(matches!(result, Err(ExecError::ReadOnly { .. })));
     }
-
-    #[test]
-    fn session_transaction_rollback_unimplemented_mutation() {
-        let schema = test_schema();
-        let backend = test_backend(&schema);
-        let file = typed_delete(&schema);
-        let mut session = ExecSession::new(&backend, &schema);
-        let result = session.execute(&file, Utc::now(), ExecOptions::default());
-        assert!(matches!(result, Err(ExecError::Unsupported { .. })));
-
-        let (_, id, name) = item_fields(&schema);
-        let rows = backend
-            .fetch(
-                schema.roots[0].struct_id,
-                &[id, name],
-                &FetchConstraints::EMPTY,
-            )
-            .unwrap();
-        assert!(rows.is_empty());
-    }
 }
