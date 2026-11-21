@@ -33,6 +33,45 @@ pub trait Storage {
         fields: &[FieldId],
         constraints: &FetchConstraints,
     ) -> Result<Vec<Vec<Row>>, ExecError>;
+
+    /// Begin a write transaction (if supported by the backend)
+    fn begin_write(&self) -> Result<Box<dyn WriteTxn + '_>, ExecError> {
+        Err(ExecError::ReadOnly {
+            message: "storage backend does not support mutations".to_string(),
+        })
+    }
+}
+
+/// A transaction-scoped mutation interface
+pub trait WriteTxn {
+    fn insert_row(
+        &mut self,
+        struct_id: StructId,
+        values: &[(FieldId, Val)],
+    ) -> Result<Key, ExecError>;
+
+    fn insert_rows(
+        &mut self,
+        struct_id: StructId,
+        rows: &[Vec<(FieldId, Val)>],
+    ) -> Result<Vec<Key>, ExecError> {
+        rows.iter()
+            .map(|values| self.insert_row(struct_id, values))
+            .collect()
+    }
+
+    fn update_row(
+        &mut self,
+        struct_id: StructId,
+        key: Key,
+        values: &[(FieldId, Val)],
+    ) -> Result<(), ExecError>;
+
+    fn delete_rows(&mut self, struct_id: StructId, keys: &[Key]) -> Result<(), ExecError>;
+
+    fn commit(&mut self) -> Result<(), ExecError>;
+
+    fn rollback(&mut self) -> Result<(), ExecError>;
 }
 
 #[cfg(test)]

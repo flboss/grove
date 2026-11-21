@@ -13,6 +13,8 @@ pub enum ExecError {
     Storage { message: String },
     /// A feature that the executor does not yet implement
     Unsupported { message: String },
+    /// Storage does not permit mutations
+    ReadOnly { message: String },
 }
 
 impl fmt::Display for ExecError {
@@ -22,6 +24,7 @@ impl fmt::Display for ExecError {
             ExecError::Integrity { message } => write!(f, "data integrity error: {message}"),
             ExecError::Storage { message } => write!(f, "storage error: {message}"),
             ExecError::Unsupported { message } => write!(f, "unsupported: {message}"),
+            ExecError::ReadOnly { message } => write!(f, "read-only: {message}"),
         }
     }
 }
@@ -43,6 +46,9 @@ impl ExecError {
                 message: prefixed(message),
             },
             ExecError::Unsupported { message } => ExecError::Unsupported {
+                message: prefixed(message),
+            },
+            ExecError::ReadOnly { message } => ExecError::ReadOnly {
                 message: prefixed(message),
             },
         }
