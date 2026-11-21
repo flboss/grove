@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
 use grove_query::typecheck::types::{CollectionOriginKind, TypedExpr, TypedMutationStmt};
-use grove_schema::validated::{Field, FieldId, RelationId, StructId, ValidatedSchema, ValueType};
+use grove_schema::validated::{
+    Field, FieldId, Relation, RelationId, StructId, ValidatedSchema, ValueType,
+};
 
 use crate::error::ExecError;
 use crate::pushdown::FetchConstraints;
@@ -497,7 +499,43 @@ fn delete_owned_cascade(
         delete_owned_cascade(ctx, write, target, child_keys, seen)?;
     }
 
+    cleanup_non_owned_links(ctx.schema, struct_id, &keys, write)?;
     write.delete_rows(struct_id, &keys)
+}
+
+/// Clear non-owning FKs that reference deleted rows
+fn cleanup_non_owned_links(
+    schema: &ValidatedSchema,
+    struct_id: StructId,
+    keys: &[Key],
+    write: &mut dyn WriteTxn,
+) -> Result<(), ExecError> {
+    let table = schema.structs[struct_id.index()].table;
+    for (index, relation) in schema.relations.iter().enumerate() {
+        let rel = RelationId::new(index);
+        match relation {
+            Relation::OneToOne { pk, .. }
+            | Relation::ManyToOne { pk, .. }
+            | Relation::OneToMany { pk, .. } => {
+                if pk.table_id() == table && !relation_has_owning_endpoint(schema, relation) {
+                    write.clear_foreign_keys(rel, keys)?;
+                }
+            }
+            Relation::ManyToMany { .. } => {
+                return Err(ExecError::Unsupported {
+                    message: "ManyToMany FK cleanup is not yet implemented".to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn relation_has_owning_endpoint(schema: &ValidatedSchema, relation: &Relation) -> bool {
+    relation
+        .endpoints()
+        .iter()
+        .any(|field| matches!(schema.field(*field), Some(Field::Ref { owning: true, .. })))
 }
 
 #[cfg(test)]
@@ -1151,4 +1189,116 @@ mod tests {
 
         assert_eq!(result, Some(int(0)));
     }
+
+    fn one_to_many_schema() -> ValidatedSchema {
+        grove_schema::validate(
+            grove_schema::parse_schema(
+                r#"
+                root parents: Parent;
+                root children: Child;
+                struct Parent {
+                    id: Int,
+                    name: String,
+                    children: &List<Child>,
+                }
+                struct Child {
+                    id: Int,
+                    name: String,
+                    parent: &?Parent,
+                }
+                rel Parent.children <->> Child.parent (children.parent_id -> parents.id);
+                "#,
+            )
+            .0
+            .expect("invalid one-to-many schema"),
+        )
+        .0
+        .expect("invalid one-to-many schema")
+    }
+
+    fn one_to_many_backend(schema: &ValidatedSchema) -> SqliteBackend<'_> {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE parents(id INTEGER, name TEXT);
+             CREATE TABLE children(id INTEGER, name TEXT, parent_id INTEGER);
+             INSERT INTO parents(id, name) VALUES (1, 'parent');
+             INSERT INTO children(id, name, parent_id) VALUES (10, 'child', 1);",
+        )
+        .unwrap();
+        SqliteBackend::new(conn, schema).unwrap()
+    }
+
+    #[test]
+    fn delete_one_to_many_fk_cleared() {
+        let schema = one_to_many_schema();
+        let backend = one_to_many_backend(&schema);
+
+        let result = run(
+            r#"
+            parents.first().unwrap().delete();
+            children.first().unwrap() { id, parent }
+            "#,
+            &schema,
+            &backend,
+        );
+
+        assert_eq!(
+            result,
+            Some(rec(vec![("id", int(10)), ("parent", Val::None)]))
+        );
+    }
+
+    fn self_ref_schema() -> ValidatedSchema {
+        grove_schema::validate(
+            grove_schema::parse_schema(
+                r#"
+                root users: User;
+                struct User {
+                    id: Int,
+                    name: String,
+                    manager: &?User,
+                    subordinates: &List<User>,
+                }
+                rel User.manager <<-> User.subordinates (users.manager_id -> users.id);
+                "#,
+            )
+            .0
+            .expect("invalid self-ref schema"),
+        )
+        .0
+        .expect("invalid self-ref schema")
+    }
+
+    fn self_ref_backend(schema: &ValidatedSchema) -> SqliteBackend<'_> {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE users(id INTEGER, name TEXT, manager_id INTEGER);
+             INSERT INTO users(id, name, manager_id) VALUES
+                 (1, 'manager', NULL),
+                 (2, 'report', 1);",
+        )
+        .unwrap();
+        SqliteBackend::new(conn, schema).unwrap()
+    }
+
+    #[test]
+    fn delete_self_ref_fk_cleared() {
+        let schema = self_ref_schema();
+        let backend = self_ref_backend(&schema);
+
+        let result = run(
+            r#"
+            users.first().unwrap().delete();
+            users.first().unwrap() { id, manager }
+            "#,
+            &schema,
+            &backend,
+        );
+
+        assert_eq!(
+            result,
+            Some(rec(vec![("id", int(2)), ("manager", Val::None)]))
+        );
+    }
+
 }

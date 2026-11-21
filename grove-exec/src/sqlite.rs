@@ -1762,6 +1762,49 @@ impl<'conn, 'schema> WriteTxn for SqliteWriteTxn<'conn, 'schema> {
         Ok(())
     }
 
+    fn clear_foreign_keys(&mut self, rel: RelationId, referenced: &[Key]) -> Result<(), ExecError> {
+        if referenced.is_empty() {
+            return Ok(());
+        }
+        let relation =
+            self.schema
+                .relations
+                .get(rel.index())
+                .ok_or_else(|| ExecError::Integrity {
+                    message: format!("unknown relation id {} (internal error)", rel.index()),
+                })?;
+        let (fk, pk) = match relation {
+            Relation::OneToOne { fk, pk, .. }
+            | Relation::ManyToOne { fk, pk, .. }
+            | Relation::OneToMany { fk, pk, .. } => (*fk, *pk),
+            Relation::ManyToMany { .. } => {
+                return Err(ExecError::Integrity {
+                    message: "many-to-many relations do not use FK cleanup (internal error)"
+                        .to_string(),
+                });
+            }
+        };
+        let referencing_table = quote(&self.schema.tables[fk.table_id().index()].name);
+        let fk = quote(self.schema.column_name(fk));
+        let referenced_table = quote(&self.schema.tables[pk.table_id().index()].name);
+        let pk = quote(self.schema.column_name(pk));
+        let txn = self.txn()?;
+        for chunk in referenced.chunks(500) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!(
+                "UPDATE {referencing_table} SET {fk} = NULL WHERE {fk} IN \
+                 (SELECT {pk} FROM {referenced_table} WHERE _rowid_ IN ({placeholders}))"
+            );
+            let params = chunk.iter().map(|key| Value::Integer(key.0));
+            let mut stmt = txn
+                .prepare_cached(&sql)
+                .map_err(|err| SqliteBackend::storage_error("clear FK (prepare)", err))?;
+            stmt.execute(params_from_iter(params))
+                .map_err(|err| SqliteBackend::storage_error("clear FK (execute)", err))?;
+        }
+        Ok(())
+    }
+
     fn commit(&mut self) -> Result<(), ExecError> {
         let txn = self.txn.take().ok_or_else(|| ExecError::Integrity {
             message: "write transaction is already finished (internal error)".to_string(),

@@ -97,6 +97,16 @@ pub trait WriteTxn {
 
     fn delete_rows(&mut self, struct_id: StructId, keys: &[Key]) -> Result<(), ExecError>;
 
+    fn clear_foreign_keys(
+        &mut self,
+        _rel: RelationId,
+        _referenced: &[Key],
+    ) -> Result<(), ExecError> {
+        Err(ExecError::Unsupported {
+            message: "backend does not support foreign-key cleanup".to_string(),
+        })
+    }
+
     fn commit(&mut self) -> Result<(), ExecError>;
 
     fn rollback(&mut self) -> Result<(), ExecError>;
