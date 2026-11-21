@@ -1,12 +1,16 @@
 use grove_query::typecheck::types::{CollectionOriginKind, TypedExpr, TypedMutationStmt};
-use grove_schema::validated::{Field, FieldId, StructId, ValidatedSchema, ValueType};
+use grove_schema::validated::{Field, FieldId, RelationId, StructId, ValidatedSchema, ValueType};
 
 use crate::error::ExecError;
-use crate::storage::WriteTxn;
-use crate::value::{RecordVal, Val, unwrap_optional_depth};
+use crate::storage::{Key, WriteTxn};
+use crate::value::{CollectionOrigin, RecordVal, Val, unwrap_optional_depth};
 
 use super::{EvalCtx, eval};
 
+type FieldValues = Vec<(FieldId, Val)>;
+type RecordParts = (FieldValues, FieldValues);
+
+/// Dispatch typed mutation statement to its executor
 pub(crate) fn exec_mutation(
     stmt: &TypedMutationStmt,
     ctx: &mut EvalCtx<'_>,
@@ -34,56 +38,172 @@ fn exec_insert(
     ctx: &mut EvalCtx<'_>,
     write: &mut dyn WriteTxn,
 ) -> Result<(), ExecError> {
-    let Some(CollectionOriginKind::Root(root_idx)) = base.provenance.collection else {
-        return Err(ExecError::Unsupported {
-            message: "nested insert targets are not yet implemented".to_string(),
-        });
+    let Some(target) = resolve_insert_target(base, opt_depth, ctx)? else {
+        return Ok(());
     };
-    let root = ctx
-        .schema
-        .roots
-        .get(root_idx)
-        .ok_or_else(|| ExecError::Integrity {
-            message: format!("unknown root {root_idx} (internal error)"),
-        })?;
-    let struct_id = root.struct_id;
-
-    if opt_depth > 0 {
-        let target = eval(base, ctx)?;
-        let (_, peeled) = unwrap_optional_depth(target, opt_depth)?;
-        if peeled < opt_depth {
-            return Ok(());
-        }
-    }
-
     let arg = eval(arg, ctx)?;
     let records = collect_insert_records(arg)?;
+    insert_group(ctx.schema, target, records, write)
+}
+
+enum InsertTarget {
+    Root {
+        struct_id: StructId,
+    },
+    Ref {
+        struct_id: StructId,
+        relation: RelationId,
+        parent: Key,
+        parent_is_first: bool,
+    },
+}
+
+impl InsertTarget {
+    fn struct_id(&self) -> StructId {
+        match self {
+            InsertTarget::Root { struct_id } | InsertTarget::Ref { struct_id, .. } => *struct_id,
+        }
+    }
+}
+
+/// Resolve an insert target to a root or parented collection
+fn resolve_insert_target(
+    base: &TypedExpr,
+    opt_depth: usize,
+    ctx: &mut EvalCtx<'_>,
+) -> Result<Option<InsertTarget>, ExecError> {
+    let Some(origin) = base.provenance.collection else {
+        return Err(ExecError::Unsupported {
+            message: "insert target has no collection origin".to_string(),
+        });
+    };
+    match origin {
+        CollectionOriginKind::Root(root_idx) => {
+            let root = ctx
+                .schema
+                .roots
+                .get(root_idx)
+                .ok_or_else(|| ExecError::Integrity {
+                    message: format!("unknown root {root_idx} (internal error)"),
+                })?;
+            if opt_depth > 0 {
+                let target = eval(base, ctx)?;
+                let (_, peeled) = unwrap_optional_depth(target, opt_depth)?;
+                if peeled < opt_depth {
+                    return Ok(None);
+                }
+            }
+            Ok(Some(InsertTarget::Root {
+                struct_id: root.struct_id,
+            }))
+        }
+        CollectionOriginKind::Ref(field_id) => {
+            let target = eval(base, ctx)?;
+            let target = if opt_depth > 0 {
+                let (target, peeled) = unwrap_optional_depth(target, opt_depth)?;
+                if peeled < opt_depth {
+                    return Ok(None);
+                }
+                target
+            } else {
+                target
+            };
+            let Val::List(list) = target else {
+                return Err(ExecError::Integrity {
+                    message: "nested insert target did not evaluate to a list".to_string(),
+                });
+            };
+            let Some(CollectionOrigin::Ref { field, parent }) = list.origin else {
+                return Err(ExecError::Integrity {
+                    message: "nested insert target has no ref collection origin".to_string(),
+                });
+            };
+            if field != field_id {
+                return Err(ExecError::Integrity {
+                    message: "nested insert origin field mismatch (internal error)".to_string(),
+                });
+            }
+            let Some(Field::Ref {
+                target: struct_id,
+                is_list: true,
+                owning: true,
+                ..
+            }) = ctx.schema.field(field)
+            else {
+                return Err(ExecError::Unsupported {
+                    message: "insert through unsupported reference (internal error)".to_string(),
+                });
+            };
+            let relation =
+                ctx.schema
+                    .relation_of_field(field)
+                    .ok_or_else(|| ExecError::Integrity {
+                        message: "insert target Ref has no relation (internal error)".to_string(),
+                    })?;
+            let parent_is_first = ctx.schema.relations[relation.index()].endpoints()[0] == field;
+            Ok(Some(InsertTarget::Ref {
+                struct_id: *struct_id,
+                relation,
+                parent: parent.key,
+                parent_is_first,
+            }))
+        }
+    }
+}
+
+/// Insert base records, then recursively insert owned child refs
+fn insert_group(
+    schema: &ValidatedSchema,
+    target: InsertTarget,
+    records: Vec<RecordVal>,
+    write: &mut dyn WriteTxn,
+) -> Result<(), ExecError> {
     if records.is_empty() {
         return Ok(());
     }
+    let struct_id = target.struct_id();
+    let mut values = Vec::with_capacity(records.len());
+    let mut owned = Vec::with_capacity(records.len());
+    for record in records {
+        let (base, children) = record_parts(schema, struct_id, record)?;
+        values.push(base);
+        owned.push(children);
+    }
 
-    let values = records
-        .into_iter()
-        .map(|record| record_values(ctx.schema, struct_id, record))
-        .collect::<Result<Vec<_>, _>>()?;
-    write.insert_rows(struct_id, &values)?;
+    let keys = match &target {
+        InsertTarget::Root { .. } => write.insert_rows(struct_id, &values)?,
+        InsertTarget::Ref {
+            relation,
+            parent,
+            parent_is_first,
+            ..
+        } => write.insert_rows_with_parent(
+            struct_id,
+            &values,
+            *relation,
+            *parent,
+            *parent_is_first,
+        )?,
+    };
+    if keys.len() != values.len() {
+        return Err(ExecError::Integrity {
+            message: "insert returned an unexpected number of row keys".to_string(),
+        });
+    }
+
+    for (children, key) in owned.into_iter().zip(keys) {
+        for (field_id, value) in children {
+            insert_owned_field(schema, field_id, value, key, write)?;
+        }
+    }
     Ok(())
 }
 
+/// Normalize an insert argument value into a list of records
 fn collect_insert_records(value: Val) -> Result<Vec<RecordVal>, ExecError> {
     match value {
         Val::Record(record) => Ok(vec![record]),
-        Val::List(list) => list
-            .into_iter()
-            .map(|item| match item {
-                Val::Record(record) => Ok(record),
-                other => Err(ExecError::Integrity {
-                    message: format!(
-                        "insert argument list contains non-record value {other} (internal error)"
-                    ),
-                }),
-            })
-            .collect(),
+        Val::List(list) => list.into_iter().map(record_from_value).collect(),
         other => Err(ExecError::Integrity {
             message: format!(
                 "insert argument is not a record or list of records: {other} (internal error)"
@@ -92,11 +212,21 @@ fn collect_insert_records(value: Val) -> Result<Vec<RecordVal>, ExecError> {
     }
 }
 
-fn record_values(
+fn record_from_value(value: Val) -> Result<RecordVal, ExecError> {
+    match value {
+        Val::Record(record) => Ok(record),
+        other => Err(ExecError::Integrity {
+            message: format!("expected record value, got {other} (internal error)"),
+        }),
+    }
+}
+
+/// Split a record into base column values and owned ref values
+fn record_parts(
     schema: &ValidatedSchema,
     struct_id: StructId,
     mut record: RecordVal,
-) -> Result<Vec<(FieldId, Val)>, ExecError> {
+) -> Result<RecordParts, ExecError> {
     let struct_def = schema
         .structs
         .get(struct_id.index())
@@ -104,29 +234,129 @@ fn record_values(
             message: format!("unknown struct id {} (internal error)", struct_id.index()),
         })?;
     let mut values = Vec::new();
+    let mut owned = Vec::new();
     for (local, field) in struct_def.fields.iter().enumerate() {
         let field_id = FieldId::new(struct_id, local);
-        if let Some(index) = record
+        let index = record
             .iter()
-            .position(|(field_name, _)| field_name.as_ref() == field.name())
-        {
-            let value = record.fields.swap_remove(index).1;
-            values.push((field_id, value));
-        } else if matches!(
-            field,
-            Field::Value {
-                ty: ValueType::Optional(_),
-                ..
-            } | Field::Ref {
-                optional: true,
+            .position(|(field_name, _)| field_name.as_ref() == field.name());
+        match field {
+            Field::Ref {
                 owning: true,
+                optional,
                 ..
+            } => {
+                if let Some(index) = index {
+                    let value = record.fields.swap_remove(index).1;
+                    if !matches!(value, Val::None) {
+                        owned.push((field_id, value));
+                    }
+                } else if !*optional {
+                    return Err(ExecError::Integrity {
+                        message: format!(
+                            "missing insert field `{}` (internal error)",
+                            field.name()
+                        ),
+                    });
+                }
             }
-        ) {
-            values.push((field_id, Val::None));
+            Field::Ref { owning: false, .. } => {
+                if index.is_some() {
+                    return Err(ExecError::Integrity {
+                        message: format!(
+                            "non-owning ref `{}` cannot be inserted (internal error)",
+                            field.name()
+                        ),
+                    });
+                }
+            }
+            Field::Value { ty, .. } | Field::Array { element: ty, .. } => {
+                if let Some(index) = index {
+                    values.push((field_id, record.fields.swap_remove(index).1));
+                } else if matches!(ty, ValueType::Optional(_)) {
+                    values.push((field_id, Val::None));
+                } else {
+                    return Err(ExecError::Integrity {
+                        message: format!(
+                            "missing insert field `{}` (internal error)",
+                            field.name()
+                        ),
+                    });
+                }
+            }
         }
     }
-    Ok(values)
+    Ok((values, owned))
+}
+
+/// Insert one owning ref field's records beneath a parent row
+fn insert_owned_field(
+    schema: &ValidatedSchema,
+    field_id: FieldId,
+    value: Val,
+    parent: Key,
+    write: &mut dyn WriteTxn,
+) -> Result<(), ExecError> {
+    let Some(Field::Ref {
+        target,
+        optional,
+        is_list,
+        owning,
+        ..
+    }) = schema.field(field_id)
+    else {
+        return Err(ExecError::Integrity {
+            message: "owned insert field is not a ref (internal error)".to_string(),
+        });
+    };
+    if !*owning {
+        return Err(ExecError::Integrity {
+            message: "attempted recursive insert through non-owning ref (internal error)"
+                .to_string(),
+        });
+    }
+    let records = if *is_list {
+        let Val::List(list) = value else {
+            return Err(ExecError::Integrity {
+                message: "list ref field did not contain a list (internal error)".to_string(),
+            });
+        };
+        list.into_iter()
+            .map(record_from_value)
+            .collect::<Result<Vec<_>, _>>()?
+    } else if *optional {
+        match value {
+            Val::None => Vec::new(),
+            Val::Some(value) => vec![record_from_value(*value)?],
+            other => {
+                return Err(ExecError::Integrity {
+                    message: format!("optional ref field contained {other} (internal error)"),
+                });
+            }
+        }
+    } else {
+        vec![record_from_value(value)?]
+    };
+    if records.is_empty() {
+        return Ok(());
+    }
+    let relation = schema
+        .relation_of_field(field_id)
+        .ok_or_else(|| ExecError::Integrity {
+            message: "owned insert field has no relation (internal error)".to_string(),
+        })?;
+    let parent_is_first = schema.relations[relation.index()].endpoints()[0] == field_id;
+    insert_group(
+        schema,
+        InsertTarget::Ref {
+            struct_id: *target,
+            relation,
+            parent,
+            parent_is_first,
+        },
+        records,
+        write,
+    )
 }
 
 #[cfg(test)]
@@ -283,5 +513,151 @@ mod tests {
         );
 
         assert_eq!(result, Some(Val::Scalar(Scalar::Int(1))));
+    }
+
+    fn ref_schema() -> ValidatedSchema {
+        grove_schema::validate(
+            grove_schema::parse_schema(
+                r#"
+                root users: User;
+                struct User {
+                    id: Int,
+                    name: String,
+                    orders: List<Order>,
+                    profile: ?Profile,
+                }
+                struct Order {
+                    id: Int,
+                    total: Int,
+                    user: &User,
+                }
+                struct Profile {
+                    bio: String,
+                    user: &User,
+                }
+                rel Order.user <<-> User.orders (orders.user_id -> users.id);
+                rel Profile.user <-> User.profile (profiles.user_id -> users.id);
+                "#,
+            )
+            .0
+            .expect("invalid ref mutation schema"),
+        )
+        .0
+        .expect("invalid ref mutation schema")
+    }
+
+    fn ref_backend(schema: &ValidatedSchema) -> SqliteBackend<'_> {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE users(id INTEGER, name TEXT);
+             CREATE TABLE orders(id INTEGER, total INTEGER, user_id INTEGER);
+             CREATE TABLE profiles(bio TEXT, user_id INTEGER);",
+        )
+        .unwrap();
+        SqliteBackend::new(conn, schema).unwrap()
+    }
+
+    #[test]
+    fn insert_nested_owning_collection_target() {
+        let schema = ref_schema();
+        let backend = ref_backend(&schema);
+
+        let result = run(
+            r#"
+            users.insert({ id = 1, name = "A", orders = [] });
+            users.first().unwrap().orders.insert({ id = 10, total = 100 });
+            users.first().unwrap().orders { id, total }
+            "#,
+            &schema,
+            &backend,
+        );
+
+        assert_eq!(
+            result,
+            Some(Val::list(vec![rec(vec![
+                ("id", int(10)),
+                ("total", int(100)),
+            ])]))
+        );
+    }
+
+    #[test]
+    fn insert_recursive_owning_children() {
+        let schema = ref_schema();
+        let backend = ref_backend(&schema);
+
+        let result = run(
+            r#"
+            users.insert({
+                id = 1,
+                name = "A",
+                orders = [
+                    { id = 10, total = 100 },
+                    { id = 11, total = 110 },
+                ],
+            });
+            users.first().unwrap().orders { id, total }
+            "#,
+            &schema,
+            &backend,
+        );
+
+        assert_eq!(
+            result,
+            Some(Val::list(vec![
+                rec(vec![("id", int(10)), ("total", int(100))]),
+                rec(vec![("id", int(11)), ("total", int(110))]),
+            ]))
+        );
+    }
+
+    #[test]
+    fn insert_optional_single_owning_child() {
+        let schema = ref_schema();
+        let backend = ref_backend(&schema);
+
+        let result = run(
+            r#"
+            users.insert({
+                id = 1,
+                name = "A",
+                orders = [],
+                profile = some({ bio = "bio" }),
+            });
+            users.first().unwrap().profile?.bio
+            "#,
+            &schema,
+            &backend,
+        );
+
+        assert_eq!(result, Some(some(str("bio"))));
+    }
+
+    #[test]
+    fn insert_bulk_recursive_children_per_parent() {
+        let schema = ref_schema();
+        let backend = ref_backend(&schema);
+
+        let result = run(
+            r#"
+            users.insert([
+                { id = 1, name = "A", orders = [{ id = 10, total = 1 }] },
+                {
+                    id = 2,
+                    name = "B",
+                    orders = [
+                        { id = 20, total = 2 },
+                        { id = 21, total = 3 },
+                    ],
+                },
+                { id = 3, name = "C", orders = [] },
+            ]);
+            users.map($.orders.len())
+            "#,
+            &schema,
+            &backend,
+        );
+
+        assert_eq!(result, Some(Val::list(vec![int(1), int(2), int(0)])));
     }
 }
