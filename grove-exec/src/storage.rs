@@ -36,7 +36,7 @@ pub trait Storage {
 
     /// Begin a write transaction (if supported by the backend)
     fn begin_write(&self) -> Result<Box<dyn WriteTxn + '_>, ExecError> {
-        Err(ExecError::ReadOnly {
+        Err(ExecError::Unsupported {
             message: "storage backend does not support mutations".to_string(),
         })
     }
@@ -57,6 +57,34 @@ pub trait WriteTxn {
     ) -> Result<Vec<Key>, ExecError> {
         rows.iter()
             .map(|values| self.insert_row(struct_id, values))
+            .collect()
+    }
+
+    fn insert_row_with_parent(
+        &mut self,
+        _struct_id: StructId,
+        _values: &[(FieldId, Val)],
+        _rel: RelationId,
+        _parent: Key,
+        _parent_is_first: bool,
+    ) -> Result<Key, ExecError> {
+        Err(ExecError::Unsupported {
+            message: "backend does not support inserting through relations".to_string(),
+        })
+    }
+
+    fn insert_rows_with_parent(
+        &mut self,
+        struct_id: StructId,
+        rows: &[Vec<(FieldId, Val)>],
+        rel: RelationId,
+        parent: Key,
+        parent_is_first: bool,
+    ) -> Result<Vec<Key>, ExecError> {
+        rows.iter()
+            .map(|values| {
+                self.insert_row_with_parent(struct_id, values, rel, parent, parent_is_first)
+            })
             .collect()
     }
 

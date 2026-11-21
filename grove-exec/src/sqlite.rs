@@ -5,13 +5,13 @@ use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 use grove_schema::validated::{
-    EnumId, EnumUnderlying, EnumValue, Field, FieldId, Relation, RelationId, ScalarType,
+    ColumnId, EnumId, EnumUnderlying, EnumValue, Field, FieldId, Relation, RelationId, ScalarType,
     StorageTable, StructId, ValidatedSchema, ValueType,
 };
 use rusqlite::config::DbConfig;
 use rusqlite::params_from_iter;
 use rusqlite::types::{Value, ValueRef};
-use rusqlite::{Connection, Statement, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, Statement, Transaction, TransactionBehavior};
 
 use crate::codec;
 use crate::error::ExecError;
@@ -1263,6 +1263,108 @@ impl SqliteWriteTxn<'_, '_> {
             .collect()
     }
 
+    fn insert_encoded_row(
+        &mut self,
+        table: &str,
+        columns: &[String],
+        params: &[Value],
+    ) -> Result<Key, ExecError> {
+        let sql = if columns.is_empty() {
+            format!("INSERT INTO {table} DEFAULT VALUES")
+        } else {
+            let placeholders = vec!["?"; columns.len()].join(", ");
+            format!(
+                "INSERT INTO {table} ({}) VALUES ({placeholders})",
+                columns.join(", ")
+            )
+        };
+        let txn = self.txn()?;
+        let mut stmt = txn
+            .prepare_cached(&sql)
+            .map_err(|err| SqliteBackend::storage_error("insert row (prepare)", err))?;
+        stmt.execute(params_from_iter(params))
+            .map_err(|err| SqliteBackend::storage_error("insert row (execute)", err))?;
+        Ok(Key(txn.last_insert_rowid()))
+    }
+
+    fn insert_encoded_rows(
+        &mut self,
+        table: &str,
+        columns: &[String],
+        encoded_rows: &[Vec<Value>],
+    ) -> Result<Vec<Key>, ExecError> {
+        let width = columns.len();
+        let rows_per_chunk = (500 / width).max(1);
+        let row_placeholders = format!("({})", vec!["?"; width].join(", "));
+        let txn = self.txn()?;
+        let mut keys = Vec::with_capacity(encoded_rows.len());
+        for chunk in encoded_rows.chunks(rows_per_chunk) {
+            let values = vec![row_placeholders.as_str(); chunk.len()].join(", ");
+            let sql = format!(
+                "INSERT INTO {table} ({}) VALUES {values} RETURNING _rowid_",
+                columns.join(", ")
+            );
+            let mut params = Vec::with_capacity(chunk.len() * width);
+            for row in chunk {
+                params.extend(row.iter().cloned());
+            }
+            let mut stmt = txn
+                .prepare_cached(&sql)
+                .map_err(|err| SqliteBackend::storage_error("insert rows (prepare)", err))?;
+            let mut returned = stmt
+                .query(params_from_iter(params))
+                .map_err(|err| SqliteBackend::storage_error("insert rows (execute)", err))?;
+            while let Some(row) = returned
+                .next()
+                .map_err(|err| SqliteBackend::storage_error("insert rows (returning)", err))?
+            {
+                let rowid = row
+                    .get(0)
+                    .map_err(|err| SqliteBackend::storage_error("insert rows (rowid)", err))?;
+                keys.push(Key(rowid));
+            }
+        }
+        Ok(keys)
+    }
+
+    fn relation_key_columns(&self, rel: RelationId) -> Result<(ColumnId, ColumnId), ExecError> {
+        match self.schema.relations.get(rel.index()) {
+            Some(Relation::OneToOne { fk, pk, .. } | Relation::ManyToOne { fk, pk, .. }) => {
+                Ok((*fk, *pk))
+            }
+            Some(Relation::OneToMany { .. } | Relation::ManyToMany { .. }) => {
+                Err(ExecError::Unsupported {
+                    message: "inserting through non-owning relations is not implemented"
+                        .to_string(),
+                })
+            }
+            None => Err(ExecError::Integrity {
+                message: format!("unknown relation id {} (internal error)", rel.index()),
+            }),
+        }
+    }
+
+    fn fetch_parent_key(&self, pk: ColumnId, parent: Key) -> Result<Value, ExecError> {
+        let table = quote(&self.schema.tables[pk.table_id().index()].name);
+        let column = quote(self.schema.column_name(pk));
+        let sql = format!("SELECT {column} FROM {table} WHERE _rowid_ = ?");
+        let txn = self.txn()?;
+        let value: Option<Value> = txn
+            .query_row(&sql, [parent.0], |row| row.get(0))
+            .optional()
+            .map_err(|err| SqliteBackend::storage_error("fetch parent key", err))?;
+        match value {
+            Some(Value::Null) | None => Err(ExecError::Integrity {
+                message: format!(
+                    "insert parent row {} has no join key in column `{}`",
+                    parent.0,
+                    self.schema.column_name(pk)
+                ),
+            }),
+            Some(value) => Ok(value),
+        }
+    }
+
     fn txn(&self) -> Result<&Transaction<'_>, ExecError> {
         self.txn.as_ref().ok_or_else(|| ExecError::Integrity {
             message: "write transaction is already finished (internal error)".to_string(),
@@ -1376,22 +1478,7 @@ impl<'conn, 'schema> WriteTxn for SqliteWriteTxn<'conn, 'schema> {
     ) -> Result<Key, ExecError> {
         let table = self.table_name(struct_id)?;
         let (columns, params) = self.encode_row(struct_id, values)?;
-        let sql = if columns.is_empty() {
-            format!("INSERT INTO {table} DEFAULT VALUES")
-        } else {
-            let placeholders = vec!["?"; columns.len()].join(", ");
-            format!(
-                "INSERT INTO {table} ({}) VALUES ({placeholders})",
-                columns.join(", ")
-            )
-        };
-        let txn = self.txn()?;
-        let mut stmt = txn
-            .prepare_cached(&sql)
-            .map_err(|err| SqliteBackend::storage_error("insert row (prepare)", err))?;
-        stmt.execute(params_from_iter(params.iter()))
-            .map_err(|err| SqliteBackend::storage_error("insert row (execute)", err))?;
-        Ok(Key(txn.last_insert_rowid()))
+        self.insert_encoded_row(&table, &columns, &params)
     }
 
     fn insert_rows(
@@ -1420,39 +1507,69 @@ impl<'conn, 'schema> WriteTxn for SqliteWriteTxn<'conn, 'schema> {
         if columns.is_empty() {
             return self.insert_rows_individually(struct_id, rows);
         }
+        self.insert_encoded_rows(&table, &columns, &encoded_rows)
+    }
 
-        let width = columns.len();
-        let rows_per_chunk = (500 / width).max(1);
-        let row_placeholders = format!("({})", vec!["?"; width].join(", "));
-        let txn = self.txn()?;
-        let mut keys = Vec::with_capacity(rows.len());
-        for chunk in encoded_rows.chunks(rows_per_chunk) {
-            let values = vec![row_placeholders.as_str(); chunk.len()].join(", ");
-            let sql = format!(
-                "INSERT INTO {table} ({}) VALUES {values} RETURNING _rowid_",
-                columns.join(", ")
-            );
-            let mut params = Vec::with_capacity(chunk.len() * width);
-            for row in chunk {
-                params.extend(row.iter().cloned());
-            }
-            let mut stmt = txn
-                .prepare_cached(&sql)
-                .map_err(|err| SqliteBackend::storage_error("insert rows (prepare)", err))?;
-            let mut returned = stmt
-                .query(params_from_iter(params))
-                .map_err(|err| SqliteBackend::storage_error("insert rows (execute)", err))?;
-            while let Some(row) = returned
-                .next()
-                .map_err(|err| SqliteBackend::storage_error("insert rows (returning)", err))?
-            {
-                let rowid = row
-                    .get(0)
-                    .map_err(|err| SqliteBackend::storage_error("insert rows (rowid)", err))?;
-                keys.push(Key(rowid));
-            }
+    fn insert_row_with_parent(
+        &mut self,
+        struct_id: StructId,
+        values: &[(FieldId, Val)],
+        rel: RelationId,
+        parent: Key,
+        _parent_is_first: bool,
+    ) -> Result<Key, ExecError> {
+        let (fk, pk) = self.relation_key_columns(rel)?;
+        let parent_key = self.fetch_parent_key(pk, parent)?;
+        let table = self.table_name(struct_id)?;
+        let (mut columns, mut params) = self.encode_row(struct_id, values)?;
+        columns.push(quote(self.schema.column_name(fk)));
+        params.push(parent_key);
+        self.insert_encoded_row(&table, &columns, &params)
+    }
+
+    fn insert_rows_with_parent(
+        &mut self,
+        struct_id: StructId,
+        rows: &[Vec<(FieldId, Val)>],
+        rel: RelationId,
+        parent: Key,
+        parent_is_first: bool,
+    ) -> Result<Vec<Key>, ExecError> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(keys)
+        let (fk, pk) = self.relation_key_columns(rel)?;
+        let parent_key = self.fetch_parent_key(pk, parent)?;
+        let table = self.table_name(struct_id)?;
+        let fk_column = quote(self.schema.column_name(fk));
+        let mut columns: Option<Vec<String>> = None;
+        let mut encoded_rows = Vec::with_capacity(rows.len());
+        for row in rows {
+            let (mut row_columns, mut params) = self.encode_row(struct_id, row)?;
+            row_columns.push(fk_column.clone());
+            params.push(parent_key.clone());
+            if let Some(existing) = &columns {
+                if existing != &row_columns {
+                    return rows
+                        .iter()
+                        .map(|row| {
+                            self.insert_row_with_parent(
+                                struct_id,
+                                row,
+                                rel,
+                                parent,
+                                parent_is_first,
+                            )
+                        })
+                        .collect();
+                }
+            } else {
+                columns = Some(row_columns);
+            }
+            encoded_rows.push(params);
+        }
+        let columns = columns.expect("rows is non-empty");
+        self.insert_encoded_rows(&table, &columns, &encoded_rows)
     }
 
     fn update_row(

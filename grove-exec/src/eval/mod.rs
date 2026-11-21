@@ -946,7 +946,7 @@ mod tests {
         let err = session
             .execute(&typed, FIXED_NOW, ExecOptions::default())
             .unwrap_err();
-        assert!(matches!(err, ExecError::ReadOnly { .. }), "{err:?}");
+        assert!(matches!(err, ExecError::Unsupported { .. }), "{err:?}");
         assert_eq!(session.bindings().count(), 0);
     }
 
