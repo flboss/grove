@@ -1,6 +1,6 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
@@ -11,13 +11,13 @@ use grove_schema::validated::{
 use rusqlite::config::DbConfig;
 use rusqlite::params_from_iter;
 use rusqlite::types::{Value, ValueRef};
-use rusqlite::{Connection, Statement};
+use rusqlite::{Connection, Statement, Transaction, TransactionBehavior};
 
 use crate::codec;
 use crate::error::ExecError;
 use crate::pushdown::{CmpOp, FetchConstraints, PushExpr, StringOp};
-use crate::storage::{Key, Row, Storage};
-use crate::value::{Scalar, Val};
+use crate::storage::{Key, Row, Storage, WriteTxn};
+use crate::value::{Scalar, Val, enum_variant_scalar};
 
 pub struct SqliteBackend<'a> {
     conn: Connection,
@@ -1150,7 +1150,322 @@ impl SqliteBackend<'_> {
     }
 }
 
+struct SqliteWriteTxn<'conn, 'schema> {
+    txn: Option<Transaction<'conn>>,
+    schema: &'schema ValidatedSchema,
+}
+
+impl SqliteWriteTxn<'_, '_> {
+    fn table_name(&self, struct_id: StructId) -> Result<String, ExecError> {
+        let struct_def =
+            self.schema
+                .structs
+                .get(struct_id.index())
+                .ok_or_else(|| ExecError::Integrity {
+                    message: format!("unknown struct id {} (internal error)", struct_id.index()),
+                })?;
+        Ok(quote(&self.schema.tables[struct_def.table.index()].name))
+    }
+
+    fn encode_row(
+        &self,
+        struct_id: StructId,
+        values: &[(FieldId, Val)],
+    ) -> Result<(Vec<String>, Vec<Value>), ExecError> {
+        let struct_def =
+            self.schema
+                .structs
+                .get(struct_id.index())
+                .ok_or_else(|| ExecError::Integrity {
+                    message: format!("unknown struct id {} (internal error)", struct_id.index()),
+                })?;
+        let mut seen = HashSet::with_capacity(values.len());
+        let mut columns = Vec::new();
+        let mut params = Vec::new();
+        for (field_id, value) in values {
+            if field_id.struct_id() != struct_id {
+                return Err(ExecError::Integrity {
+                    message: format!(
+                        "write field {field_id:?} belongs to another struct (internal error)"
+                    ),
+                });
+            }
+            if !seen.insert(field_id.local()) {
+                return Err(ExecError::Integrity {
+                    message: format!(
+                        "write field {field_id:?} specified more than once (internal error)"
+                    ),
+                });
+            }
+            let field =
+                struct_def
+                    .fields
+                    .get(field_id.local())
+                    .ok_or_else(|| ExecError::Integrity {
+                        message: format!(
+                            "unknown field {field_id:?} on struct `{}` (internal error)",
+                            struct_def.name
+                        ),
+                    })?;
+            match field {
+                Field::Value {
+                    ty,
+                    columns: field_columns,
+                    ..
+                } => {
+                    if ty.has_array() {
+                        return Err(ExecError::Unsupported {
+                            message: "writing array-valued fields is not yet implemented"
+                                .to_string(),
+                        });
+                    }
+                    let mut encoded = Vec::new();
+                    encode_value(ty, value, self.schema, &mut encoded)?;
+                    if encoded.len() != field_columns.len() {
+                        return Err(ExecError::Integrity {
+                            message: format!(
+                                "field {field_id:?} encoded to {} values for {} columns (internal error)",
+                                encoded.len(),
+                                field_columns.len()
+                            ),
+                        });
+                    }
+                    for (column, value) in field_columns.iter().zip(encoded) {
+                        columns.push(quote(self.schema.column_name(*column)));
+                        params.push(value);
+                    }
+                }
+                Field::Array { .. } => {
+                    return Err(ExecError::Unsupported {
+                        message: "writing array fields is not yet implemented".to_string(),
+                    });
+                }
+                Field::Ref { name, .. } => {
+                    return Err(ExecError::Integrity {
+                        message: format!(
+                            "attempted to write directly to referennce field `{}.{name}` (internal error)",
+                            struct_def.name
+                        ),
+                    });
+                }
+            }
+        }
+        Ok((columns, params))
+    }
+
+    fn txn(&self) -> Result<&Transaction<'_>, ExecError> {
+        self.txn.as_ref().ok_or_else(|| ExecError::Integrity {
+            message: "write transaction is already finished (internal error)".to_string(),
+        })
+    }
+}
+
+fn encode_value(
+    ty: &ValueType,
+    value: &Val,
+    schema: &ValidatedSchema,
+    out: &mut Vec<Value>,
+) -> Result<(), ExecError> {
+    match ty {
+        ValueType::Scalar(scalar_ty) => {
+            let Val::Scalar(scalar) = value else {
+                return Err(ExecError::Integrity {
+                    message: format!("expected scalar value, got {value}"),
+                });
+            };
+            let encoded = match (scalar_ty, scalar) {
+                (ScalarType::Int, Scalar::Int(n)) => Value::Integer(*n),
+                (ScalarType::Float, Scalar::Float(x)) => Value::Real(*x),
+                (ScalarType::Dec, Scalar::Dec(d)) => scalar_value(&Scalar::Dec(*d)),
+                (ScalarType::String, Scalar::String(s)) => Value::Text(s.clone()),
+                (ScalarType::Bytes, Scalar::Bytes(bytes)) => Value::Blob(bytes.clone()),
+                (ScalarType::Bool, Scalar::Bool(b)) => Value::Integer(i64::from(*b)),
+                (ScalarType::Instant, Scalar::Instant(t)) => scalar_value(&Scalar::Instant(*t)),
+                (ScalarType::Duration, Scalar::Duration(d)) => scalar_value(&Scalar::Duration(*d)),
+                _ => {
+                    return Err(ExecError::Integrity {
+                        message: format!("value {value} does not match column type {scalar_ty:?}"),
+                    });
+                }
+            };
+            out.push(encoded);
+        }
+        ValueType::Enum(id) => {
+            let Val::Enum(found, variant) = value else {
+                return Err(ExecError::Integrity {
+                    message: format!("expected enum value, got {value}"),
+                });
+            };
+            if found != id {
+                return Err(ExecError::Integrity {
+                    message: format!(
+                        "enum id {} does not match target {}",
+                        found.index(),
+                        id.index()
+                    ),
+                });
+            }
+            let enum_def = schema
+                .enums
+                .get(id.index())
+                .ok_or_else(|| ExecError::Integrity {
+                    message: format!("unknown enum id {} (internal error)", id.index()),
+                })?;
+            let scalar =
+                enum_variant_scalar(enum_def, *variant).ok_or_else(|| ExecError::Integrity {
+                    message: format!("enum `{}` has no variant index {variant}", enum_def.name),
+                })?;
+            out.push(scalar_value(&scalar));
+        }
+        ValueType::Optional(inner) => match value {
+            Val::None => {
+                for _ in 0..leaf_count(inner) {
+                    out.push(Value::Null);
+                }
+            }
+            Val::Some(value) => encode_value(inner, value, schema, out)?,
+            other => {
+                return Err(ExecError::Integrity {
+                    message: format!("expected optional value, got {other}"),
+                });
+            }
+        },
+        ValueType::Tuple(elements) => {
+            let Val::Tuple(values) = value else {
+                return Err(ExecError::Integrity {
+                    message: format!("expected tuple value, got {value}"),
+                });
+            };
+            if values.len() != elements.len() {
+                return Err(ExecError::Integrity {
+                    message: format!(
+                        "tuple has {} values for {} element types",
+                        values.len(),
+                        elements.len()
+                    ),
+                });
+            }
+            for (element_ty, value) in elements.iter().zip(values) {
+                encode_value(element_ty, value, schema, out)?;
+            }
+        }
+        ValueType::Array { .. } => {
+            return Err(ExecError::Unsupported {
+                message: "writing array values is not yet implemented".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+impl<'conn, 'schema> WriteTxn for SqliteWriteTxn<'conn, 'schema> {
+    fn insert_row(
+        &mut self,
+        struct_id: StructId,
+        values: &[(FieldId, Val)],
+    ) -> Result<Key, ExecError> {
+        let table = self.table_name(struct_id)?;
+        let (columns, params) = self.encode_row(struct_id, values)?;
+        let sql = if columns.is_empty() {
+            format!("INSERT INTO {table} DEFAULT VALUES")
+        } else {
+            let placeholders = vec!["?"; columns.len()].join(", ");
+            format!(
+                "INSERT INTO {table} ({}) VALUES ({placeholders})",
+                columns.join(", ")
+            )
+        };
+        let txn = self.txn()?;
+        let mut stmt = txn
+            .prepare_cached(&sql)
+            .map_err(|err| SqliteBackend::storage_error("insert row (prepare)", err))?;
+        stmt.execute(params_from_iter(params.iter()))
+            .map_err(|err| SqliteBackend::storage_error("insert row (execute)", err))?;
+        Ok(Key(txn.last_insert_rowid()))
+    }
+
+    fn update_row(
+        &mut self,
+        struct_id: StructId,
+        key: Key,
+        values: &[(FieldId, Val)],
+    ) -> Result<(), ExecError> {
+        let table = self.table_name(struct_id)?;
+        let (columns, mut params) = self.encode_row(struct_id, values)?;
+        if columns.is_empty() {
+            return Ok(());
+        }
+        let assignments = columns
+            .iter()
+            .map(|column| format!("{column} = ?"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        params.push(Value::Integer(key.0));
+        let sql = format!("UPDATE {table} SET {assignments} WHERE _rowid_ = ?");
+        let txn = self.txn()?;
+        let mut stmt = txn
+            .prepare_cached(&sql)
+            .map_err(|err| SqliteBackend::storage_error("update row (prepare)", err))?;
+        stmt.execute(params_from_iter(params.iter()))
+            .map_err(|err| SqliteBackend::storage_error("update row (execute)", err))?;
+        Ok(())
+    }
+
+    fn delete_rows(&mut self, struct_id: StructId, keys: &[Key]) -> Result<(), ExecError> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let table = self.table_name(struct_id)?;
+        let txn = self.txn()?;
+        for chunk in keys.chunks(500) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!("DELETE FROM {table} WHERE _rowid_ IN ({placeholders})");
+            let params = chunk.iter().map(|key| Value::Integer(key.0));
+            let mut stmt = txn
+                .prepare_cached(&sql)
+                .map_err(|err| SqliteBackend::storage_error("delete rows (prepare)", err))?;
+            stmt.execute(params_from_iter(params))
+                .map_err(|err| SqliteBackend::storage_error("delete rows (execute)", err))?;
+        }
+        Ok(())
+    }
+
+    fn commit(&mut self) -> Result<(), ExecError> {
+        let txn = self.txn.take().ok_or_else(|| ExecError::Integrity {
+            message: "write transaction is already finished (internal error)".to_string(),
+        })?;
+        txn.commit()
+            .map_err(|err| SqliteBackend::storage_error("commit write transaction", err))
+    }
+
+    fn rollback(&mut self) -> Result<(), ExecError> {
+        let txn = self.txn.take().ok_or_else(|| ExecError::Integrity {
+            message: "write transaction is already finished (internal error)".to_string(),
+        })?;
+        txn.rollback()
+            .map_err(|err| SqliteBackend::storage_error("rollback write transaction", err))
+    }
+}
+
 impl Storage for SqliteBackend<'_> {
+    fn begin_write(&self) -> Result<Box<dyn WriteTxn + '_>, ExecError> {
+        if self
+            .conn
+            .is_readonly("main")
+            .map_err(|err| Self::storage_error("check read-only database", err))?
+        {
+            return Err(ExecError::ReadOnly {
+                message: "database connection is read-only".to_string(),
+            });
+        }
+        let txn = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+            .map_err(|err| Self::storage_error("begin write transaction", err))?;
+        Ok(Box::new(SqliteWriteTxn {
+            txn: Some(txn),
+            schema: self.schema,
+        }))
+    }
+
     fn fetch(
         &self,
         struct_id: StructId,
@@ -3430,5 +3745,145 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, ExecError::Integrity { .. }), "{err:?}");
+    }
+
+    fn write_schema() -> ValidatedSchema {
+        grove_schema::validate(
+            grove_schema::parse_schema(
+                r#"
+                root items: Item;
+                struct Item {
+                    id: Int,
+                    name: String,
+                    maybe: ?Int,
+                }
+                "#,
+            )
+            .0
+            .expect("invalid write schema"),
+        )
+        .0
+        .expect("invalid write schema")
+    }
+
+    fn write_item_fields(schema: &ValidatedSchema) -> (StructId, FieldId, FieldId, FieldId) {
+        let item = schema.roots[0].struct_id;
+        (
+            item,
+            schema.struct_field(item, "id").unwrap().0,
+            schema.struct_field(item, "name").unwrap().0,
+            schema.struct_field(item, "maybe").unwrap().0,
+        )
+    }
+
+    fn write_test_backend(schema: &ValidatedSchema) -> Result<SqliteBackend<'_>, rusqlite::Error> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch("CREATE TABLE items(id INTEGER, name TEXT, maybe INTEGER)")?;
+        Ok(SqliteBackend::new(conn, schema).expect("write test backend should pass verification"))
+    }
+
+    #[test]
+    fn write_txn_insert_commit_read() {
+        let schema = write_schema();
+        let backend = write_test_backend(&schema).unwrap();
+        let (item, id, name, maybe) = write_item_fields(&schema);
+
+        let mut txn = backend.begin_write().unwrap();
+        let key = txn
+            .insert_row(
+                item,
+                &[(id, int(1)), (name, str("alpha")), (maybe, Val::None)],
+            )
+            .unwrap();
+        txn.commit().unwrap();
+
+        let rows = backend
+            .fetch(item, &[id, name, maybe], &FetchConstraints::EMPTY)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].rowid, key);
+        assert_eq!(rows[0].values, vec![int(1), str("alpha"), Val::None]);
+    }
+
+    #[test]
+    fn write_txn_drop_rollback() {
+        let schema = write_schema();
+        let backend = write_test_backend(&schema).unwrap();
+        let (item, id, name, maybe) = write_item_fields(&schema);
+
+        let mut txn = backend.begin_write().unwrap();
+        txn.insert_row(
+            item,
+            &[(id, int(1)), (name, str("alpha")), (maybe, Val::None)],
+        )
+        .unwrap();
+        drop(txn);
+
+        let rows = backend
+            .fetch(item, &[id, name, maybe], &FetchConstraints::EMPTY)
+            .unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn write_txn_update_delete_batch_insert() {
+        let schema = write_schema();
+        let backend = write_test_backend(&schema).unwrap();
+        let (item, id, name, maybe) = write_item_fields(&schema);
+
+        let mut txn = backend.begin_write().unwrap();
+        let keys = txn
+            .insert_rows(
+                item,
+                &[
+                    vec![(id, int(1)), (name, str("alpha")), (maybe, Val::None)],
+                    vec![(id, int(2)), (name, str("beta")), (maybe, Val::None)],
+                ],
+            )
+            .unwrap();
+        assert_eq!(keys.len(), 2);
+
+        txn.update_row(item, keys[0], &[(name, str("gamma"))])
+            .unwrap();
+        txn.commit().unwrap();
+
+        let rows = backend
+            .fetch(item, &[id, name, maybe], &FetchConstraints::EMPTY)
+            .unwrap();
+        assert_eq!(rows[0].values, vec![int(1), str("gamma"), Val::None]);
+        assert_eq!(rows[1].values, vec![int(2), str("beta"), Val::None]);
+
+        let mut txn = backend.begin_write().unwrap();
+        txn.delete_rows(item, &keys).unwrap();
+        txn.commit().unwrap();
+
+        let rows = backend
+            .fetch(item, &[id, name, maybe], &FetchConstraints::EMPTY)
+            .unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn write_txn_readonly_connection_rejected() {
+        let schema = write_schema();
+        let path = std::env::temp_dir().join(format!(
+            "grove-write-txn-readonly-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE items(id INTEGER, name TEXT, maybe INTEGER)")
+                .unwrap();
+        }
+        let conn =
+            Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let backend = SqliteBackend::new(conn, &schema).unwrap();
+        assert!(matches!(
+            backend.begin_write(),
+            Err(ExecError::ReadOnly { .. })
+        ));
+        drop(backend);
+        let _ = std::fs::remove_file(&path);
     }
 }
