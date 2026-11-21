@@ -5,7 +5,7 @@ use grove_query::ast::{BinaryOp, Literal, SortDir, UnaryOp};
 use grove_query::methods::MethodId;
 use grove_query::typecheck::types::{
     IdentBinding, QueryType, RecordSource, TypedExpr, TypedExprKind, TypedMethodArg,
-    TypedQueryFile, TypedStatement,
+    TypedMutationStmt, TypedQueryFile, TypedStatement,
 };
 use grove_schema::validated::{Field, FieldId, ScalarType, StructId, ValidatedSchema, ValueType};
 use grove_types::NodeId;
@@ -151,7 +151,17 @@ impl PushdownPlan {
                     };
                     builder.visit(&let_stmt.value, need);
                 }
-                TypedStatement::Expr(_) | TypedStatement::Mutation(_) => {}
+                TypedStatement::Expr(_) => {}
+                TypedStatement::Mutation(mutation) => match mutation {
+                    TypedMutationStmt::Insert { base, arg, .. }
+                    | TypedMutationStmt::Update { base, arg, .. } => {
+                        builder.visit(base, Need::Narrow);
+                        builder.visit(arg, Need::Narrow);
+                    }
+                    TypedMutationStmt::Delete { base, .. } => {
+                        builder.visit(base, Need::Narrow);
+                    }
+                },
             }
         }
         if let Some(result) = &file.result {
