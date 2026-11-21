@@ -22,7 +22,11 @@ pub enum TypeError {
     EmptyProjection { span: Span },
     MutationOnProjection { span: Span },
     MutationOnNonList { got: String, span: Span },
-    InsertOnNonRoot { got: String, span: Span },
+    MutationOnOptional { got: String, span: Span },
+    MutationTargetNotTraceable { got: String, span: Span },
+    InsertOnRecord { got: String, span: Span },
+    InsertTargetNotCollection { got: String, span: Span },
+    InsertOnNonOwningCollection { field: String, struct_name: String, span: Span },
     StructFieldNotInSchema { field: String, struct_name: String, span: Span },
     InsertMissingRequiredField { field: String, struct_name: String, span: Span },
     StructFieldTypeMismatch { field: String, struct_name: String, expected: String, got: String, span: Span },
@@ -191,14 +195,48 @@ impl From<TypeError> for Diagnostic {
                 "QT0020",
                 format!("mutation base type incompatible, got `{got}`"),
                 span,
+                "expected a record or list of records",
+            ),
+            TypeError::MutationOnOptional { got, span } => Diagnostic::error(
+                "QT0035",
+                format!("cannot mutate optional target `{got}` without optional chaining"),
+                span,
+                "optional mutation target",
+            )
+            .with_help("use `?.` on the mutation call or unwrap the target first"),
+            TypeError::MutationTargetNotTraceable { got, span } => Diagnostic::error(
+                "QT0036",
+                format!("mutation target `{got}` cannot be traced to storage data"),
+                span,
+                "untraceable mutation target",
+            )
+            .with_note("targets must come directly from storage, not from `let`, `map`, or constructed values"),
+            TypeError::InsertOnRecord { got, span } => Diagnostic::error(
+                "QT0037",
+                format!("insert target must be a list of records, got `{got}`"),
+                span,
                 "expected list of records",
             ),
-            TypeError::InsertOnNonRoot { got, span } => Diagnostic::error(
-                "QT0021",
-                format!("insert base must be a root collection, got `{got}`"),
+            TypeError::InsertTargetNotCollection { got, span } => Diagnostic::error(
+                "QT0038",
+                format!("insert target `{got}` does not identify a single mutable collection"),
                 span,
-                "expected root collection",
-            ),
+                "ambiguous insert collection",
+            )
+            .with_note("`flatten`, `extend`, and `map` do not preserve a single insert collection"),
+            TypeError::InsertOnNonOwningCollection {
+                field,
+                struct_name,
+                span,
+            } => Diagnostic::error(
+                "QT0039",
+                format!(
+                    "cannot insert through non-owning collection `{struct_name}.{field}`"
+                ),
+                span,
+                "non-owning insert target",
+            )
+            .with_note("inserting non-owning references is not implemented"),
             TypeError::StructFieldNotInSchema {
                 field,
                 struct_name,

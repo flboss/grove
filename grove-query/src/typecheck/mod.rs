@@ -1502,7 +1502,7 @@ fn typecheck_mutation(
     match kind {
         MutationKind::Delete => {
             let typed_base = infer(&mutation.base, env)?;
-            check_mutation_base(&typed_base.ty, typed_base.span)?;
+            check_mutation_base(&typed_base, mutation.opt_depth)?;
             Ok(TypedStatement::Mutation(TypedMutationStmt::Delete {
                 span: mutation.kind.span,
                 base: typed_base,
@@ -1510,7 +1510,8 @@ fn typecheck_mutation(
             }))
         }
         MutationKind::Insert => {
-            let (typed_base, struct_id) = check_insert_base(&mutation.base, env)?;
+            let typed_base = infer(&mutation.base, env)?;
+            let struct_id = check_insert_base(&typed_base, mutation.opt_depth, env.schema())?;
             let mut typed_arg = infer(&mutation.args[0], env)?;
             validate_insert(struct_id, &mut typed_arg, env)?;
             Ok(TypedStatement::Mutation(TypedMutationStmt::Insert {
@@ -1522,7 +1523,7 @@ fn typecheck_mutation(
         }
         MutationKind::Update => {
             let typed_base = infer(&mutation.base, env)?;
-            let struct_id = check_mutation_base(&typed_base.ty, typed_base.span)?;
+            let struct_id = check_mutation_base(&typed_base, mutation.opt_depth)?;
             env.push_scope();
             env.define(
                 "prev".to_string(),
@@ -1542,77 +1543,170 @@ fn typecheck_mutation(
     }
 }
 
-fn check_mutation_base(ty: &QueryType, span: Span) -> Result<StructId, TypeError> {
-    match ty {
-        QueryType::List(inner) => match inner.as_ref() {
-            QueryType::Record(RecordSource::Schema(id)) => Ok(*id),
-            QueryType::Record(RecordSource::Projection(_)) => {
-                Err(TypeError::MutationOnProjection { span })
-            }
-            _ => Err(TypeError::MutationOnNonList {
-                got: ty.to_string(),
-                span,
-            }),
-        },
-        _ => Err(TypeError::MutationOnNonList {
-            got: ty.to_string(),
-            span,
-        }),
-    }
-}
-
-fn check_insert_base(base: &Expr, env: &mut TypeEnv) -> Result<(TypedExpr, StructId), TypeError> {
-    let base_ident = match base {
-        Expr::Ident(name) => name,
-        _ => {
-            return Err(TypeError::InsertOnNonRoot {
-                got: "expression".into(),
-                span: base.span(),
-            });
-        }
-    };
-    let Some(root_idx) = env
-        .schema()
-        .roots
-        .iter()
-        .position(|r| r.name == base_ident.value)
-    else {
-        return Err(TypeError::InsertOnNonRoot {
-            got: base_ident.value.clone(),
-            span: base_ident.span,
+fn check_mutation_base(typed_base: &TypedExpr, opt_depth: usize) -> Result<StructId, TypeError> {
+    let Some(ty) = typed_base.ty.unwrap_optional_depth(opt_depth) else {
+        return Err(TypeError::OptionalDepthMismatch {
+            depth: opt_depth,
+            ty: typed_base.ty.to_string(),
+            span: typed_base.span,
         });
     };
-    let (entry, depth) = env
-        .resolve(base_ident)
-        .ok_or_else(|| TypeError::UnknownIdentifier {
-            name: base_ident.to_string(),
-            span: base_ident.span,
-        })?;
-    let struct_id = match &entry.ty {
-        QueryType::List(inner)
-            if let QueryType::Record(RecordSource::Schema(id)) = inner.as_ref() =>
-        {
-            *id
+    if ty.is_optional() {
+        return Err(TypeError::MutationOnOptional {
+            got: typed_base.ty.to_string(),
+            span: typed_base.span,
+        });
+    }
+
+    let struct_id = match ty {
+        QueryType::Record(RecordSource::Schema(id)) => *id,
+        QueryType::List(inner) => match inner.as_ref() {
+            QueryType::Record(RecordSource::Schema(id)) => *id,
+            QueryType::Record(RecordSource::Projection(_)) => {
+                return Err(TypeError::MutationOnProjection {
+                    span: typed_base.span,
+                });
+            }
+            _ => {
+                return Err(TypeError::MutationOnNonList {
+                    got: typed_base.ty.to_string(),
+                    span: typed_base.span,
+                });
+            }
+        },
+        QueryType::Record(RecordSource::Projection(_)) => {
+            return Err(TypeError::MutationOnProjection {
+                span: typed_base.span,
+            });
         }
         _ => {
-            return Err(TypeError::InsertOnNonRoot {
-                got: base_ident.value.clone(),
-                span: base_ident.span,
+            return Err(TypeError::MutationOnNonList {
+                got: typed_base.ty.to_string(),
+                span: typed_base.span,
             });
         }
     };
-    let span = base.span();
-    let typed_base = env.typed_with_provenance(
-        TypedExprKind::Ident {
-            name: base_ident.clone(),
-            binding: IdentBinding::Root { root_idx },
-            depth,
+
+    if !typed_base.provenance.rows {
+        return Err(TypeError::MutationTargetNotTraceable {
+            got: typed_base.ty.to_string(),
+            span: typed_base.span,
+        });
+    }
+    Ok(struct_id)
+}
+
+fn check_insert_base(
+    typed_base: &TypedExpr,
+    opt_depth: usize,
+    schema: &ValidatedSchema,
+) -> Result<StructId, TypeError> {
+    let Some(ty) = typed_base.ty.unwrap_optional_depth(opt_depth) else {
+        return Err(TypeError::OptionalDepthMismatch {
+            depth: opt_depth,
+            ty: typed_base.ty.to_string(),
+            span: typed_base.span,
+        });
+    };
+    if ty.is_optional() {
+        return Err(TypeError::MutationOnOptional {
+            got: typed_base.ty.to_string(),
+            span: typed_base.span,
+        });
+    }
+
+    let struct_id = match ty {
+        QueryType::List(inner) => match inner.as_ref() {
+            QueryType::Record(RecordSource::Schema(id)) => *id,
+            QueryType::Record(RecordSource::Projection(_)) => {
+                return Err(TypeError::MutationOnProjection {
+                    span: typed_base.span,
+                });
+            }
+            _ => {
+                return Err(TypeError::MutationOnNonList {
+                    got: typed_base.ty.to_string(),
+                    span: typed_base.span,
+                });
+            }
         },
-        entry.ty.clone(),
-        TargetProvenance::root(root_idx),
-        span,
-    );
-    Ok((typed_base, struct_id))
+        QueryType::Record(RecordSource::Schema(_))
+        | QueryType::Record(RecordSource::Projection(_)) => {
+            return Err(TypeError::InsertOnRecord {
+                got: typed_base.ty.to_string(),
+                span: typed_base.span,
+            });
+        }
+        _ => {
+            return Err(TypeError::MutationOnNonList {
+                got: typed_base.ty.to_string(),
+                span: typed_base.span,
+            });
+        }
+    };
+
+    if !typed_base.provenance.rows {
+        return Err(TypeError::MutationTargetNotTraceable {
+            got: typed_base.ty.to_string(),
+            span: typed_base.span,
+        });
+    }
+
+    let Some(collection) = typed_base.provenance.collection else {
+        return Err(TypeError::InsertTargetNotCollection {
+            got: typed_base.ty.to_string(),
+            span: typed_base.span,
+        });
+    };
+    match collection {
+        CollectionOriginKind::Root(root_idx) => {
+            if let Some(root) = schema.roots.get(root_idx)
+                && root.struct_id == struct_id
+            {
+            } else {
+                return Err(TypeError::MutationTargetNotTraceable {
+                    got: typed_base.ty.to_string(),
+                    span: typed_base.span,
+                });
+            };
+        }
+        CollectionOriginKind::Ref(field_id) => {
+            let Some(Field::Ref {
+                name,
+                target,
+                is_list,
+                owning,
+                ..
+            }) = schema.field(field_id)
+            else {
+                return Err(TypeError::MutationTargetNotTraceable {
+                    got: typed_base.ty.to_string(),
+                    span: typed_base.span,
+                });
+            };
+            if *target != struct_id {
+                return Err(TypeError::MutationTargetNotTraceable {
+                    got: typed_base.ty.to_string(),
+                    span: typed_base.span,
+                });
+            }
+            if !*is_list {
+                return Err(TypeError::InsertOnRecord {
+                    got: typed_base.ty.to_string(),
+                    span: typed_base.span,
+                });
+            }
+            if !*owning {
+                let struct_name = schema.structs[field_id.struct_id().index()].name.clone();
+                return Err(TypeError::InsertOnNonOwningCollection {
+                    field: name.clone(),
+                    struct_name,
+                    span: typed_base.span,
+                });
+            }
+        }
+    }
+    Ok(struct_id)
 }
 
 fn expect_constructed_record(
@@ -1868,6 +1962,39 @@ mod tests {
         )
         .0
         .expect("invalid test schema")
+    }
+
+    const MUTATION_SCHEMA_SRC: &str = r#"
+        root users: User;
+        root images: Image;
+        struct User {
+            id: Int,
+            name: String,
+            orders: List<Order>,
+        }
+        struct Order {
+            id: Int,
+            total: Int,
+            user: &User,
+            image: &?Image,
+        }
+        struct Image {
+            id: Int,
+            title: String,
+            orders: &List<Order>,
+        }
+        rel Order.user <<-> User.orders (orders.user_id -> users.id);
+        rel Image.orders <->> Order.image (orders.image_id -> images.id);
+    "#;
+
+    fn mutation_schema() -> ValidatedSchema {
+        grove_schema::validate(
+            grove_schema::parse_schema(MUTATION_SCHEMA_SRC)
+                .0
+                .expect("invalid mutation schema"),
+        )
+        .0
+        .expect("invalid mutation schema")
     }
 
     const ENUM_SCHEMA_SRC: &str = r#"
@@ -4362,14 +4489,136 @@ mod tests {
     }
 
     #[test]
-    fn mutation_preserves_optional_depth() {
-        let typed = typecheck_ok("users?.delete(); 0", &test_schema());
+    fn mutation_optional_depth_preserved() {
+        let typed = typecheck_ok("users.first()?.delete(); 0", &test_schema());
         let TypedStatement::Mutation(TypedMutationStmt::Delete { opt_depth, .. }) =
             &typed.statements[0]
         else {
             panic!("expected delete mutation");
         };
         assert_eq!(*opt_depth, 1);
+    }
+
+    #[test]
+    fn mutation_record_targets() {
+        let schema = test_schema();
+        typecheck_ok("users.first().unwrap().delete(); 0", &schema);
+        typecheck_ok("users.first().unwrap().update({ age = 31 }); 0", &schema);
+        typecheck_ok("users.first()?.delete(); 0", &schema);
+        typecheck_ok("users.first()?.update({ age = 31 }); 0", &schema);
+    }
+
+    #[test]
+    fn mutation_optional_target_errors() {
+        let schema = test_schema();
+        assert_eq!(
+            error_codes("users.first().delete(); 0", &schema),
+            ["QT0035"]
+        );
+        assert_eq!(
+            error_codes("users.first().update({ age = 31 }); 0", &schema),
+            ["QT0035"]
+        );
+        assert_eq!(
+            error_codes("users.first()??.delete(); 0", &schema),
+            ["QT0032"]
+        );
+    }
+
+    #[test]
+    fn mutation_let_targets_rejected() {
+        let schema = mutation_schema();
+        assert_eq!(
+            error_codes("let u = users; u.delete(); 0", &schema),
+            ["QT0036"]
+        );
+        assert_eq!(
+            error_codes(
+                r#"let u = users; u.insert({ id = 1, name = "A", orders = [] }); 0"#,
+                &schema
+            ),
+            ["QT0036"]
+        );
+    }
+
+    #[test]
+    fn mutation_insert_targets() {
+        let schema = mutation_schema();
+        typecheck_ok(
+            r#"users.insert({ id = 1, name = "A", orders = [] }); 0"#,
+            &schema,
+        );
+        typecheck_ok(
+            r#"users[id > 0].insert({ id = 1, name = "A", orders = [] }); 0"#,
+            &schema,
+        );
+        typecheck_ok(
+            r#"users.first().unwrap().orders.insert({ id = 1, total = 10 }); 0"#,
+            &schema,
+        );
+        typecheck_ok(
+            r#"users.first()?.orders?.insert({ id = 1, total = 10 }); 0"#,
+            &schema,
+        );
+
+        assert_eq!(
+            error_codes(
+                r#"users.first().unwrap().insert({ id = 1, name = "A", orders = [] }); 0"#,
+                &schema
+            ),
+            ["QT0037"]
+        );
+        assert_eq!(
+            error_codes(
+                r#"users.orders.flatten().insert({ id = 1, total = 10 }); 0"#,
+                &schema
+            ),
+            ["QT0038"]
+        );
+        assert_eq!(
+            error_codes(
+                r#"users.extend(users.take(0)).insert({ id = 1, name = "A", orders = [] }); 0"#,
+                &schema
+            ),
+            ["QT0038"]
+        );
+        assert_eq!(
+            error_codes(
+                r#"images.first().unwrap().orders.insert({ id = 1, total = 10 }); 0"#,
+                &schema
+            ),
+            ["QT0039"]
+        );
+    }
+
+    #[test]
+    fn mutation_nested_and_non_owning_delete_targets() {
+        let schema = mutation_schema();
+        typecheck_ok("users.orders.flatten().delete(); 0", &schema);
+        typecheck_ok("users.orders.flatten().update({ total = 1 }); 0", &schema);
+        typecheck_ok("users.first()?.orders?.delete(); 0", &schema);
+        typecheck_ok("images.first().unwrap().orders.delete(); 0", &schema);
+    }
+
+    #[test]
+    fn mutation_projected_and_untraceable_targets() {
+        let schema = mutation_schema();
+        assert_eq!(
+            error_codes(
+                r#"users { id }.insert({ id = 1, name = "A", orders = [] }); 0"#,
+                &schema
+            ),
+            ["QT0019"]
+        );
+        assert_eq!(error_codes("users { id }.delete(); 0", &schema), ["QT0019"]);
+        assert_eq!(
+            error_codes(
+                r#"users.map($).insert({ id = 1, name = "A", orders = [] }); 0"#,
+                &schema
+            ),
+            ["QT0036"]
+        );
+        assert_eq!(error_codes("users.map($).delete(); 0", &schema), ["QT0036"]);
     }
 
     #[test]
@@ -4505,15 +4754,6 @@ mod tests {
     fn mutation_duplicate_field() {
         let (file, _diags) = crate::parse_query(
             r#"users.insert({ name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, name = "Bob", created = @now }); 0"#,
-        );
-        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
-        assert!(!diags.is_empty());
-    }
-
-    #[test]
-    fn mutation_insert_on_non_root() {
-        let (file, _diags) = crate::parse_query(
-            r#"users[age == 30].insert({ name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, created = @now }); 0"#,
         );
         let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(!diags.is_empty());
