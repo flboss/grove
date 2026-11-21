@@ -118,6 +118,17 @@ pub trait WriteTxn {
         })
     }
 
+    fn delete_array_field(
+        &mut self,
+        _struct_id: StructId,
+        _field_id: FieldId,
+        _keys: &[Key],
+    ) -> Result<(), ExecError> {
+        Err(ExecError::Unsupported {
+            message: "backend does not support array-row cleanup".to_string(),
+        })
+    }
+
     fn commit(&mut self) -> Result<(), ExecError>;
 
     fn rollback(&mut self) -> Result<(), ExecError>;

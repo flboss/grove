@@ -1500,6 +1500,45 @@ impl SqliteWriteTxn<'_, '_> {
         }
     }
 
+    fn delete_array_tree(
+        &self,
+        storage: &StorageTable,
+        element: &ValueType,
+        parent_select: &str,
+        params: &[Value],
+    ) -> Result<(), ExecError> {
+        let mut nodes = Vec::new();
+        let mut pos = 0;
+        collect_top_level_arrays(element, &mut pos, &mut nodes);
+        let parent_table = quote(&self.schema.tables[storage.table.index()].name);
+        let parent_key = quote(self.schema.column_name(storage.key));
+        for (child_storage, child_element, child_pos) in nodes {
+            let parent_link = storage
+                .value
+                .get(child_pos)
+                .ok_or_else(|| ExecError::Integrity {
+                    message: "nested array position has no storage column (internal error)"
+                        .to_string(),
+                })?;
+            let parent_link = quote(self.schema.column_name(*parent_link));
+            let nested_select = format!(
+                "SELECT p.{parent_link} FROM {parent_table} AS p \
+                 WHERE p.{parent_key} IN ({parent_select})"
+            );
+            self.delete_array_tree(child_storage, child_element, &nested_select, params)?;
+        }
+        let table = quote(&self.schema.tables[storage.table.index()].name);
+        let key = quote(self.schema.column_name(storage.key));
+        let sql = format!("DELETE FROM {table} WHERE {key} IN ({parent_select})");
+        let txn = self.txn()?;
+        let mut stmt = txn
+            .prepare_cached(&sql)
+            .map_err(|err| SqliteBackend::storage_error("delete array rows (prepare)", err))?;
+        stmt.execute(params_from_iter(params.iter()))
+            .map_err(|err| SqliteBackend::storage_error("delete array rows (execute)", err))?;
+        Ok(())
+    }
+
     fn txn(&self) -> Result<&Transaction<'_>, ExecError> {
         self.txn.as_ref().ok_or_else(|| ExecError::Integrity {
             message: "write transaction is already finished (internal error)".to_string(),
@@ -1611,6 +1650,26 @@ fn value_write_width(ty: &ValueType) -> usize {
         ValueType::Scalar(_) | ValueType::Enum(_) | ValueType::Array { .. } => 1,
         ValueType::Tuple(elements) => elements.iter().map(value_write_width).sum(),
         ValueType::Optional(inner) => value_write_width(inner),
+    }
+}
+
+fn collect_top_level_arrays<'a>(
+    ty: &'a ValueType,
+    pos: &mut usize,
+    out: &mut Vec<(&'a StorageTable, &'a ValueType, usize)>,
+) {
+    match ty {
+        ValueType::Scalar(_) | ValueType::Enum(_) => *pos += 1,
+        ValueType::Tuple(elements) => {
+            for element in elements {
+                collect_top_level_arrays(element, pos, out);
+            }
+        }
+        ValueType::Optional(inner) => collect_top_level_arrays(inner, pos, out),
+        ValueType::Array { element, storage } => {
+            out.push((storage, element, *pos));
+            *pos += 1;
+        }
     }
 }
 
@@ -1857,6 +1916,79 @@ impl<'conn, 'schema> WriteTxn for SqliteWriteTxn<'conn, 'schema> {
                 .map_err(|err| SqliteBackend::storage_error("delete join rows (prepare)", err))?;
             stmt.execute(params_from_iter(params))
                 .map_err(|err| SqliteBackend::storage_error("delete join rows (execute)", err))?;
+        }
+        Ok(())
+    }
+
+    fn delete_array_field(
+        &mut self,
+        struct_id: StructId,
+        field_id: FieldId,
+        keys: &[Key],
+    ) -> Result<(), ExecError> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let struct_def =
+            self.schema
+                .structs
+                .get(struct_id.index())
+                .ok_or_else(|| ExecError::Integrity {
+                    message: format!("unknown struct id {} (internal error)", struct_id.index()),
+                })?;
+        let field =
+            struct_def
+                .fields
+                .get(field_id.local())
+                .ok_or_else(|| ExecError::Integrity {
+                    message: format!("unknown field {field_id:?} (internal error)"),
+                })?;
+        if field_id.struct_id() != struct_id {
+            return Err(ExecError::Integrity {
+                message: "array field belongs to another struct (internal error)".to_string(),
+            });
+        }
+        let table = quote(&self.schema.tables[struct_def.table.index()].name);
+        match field {
+            Field::Array {
+                link,
+                element,
+                storage,
+                ..
+            } => {
+                for chunk in keys.chunks(500) {
+                    let placeholders = vec!["?"; chunk.len()].join(", ");
+                    let link = quote(self.schema.column_name(*link));
+                    let parent_select = format!(
+                        "SELECT o.{link} FROM {table} AS o WHERE o._rowid_ IN ({placeholders})"
+                    );
+                    let params: Vec<Value> =
+                        chunk.iter().map(|key| Value::Integer(key.0)).collect();
+                    self.delete_array_tree(storage, element, &parent_select, &params)?;
+                }
+            }
+            Field::Value { ty, columns, .. } if ty.has_array() => {
+                let mut nodes = Vec::new();
+                let mut pos = 0;
+                collect_top_level_arrays(ty, &mut pos, &mut nodes);
+                for chunk in keys.chunks(500) {
+                    let placeholders = vec!["?"; chunk.len()].join(", ");
+                    let params: Vec<Value> =
+                        chunk.iter().map(|key| Value::Integer(key.0)).collect();
+                    for (storage, element, node_pos) in &nodes {
+                        let link = columns.get(*node_pos).ok_or_else(|| ExecError::Integrity {
+                            message: "array position has no owner column (internal error)"
+                                .to_string(),
+                        })?;
+                        let link = quote(self.schema.column_name(*link));
+                        let parent_select = format!(
+                            "SELECT o.{link} FROM {table} AS o WHERE o._rowid_ IN ({placeholders})"
+                        );
+                        self.delete_array_tree(storage, element, &parent_select, &params)?;
+                    }
+                }
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -4316,5 +4448,73 @@ mod tests {
         ));
         drop(backend);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_txn_delete_array_field_recursive() {
+        let schema = grove_schema::validate(
+            grove_schema::parse_schema(
+                r#"
+                root rows: Row;
+                struct Row {
+                    id: Int,
+                    tags: List<String>@tags_ref via row_tags[row_key, tag],
+                    nums: List<Int>@nums_ref via row_nums[row_key, num],
+                    matrix: List<List<Int> via inner_nums[inner_key, val]>@matrix_ref
+                        via outer_nums[outer_key, inner_key],
+                    extra: (Int, List<String> via extra_tags[ekey, eval])@(eid, elink),
+                }
+                "#,
+            )
+            .0
+            .unwrap(),
+        )
+        .0
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE rows(id INTEGER, tags_ref INTEGER, nums_ref INTEGER,
+                 matrix_ref INTEGER, eid INTEGER, elink INTEGER);
+             CREATE TABLE row_tags(row_key INTEGER, tag TEXT);
+             CREATE TABLE row_nums(row_key INTEGER, num INTEGER);
+             CREATE TABLE outer_nums(outer_key INTEGER, inner_key INTEGER);
+             CREATE TABLE inner_nums(inner_key INTEGER, val INTEGER);
+             CREATE TABLE extra_tags(ekey INTEGER, eval TEXT);
+             INSERT INTO rows VALUES (1, 100, 110, 200, 7, 300);
+             INSERT INTO row_tags VALUES (100, 'a'), (100, 'b');
+             INSERT INTO row_nums VALUES (110, 1), (110, 2);
+             INSERT INTO outer_nums VALUES (200, 20);
+             INSERT INTO inner_nums VALUES (20, 1), (20, 2);
+             INSERT INTO extra_tags VALUES (300, 'x');",
+        )
+        .unwrap();
+        let backend = SqliteBackend::new(conn, &schema).unwrap();
+        let row = schema.roots[0].struct_id;
+        let tags = schema.struct_field(row, "tags").unwrap().0;
+        let nums = schema.struct_field(row, "nums").unwrap().0;
+        let matrix = schema.struct_field(row, "matrix").unwrap().0;
+        let extra = schema.struct_field(row, "extra").unwrap().0;
+
+        let mut txn = backend.begin_write().unwrap();
+        for field in [tags, nums, matrix, extra] {
+            txn.delete_array_field(row, field, &[Key(1)]).unwrap();
+        }
+        txn.commit().unwrap();
+
+        for table in [
+            "row_tags",
+            "row_nums",
+            "outer_nums",
+            "inner_nums",
+            "extra_tags",
+        ] {
+            let count: i64 = backend
+                .conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "{table}");
+        }
     }
 }

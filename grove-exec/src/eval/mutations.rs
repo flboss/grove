@@ -499,6 +499,20 @@ fn delete_owned_cascade(
         delete_owned_cascade(ctx, write, target, child_keys, seen)?;
     }
 
+    let array_fields: Vec<FieldId> = struct_def
+        .fields
+        .iter()
+        .enumerate()
+        .filter_map(|(local, field)| match field {
+            Field::Array { .. } => Some(FieldId::new(struct_id, local)),
+            Field::Value { ty, .. } if ty.has_array() => Some(FieldId::new(struct_id, local)),
+            _ => None,
+        })
+        .collect();
+    for field_id in array_fields {
+        write.delete_array_field(struct_id, field_id, &keys)?;
+    }
+
     cleanup_non_owned_links(ctx.schema, struct_id, &keys, write)?;
     write.delete_rows(struct_id, &keys)
 }
