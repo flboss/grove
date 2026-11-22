@@ -71,6 +71,7 @@ pub enum TokenKind {
     Star,
     Slash,
     Percent,
+    Ampersand,
     AmpAmp,
     PipePipe,
     DoubleColon,

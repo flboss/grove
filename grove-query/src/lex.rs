@@ -103,7 +103,7 @@ impl<'src> Lexer<'src> {
                 '!' => self.scan_pair(start, '=', TokenKind::BangEquals, TokenKind::Bang),
                 '<' => self.scan_pair(start, '=', TokenKind::LessEquals, TokenKind::Less),
                 '>' => self.scan_pair(start, '=', TokenKind::GreaterEquals, TokenKind::Greater),
-                '&' => self.scan_amp_or_error(start),
+                '&' => self.scan_pair(start, '&', TokenKind::AmpAmp, TokenKind::Ampersand),
                 '|' => self.scan_pipe_or_error(start),
                 '?' => self.scan_question(start),
                 ':' => self.scan_colon(start),
@@ -202,17 +202,6 @@ impl<'src> Lexer<'src> {
             return self.make_token(start, TokenKind::TripleDot);
         }
         self.make_token(start, TokenKind::Dot)
-    }
-
-    fn scan_amp_or_error(&mut self, start: usize) -> Token {
-        if self.peek_char() == Some('&') {
-            self.bump();
-            return self.make_token(start, TokenKind::AmpAmp);
-        }
-        self.emit_error(QueryLexError::UnexpectedAmpersand {
-            span: self.span_from(start),
-        });
-        self.advance()
     }
 
     fn scan_pipe_or_error(&mut self, start: usize) -> Token {
@@ -1950,11 +1939,14 @@ mod tests {
     }
 
     #[test]
-    fn lone_ampersand_is_error() {
-        let mut lex = Lexer::new("a & b");
-        assert_ident!(lex, "a");
-        assert_ident!(lex, "b");
-        assert_eq!(lex.take_diagnostics().len(), 1);
+    fn ampersand_ref_logical_and() {
+        let mut lex = Lexer::new("& && &&&");
+        assert_token!(lex, TokenKind::Ampersand);
+        assert_token!(lex, TokenKind::AmpAmp);
+        assert_token!(lex, TokenKind::AmpAmp);
+        assert_token!(lex, TokenKind::Ampersand);
+        assert_eof!(lex);
+        assert!(lex.take_diagnostics().is_empty());
     }
 
     #[test]

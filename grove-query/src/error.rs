@@ -24,7 +24,6 @@ pub enum QueryLexError {
     UnicodeEscapeTooManyDigits { span: Span },
     UnicodeEscapeInvalidScalarValue { span: Span, value: u32 },
 
-    UnexpectedAmpersand { span: Span },
     UnexpectedPipe { span: Span },
 
     IncompleteExponent { span: Span },
@@ -178,10 +177,6 @@ impl From<QueryLexError> for Diagnostic {
                 span,
                 "invalid scalar value",
             ),
-            UnexpectedAmpersand { span } => {
-                Diagnostic::error("QL0013", "unexpected `&`", span, "unexpected `&`")
-                    .with_help("use `&&` for logical AND")
-            }
             UnexpectedPipe { span } => {
                 Diagnostic::error("QL0014", "unexpected `|`", span, "unexpected `|`")
                     .with_help("use `||` for logical OR")
