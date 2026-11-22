@@ -622,7 +622,7 @@ impl<'a> PlanBuilder<'a> {
                 None
             }
             TypedExprKind::RowRef { expr: inner } => {
-                self.visit(inner, Need::Whole);
+                self.visit(inner, Need::Narrow);
                 None
             }
             TypedExprKind::Some { value } => {
