@@ -254,6 +254,15 @@ impl<'src> Parser<'src> {
 
     fn parse_unary(&mut self, allow_projection_braces: bool) -> Result<Expr, ()> {
         match self.current.value {
+            TokenKind::Ampersand => {
+                let op_tok = self.bump();
+                let expr = self.parse_unary(allow_projection_braces)?;
+                let span = self.span_from(op_tok.span.start);
+                Ok(Expr::RowRef {
+                    expr: Box::new(expr),
+                    span,
+                })
+            }
             TokenKind::Minus => {
                 let op_tok = self.bump();
                 let expr = self.parse_unary(allow_projection_braces)?;
@@ -2081,6 +2090,42 @@ mod tests {
                 }
             }
             other => panic!("expected unary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn row_ref() {
+        match parse_ok("&users") {
+            Expr::RowRef { expr, .. } => {
+                assert!(matches!(*expr, Expr::Ident(name) if name.value == "users"));
+            }
+            other => panic!("expected row ref, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn row_ref_precedence_over_postfix_chain() {
+        match parse_ok("&users.first()") {
+            Expr::RowRef { expr, .. } => match *expr {
+                Expr::Method { base, name, .. } => {
+                    assert_eq!(name.value, "first");
+                    assert!(matches!(*base, Expr::Ident(name) if name.value == "users"));
+                }
+                other => panic!("expected method inside row ref, got {other:?}"),
+            },
+            other => panic!("expected row ref, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn row_ref_logical_and() {
+        match parse_ok("&a&&&b") {
+            Expr::Binary { op, lhs, rhs, .. } => {
+                assert_eq!(op.value, BinaryOp::And);
+                assert!(matches!(*lhs, Expr::RowRef { .. }));
+                assert!(matches!(*rhs, Expr::RowRef { .. }));
+            }
+            other => panic!("expected binary, got {other:?}"),
         }
     }
 

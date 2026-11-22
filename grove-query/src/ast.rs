@@ -103,6 +103,10 @@ pub enum Expr {
         default: Box<Expr>,
         span: Span,
     },
+    RowRef {
+        expr: Box<Expr>,
+        span: Span,
+    },
     Unary {
         op: Spanned<UnaryOp>,
         expr: Box<Expr>,
@@ -159,6 +163,7 @@ impl Expr {
             | Expr::Some { span, .. }
             | Expr::Struct { span, .. }
             | Expr::If { span, .. }
+            | Expr::RowRef { span, .. }
             | Expr::Unary { span, .. }
             | Expr::Binary { span, .. }
             | Expr::Cast { span, .. }

@@ -314,6 +314,7 @@ fn infer(expr: &Expr, env: &mut TypeEnv) -> Result<TypedExpr, TypeError> {
         }
         Expr::Binary { op, lhs, rhs, .. } => infer_binary(op, lhs, rhs, env),
         Expr::Unary { op, expr, .. } => infer_unary(op, expr, env),
+        Expr::RowRef { expr, span } => infer_row_ref(expr, *span, env),
         Expr::Tuple { elements, .. } => {
             let mut typed_elems = Vec::new();
             for elem in elements {
@@ -1266,6 +1267,11 @@ fn infer_unary(
     ))
 }
 
+fn infer_row_ref(expr: &Expr, span: Span, env: &mut TypeEnv) -> Result<TypedExpr, TypeError> {
+    let _ = infer(expr, env)?;
+    Err(TypeError::RowRefNotAllowed { span })
+}
+
 fn types_compatible(a: &mut QueryType, b: &mut QueryType, schema: &ValidatedSchema) -> bool {
     match (a, b) {
         (QueryType::Unknown, QueryType::Unknown) => true,
@@ -2054,6 +2060,11 @@ mod tests {
                 variant: 1
             } if enum_id == priority_id
         ));
+    }
+
+    #[test]
+    fn row_ref_outside_mutation_rejected() {
+        assert_eq!(error_codes("&users", &test_schema()), vec!["QT0040"]);
     }
 
     #[test]

@@ -27,6 +27,7 @@ pub enum TypeError {
     InsertOnRecord { got: String, span: Span },
     InsertTargetNotCollection { got: String, span: Span },
     InsertOnNonOwningCollection { field: String, struct_name: String, span: Span },
+    RowRefNotAllowed { span: Span },
     StructFieldNotInSchema { field: String, struct_name: String, span: Span },
     InsertMissingRequiredField { field: String, struct_name: String, span: Span },
     StructFieldTypeMismatch { field: String, struct_name: String, expected: String, got: String, span: Span },
@@ -237,6 +238,12 @@ impl From<TypeError> for Diagnostic {
                 "non-owning insert target",
             )
             .with_note("inserting non-owning references is not implemented"),
+            TypeError::RowRefNotAllowed { span } => Diagnostic::error(
+                "QT0040",
+                "row references are only allowed inside mutation arguments",
+                span,
+                "row reference not allowed here",
+            ),
             TypeError::StructFieldNotInSchema {
                 field,
                 struct_name,
