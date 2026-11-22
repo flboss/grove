@@ -229,6 +229,9 @@ pub fn eval(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
         }
         TypedExprKind::Binary { op, lhs, rhs } => eval_binary(op, lhs, rhs, ctx, expr.span),
         TypedExprKind::Unary { op, expr: inner } => eval_unary(op, inner, ctx, expr.span),
+        TypedExprKind::RowRef { .. } => Err(ExecError::Unsupported {
+            message: "row reference evaluation is not implemented yet".to_string(),
+        }),
         TypedExprKind::Field {
             base,
             name,

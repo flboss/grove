@@ -1395,6 +1395,10 @@ fn check(
         TypedExprKind::Unary { expr: operand, .. } => {
             check(operand, &mut expr.ty, env)?;
         }
+        TypedExprKind::RowRef { expr: operand } => {
+            let mut ty = operand.ty.clone();
+            check(operand, &mut ty, env)?;
+        }
         // no propagation
         TypedExprKind::Cast { expr: operand, .. } => {
             let mut ty = operand.ty.clone();
@@ -2060,6 +2064,17 @@ mod tests {
                 variant: 1
             } if enum_id == priority_id
         ));
+    }
+
+    #[test]
+    fn row_ref_type_equality_display() {
+        let schema = test_schema();
+        let user_id = schema.roots[0].struct_id;
+        let ty = QueryType::RowRef(user_id);
+        assert_eq!(ty.to_string(), format!("&Struct#{}", user_id.index()));
+        assert!(!ty.is_unknown());
+        assert!(ty.eq(&QueryType::RowRef(user_id), &schema));
+        assert!(!ty.eq(&QueryType::Record(RecordSource::Schema(user_id)), &schema));
     }
 
     #[test]
@@ -3029,6 +3044,7 @@ mod tests {
             TypedExprKind::Unary { expr, .. } | TypedExprKind::Cast { expr, .. } => {
                 collect_node_ids(expr, ids);
             }
+            TypedExprKind::RowRef { expr } => collect_node_ids(expr, ids),
             TypedExprKind::Method { base, args, .. } => {
                 collect_node_ids(base, ids);
                 for arg in args {

@@ -621,6 +621,10 @@ impl<'a> PlanBuilder<'a> {
                 self.visit(inner, Need::Whole);
                 None
             }
+            TypedExprKind::RowRef { expr: inner } => {
+                self.visit(inner, Need::Whole);
+                None
+            }
             TypedExprKind::Some { value } => {
                 self.visit(value, need);
                 None
@@ -735,6 +739,7 @@ impl<'a> PlanBuilder<'a> {
                     self.mark_used_whole(&field.ty);
                 }
             }
+            QueryType::RowRef(_) => {}
             QueryType::Scalar(_) | QueryType::Enum(_) | QueryType::Void | QueryType::Unknown => {}
         }
     }
@@ -1209,6 +1214,7 @@ mod tests {
             }
             TypedExprKind::Unary { expr: inner, .. }
             | TypedExprKind::Cast { expr: inner, .. }
+            | TypedExprKind::RowRef { expr: inner }
             | TypedExprKind::Some { value: inner } => walk(inner, f),
             TypedExprKind::If { arms, default } => {
                 for (condition, value) in arms {

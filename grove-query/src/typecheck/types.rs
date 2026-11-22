@@ -158,6 +158,9 @@ pub enum TypedExprKind {
         op: Spanned<UnaryOp>,
         expr: Box<TypedExpr>,
     },
+    RowRef {
+        expr: Box<TypedExpr>,
+    },
     Cast {
         expr: Box<TypedExpr>,
         kind: CastKind,
@@ -258,6 +261,7 @@ pub enum QueryType {
     List(Box<QueryType>),
     Tuple(Vec<QueryType>),
     Record(RecordSource),
+    RowRef(StructId),
     Void,
     Unknown,
 }
@@ -329,6 +333,7 @@ impl QueryType {
                 RecordSource::Schema(_) => false,
                 RecordSource::Projection(fields) => fields.iter().any(|f| f.ty.is_unknown()),
             },
+            QueryType::RowRef(_) => false,
             QueryType::Unknown => true,
         }
     }
@@ -373,6 +378,7 @@ impl QueryType {
                         .all(|(left, right)| left.eq(right, schema))
             }
             (QueryType::Record(left), QueryType::Record(right)) => left.eq(right, schema),
+            (QueryType::RowRef(left), QueryType::RowRef(right)) => left == right,
             (QueryType::Void, QueryType::Void) | (QueryType::Unknown, QueryType::Unknown) => true,
             _ => false,
         }
@@ -472,6 +478,7 @@ impl fmt::Display for QueryType {
             QueryType::Record(RecordSource::Schema(struct_id)) => {
                 write!(f, "Struct#{}", struct_id.index())
             }
+            QueryType::RowRef(struct_id) => write!(f, "&Struct#{}", struct_id.index()),
             QueryType::Enum(enum_id) => write!(f, "Enum#{}", enum_id.index()),
             QueryType::Void => write!(f, "Void"),
             QueryType::Unknown => write!(f, "_"),

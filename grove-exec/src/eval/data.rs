@@ -493,6 +493,7 @@ fn collect_owning_refs_at(
         }
         TypedExprKind::Unary { expr, .. }
         | TypedExprKind::Cast { expr, .. }
+        | TypedExprKind::RowRef { expr }
         | TypedExprKind::Some { value: expr } => {
             collect_owning_refs_at(expr, schema, skip, frames, fields);
         }
