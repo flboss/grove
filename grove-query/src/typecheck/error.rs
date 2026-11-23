@@ -30,11 +30,14 @@ pub enum TypeError {
     RowRefNotAllowed { span: Span },
     RowRefSourceNotTraceable { got: String, span: Span },
     RowRefOperationNotAllowed { operation: String, span: Span },
+    UpdateOwningBackref { field: String, struct_name: String, span: Span },
+    InsertOwningBackref { field: String, struct_name: String, span: Span },
+    RowRefTargetMismatch { field: String, struct_name: String, expected: String, got: String, span: Span },
+    RowRefRequired { field: String, struct_name: String, expected: String, got: String, span: Span },
     StructFieldNotInSchema { field: String, struct_name: String, span: Span },
     InsertMissingRequiredField { field: String, struct_name: String, span: Span },
     StructFieldTypeMismatch { field: String, struct_name: String, expected: String, got: String, span: Span },
     DuplicateStructField { name: String, span: Span },
-    RefFieldInMutation { field: String, struct_name: String, span: Span },
     UnexpectedType { expected: String, got: String, span: Span },
     TupleAccessOnNonTuple { base_ty: String, span: Span },
     TupleIndexOutOfRange { index: usize, len: usize, span: Span },
@@ -264,6 +267,59 @@ impl From<TypeError> for Diagnostic {
                 "row references are opaque",
             )
             .with_help("only shape-preserving list and optional operations are supported"),
+            TypeError::UpdateOwningBackref {
+                field,
+                struct_name,
+                span,
+            } => Diagnostic::error(
+                "QT0043",
+                format!(
+                    "cannot mutate non-owning field `{struct_name}.{field}` on an owning relation"
+                ),
+                span,
+                "non-owning field of an owning relation",
+            )
+            .with_note("the owning side manages this back-reference"),
+            TypeError::InsertOwningBackref {
+                field,
+                struct_name,
+                span,
+            } => Diagnostic::error(
+                "QT0044",
+                format!(
+                    "cannot supply non-owning back-reference `{struct_name}.{field}` in an insert"
+                ),
+                span,
+                "non-owning field of an owning relation",
+            )
+            .with_note("the parent assigns this back-reference on insertion"),
+            TypeError::RowRefTargetMismatch {
+                field,
+                struct_name,
+                expected,
+                got,
+                span,
+            } => Diagnostic::error(
+                "QT0045",
+                format!(
+                    "row reference for field `{field}` in struct `{struct_name}` \
+                    targets the wrong struct"
+                ),
+                span,
+                format!("expected {expected}, got {got}"),
+            ),
+            TypeError::RowRefRequired {
+                field,
+                struct_name,
+                expected,
+                got,
+                span,
+            } => Diagnostic::error(
+                "QT0046",
+                format!("field `{field}` in struct `{struct_name}` requires a row reference"),
+                span,
+                format!("expected {expected}, got {got}"),
+            ),
             TypeError::StructFieldNotInSchema {
                 field,
                 struct_name,
@@ -302,19 +358,6 @@ impl From<TypeError> for Diagnostic {
                 span,
                 "duplicate field",
             ),
-            TypeError::RefFieldInMutation {
-                field,
-                struct_name,
-                span,
-            } => Diagnostic::error(
-                "QT0026",
-                format!("field `{field}` in struct `{struct_name}` not supported in mutation"),
-                span,
-                "ref field not allowed",
-            )
-            .with_note(format!(
-                "`{field}` is a non-owning reference and cannot be provided in a mutation"
-            )),
             TypeError::UnexpectedType {
                 expected,
                 got,

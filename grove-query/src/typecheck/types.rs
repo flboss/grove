@@ -362,6 +362,22 @@ impl QueryType {
         }
     }
 
+    pub fn contains_row_ref(&self) -> bool {
+        match self {
+            QueryType::RowRef(_) => true,
+            QueryType::Optional(inner) | QueryType::List(inner) => inner.contains_row_ref(),
+            QueryType::Tuple(elements) => elements.iter().any(QueryType::contains_row_ref),
+            QueryType::Record(RecordSource::Projection(fields)) => {
+                fields.iter().any(|field| field.ty.contains_row_ref())
+            }
+            QueryType::Scalar(_)
+            | QueryType::Enum(_)
+            | QueryType::Record(RecordSource::Schema(_))
+            | QueryType::Void
+            | QueryType::Unknown => false,
+        }
+    }
+
     pub fn eq(&self, other: &QueryType, schema: &ValidatedSchema) -> bool {
         match (self, other) {
             (QueryType::Scalar(left), QueryType::Scalar(right)) => left == right,
