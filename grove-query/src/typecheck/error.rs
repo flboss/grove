@@ -26,7 +26,6 @@ pub enum TypeError {
     MutationTargetNotTraceable { got: String, span: Span },
     InsertOnRecord { got: String, span: Span },
     InsertTargetNotCollection { got: String, span: Span },
-    InsertOnNonOwningCollection { field: String, struct_name: String, span: Span },
     RowRefNotAllowed { span: Span },
     RowRefSourceNotTraceable { got: String, span: Span },
     RowRefOperationNotAllowed { operation: String, span: Span },
@@ -34,6 +33,7 @@ pub enum TypeError {
     InsertOwningBackref { field: String, struct_name: String, span: Span },
     RowRefTargetMismatch { field: String, struct_name: String, expected: String, got: String, span: Span },
     RowRefRequired { field: String, struct_name: String, expected: String, got: String, span: Span },
+    InsertTargetRowRefRequired { field: String, struct_name: String, expected: String, got: String, span: Span },
     StructFieldNotInSchema { field: String, struct_name: String, span: Span },
     InsertMissingRequiredField { field: String, struct_name: String, span: Span },
     StructFieldTypeMismatch { field: String, struct_name: String, expected: String, got: String, span: Span },
@@ -233,17 +233,6 @@ impl From<TypeError> for Diagnostic {
                 "ambiguous insert collection",
             )
             .with_note("`flatten`, `extend`, and `map` do not preserve a single insert collection"),
-            TypeError::InsertOnNonOwningCollection {
-                field,
-                struct_name,
-                span,
-            } => Diagnostic::error(
-                "QT0039",
-                format!("cannot insert through non-owning collection `{struct_name}.{field}`"),
-                span,
-                "non-owning insert target",
-            )
-            .with_note("inserting non-owning references is not implemented"),
             TypeError::RowRefNotAllowed { span } => Diagnostic::error(
                 "QT0040",
                 "row references are only allowed inside mutation arguments",
@@ -320,6 +309,21 @@ impl From<TypeError> for Diagnostic {
                 span,
                 format!("expected {expected}, got {got}"),
             ),
+            TypeError::InsertTargetRowRefRequired {
+                field,
+                struct_name,
+                expected,
+                got,
+                span,
+            } => Diagnostic::error(
+                "QT0047",
+                format!(
+                    "insert into non-owning collection `{struct_name}.{field}` requires row references"
+                ),
+                span,
+                format!("expected {expected}, got {got}"),
+            )
+            .with_note("reference (an) existing row(s) with `&`"),
             TypeError::StructFieldNotInSchema {
                 field,
                 struct_name,

@@ -1323,6 +1323,7 @@ fn infer_unary(
     ))
 }
 
+/// Build a RowRef from a traceable mutation source
 fn infer_row_ref(expr: &Expr, span: Span, env: &mut TypeEnv) -> Result<TypedExpr, TypeError> {
     if !env.allow_row_refs {
         return Err(TypeError::RowRefNotAllowed { span });
@@ -1617,9 +1618,17 @@ fn typecheck_mutation(
         }
         MutationKind::Insert => {
             let typed_base = infer(&mutation.base, env)?;
-            let struct_id = check_insert_base(&typed_base, mutation.opt_depth, env.schema())?;
+            let (struct_id, source) =
+                check_insert_base(&typed_base, mutation.opt_depth, env.schema())?;
             let mut typed_arg = infer_mutation_arg(&mutation.args[0], env)?;
-            validate_insert(struct_id, &mut typed_arg, env.schema())?;
+            match source {
+                InsertTargetSource::Root | InsertTargetSource::OwningRef => {
+                    validate_insert_arg_owning(struct_id, &mut typed_arg, env.schema())?;
+                }
+                InsertTargetSource::NonOwningRef { field } => {
+                    validate_insert_arg_non_owning(field, struct_id, &mut typed_arg, env.schema())?;
+                }
+            }
             Ok(TypedStatement::Mutation(TypedMutationStmt::Insert {
                 span: mutation.kind.span,
                 base: typed_base,
@@ -1638,7 +1647,7 @@ fn typecheck_mutation(
             );
             let mut typed_arg = infer_mutation_arg(&mutation.args[0], env)?;
             env.pop_scope();
-            validate_update(struct_id, &mut typed_arg, env.schema())?;
+            validate_update_arg(struct_id, &mut typed_arg, env.schema())?;
             Ok(TypedStatement::Mutation(TypedMutationStmt::Update {
                 span: mutation.kind.span,
                 base: typed_base,
@@ -1702,11 +1711,20 @@ fn check_mutation_base(typed_base: &TypedExpr, opt_depth: usize) -> Result<Struc
     Ok(struct_id)
 }
 
+/// Classifies insert target collection ownership
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InsertTargetSource {
+    Root,
+    OwningRef,
+    NonOwningRef { field: FieldId },
+}
+
+/// Check an insert target and return its element struct and ownership source
 fn check_insert_base(
     typed_base: &TypedExpr,
     opt_depth: usize,
     schema: &ValidatedSchema,
-) -> Result<StructId, TypeError> {
+) -> Result<(StructId, InsertTargetSource), TypeError> {
     let Some(ty) = typed_base.ty.unwrap_optional_depth(opt_depth) else {
         return Err(TypeError::OptionalDepthMismatch {
             depth: opt_depth,
@@ -1775,6 +1793,7 @@ fn check_insert_base(
                     span: typed_base.span,
                 });
             };
+            Ok((struct_id, InsertTargetSource::Root))
         }
         CollectionOriginKind::Ref(field_id) => {
             let Some(Field::Ref {
@@ -1802,17 +1821,23 @@ fn check_insert_base(
                     span: typed_base.span,
                 });
             }
-            if !*owning {
+            if *owning {
+                Ok((struct_id, InsertTargetSource::OwningRef))
+            } else if relation_has_owning_endpoint(schema, field_id) {
                 let struct_name = schema.structs[field_id.struct_id().index()].name.clone();
-                return Err(TypeError::InsertOnNonOwningCollection {
+                Err(TypeError::InsertOwningBackref {
                     field: name.clone(),
                     struct_name,
                     span: typed_base.span,
-                });
+                })
+            } else {
+                Ok((
+                    struct_id,
+                    InsertTargetSource::NonOwningRef { field: field_id },
+                ))
             }
         }
     }
-    Ok(struct_id)
 }
 
 fn expect_constructed_record(
@@ -1877,7 +1902,60 @@ fn same_row_ref_shape(expected: &QueryType, got: &QueryType) -> bool {
     }
 }
 
-/// Validates a non-owning mutation field against its required RowRef shape
+/// Returns the RowRef target struct nested under optional/list
+fn row_ref_target_of(ty: &QueryType) -> Option<StructId> {
+    match ty {
+        QueryType::RowRef(target) => Some(*target),
+        QueryType::Optional(inner) | QueryType::List(inner) => row_ref_target_of(inner),
+        _ => None,
+    }
+}
+
+/// Validate an insert argument for a non-owning collection target
+fn validate_insert_arg_non_owning(
+    field: FieldId,
+    struct_id: StructId,
+    typed_arg: &mut TypedExpr,
+    schema: &ValidatedSchema,
+) -> Result<(), TypeError> {
+    let Some(Field::Ref { name, .. }) = schema.field(field) else {
+        return Err(TypeError::MutationTargetNotTraceable {
+            got: typed_arg.ty.to_string(),
+            span: typed_arg.span,
+        });
+    };
+    let struct_name = &schema.structs[field.struct_id().index()].name;
+
+    let mut single = QueryType::RowRef(struct_id);
+    if types_compatible(&mut single, &mut typed_arg.ty, schema) {
+        return Ok(());
+    }
+
+    let mut expected_list = QueryType::List(Box::new(QueryType::RowRef(struct_id)));
+    if types_compatible(&mut expected_list, &mut typed_arg.ty, schema) {
+        return Ok(());
+    }
+
+    if row_ref_target_of(&typed_arg.ty).is_some_and(|target| target != struct_id) {
+        return Err(TypeError::RowRefTargetMismatch {
+            field: name.clone(),
+            struct_name: struct_name.clone(),
+            expected: single.to_string(),
+            got: typed_arg.ty.to_string(),
+            span: typed_arg.span,
+        });
+    }
+
+    Err(TypeError::InsertTargetRowRefRequired {
+        field: name.clone(),
+        struct_name: struct_name.clone(),
+        expected: single.to_string(),
+        got: typed_arg.ty.to_string(),
+        span: typed_arg.span,
+    })
+}
+
+/// Validate a non-owning mutation field against its required RowRef shape
 fn validate_row_ref_field(
     field: &str,
     mut expected: QueryType,
@@ -1910,7 +1988,133 @@ fn validate_row_ref_field(
     })
 }
 
-fn validate_insert(
+/// Validate a supplied mutation field according to its ownership and value kind
+fn validate_mutation_field(
+    struct_id: StructId,
+    proj_field: &mut ProjectionField,
+    schema: &ValidatedSchema,
+    kind: MutationKind,
+    span: Span,
+) -> Result<(), TypeError> {
+    let struct_name = &schema.structs[struct_id.index()].name;
+    let Some((field_id, schema_field)) = schema.struct_field(struct_id, &proj_field.name) else {
+        return Err(TypeError::StructFieldNotInSchema {
+            field: proj_field.name.clone(),
+            struct_name: struct_name.to_string(),
+            span,
+        });
+    };
+    match schema_field {
+        Field::Ref {
+            name,
+            owning: false,
+            ..
+        } => {
+            if relation_has_owning_endpoint(schema, field_id) {
+                return Err(match kind {
+                    MutationKind::Insert => TypeError::InsertOwningBackref {
+                        field: name.clone(),
+                        struct_name: struct_name.to_string(),
+                        span,
+                    },
+                    MutationKind::Update | MutationKind::Delete => TypeError::UpdateOwningBackref {
+                        field: name.clone(),
+                        struct_name: struct_name.to_string(),
+                        span,
+                    },
+                });
+            }
+            let expected =
+                row_ref_field_type(schema_field).expect("non-owning ref has a row ref type");
+            validate_row_ref_field(name, expected, struct_name, proj_field, schema, span)
+        }
+        Field::Ref {
+            name, owning: true, ..
+        } => {
+            let expected = QueryType::from(schema_field);
+            validate_owning_ref_type(
+                name,
+                struct_name,
+                &expected,
+                &mut proj_field.ty,
+                schema,
+                kind,
+                span,
+            )
+        }
+        Field::Value { .. } | Field::Array { .. } => {
+            let mut expected = QueryType::from(schema_field);
+            if types_compatible(&mut expected, &mut proj_field.ty, schema) {
+                Ok(())
+            } else {
+                Err(TypeError::StructFieldTypeMismatch {
+                    field: proj_field.name.clone(),
+                    struct_name: struct_name.to_string(),
+                    expected: expected.to_string(),
+                    got: proj_field.ty.to_string(),
+                    span,
+                })
+            }
+        }
+    }
+}
+
+/// Recursively validate constructed owned-child values against the target schema
+fn validate_owning_ref_type(
+    field: &str,
+    struct_name: &str,
+    expected: &QueryType,
+    actual: &mut QueryType,
+    schema: &ValidatedSchema,
+    kind: MutationKind,
+    span: Span,
+) -> Result<(), TypeError> {
+    match (expected, actual) {
+        (QueryType::Optional(expected), QueryType::Optional(actual))
+        | (QueryType::List(expected), QueryType::List(actual)) => {
+            validate_owning_ref_type(field, struct_name, expected, actual, schema, kind, span)
+        }
+        (
+            QueryType::Record(RecordSource::Schema(target)),
+            QueryType::Record(RecordSource::Projection(fields)),
+        ) => validate_mutation_fields(*target, fields, schema, kind, span),
+        (
+            QueryType::Record(RecordSource::Schema(target)),
+            QueryType::Record(RecordSource::Schema(actual)),
+        ) if target == actual => Ok(()),
+        (expected, actual) => {
+            let mut expected = expected.clone();
+            if types_compatible(&mut expected, actual, schema) {
+                Ok(())
+            } else {
+                Err(TypeError::StructFieldTypeMismatch {
+                    field: field.to_string(),
+                    struct_name: struct_name.to_string(),
+                    expected: expected.to_string(),
+                    got: actual.to_string(),
+                    span,
+                })
+            }
+        }
+    }
+}
+
+/// Validate supplied record fields, recursing through owned children
+fn validate_mutation_fields(
+    struct_id: StructId,
+    proj_fields: &mut [ProjectionField],
+    schema: &ValidatedSchema,
+    kind: MutationKind,
+    span: Span,
+) -> Result<(), TypeError> {
+    for proj_field in proj_fields {
+        validate_mutation_field(struct_id, proj_field, schema, kind, span)?;
+    }
+    Ok(())
+}
+
+/// Validate an insert argument for a root or owning collection target
+fn validate_insert_arg_owning(
     sid: StructId,
     typed_arg: &mut TypedExpr,
     schema: &ValidatedSchema,
@@ -1969,114 +2173,31 @@ fn validate_insert(
         }
     }
 
-    for proj_field in proj_fields {
-        let Some((field_id, schema_field)) = schema.struct_field(sid, &proj_field.name) else {
-            return Err(TypeError::StructFieldNotInSchema {
-                field: proj_field.name.clone(),
-                struct_name: struct_name.clone(),
-                span: typed_arg.span,
-            });
-        };
-
-        if let Field::Ref {
-            name,
-            owning: false,
-            ..
-        } = schema_field
-        {
-            if relation_has_owning_endpoint(schema, field_id) {
-                return Err(TypeError::InsertOwningBackref {
-                    field: name.clone(),
-                    struct_name: struct_name.clone(),
-                    span: typed_arg.span,
-                });
-            }
-            let expected =
-                row_ref_field_type(schema_field).expect("non-owning ref has a row ref type");
-            validate_row_ref_field(
-                name,
-                expected,
-                struct_name,
-                proj_field,
-                schema,
-                typed_arg.span,
-            )?;
-            continue;
-        }
-
-        let mut schema_ty = QueryType::from(schema_field);
-
-        if !types_compatible(&mut schema_ty, &mut proj_field.ty, schema) {
-            return Err(TypeError::StructFieldTypeMismatch {
-                field: proj_field.name.clone(),
-                struct_name: struct_name.clone(),
-                expected: schema_ty.to_string(),
-                got: proj_field.ty.to_string(),
-                span: typed_arg.span,
-            });
-        }
-    }
-
-    Ok(())
+    validate_mutation_fields(
+        sid,
+        proj_fields,
+        schema,
+        MutationKind::Insert,
+        typed_arg.span,
+    )
 }
 
-fn validate_update(
+/// Validate an update argument against the target struct
+fn validate_update_arg(
     sid: StructId,
     typed_arg: &mut TypedExpr,
     schema: &ValidatedSchema,
 ) -> Result<(), TypeError> {
-    let struct_ = &schema.structs[sid.index()];
     let proj_fields =
         expect_constructed_record(&mut typed_arg.ty, typed_arg.span, MutationKind::Update)?;
 
-    for proj_field in proj_fields {
-        let Some((field_id, schema_field)) = schema.struct_field(sid, &proj_field.name) else {
-            return Err(TypeError::StructFieldNotInSchema {
-                field: proj_field.name.clone(),
-                struct_name: struct_.name.clone(),
-                span: typed_arg.span,
-            });
-        };
-
-        if let Field::Ref {
-            name,
-            owning: false,
-            ..
-        } = schema_field
-        {
-            if relation_has_owning_endpoint(schema, field_id) {
-                return Err(TypeError::UpdateOwningBackref {
-                    field: name.clone(),
-                    struct_name: struct_.name.clone(),
-                    span: typed_arg.span,
-                });
-            }
-            let expected =
-                row_ref_field_type(schema_field).expect("non-owning ref has a row ref type");
-            validate_row_ref_field(
-                name,
-                expected,
-                &struct_.name,
-                proj_field,
-                schema,
-                typed_arg.span,
-            )?;
-            continue;
-        }
-
-        let mut schema_ty = QueryType::from(schema_field);
-
-        if !types_compatible(&mut schema_ty, &mut proj_field.ty, schema) {
-            return Err(TypeError::StructFieldTypeMismatch {
-                field: proj_field.name.clone(),
-                struct_name: struct_.name.clone(),
-                expected: schema_ty.to_string(),
-                got: proj_field.ty.to_string(),
-                span: typed_arg.span,
-            });
-        }
-    }
-    Ok(())
+    validate_mutation_fields(
+        sid,
+        proj_fields,
+        schema,
+        MutationKind::Update,
+        typed_arg.span,
+    )
 }
 
 pub fn typecheck(
@@ -4916,6 +5037,14 @@ mod tests {
             r#"users.first()?.orders?.insert({ id = 1, total = 10 }); 0"#,
             &schema,
         );
+        typecheck_ok(
+            r#"images.first().unwrap().orders.insert(&users.orders.flatten()); 0"#,
+            &schema,
+        );
+        typecheck_ok(
+            r#"images.first().unwrap().orders.insert(&users.orders.flatten().first().unwrap()); 0"#,
+            &schema,
+        );
 
         assert_eq!(
             error_codes(
@@ -4943,7 +5072,28 @@ mod tests {
                 r#"images.first().unwrap().orders.insert({ id = 1, total = 10 }); 0"#,
                 &schema
             ),
-            ["QT0039"]
+            ["QT0047"]
+        );
+        assert_eq!(
+            error_codes(
+                r#"images.first().unwrap().orders.insert(users.orders.flatten()); 0"#,
+                &schema
+            ),
+            ["QT0047"]
+        );
+        assert_eq!(
+            error_codes(
+                r#"images.first().unwrap().orders.insert(&users.orders.flatten().first()); 0"#,
+                &schema
+            ),
+            ["QT0047"]
+        );
+        assert_eq!(
+            error_codes(
+                r#"images.first().unwrap().orders.insert(&users); 0"#,
+                &schema
+            ),
+            ["QT0045"]
         );
     }
 
@@ -5031,6 +5181,71 @@ mod tests {
         assert_eq!(
             error_codes(
                 "users.first().unwrap().orders.insert({ id = 1, total = 10, user = &users.first().unwrap() });",
+                &schema
+            ),
+            ["QT0044"]
+        );
+    }
+
+    #[test]
+    fn mutation_row_refs_inside_nested_owned_children() {
+        let schema = mutation_schema();
+        typecheck_ok(
+            r#"users.insert({ id = 1, name = "A", orders = [{ id = 10, total = 1, image = some(&images.first().unwrap()) }] });"#,
+            &schema,
+        );
+        typecheck_ok(
+            r#"users.first().unwrap().update({ orders = [{ id = 10, total = 1, image = some(&images.first().unwrap()) }] });"#,
+            &schema,
+        );
+
+        let schema = nested_schema();
+        typecheck_ok(
+            r#"users.insert({ name = "A", active = true, orders = [{ total = 1.0, items = [{ sku = "x" }] }] });"#,
+            &schema,
+        );
+        typecheck_ok(
+            r#"users.first().unwrap().update({ orders = [{ total = 1.0, items = [{ sku = "x" }] }] });"#,
+            &schema,
+        );
+    }
+
+    #[test]
+    fn mutation_nested_owned_child_row_ref_errors() {
+        let schema = mutation_schema();
+        assert_eq!(
+            error_codes(
+                r#"users.insert({ id = 1, name = "A", orders = [{ id = 10, total = 1, user = &users.first().unwrap() }] });"#,
+                &schema
+            ),
+            ["QT0044"]
+        );
+        assert_eq!(
+            error_codes(
+                r#"users.first().unwrap().update({ orders = [{ id = 10, total = 1, user = &users.first().unwrap() }] });"#,
+                &schema
+            ),
+            ["QT0043"]
+        );
+        assert_eq!(
+            error_codes(
+                r#"users.insert({ id = 1, name = "A", orders = [{ id = 10, total = 1, image = some(&users.first().unwrap()) }] });"#,
+                &schema
+            ),
+            ["QT0045"]
+        );
+        assert_eq!(
+            error_codes(
+                r#"users.insert({ id = 1, name = "A", orders = [{ id = 10, total = 1, image = some(images.first().unwrap()) }] });"#,
+                &schema
+            ),
+            ["QT0046"]
+        );
+
+        let schema = nested_schema();
+        assert_eq!(
+            error_codes(
+                r#"users.insert({ name = "A", active = true, orders = [{ total = 1.0, items = [{ sku = "x", order = &users.orders.flatten().items.flatten().first().unwrap() }] }] });"#,
                 &schema
             ),
             ["QT0044"]
