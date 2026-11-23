@@ -778,6 +778,13 @@ fn infer_field(
         other => (other, false),
     };
 
+    if row_ref_container_leaf(inner) {
+        return Err(TypeError::RowRefOperationNotAllowed {
+            operation: format!("field access `.{}`", name.value),
+            span: name.span,
+        });
+    }
+
     let mut field_ty =
         record_field_by_name(inner, name, schema).ok_or_else(|| TypeError::UnknownField {
             field: name.value.clone(),
@@ -871,6 +878,13 @@ fn infer_method(
         base_ty: base.ty.to_string(),
         span: name.span,
     })?;
+
+    if type_contains_row_ref(resolve_ty) && !row_ref_method_allowed(def.id) {
+        return Err(TypeError::RowRefOperationNotAllowed {
+            operation: name.value.clone(),
+            span: name.span,
+        });
+    }
 
     let mut fixed_args = def.fixed_arg_types(resolve_ty);
 
@@ -1038,6 +1052,53 @@ fn method_provenance(
     }
 }
 
+fn type_contains_row_ref(ty: &QueryType) -> bool {
+    match ty {
+        QueryType::RowRef(_) => true,
+        QueryType::Optional(inner) | QueryType::List(inner) => type_contains_row_ref(inner),
+        QueryType::Tuple(elements) => elements.iter().any(type_contains_row_ref),
+        QueryType::Record(RecordSource::Projection(fields)) => {
+            fields.iter().any(|field| type_contains_row_ref(&field.ty))
+        }
+        QueryType::Scalar(_)
+        | QueryType::Enum(_)
+        | QueryType::Record(RecordSource::Schema(_))
+        | QueryType::Void
+        | QueryType::Unknown => false,
+    }
+}
+
+fn row_ref_container_leaf(ty: &QueryType) -> bool {
+    match ty {
+        QueryType::RowRef(_) => true,
+        QueryType::Optional(inner) | QueryType::List(inner) => row_ref_container_leaf(inner),
+        _ => false,
+    }
+}
+
+fn row_ref_method_allowed(method: MethodId) -> bool {
+    matches!(
+        method,
+        MethodId::OptionalIsSome
+            | MethodId::OptionalIsNone
+            | MethodId::OptionalUnwrap
+            | MethodId::OptionalUnwrapOr
+            | MethodId::ListTake
+            | MethodId::ListSkip
+            | MethodId::ListTakeBack
+            | MethodId::ListSkipBack
+            | MethodId::ListReverse
+            | MethodId::ListFirst
+            | MethodId::ListNth
+            | MethodId::ListLast
+            | MethodId::ListLen
+            | MethodId::ListExtend
+            | MethodId::ListFlatten
+            | MethodId::ListCompact
+            | MethodId::ListTranspose
+    )
+}
+
 fn infer_binary(
     op: &Spanned<BinaryOp>,
     lhs: &Expr,
@@ -1047,6 +1108,13 @@ fn infer_binary(
     let mut typed_lhs = infer(lhs, env)?;
     let mut typed_rhs = infer(rhs, env)?;
     let span = typed_lhs.span.merge(typed_rhs.span);
+
+    if type_contains_row_ref(&typed_lhs.ty) || type_contains_row_ref(&typed_rhs.ty) {
+        return Err(TypeError::RowRefOperationNotAllowed {
+            operation: op.value.to_string(),
+            span,
+        });
+    }
 
     let result_ty = match op.value {
         BinaryOp::In => infer_binary_in(&mut typed_lhs.ty, &mut typed_rhs.ty, span, env.schema())?,
@@ -2140,7 +2208,7 @@ mod tests {
     }
 
     #[test]
-    fn row_ref_outside_mutation_rejected() {
+    fn row_ref_only_inside_mutation_args() {
         let schema = test_schema();
         assert_eq!(error_codes("&users", &schema), vec!["QT0040"]);
         assert_eq!(error_codes("let r = &users;", &schema), vec!["QT0040"]);
@@ -2148,11 +2216,6 @@ mod tests {
             error_codes("users.filter(&users).len()", &schema),
             vec!["QT0040"]
         );
-    }
-
-    #[test]
-    fn row_ref_allowed_in_mutation_arguments() {
-        let schema = nested_schema();
         assert_eq!(
             error_codes(
                 "users.update({ active = &users.first().unwrap() }); 0",
@@ -2160,6 +2223,104 @@ mod tests {
             ),
             ["QT0024"]
         );
+    }
+
+    #[test]
+    fn row_ref_shapes() {
+        let schema = nested_schema();
+        let user = nested_struct(&schema, "User");
+        let order = nested_struct(&schema, "Order");
+
+        assert_eq!(
+            infer_ok_with_row_ref("&users", &schema, true).ty,
+            QueryType::List(Box::new(QueryType::RowRef(user)))
+        );
+        assert_eq!(
+            infer_ok_with_row_ref("&users.first()", &schema, true).ty,
+            QueryType::Optional(Box::new(QueryType::RowRef(user)))
+        );
+        assert_eq!(
+            infer_ok_with_row_ref("(&users).first()", &schema, true).ty,
+            QueryType::Optional(Box::new(QueryType::RowRef(user)))
+        );
+        assert_eq!(
+            infer_ok_with_row_ref("&users.first().unwrap()", &schema, true).ty,
+            QueryType::RowRef(user)
+        );
+        assert_eq!(
+            infer_ok_with_row_ref("&users.subordinates", &schema, true).ty,
+            QueryType::List(Box::new(QueryType::List(Box::new(QueryType::RowRef(user)))))
+        );
+        assert_eq!(
+            infer_ok_with_row_ref("&users.orders.flatten()", &schema, true).ty,
+            QueryType::List(Box::new(QueryType::RowRef(order)))
+        );
+        assert_eq!(
+            infer_ok_with_row_ref("(&users.orders).flatten()", &schema, true).ty,
+            QueryType::List(Box::new(QueryType::RowRef(order)))
+        );
+        assert!(matches!(
+            infer_ok_with_row_ref("&users", &schema, true).kind,
+            TypedExprKind::RowRef { .. }
+        ));
+    }
+
+    #[test]
+    fn row_ref_is_opaque() {
+        let schema = nested_schema();
+        for source in [
+            "(&users.first().unwrap()).name",
+            "(&users).unique()",
+            "(&users).contains(&users.first().unwrap())",
+            "(&users).filter(true)",
+            "(&users).map(true)",
+            "(&users.first()).map(true)",
+            "(&users).subordinates",
+            "&users == &users",
+        ] {
+            assert_eq!(
+                infer_err_with_row_ref(source, &schema, true),
+                ["QT0042"],
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn row_ref_shape_preserving_operations_allowed() {
+        let schema = nested_schema();
+        for source in [
+            "(&users).take(2)",
+            "(&users).skip(1)",
+            "(&users).take_back(1)",
+            "(&users).skip_back(1)",
+            "(&users).reverse()",
+            "(&users).first()",
+            "(&users).nth(0)",
+            "(&users).last()",
+            "(&users).len()",
+            "(&users).extend(&users.take(1))",
+            "&users.take(2)",
+            "(&users.first()).unwrap()",
+            "(&users.first()).is_some()",
+            "(&users.first()).is_none()",
+            "(&users.first()).unwrap_or(&users.first().unwrap())",
+        ] {
+            infer_ok_with_row_ref(source, &schema, true);
+        }
+    }
+
+    #[test]
+    fn row_ref_untraceable_source() {
+        let schema = nested_schema();
+        for source in [
+            r#"users.update({ active = &users { name } });"#,
+            r#"let u = users; users.update({ active = &u });"#,
+            r#"users.update({ active = & &users });"#,
+            r#"users.update({ active = &1 });"#,
+        ] {
+            assert_eq!(error_codes(source, &schema), ["QT0041"], "{source}");
+        }
     }
 
     #[test]
