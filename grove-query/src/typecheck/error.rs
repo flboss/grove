@@ -28,6 +28,8 @@ pub enum TypeError {
     InsertTargetNotCollection { got: String, span: Span },
     InsertOnNonOwningCollection { field: String, struct_name: String, span: Span },
     RowRefNotAllowed { span: Span },
+    RowRefSourceNotTraceable { got: String, span: Span },
+    RowRefOperationNotAllowed { operation: String, span: Span },
     StructFieldNotInSchema { field: String, struct_name: String, span: Span },
     InsertMissingRequiredField { field: String, struct_name: String, span: Span },
     StructFieldTypeMismatch { field: String, struct_name: String, expected: String, got: String, span: Span },
@@ -211,7 +213,10 @@ impl From<TypeError> for Diagnostic {
                 span,
                 "untraceable mutation target",
             )
-            .with_note("targets must come directly from storage, not from `let`, `map`, or constructed values"),
+            .with_note(
+                "targets must come directly from storage, \
+                not from `let`, partly or fully constructed values",
+            ),
             TypeError::InsertOnRecord { got, span } => Diagnostic::error(
                 "QT0037",
                 format!("insert target must be a list of records, got `{got}`"),
@@ -231,9 +236,7 @@ impl From<TypeError> for Diagnostic {
                 span,
             } => Diagnostic::error(
                 "QT0039",
-                format!(
-                    "cannot insert through non-owning collection `{struct_name}.{field}`"
-                ),
+                format!("cannot insert through non-owning collection `{struct_name}.{field}`"),
                 span,
                 "non-owning insert target",
             )
@@ -244,6 +247,23 @@ impl From<TypeError> for Diagnostic {
                 span,
                 "row reference not allowed here",
             ),
+            TypeError::RowRefSourceNotTraceable { got, span } => Diagnostic::error(
+                "QT0041",
+                format!("row reference source `{got}` cannot be traced to storage data"),
+                span,
+                "untraceable row reference source",
+            )
+            .with_note(
+                "row references must point at existing record in storage, \
+                not at `let`, partly or fully constructed values",
+            ),
+            TypeError::RowRefOperationNotAllowed { operation, span } => Diagnostic::error(
+                "QT0042",
+                format!("operation `{operation}` is not allowed on row references"),
+                span,
+                "row references are opaque",
+            )
+            .with_help("only shape-preserving list and optional operations are supported"),
             TypeError::StructFieldNotInSchema {
                 field,
                 struct_name,
@@ -352,7 +372,8 @@ impl From<TypeError> for Diagnostic {
                 "ambiguous cast",
             )
             .with_help(
-                "the target type cannot be reconciled with information already known about the value's type",
+                "the target type cannot be reconciled with information \
+                    already known about the value's type",
             ),
         }
     }

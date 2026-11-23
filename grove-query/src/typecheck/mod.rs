@@ -30,6 +30,7 @@ struct TypeEnv<'s> {
     schema: &'s ValidatedSchema,
     element_depth: usize,
     next_id: u64,
+    allow_row_refs: bool,
 }
 
 impl<'s> TypeEnv<'s> {
@@ -39,6 +40,7 @@ impl<'s> TypeEnv<'s> {
             schema,
             element_depth: 0,
             next_id: 0,
+            allow_row_refs: false,
         };
 
         for (root_idx, root) in schema.roots.iter().enumerate() {
@@ -1268,8 +1270,46 @@ fn infer_unary(
 }
 
 fn infer_row_ref(expr: &Expr, span: Span, env: &mut TypeEnv) -> Result<TypedExpr, TypeError> {
-    let _ = infer(expr, env)?;
-    Err(TypeError::RowRefNotAllowed { span })
+    if !env.allow_row_refs {
+        return Err(TypeError::RowRefNotAllowed { span });
+    }
+    let typed = infer(expr, env)?;
+    let ty = row_ref_shape(&typed.ty, typed.provenance).ok_or_else(|| {
+        TypeError::RowRefSourceNotTraceable {
+            got: typed.ty.to_string(),
+            span,
+        }
+    })?;
+    Ok(env.typed(
+        TypedExprKind::RowRef {
+            expr: Box::new(typed),
+        },
+        ty,
+        span,
+    ))
+}
+
+fn row_ref_shape(ty: &QueryType, provenance: TargetProvenance) -> Option<QueryType> {
+    match ty {
+        QueryType::Record(RecordSource::Schema(struct_id)) if provenance.rows => {
+            Some(QueryType::RowRef(*struct_id))
+        }
+        QueryType::Optional(inner) => {
+            row_ref_shape(inner, provenance).map(|inner| QueryType::Optional(Box::new(inner)))
+        }
+        QueryType::List(inner) => {
+            row_ref_shape(inner, provenance).map(|inner| QueryType::List(Box::new(inner)))
+        }
+        _ => None,
+    }
+}
+
+fn infer_mutation_arg(expr: &Expr, env: &mut TypeEnv) -> Result<TypedExpr, TypeError> {
+    let previous = env.allow_row_refs;
+    env.allow_row_refs = true;
+    let result = infer(expr, env);
+    env.allow_row_refs = previous;
+    result
 }
 
 fn types_compatible(a: &mut QueryType, b: &mut QueryType, schema: &ValidatedSchema) -> bool {
@@ -1522,7 +1562,7 @@ fn typecheck_mutation(
         MutationKind::Insert => {
             let typed_base = infer(&mutation.base, env)?;
             let struct_id = check_insert_base(&typed_base, mutation.opt_depth, env.schema())?;
-            let mut typed_arg = infer(&mutation.args[0], env)?;
+            let mut typed_arg = infer_mutation_arg(&mutation.args[0], env)?;
             validate_insert(struct_id, &mut typed_arg, env.schema())?;
             Ok(TypedStatement::Mutation(TypedMutationStmt::Insert {
                 span: mutation.kind.span,
@@ -1540,7 +1580,7 @@ fn typecheck_mutation(
                 QueryType::Record(RecordSource::Schema(struct_id)),
                 IdentBinding::Prev { struct_id },
             );
-            let mut typed_arg = infer(&mutation.args[0], env)?;
+            let mut typed_arg = infer_mutation_arg(&mutation.args[0], env)?;
             env.pop_scope();
             validate_update(struct_id, &mut typed_arg, env.schema())?;
             Ok(TypedStatement::Mutation(TypedMutationStmt::Update {
@@ -2019,10 +2059,32 @@ mod tests {
     }
 
     fn infer_ok(source: &str, schema: &ValidatedSchema) -> TypedExpr {
+        infer_ok_with_row_ref(source, schema, false)
+    }
+
+    fn infer_ok_with_row_ref(
+        source: &str,
+        schema: &ValidatedSchema,
+        allow_row_refs: bool,
+    ) -> TypedExpr {
         let mut env = TypeEnv::new(schema);
+        env.allow_row_refs = allow_row_refs;
         let (file, parse_diags) = crate::parse_query(source);
         assert!(parse_diags.is_empty(), "parse diagnostics: {parse_diags:?}");
         infer(file.unwrap().output().unwrap(), &mut env).unwrap()
+    }
+
+    fn infer_err_with_row_ref(
+        source: &str,
+        schema: &ValidatedSchema,
+        allow_row_refs: bool,
+    ) -> Vec<String> {
+        let mut env = TypeEnv::new(schema);
+        env.allow_row_refs = allow_row_refs;
+        let (file, parse_diags) = crate::parse_query(source);
+        assert!(parse_diags.is_empty(), "parse diagnostics: {parse_diags:?}");
+        let err = infer(file.unwrap().output().unwrap(), &mut env).unwrap_err();
+        vec![Diagnostic::from(err).code.to_string()]
     }
 
     fn typecheck_ok(source: &str, schema: &ValidatedSchema) -> TypedQueryFile {
@@ -2079,7 +2141,25 @@ mod tests {
 
     #[test]
     fn row_ref_outside_mutation_rejected() {
-        assert_eq!(error_codes("&users", &test_schema()), vec!["QT0040"]);
+        let schema = test_schema();
+        assert_eq!(error_codes("&users", &schema), vec!["QT0040"]);
+        assert_eq!(error_codes("let r = &users;", &schema), vec!["QT0040"]);
+        assert_eq!(
+            error_codes("users.filter(&users).len()", &schema),
+            vec!["QT0040"]
+        );
+    }
+
+    #[test]
+    fn row_ref_allowed_in_mutation_arguments() {
+        let schema = nested_schema();
+        assert_eq!(
+            error_codes(
+                "users.update({ active = &users.first().unwrap() }); 0",
+                &schema
+            ),
+            ["QT0024"]
+        );
     }
 
     #[test]
