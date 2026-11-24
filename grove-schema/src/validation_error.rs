@@ -1,7 +1,7 @@
 use grove_types::{Diagnostic, Span};
 
 #[derive(Debug, Clone)]
-pub enum SchemaValidationError {
+pub(crate) enum SchemaValidationError {
     UnknownTypeRef {
         name: String,
         occurrences: Vec<Span>,

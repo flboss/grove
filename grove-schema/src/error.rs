@@ -2,7 +2,7 @@ use grove_types::{Diagnostic, Span};
 
 #[rustfmt::skip] // preserve one-line-per-variant formatting
 #[derive(Debug, Clone)]
-pub enum SchemaParseError {
+pub(crate) enum SchemaParseError {
     UnexpectedChar { span: Span, ch: char },
     UnclosedString { span: Span },
     UnclosedBacktickIdent { span: Span },

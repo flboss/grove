@@ -26,7 +26,7 @@ impl<'src> Lexer<'src> {
         self.advance()
     }
 
-    pub fn peek(&mut self) -> &Token {
+    pub(crate) fn peek(&mut self) -> &Token {
         if self.peeked.is_none() {
             self.peeked = Some(self.advance());
         }

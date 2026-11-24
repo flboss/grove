@@ -1,11 +1,11 @@
 pub mod ast;
-pub mod error;
+mod error;
 pub mod lex;
-pub mod parse;
+mod parse;
 pub mod token;
 pub mod validated;
-pub mod validation;
-pub mod validation_error;
+mod validation;
+mod validation_error;
 
 use grove_types::Diagnostic;
 

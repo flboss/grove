@@ -10,22 +10,22 @@ use crate::lex::Lexer;
 use crate::token::{Token, TokenKind};
 use grove_types::{Diagnostic, Span, Spanned};
 
-pub type PResult<T> = Result<T, ()>;
+pub(crate) type PResult<T> = Result<T, ()>;
 
-pub struct Parser<'src> {
+pub(crate) struct Parser<'src> {
     lexer: Lexer<'src>,
     diagnostics: Vec<Diagnostic>,
 }
 
 impl<'src> Parser<'src> {
-    pub fn new(source: &'src str) -> Self {
+    pub(crate) fn new(source: &'src str) -> Self {
         Parser {
             lexer: Lexer::new(source),
             diagnostics: Vec::new(),
         }
     }
 
-    pub fn parse_schema(mut self) -> (Option<Schema>, Vec<Diagnostic>) {
+    pub(crate) fn parse_schema(mut self) -> (Option<Schema>, Vec<Diagnostic>) {
         let mut schema = Schema {
             roots: Vec::new(),
             structs: Vec::new(),

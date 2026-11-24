@@ -18,7 +18,7 @@ use crate::validated::{
 use crate::validation_error::SchemaValidationError;
 use grove_types::{Diagnostic, Span};
 
-pub struct Builder<'s> {
+pub(crate) struct Builder<'s> {
     schema: &'s Schema,
     declared_structs: HashSet<&'s str>,
     relation_endpoint_fields: HashMap<(&'s str, &'s str), usize>,
