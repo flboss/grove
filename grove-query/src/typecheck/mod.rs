@@ -2440,7 +2440,7 @@ mod tests {
         );
         assert_eq!(
             error_codes(
-                "users.update({ active = &users.first().unwrap() }); 0",
+                "users.update({ active = &users.first().unwrap() });",
                 &schema
             ),
             ["QT0024"]
@@ -3218,14 +3218,14 @@ mod tests {
 
     #[test]
     fn let_use_before_def() {
-        let (file, _) = crate::parse_query("let x = y; 0");
+        let (file, _) = crate::parse_query("let x = y;");
         let (_, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(diags.iter().any(|d| d.code.as_ref() == "QT0001"));
     }
 
     #[test]
     fn let_self_reference_error() {
-        let (file, _) = crate::parse_query("let x = x; 0");
+        let (file, _) = crate::parse_query("let x = x;");
         let (_, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(diags.iter().any(|d| d.code.as_ref() == "QT0001"));
     }
@@ -3268,7 +3268,7 @@ mod tests {
     fn ident_binding_prev() {
         let schema = test_schema();
         let user = schema.roots[0].struct_id;
-        let (file, _) = crate::parse_query(r#"users[age == 30].update({ age = prev.age + 1 }); 0"#);
+        let (file, _) = crate::parse_query(r#"users[age == 30].update({ age = prev.age + 1 });"#);
         let (typed, diags) = typecheck(file.unwrap(), &schema);
         assert!(diags.is_empty(), "expected no errors, got {diags:?}");
         let TypedStatement::Mutation(TypedMutationStmt::Update { arg, .. }) =
@@ -4891,7 +4891,7 @@ mod tests {
     #[test]
     fn mutation_insert() {
         let (file, _diags) = crate::parse_query(
-            r#"users.insert({ name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, created = @now }); 0"#,
+            r#"users.insert({ name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, created = @now });"#,
         );
         let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(diags.is_empty(), "expected no errors, got {diags:?}");
@@ -4899,7 +4899,7 @@ mod tests {
 
     #[test]
     fn mutation_update() {
-        let (file, _diags) = crate::parse_query(r#"users[age == 30].update({ age = 31 }); 0"#);
+        let (file, _diags) = crate::parse_query(r#"users[age == 30].update({ age = 31 });"#);
         let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(diags.is_empty(), "expected no errors, got {diags:?}");
     }
@@ -4907,35 +4907,35 @@ mod tests {
     #[test]
     fn mutation_update_with_prev() {
         let (file, _diags) =
-            crate::parse_query(r#"users[age == 30].update({ age = prev.age + 1 }); 0"#);
+            crate::parse_query(r#"users[age == 30].update({ age = prev.age + 1 });"#);
         let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(diags.is_empty(), "expected no errors, got {diags:?}");
     }
 
     #[test]
     fn mutation_delete() {
-        let (file, _diags) = crate::parse_query(r#"users[!active].delete(); 0"#);
+        let (file, _diags) = crate::parse_query(r#"users[!active].delete();"#);
         let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(diags.is_empty(), "expected no errors, got {diags:?}");
     }
 
     #[test]
     fn mutation_on_projection_error() {
-        let (file, _diags) = crate::parse_query(r#"users { name }.insert({ name = "Alice" }); 0"#);
+        let (file, _diags) = crate::parse_query(r#"users { name }.insert({ name = "Alice" });"#);
         let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(!diags.is_empty());
     }
 
     #[test]
     fn mutation_on_scalar_error() {
-        let (file, _diags) = crate::parse_query(r#"42.insert({ name = "Alice" }); 0"#);
+        let (file, _diags) = crate::parse_query(r#"42.insert({ name = "Alice" });"#);
         let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(!diags.is_empty());
     }
 
     #[test]
     fn mutation_delete_arg_error() {
-        let (file, _diags) = crate::parse_query(r#"users[!active].delete("abc"); 0"#);
+        let (file, _diags) = crate::parse_query(r#"users[!active].delete("abc");"#);
         let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(!diags.is_empty());
     }
@@ -4944,9 +4944,9 @@ mod tests {
     fn mutation_extra_args_error() {
         let schema = test_schema();
         for source in [
-            r#"users.insert({ name = "A" }, { name = "B" }); 0"#,
-            r#"users.update({ age = 1 }, { age = 2 }); 0"#,
-            r#"users.delete(1); 0"#,
+            r#"users.insert({ name = "A" }, { name = "B" });"#,
+            r#"users.update({ age = 1 }, { age = 2 });"#,
+            r#"users.delete(1);"#,
         ] {
             assert_eq!(error_codes(source, &schema), ["QT0004"], "{source}");
         }
@@ -4954,12 +4954,12 @@ mod tests {
 
     #[test]
     fn mutation_missing_insert_arg_error() {
-        assert_eq!(error_codes("users.insert(); 0", &test_schema()), ["QT0004"]);
+        assert_eq!(error_codes("users.insert();", &test_schema()), ["QT0004"]);
     }
 
     #[test]
     fn mutation_optional_depth_preserved() {
-        let typed = typecheck_ok("users.first()?.delete(); 0", &test_schema());
+        let typed = typecheck_ok("users.first()?.delete();", &test_schema());
         let TypedStatement::Mutation(TypedMutationStmt::Delete { opt_depth, .. }) =
             &typed.statements[0]
         else {
@@ -4971,25 +4971,22 @@ mod tests {
     #[test]
     fn mutation_record_targets() {
         let schema = test_schema();
-        typecheck_ok("users.first().unwrap().delete(); 0", &schema);
-        typecheck_ok("users.first().unwrap().update({ age = 31 }); 0", &schema);
-        typecheck_ok("users.first()?.delete(); 0", &schema);
-        typecheck_ok("users.first()?.update({ age = 31 }); 0", &schema);
+        typecheck_ok("users.first().unwrap().delete();", &schema);
+        typecheck_ok("users.first().unwrap().update({ age = 31 });", &schema);
+        typecheck_ok("users.first()?.delete();", &schema);
+        typecheck_ok("users.first()?.update({ age = 31 });", &schema);
     }
 
     #[test]
     fn mutation_optional_target_errors() {
         let schema = test_schema();
+        assert_eq!(error_codes("users.first().delete();", &schema), ["QT0035"]);
         assert_eq!(
-            error_codes("users.first().delete(); 0", &schema),
+            error_codes("users.first().update({ age = 31 });", &schema),
             ["QT0035"]
         );
         assert_eq!(
-            error_codes("users.first().update({ age = 31 }); 0", &schema),
-            ["QT0035"]
-        );
-        assert_eq!(
-            error_codes("users.first()??.delete(); 0", &schema),
+            error_codes("users.first()??.delete();", &schema),
             ["QT0032"]
         );
     }
@@ -4998,12 +4995,12 @@ mod tests {
     fn mutation_let_targets_rejected() {
         let schema = mutation_schema();
         assert_eq!(
-            error_codes("let u = users; u.delete(); 0", &schema),
+            error_codes("let u = users; u.delete();", &schema),
             ["QT0036"]
         );
         assert_eq!(
             error_codes(
-                r#"let u = users; u.insert({ id = 1, name = "A", orders = [] }); 0"#,
+                r#"let u = users; u.insert({ id = 1, name = "A", orders = [] });"#,
                 &schema
             ),
             ["QT0036"]
@@ -5014,77 +5011,74 @@ mod tests {
     fn mutation_insert_targets() {
         let schema = mutation_schema();
         typecheck_ok(
-            r#"users.insert({ id = 1, name = "A", orders = [] }); 0"#,
+            r#"users.insert({ id = 1, name = "A", orders = [] });"#,
             &schema,
         );
         typecheck_ok(
-            r#"users[id > 0].insert({ id = 1, name = "A", orders = [] }); 0"#,
+            r#"users[id > 0].insert({ id = 1, name = "A", orders = [] });"#,
             &schema,
         );
         typecheck_ok(
-            r#"users.first().unwrap().orders.insert({ id = 1, total = 10 }); 0"#,
+            r#"users.first().unwrap().orders.insert({ id = 1, total = 10 });"#,
             &schema,
         );
         typecheck_ok(
-            r#"users.first()?.orders?.insert({ id = 1, total = 10 }); 0"#,
+            r#"users.first()?.orders?.insert({ id = 1, total = 10 });"#,
             &schema,
         );
         typecheck_ok(
-            r#"images.first().unwrap().orders.insert(&users.orders.flatten()); 0"#,
+            r#"images.first().unwrap().orders.insert(&users.orders.flatten());"#,
             &schema,
         );
         typecheck_ok(
-            r#"images.first().unwrap().orders.insert(&users.orders.flatten().first().unwrap()); 0"#,
+            r#"images.first().unwrap().orders.insert(&users.orders.flatten().first().unwrap());"#,
             &schema,
         );
 
         assert_eq!(
             error_codes(
-                r#"users.first().unwrap().insert({ id = 1, name = "A", orders = [] }); 0"#,
+                r#"users.first().unwrap().insert({ id = 1, name = "A", orders = [] });"#,
                 &schema
             ),
             ["QT0037"]
         );
         assert_eq!(
             error_codes(
-                r#"users.orders.flatten().insert({ id = 1, total = 10 }); 0"#,
+                r#"users.orders.flatten().insert({ id = 1, total = 10 });"#,
                 &schema
             ),
             ["QT0038"]
         );
         assert_eq!(
             error_codes(
-                r#"users.extend(users.take(0)).insert({ id = 1, name = "A", orders = [] }); 0"#,
+                r#"users.extend(users.take(0)).insert({ id = 1, name = "A", orders = [] });"#,
                 &schema
             ),
             ["QT0038"]
         );
         assert_eq!(
             error_codes(
-                r#"images.first().unwrap().orders.insert({ id = 1, total = 10 }); 0"#,
+                r#"images.first().unwrap().orders.insert({ id = 1, total = 10 });"#,
                 &schema
             ),
             ["QT0047"]
         );
         assert_eq!(
             error_codes(
-                r#"images.first().unwrap().orders.insert(users.orders.flatten()); 0"#,
+                r#"images.first().unwrap().orders.insert(users.orders.flatten());"#,
                 &schema
             ),
             ["QT0047"]
         );
         assert_eq!(
             error_codes(
-                r#"images.first().unwrap().orders.insert(&users.orders.flatten().first()); 0"#,
+                r#"images.first().unwrap().orders.insert(&users.orders.flatten().first());"#,
                 &schema
             ),
             ["QT0047"]
         );
         assert_eq!(
-            error_codes(
-                r#"images.first().unwrap().orders.insert(&users); 0"#,
-                &schema
-            ),
+            error_codes(r#"images.first().unwrap().orders.insert(&users);"#, &schema),
             ["QT0045"]
         );
     }
@@ -5092,10 +5086,10 @@ mod tests {
     #[test]
     fn mutation_nested_and_non_owning_delete_targets() {
         let schema = mutation_schema();
-        typecheck_ok("users.orders.flatten().delete(); 0", &schema);
-        typecheck_ok("users.orders.flatten().update({ total = 1 }); 0", &schema);
-        typecheck_ok("users.first()?.orders?.delete(); 0", &schema);
-        typecheck_ok("images.first().unwrap().orders.delete(); 0", &schema);
+        typecheck_ok("users.orders.flatten().delete();", &schema);
+        typecheck_ok("users.orders.flatten().update({ total = 1 });", &schema);
+        typecheck_ok("users.first()?.orders?.delete();", &schema);
+        typecheck_ok("images.first().unwrap().orders.delete();", &schema);
     }
 
     #[test]
@@ -5249,20 +5243,20 @@ mod tests {
         let schema = mutation_schema();
         assert_eq!(
             error_codes(
-                r#"users { id }.insert({ id = 1, name = "A", orders = [] }); 0"#,
+                r#"users { id }.insert({ id = 1, name = "A", orders = [] });"#,
                 &schema
             ),
             ["QT0019"]
         );
-        assert_eq!(error_codes("users { id }.delete(); 0", &schema), ["QT0019"]);
+        assert_eq!(error_codes("users { id }.delete();", &schema), ["QT0019"]);
         assert_eq!(
             error_codes(
-                r#"users.map($).insert({ id = 1, name = "A", orders = [] }); 0"#,
+                r#"users.map($).insert({ id = 1, name = "A", orders = [] });"#,
                 &schema
             ),
             ["QT0036"]
         );
-        assert_eq!(error_codes("users.map($).delete(); 0", &schema), ["QT0036"]);
+        assert_eq!(error_codes("users.map($).delete();", &schema), ["QT0036"]);
     }
 
     #[test]
@@ -5356,7 +5350,7 @@ mod tests {
 
     #[test]
     fn mutation_insert_missing_required() {
-        let (file, _diags) = crate::parse_query(r#"users.insert({ name = "Alice" }); 0"#);
+        let (file, _diags) = crate::parse_query(r#"users.insert({ name = "Alice" });"#);
         let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(!diags.is_empty());
     }
@@ -5364,7 +5358,7 @@ mod tests {
     #[test]
     fn mutation_insert_unknown_field() {
         let (file, _diags) = crate::parse_query(
-            r#"users.insert({ name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, created = @now, bogus = 1 }); 0"#,
+            r#"users.insert({ name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, created = @now, bogus = 1 });"#,
         );
         let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(!diags.is_empty());
@@ -5373,7 +5367,7 @@ mod tests {
     #[test]
     fn mutation_insert_wrong_type() {
         let (file, _diags) = crate::parse_query(
-            r#"users.insert({ name = 42, age = 30, score = 1.0f, balance = 0.0, active = true, created = @now }); 0"#,
+            r#"users.insert({ name = 42, age = 30, score = 1.0f, balance = 0.0, active = true, created = @now });"#,
         );
         let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(!diags.is_empty());
@@ -5381,7 +5375,7 @@ mod tests {
 
     #[test]
     fn mutation_update_unknown_field() {
-        let (file, _diags) = crate::parse_query(r#"users[name == "Bob"].update({ bogus = 2 }); 0"#);
+        let (file, _diags) = crate::parse_query(r#"users[name == "Bob"].update({ bogus = 2 });"#);
         let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(!diags.is_empty());
     }
@@ -5389,7 +5383,7 @@ mod tests {
     #[test]
     fn mutation_update_subset() {
         let (file, _diags) =
-            crate::parse_query(r#"users[name == "Bob"].update({ age = 30, score = 2.5f }); 0"#);
+            crate::parse_query(r#"users[name == "Bob"].update({ age = 30, score = 2.5f });"#);
         let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(diags.is_empty(), "expected no errors, got {diags:?}");
     }
@@ -5397,7 +5391,7 @@ mod tests {
     #[test]
     fn mutation_duplicate_field() {
         let (file, _diags) = crate::parse_query(
-            r#"users.insert({ name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, name = "Bob", created = @now }); 0"#,
+            r#"users.insert({ name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, name = "Bob", created = @now });"#,
         );
         let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(!diags.is_empty());
@@ -5406,7 +5400,7 @@ mod tests {
     #[test]
     fn mutation_insert_optional_field_omitted() {
         let (file, _diags) = crate::parse_query(
-            r#"users.insert({ name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, created = @now }); 0"#,
+            r#"users.insert({ name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, created = @now });"#,
         );
         let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(diags.is_empty(), "expected no errors, got {diags:?}");
@@ -5415,7 +5409,7 @@ mod tests {
     #[test]
     fn mutation_insert_with_ref_field() {
         let (file, _diags) = crate::parse_query(
-            r#"users.insert({ name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, created = @now, profile = none }); 0"#,
+            r#"users.insert({ name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, created = @now, profile = none });"#,
         );
         let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(diags.is_empty());
@@ -5442,7 +5436,7 @@ mod tests {
             r#"users.insert([
                 { name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, created = @now },
                 { name = "Bob", age = 25, score = 2.0f, balance = 2.0, active = false, created = @today },
-            ]); 0"#,
+            ]);"#,
         );
         let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(diags.is_empty(), "expected no errors, got {diags:?}");
@@ -5454,7 +5448,7 @@ mod tests {
             r#"users.insert([
                 { name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, created = @now },
                 { name = "Bob", score = 2.0f, balance = 0.0, active = true, created = @now },
-            ]); 0"#,
+            ]);"#,
         );
         let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(!diags.is_empty());
@@ -5466,7 +5460,7 @@ mod tests {
             r#"users.insert([
                 { name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, created = @now },
                 { name = 42, age = 25, score = 2.0f, balance = 0.0, active = true, created = @now },
-            ]); 0"#,
+            ]);"#,
         );
         let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(!diags.is_empty());
@@ -5478,7 +5472,7 @@ mod tests {
             r#"users.insert([
                 { name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, created = @now },
                 { name = "Bob", age = 25, score = 2.0f, balance = 0.0, active = true, created = @now, foo = 1 },
-            ]); 0"#,
+            ]);"#,
         );
         let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
         assert!(!diags.is_empty());

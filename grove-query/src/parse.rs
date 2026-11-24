@@ -1234,7 +1234,7 @@ mod tests {
 
     #[test]
     fn repl_parse_invalid() {
-        for src in [";", "let x 1; 0", "42 \"leftover\""] {
+        for src in [";", "let x 1;", "42 \"leftover\""] {
             assert!(
                 matches!(
                     crate::parse_query_repl(src),
@@ -2456,7 +2456,7 @@ mod tests {
 
     #[test]
     fn mutation_all_args_preserved_opt_depth() {
-        let (file, diags) = parse_query("users?.insert({name = \"A\"}, {name = \"B\"}); 0");
+        let (file, diags) = parse_query("users?.insert({name = \"A\"}, {name = \"B\"});");
         let file = file.expect("should parse");
         let Statement::Mutation(mutation) = &file.statements[0] else {
             panic!("expected mutation");
@@ -2468,22 +2468,24 @@ mod tests {
 
     #[test]
     fn mutation_delete_statement() {
-        let src = "users[!active].delete(); 0";
+        let src = "users[!active].delete();";
         let file = parse_query(src).0.expect("should parse");
-        assert_eq!(file.statements.len(), 2);
+        assert_eq!(file.statements.len(), 1);
         assert!(
             matches!(&file.statements[0], Statement::Mutation(m) if m.kind.value == MutationKind::Delete)
         );
+        assert!(file.output().is_none());
     }
 
     #[test]
     fn mutation_update_statement() {
-        let src = "users.update({name = \"Bob\"}); 0";
+        let src = "users.update({name = \"Bob\"});";
         let file = parse_query(src).0.expect("should parse");
-        assert_eq!(file.statements.len(), 2);
+        assert_eq!(file.statements.len(), 1);
         assert!(
             matches!(&file.statements[0], Statement::Mutation(m) if m.kind.value == MutationKind::Update)
         );
+        assert!(file.output().is_none());
     }
 
     #[test]
@@ -2554,14 +2556,14 @@ mod tests {
 
     #[test]
     fn let_missing_equals() {
-        let (file, diags) = parse_query("let x 1; 0");
+        let (file, diags) = parse_query("let x 1;");
         assert!(file.is_none());
         assert!(diags.iter().any(|d| d.code.as_ref() == "QP0026"));
     }
 
     #[test]
     fn let_missing_name() {
-        let (file, diags) = parse_query("let = 1; 0");
+        let (file, diags) = parse_query("let = 1;");
         assert!(file.is_none());
         assert!(diags.iter().any(|d| d.code.as_ref() == "QP0029"));
     }
@@ -2575,7 +2577,7 @@ mod tests {
 
     #[test]
     fn let_mutation_value() {
-        let (file, diags) = parse_query("let x = users.insert({name = \"Alice\"}); 0");
+        let (file, diags) = parse_query("let x = users.insert({name = \"Alice\"});");
         assert!(file.is_none());
         assert!(diags.iter().any(|d| d.code.as_ref() == "QP0028"));
     }
@@ -2592,7 +2594,7 @@ mod tests {
 
     #[test]
     fn let_trailing_input() {
-        let (file, diags) = parse_query("let x = 1 foo; 0");
+        let (file, diags) = parse_query("let x = 1 foo;");
         assert!(file.is_none());
         assert!(diags.iter().any(|d| d.code.as_ref() == "QP0002"));
     }

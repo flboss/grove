@@ -984,7 +984,7 @@ mod tests {
                 pos = (1.5f, -2.5f),
                 kind = Kind::B,
                 maybe_kind = some(Kind::A)
-            }); 0"#,
+            });"#,
             &schema,
             &backend,
         );
@@ -1352,7 +1352,7 @@ mod tests {
         let backend = SqliteBackend::new(conn, &schema).unwrap();
 
         let file = typed(
-            "users.first()?.orders?.insert({ id = 1, total = 1 }); 0",
+            "users.first()?.orders?.insert({ id = 1, total = 1 });",
             &schema,
         );
         let err =
@@ -2075,18 +2075,22 @@ mod tests {
         let child = schema.struct_by_name("Child").unwrap().0;
         let parent_field = schema.struct_field(child, "parent").unwrap().0;
         let children_field = schema.struct_field(parent, "children").unwrap().0;
-        let missing = RowOrigin {
+        let missing_parent = RowOrigin {
+            struct_id: parent,
+            key: Key(999),
+        };
+        let missing_child = RowOrigin {
             struct_id: child,
             key: Key(999),
         };
 
         let mut txn = backend.begin_write().unwrap();
         assert!(matches!(
-            txn.link_row_refs(parent_field, Key(1), &[missing], LinkMode::Append),
+            txn.link_row_refs(parent_field, Key(1), &[missing_parent], LinkMode::Append),
             Err(ExecError::Integrity { .. })
         ));
         assert!(matches!(
-            txn.link_row_refs(children_field, Key(1), &[missing], LinkMode::Append),
+            txn.link_row_refs(children_field, Key(1), &[missing_child], LinkMode::Append),
             Err(ExecError::Integrity { .. })
         ));
         txn.rollback().unwrap();
