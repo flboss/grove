@@ -1994,7 +1994,7 @@ mod tests {
             &schema,
             &backend,
         );
-        assert_eq!(result, Some(some(int(1))));
+        assert_eq!(result, Some(some(some(int(1)))));
 
         let result = run(
             r#"
@@ -2030,6 +2030,113 @@ mod tests {
             Err(ExecError::Integrity { .. })
         ));
         txn.rollback().unwrap();
+    }
+
+    #[test]
+    fn many_to_many_link_missing_targets_rejected() {
+        let schema = many_to_many_schema();
+        let backend = many_to_many_backend(&schema);
+        let user = schema.struct_by_name("User").unwrap().0;
+        let role = schema.struct_by_name("Role").unwrap().0;
+        let roles_field = schema.struct_field(user, "roles").unwrap().0;
+        let missing = RowOrigin {
+            struct_id: role,
+            key: Key(999),
+        };
+
+        let mut txn = backend.begin_write().unwrap();
+        assert!(matches!(
+            txn.link_row_refs(roles_field, Key(1), &[missing], LinkMode::Append),
+            Err(ExecError::Integrity { .. })
+        ));
+        txn.rollback().unwrap();
+    }
+
+    #[test]
+    fn many_to_many_append_idempotence() {
+        let schema = many_to_many_schema();
+        let backend = many_to_many_backend(&schema);
+
+        let result = run(
+            r#"
+            users.find(id == 2).unwrap().roles.insert(&roles[id == 2]);
+            users.find(id == 2).unwrap().roles.insert(&roles[id == 2]);
+            roles.find(id == 1).unwrap().users.insert(&users[id == 2]);
+            (
+                users.find(id == 2).unwrap().roles.len(),
+                roles.find(id == 1).unwrap().users.len(),
+                roles.len()
+            )
+            "#,
+            &schema,
+            &backend,
+        );
+        assert_eq!(result, Some(Val::Tuple(vec![int(2), int(2), int(2)])));
+    }
+
+    #[test]
+    fn many_to_many_replace_any_endpoint() {
+        let schema = many_to_many_schema();
+        let backend = many_to_many_backend(&schema);
+
+        let result = run(
+            r#"
+            users.find(id == 1)?.update({ roles = &roles[id == 2] });
+            (
+                users.find(id == 1).unwrap().roles.id,
+                roles.len()
+            )
+            "#,
+            &schema,
+            &backend,
+        );
+        assert_eq!(
+            result,
+            Some(Val::Tuple(vec![Val::list(vec![int(2)]), int(2),]))
+        );
+
+        let result = run(
+            r#"
+            roles.find(id == 2)?.update({ users = &users[id == 2] });
+            (
+                roles.find(id == 2).unwrap().users.id,
+                users.find(id == 1).unwrap().roles.len(),
+                users.find(id == 2).unwrap().roles.id,
+                users.len(),
+            )
+            "#,
+            &schema,
+            &backend,
+        );
+        assert_eq!(
+            result,
+            Some(Val::Tuple(vec![
+                Val::list(vec![int(2)]),
+                int(0),
+                Val::list(vec![int(1), int(2)]),
+                int(2),
+            ]))
+        );
+    }
+
+    #[test]
+    fn many_to_many_clear_join_table() {
+        let schema = many_to_many_schema();
+        let backend = many_to_many_backend(&schema);
+
+        let result = run(
+            r#"
+            users.find(id == 1)?.update({ roles = [] });
+            (
+                users.find(id == 1).unwrap().roles.len(),
+                roles.len(),
+                users.len(),
+            )
+            "#,
+            &schema,
+            &backend,
+        );
+        assert_eq!(result, Some(Val::Tuple(vec![int(0), int(2), int(2)])));
     }
 
     #[test]

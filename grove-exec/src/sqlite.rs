@@ -6,7 +6,7 @@ use std::rc::Rc;
 
 use grove_schema::validated::{
     ColumnId, EnumId, EnumUnderlying, EnumValue, Field, FieldId, Relation, RelationId, ScalarType,
-    StorageTable, StructId, ValidatedSchema, ValueType,
+    StorageTable, StructId, TableId, ValidatedSchema, ValueType,
 };
 use rusqlite::config::DbConfig;
 use rusqlite::params_from_iter;
@@ -1493,6 +1493,208 @@ impl SqliteWriteTxn<'_, '_> {
         }
     }
 
+    fn fetch_row_keys(
+        &self,
+        column: ColumnId,
+        rows: &[RowOrigin],
+        role: &str,
+    ) -> Result<Vec<Value>, ExecError> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let table = quote(&self.schema.tables[column.table_id().index()].name);
+        let column_name = quote(self.schema.column_name(column));
+        let txn = self.txn()?;
+        let mut found = HashMap::with_capacity(rows.len());
+        for chunk in rows.chunks(500) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!(
+                "SELECT _rowid_, {column_name} FROM {table} WHERE _rowid_ IN ({placeholders})"
+            );
+            let params = chunk.iter().map(|origin| Value::Integer(origin.key.0));
+            let mut stmt = txn
+                .prepare_cached(&sql)
+                .map_err(|err| SqliteBackend::storage_error("fetch row keys (prepare)", err))?;
+            let mut query = stmt
+                .query(params_from_iter(params))
+                .map_err(|err| SqliteBackend::storage_error("fetch row keys (query)", err))?;
+            while let Some(row) = query
+                .next()
+                .map_err(|err| SqliteBackend::storage_error("fetch row keys (row)", err))?
+            {
+                let rowid: i64 = row
+                    .get(0)
+                    .map_err(|err| SqliteBackend::storage_error("fetch row keys (rowid)", err))?;
+                let value: Value = row
+                    .get(1)
+                    .map_err(|err| SqliteBackend::storage_error("fetch row keys (value)", err))?;
+                found.insert(rowid, value);
+            }
+        }
+
+        let mut values = Vec::with_capacity(rows.len());
+        for origin in rows {
+            let Some(value) = found.remove(&origin.key.0) else {
+                return Err(ExecError::Integrity {
+                    message: format!("{role} row {} was not found", origin.key.0),
+                });
+            };
+            if matches!(value, Value::Null) {
+                return Err(ExecError::Integrity {
+                    message: format!(
+                        "{role} row {} has no join key in column `{}`",
+                        origin.key.0,
+                        self.schema.column_name(column)
+                    ),
+                });
+            }
+            values.push(value);
+        }
+        Ok(values)
+    }
+
+    fn fetch_join_values(
+        &self,
+        join_table: TableId,
+        owner_col: ColumnId,
+        target_col: ColumnId,
+        owner: &Value,
+    ) -> Result<Vec<Value>, ExecError> {
+        let table = quote(&self.schema.tables[join_table.index()].name);
+        let owner_col = quote(self.schema.column_name(owner_col));
+        let target_col = quote(self.schema.column_name(target_col));
+        let sql = format!("SELECT {target_col} FROM {table} WHERE {owner_col} = ?");
+        let txn = self.txn()?;
+        let mut stmt = txn
+            .prepare_cached(&sql)
+            .map_err(|err| SqliteBackend::storage_error("fetch join values (prepare)", err))?;
+        let mut rows = stmt
+            .query(params_from_iter([owner]))
+            .map_err(|err| SqliteBackend::storage_error("fetch join values (query)", err))?;
+        let mut values = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(|err| SqliteBackend::storage_error("fetch join values (row)", err))?
+        {
+            values.push(
+                row.get(0).map_err(|err| {
+                    SqliteBackend::storage_error("fetch join values (value)", err)
+                })?,
+            );
+        }
+        Ok(values)
+    }
+
+    fn insert_join_rows(
+        &mut self,
+        join_table: TableId,
+        owner_col: ColumnId,
+        target_col: ColumnId,
+        owner: &Value,
+        targets: &[Value],
+    ) -> Result<(), ExecError> {
+        if targets.is_empty() {
+            return Ok(());
+        }
+        let table = quote(&self.schema.tables[join_table.index()].name);
+        let owner_col = quote(self.schema.column_name(owner_col));
+        let target_col = quote(self.schema.column_name(target_col));
+        let txn = self.txn()?;
+        for chunk in targets.chunks(500) {
+            let values = vec!["(?, ?)"; chunk.len()].join(", ");
+            let sql = format!("INSERT INTO {table} ({owner_col}, {target_col}) VALUES {values}");
+            let mut params = Vec::with_capacity(chunk.len() * 2);
+            for target in chunk {
+                params.push(owner.clone());
+                params.push(target.clone());
+            }
+            let mut stmt = txn
+                .prepare_cached(&sql)
+                .map_err(|err| SqliteBackend::storage_error("insert join rows (prepare)", err))?;
+            stmt.execute(params_from_iter(params.iter()))
+                .map_err(|err| SqliteBackend::storage_error("insert join rows (execute)", err))?;
+        }
+        Ok(())
+    }
+
+    fn link_many_to_many(
+        &mut self,
+        rel: RelationId,
+        field: FieldId,
+        owner: Key,
+        targets: &[RowOrigin],
+        mode: LinkMode,
+    ) -> Result<(), ExecError> {
+        let relation = self
+            .schema
+            .relations
+            .get(rel.index())
+            .cloned()
+            .ok_or_else(|| ExecError::Integrity {
+                message: format!("unknown relation id {} (internal error)", rel.index()),
+            })?;
+        let Relation::ManyToMany {
+            join_table,
+            a_col,
+            a_pk,
+            b_col,
+            b_pk,
+            a_ref,
+            b_ref,
+        } = relation
+        else {
+            return Err(ExecError::Integrity {
+                message: "many-to-many link requires a many-to-many relation (internal error)"
+                    .to_string(),
+            });
+        };
+        let Some(Field::Ref {
+            target, is_list, ..
+        }) = self.schema.field(field)
+        else {
+            return Err(ExecError::Integrity {
+                message: "link field is not a ref (internal error)".to_string(),
+            });
+        };
+        if !*is_list {
+            return Err(ExecError::Integrity {
+                message: "many-to-many link field must be a list (internal error)".to_string(),
+            });
+        }
+        if targets.iter().any(|origin| origin.struct_id != *target) {
+            return Err(ExecError::Integrity {
+                message: "link target struct mismatch (internal error)".to_string(),
+            });
+        }
+
+        let owner_is_first = field == a_ref;
+        let (owner_col, owner_pk, target_col, target_pk) = if owner_is_first {
+            (a_col, a_pk, b_col, b_pk)
+        } else if field == b_ref {
+            (b_col, b_pk, a_col, a_pk)
+        } else {
+            return Err(ExecError::Integrity {
+                message: "link field is not an endpoint of its relation (internal error)"
+                    .to_string(),
+            });
+        };
+
+        let owner_pk = self.fetch_row_key(owner_pk, owner, "link owner")?;
+        if mode == LinkMode::Replace {
+            self.delete_join_rows(rel, owner_is_first, &[owner])?;
+        }
+        if targets.is_empty() {
+            return Ok(());
+        }
+
+        let mut target_keys = self.fetch_row_keys(target_pk, targets, "link target")?;
+        if mode == LinkMode::Append {
+            let existing = self.fetch_join_values(join_table, owner_col, target_col, &owner_pk)?;
+            target_keys.retain(|value| !existing.iter().any(|existing| existing == value));
+        }
+        self.insert_join_rows(join_table, owner_col, target_col, &owner_pk, &target_keys)
+    }
+
     fn link_direct(
         &mut self,
         rel: RelationId,
@@ -1910,7 +2112,20 @@ impl<'conn, 'schema> WriteTxn for SqliteWriteTxn<'conn, 'schema> {
                 .ok_or_else(|| ExecError::Integrity {
                     message: "link field has no relation (internal error)".to_string(),
                 })?;
-        self.link_direct(relation, field, owner, targets, mode)
+        let mut unique_targets = Vec::with_capacity(targets.len());
+        for target in targets {
+            if !unique_targets.contains(target) {
+                unique_targets.push(*target);
+            }
+        }
+        if matches!(
+            self.schema.relations.get(relation.index()),
+            Some(Relation::ManyToMany { .. })
+        ) {
+            self.link_many_to_many(relation, field, owner, &unique_targets, mode)
+        } else {
+            self.link_direct(relation, field, owner, &unique_targets, mode)
+        }
     }
 
     fn update_row(
