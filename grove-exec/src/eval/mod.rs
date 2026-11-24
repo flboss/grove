@@ -229,9 +229,10 @@ pub fn eval(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
         }
         TypedExprKind::Binary { op, lhs, rhs } => eval_binary(op, lhs, rhs, ctx, expr.span),
         TypedExprKind::Unary { op, expr: inner } => eval_unary(op, inner, ctx, expr.span),
-        TypedExprKind::RowRef { .. } => Err(ExecError::Unsupported {
-            message: "row reference evaluation is not implemented yet".to_string(),
-        }),
+        TypedExprKind::RowRef { expr: inner } => {
+            let value = eval(inner, ctx)?;
+            eval_row_ref(value)
+        }
         TypedExprKind::Field {
             base,
             name,
@@ -251,6 +252,32 @@ pub fn eval(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
         TypedExprKind::Array { elements } => eval_array(elements, ctx),
         TypedExprKind::Struct { fields } => eval_struct(fields, ctx),
         TypedExprKind::Projection { base, items } => eval_projection(base, items, ctx),
+    }
+}
+
+/// Convert a traceable value into row references, preserving list/optional shape
+fn eval_row_ref(value: Val) -> Result<Val, ExecError> {
+    match value {
+        Val::Record(record) => record
+            .origin
+            .map(Val::RowRef)
+            .ok_or_else(|| ExecError::Integrity {
+                message: "row reference source record has no row origin (internal error)"
+                    .to_string(),
+            }),
+        Val::Some(inner) => eval_row_ref(*inner).map(|value| Val::Some(Box::new(value))),
+        Val::None => Ok(Val::None),
+        Val::List(list) => list
+            .items
+            .into_iter()
+            .map(eval_row_ref)
+            .collect::<Result<Vec<_>, _>>()
+            .map(Val::list),
+        other => Err(ExecError::Integrity {
+            message: format!(
+                "row reference source is not a record, list, or optional: {other} (internal error)"
+            ),
+        }),
     }
 }
 
@@ -548,14 +575,16 @@ mod tests {
     use super::{Env, EvalCtx, ExecOptions, ExecSession, eval};
     use crate::error::ExecError;
     use crate::pushdown::PushdownPlan;
+    use crate::storage::Key;
     use crate::testdata;
-    use crate::value::Val;
+    use crate::value::{CollectionOrigin, RowOrigin, Val};
     use grove_query::TypeBindings;
     use grove_query::typecheck::types::{
-        IdentBinding, QueryType, TargetProvenance, TypedExpr, TypedExprKind, TypedQueryFile,
+        IdentBinding, QueryType, RecordSource, TargetProvenance, TypedExpr, TypedExprKind,
+        TypedQueryFile,
     };
     use grove_schema::validated::{ScalarType, ValidatedSchema};
-    use grove_types::{Span, Spanned};
+    use grove_types::{NodeId, Span, Spanned};
     use rust_decimal::dec;
     use std::rc::Rc;
 
@@ -1023,5 +1052,108 @@ mod tests {
             session.execute(&typed, FIXED_NOW, ExecOptions::default()),
             Ok(Some(int(1)))
         );
+    }
+
+    fn eval_row_ref_value(
+        value: Val,
+        input_ty: QueryType,
+        output_ty: QueryType,
+    ) -> Result<Val, ExecError> {
+        let schema = testdata::schema();
+        let plan = PushdownPlan::disabled(&schema);
+        let mut env = Env::new();
+        env.define("source", value);
+        let mut ctx = EvalCtx::new(&mut env, FIXED_NOW, &NoStorage, &schema, &plan);
+        let span = Span::new(0, 6);
+        let source = TypedExpr {
+            kind: TypedExprKind::Ident {
+                name: Spanned::new(span, "source".to_string()),
+                binding: IdentBinding::Let,
+                depth: 0,
+            },
+            ty: input_ty,
+            provenance: TargetProvenance::NONE,
+            span,
+            id: NodeId(0),
+        };
+        let expr = TypedExpr {
+            kind: TypedExprKind::RowRef {
+                expr: Box::new(source),
+            },
+            ty: output_ty,
+            provenance: TargetProvenance::NONE,
+            span,
+            id: NodeId(1),
+        };
+        eval(&expr, &mut ctx)
+    }
+
+    #[test]
+    fn eval_row_ref_shapes() {
+        let user = testdata::struct_id(&testdata::schema(), "User");
+        let first = RowOrigin {
+            struct_id: user,
+            key: Key(10),
+        };
+        let second = RowOrigin {
+            struct_id: user,
+            key: Key(20),
+        };
+        let record_ty = QueryType::Record(RecordSource::Schema(user));
+        let row_ref_ty = QueryType::RowRef(user);
+
+        assert_eq!(
+            eval_row_ref_value(
+                Val::record_at(Vec::new(), first),
+                record_ty.clone(),
+                row_ref_ty.clone(),
+            ),
+            Ok(Val::RowRef(first))
+        );
+
+        let list = Val::list_at(
+            vec![
+                Val::record_at(Vec::new(), first),
+                Val::record_at(Vec::new(), second),
+            ],
+            CollectionOrigin::Root {
+                struct_id: user,
+                root_idx: 0,
+            },
+        );
+        let list_ty = QueryType::List(Box::new(record_ty.clone()));
+        let output_list_ty = QueryType::List(Box::new(row_ref_ty.clone()));
+        let result = eval_row_ref_value(list, list_ty, output_list_ty).unwrap();
+        assert_eq!(
+            result,
+            Val::list(vec![Val::RowRef(first), Val::RowRef(second)])
+        );
+        assert_eq!(result.collection_origin(), None);
+
+        let optional_ty = QueryType::Optional(Box::new(record_ty));
+        let output_optional_ty = QueryType::Optional(Box::new(row_ref_ty));
+        assert_eq!(
+            eval_row_ref_value(
+                Val::Some(Box::new(Val::record_at(Vec::new(), first))),
+                optional_ty.clone(),
+                output_optional_ty.clone(),
+            ),
+            Ok(Val::Some(Box::new(Val::RowRef(first))))
+        );
+        assert_eq!(
+            eval_row_ref_value(Val::None, optional_ty, output_optional_ty),
+            Ok(Val::None)
+        );
+    }
+
+    #[test]
+    fn eval_row_ref_untracked_record_rejected() {
+        let user = testdata::struct_id(&testdata::schema(), "User");
+        let result = eval_row_ref_value(
+            Val::record(Vec::new()),
+            QueryType::Record(RecordSource::Schema(user)),
+            QueryType::RowRef(user),
+        );
+        assert!(matches!(result, Err(ExecError::Integrity { .. })));
     }
 }
