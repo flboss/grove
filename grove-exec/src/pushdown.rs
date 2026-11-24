@@ -122,7 +122,6 @@ pub struct PushdownPlan {
     fields: HashMap<StructId, Vec<FieldId>>,
     rewrites: HashMap<NodeId, RewritePlan>,
     prefetch_skip: HashSet<FieldId>,
-    enabled: bool,
 }
 
 impl PushdownPlan {
@@ -176,12 +175,7 @@ impl PushdownPlan {
             fields: all_struct_fields(schema),
             rewrites: HashMap::new(),
             prefetch_skip: HashSet::new(),
-            enabled: false,
         }
-    }
-
-    pub fn is_enabled(&self) -> bool {
-        self.enabled
     }
 
     pub fn constraints_for(&self, node: NodeId) -> Option<&FetchConstraints> {
@@ -195,7 +189,8 @@ impl PushdownPlan {
             .unwrap_or(&[])
     }
 
-    pub fn runtime_rewrite(&self, node: NodeId) -> Option<RuntimeRewrite> {
+    #[cfg(test)]
+    fn runtime_rewrite(&self, node: NodeId) -> Option<RuntimeRewrite> {
         self.rewrites.get(&node).map(|n| n.rewrite)
     }
 
@@ -209,7 +204,7 @@ impl PushdownPlan {
 }
 
 /// Non-Ref fields of every struct in declaration order
-pub fn all_struct_fields(schema: &ValidatedSchema) -> HashMap<StructId, Vec<FieldId>> {
+fn all_struct_fields(schema: &ValidatedSchema) -> HashMap<StructId, Vec<FieldId>> {
     schema
         .structs
         .iter()
@@ -568,7 +563,6 @@ impl<'a> PlanBuilder<'a> {
             fields,
             rewrites,
             prefetch_skip,
-            enabled: true,
         }
     }
 
@@ -2101,7 +2095,6 @@ mod tests {
     fn disabled_pushdown_plan() {
         let schema = testdata::schema();
         let plan = PushdownPlan::disabled(&schema);
-        assert!(!plan.is_enabled());
         assert!(plan.fetches.is_empty());
         assert!(plan.rewrites.is_empty());
         assert!(plan.prefetch_skip.is_empty());

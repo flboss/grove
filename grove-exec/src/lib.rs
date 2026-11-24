@@ -1,5 +1,5 @@
-pub mod codec;
-pub mod error;
+pub(crate) mod codec;
+pub(crate) mod error;
 pub mod eval;
 pub(crate) mod method_meta;
 pub mod pushdown;

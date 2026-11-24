@@ -6,8 +6,7 @@ use rust_decimal::Decimal;
 
 use crate::value::{Scalar, Val};
 
-pub(crate) const MIDNIGHT: NaiveTime =
-    NaiveTime::from_hms_opt(0, 0, 0).expect("midnight is a valid time");
+const MIDNIGHT: NaiveTime = NaiveTime::from_hms_opt(0, 0, 0).expect("midnight is a valid time");
 
 pub(crate) fn decode_literal(lit: &Spanned<Literal>, now: DateTime<Utc>) -> Val {
     match &lit.value {

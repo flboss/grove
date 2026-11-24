@@ -12,8 +12,8 @@ use crate::storage::Storage;
 use crate::value::{Interner, Scalar, Val, rewrap_optional, unwrap_optional_depth};
 
 mod arithmetic;
-pub mod composite;
-pub mod data;
+mod composite;
+mod data;
 pub(crate) mod literals;
 mod methods;
 mod mutations;
@@ -30,7 +30,7 @@ use operators::{eval_binary, eval_cast, eval_unary};
 
 /// Lexical value scope chain
 #[derive(Debug, Default)]
-pub struct Env {
+pub(crate) struct Env {
     scopes: Vec<HashMap<Rc<str>, Val>>,
     pub(crate) element_depth: usize,
 }
@@ -117,7 +117,7 @@ impl Env {
     }
 }
 
-pub struct EvalCtx<'a> {
+pub(crate) struct EvalCtx<'a> {
     env: &'a mut Env,
     now: DateTime<Utc>,
     pub(crate) interner: Interner,
@@ -157,7 +157,7 @@ impl EvalCtx<'_> {
 }
 
 /// Evaluate an expression
-pub fn eval(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
+pub(crate) fn eval(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
     match &expr.kind {
         TypedExprKind::Literal(lit) => Ok(decode_literal(lit, ctx.now)),
         TypedExprKind::Ident {
@@ -277,7 +277,7 @@ fn eval_row_ref(value: Val) -> Result<Val, ExecError> {
 }
 
 /// Evaluate 0-based tuple element access
-pub fn eval_tuple_access(
+fn eval_tuple_access(
     base: &TypedExpr,
     index: usize,
     opt_depth: usize,
@@ -308,7 +308,7 @@ pub fn eval_tuple_access(
 }
 
 /// Evaluate a `let` and bind its value
-pub fn eval_let(stmt: &TypedLetStmt, ctx: &mut EvalCtx<'_>) -> Result<(), ExecError> {
+pub(crate) fn eval_let(stmt: &TypedLetStmt, ctx: &mut EvalCtx<'_>) -> Result<(), ExecError> {
     let mut value = eval(&stmt.value, ctx)?;
     resolve_owning_values(ctx, std::slice::from_mut(&mut value), None)?;
     ctx.env.define(ctx.interner.intern(&stmt.name.value), value);

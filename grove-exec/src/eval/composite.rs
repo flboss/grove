@@ -11,7 +11,7 @@ use crate::eval::data::{
 };
 use crate::value::Val;
 
-pub(crate) fn eval_tuple(elements: &[TypedExpr], ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
+pub(super) fn eval_tuple(elements: &[TypedExpr], ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
     let mut items = Vec::with_capacity(elements.len());
     for element in elements {
         items.push(eval(element, ctx)?);
@@ -19,7 +19,7 @@ pub(crate) fn eval_tuple(elements: &[TypedExpr], ctx: &mut EvalCtx<'_>) -> Resul
     Ok(Val::Tuple(items))
 }
 
-pub(crate) fn eval_array(elements: &[TypedExpr], ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
+pub(super) fn eval_array(elements: &[TypedExpr], ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
     let mut items = Vec::with_capacity(elements.len());
     for element in elements {
         items.push(eval(element, ctx)?);
@@ -27,7 +27,7 @@ pub(crate) fn eval_array(elements: &[TypedExpr], ctx: &mut EvalCtx<'_>) -> Resul
     Ok(Val::list(items))
 }
 
-pub(crate) fn eval_struct(
+pub(super) fn eval_struct(
     fields: &[(Spanned<String>, TypedExpr)],
     ctx: &mut EvalCtx<'_>,
 ) -> Result<Val, ExecError> {
@@ -39,7 +39,7 @@ pub(crate) fn eval_struct(
     resolve_projection_refs(ctx, Val::record(record))
 }
 
-pub(crate) fn eval_projection(
+pub(super) fn eval_projection(
     base: &TypedExpr,
     items: &[TypedProjectionItem],
     ctx: &mut EvalCtx<'_>,

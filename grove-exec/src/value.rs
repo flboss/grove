@@ -26,7 +26,7 @@ pub enum Scalar {
 }
 
 impl Scalar {
-    pub fn kind_str(&self) -> &'static str {
+    pub(crate) fn kind_str(&self) -> &'static str {
         match self {
             Scalar::Int(_) => "Int",
             Scalar::Float(_) => "Float",
@@ -344,6 +344,7 @@ impl Val {
         }
     }
 
+    #[cfg(test)]
     pub fn row_ref_origin(&self) -> Option<&RowOrigin> {
         match self {
             Val::RowRef(origin) => Some(origin),
@@ -519,12 +520,12 @@ impl Scalar {
 
 /// Field-name interner owned by the executor
 #[derive(Debug, Default)]
-pub struct Interner {
+pub(crate) struct Interner {
     names: HashSet<Rc<str>>,
 }
 
 impl Interner {
-    pub fn intern<'a>(&mut self, name: impl Into<Cow<'a, str>>) -> Rc<str> {
+    pub(crate) fn intern<'a>(&mut self, name: impl Into<Cow<'a, str>>) -> Rc<str> {
         let name = name.into();
         if let Some(existing) = self.names.get(name.as_ref()) {
             return Rc::clone(existing);
@@ -533,25 +534,17 @@ impl Interner {
         self.names.insert(Rc::clone(&arc));
         arc
     }
-
-    pub fn len(&self) -> usize {
-        self.names.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.names.is_empty()
-    }
 }
 
 /// Total nanoseconds of a Duration
-pub fn total_nanos(td: &TimeDelta) -> i128 {
+pub(crate) fn total_nanos(td: &TimeDelta) -> i128 {
     td.num_seconds() as i128 * NANOS_PER_SEC as i128 + td.subsec_nanos() as i128
 }
 
-pub const NANOS_PER_SEC: u128 = 1_000_000_000;
-pub const NANOS_PER_MIN: u128 = 60 * NANOS_PER_SEC;
-pub const NANOS_PER_HOUR: u128 = 60 * NANOS_PER_MIN;
-pub const NANOS_PER_DAY: u128 = 24 * NANOS_PER_HOUR;
+pub(crate) const NANOS_PER_SEC: u128 = 1_000_000_000;
+pub(crate) const NANOS_PER_MIN: u128 = 60 * NANOS_PER_SEC;
+pub(crate) const NANOS_PER_HOUR: u128 = 60 * NANOS_PER_MIN;
+pub(crate) const NANOS_PER_DAY: u128 = 24 * NANOS_PER_HOUR;
 
 fn fmt_duration(td: &TimeDelta) -> String {
     let total_nanos = total_nanos(td);
@@ -670,7 +663,7 @@ impl Val {
         ValFormatter::new(self, schema)
     }
 
-    pub fn fmt_with(&self, schema: &ValidatedSchema, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt_with(&self, schema: &ValidatedSchema, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Val::None => write!(f, "none"),
             Val::Some(inner) => write!(f, "some({})", inner.formatter(schema)),
@@ -753,7 +746,7 @@ pub struct ValFormatter<'v, 's> {
 }
 
 impl<'v, 's> ValFormatter<'v, 's> {
-    pub fn new(value: &'v Val, schema: &'s ValidatedSchema) -> Self {
+    pub(crate) fn new(value: &'v Val, schema: &'s ValidatedSchema) -> Self {
         ValFormatter { value, schema }
     }
 }
@@ -1011,7 +1004,7 @@ mod tests {
         let y = interner.intern("y");
         assert!(Rc::ptr_eq(&x, &interner.intern("x")));
         assert!(!Rc::ptr_eq(&x, &y));
-        assert_eq!(interner.len(), 2);
+        assert_eq!(interner.names.len(), 2);
         let list = Val::list(vec![Val::Scalar(Scalar::Int(1)), Val::None]);
         assert_eq!(list.to_string(), "[1, none]");
         let tuple = Val::Tuple(vec![

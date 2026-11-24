@@ -21,11 +21,11 @@ pub(super) enum ArithOp {
 }
 
 impl ArithOp {
-    pub(super) fn is_rhs_zero_undefined(&self) -> bool {
+    fn is_rhs_zero_undefined(&self) -> bool {
         matches!(self, ArithOp::Div | ArithOp::Rem | ArithOp::Mod)
     }
 
-    pub(super) fn full_name(&self) -> &str {
+    fn full_name(&self) -> &str {
         match self {
             ArithOp::Add => "addition",
             ArithOp::Sub => "subtraction",

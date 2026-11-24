@@ -14,7 +14,7 @@ use crate::storage::{Key, Row};
 use crate::value::{CollectionOrigin, RowOrigin, Val, rewrap_optional, unwrap_optional_depth};
 
 /// Read root table into a List<Record> (owning Refs resolved)
-pub(crate) fn exec_root(
+pub(super) fn exec_root(
     ctx: &mut EvalCtx,
     root_idx: usize,
     node: NodeId,
@@ -322,7 +322,7 @@ fn splice_owning_refs(
 }
 
 /// Resolve owning Refs anywhere in the given values, batching per FieldId
-pub(crate) fn resolve_owning_values(
+pub(super) fn resolve_owning_values(
     ctx: &mut EvalCtx,
     values: &mut [Val],
     filter: Option<&HashSet<FieldId>>,
@@ -344,11 +344,7 @@ pub(crate) fn resolve_owning_values(
 }
 
 /// Resolve an owning Ref value
-pub(crate) fn resolve_owning_ident(
-    ctx: &mut EvalCtx,
-    field: FieldId,
-    value: Val,
-) -> Result<Val, ExecError> {
+fn resolve_owning_ident(ctx: &mut EvalCtx, field: FieldId, value: Val) -> Result<Val, ExecError> {
     if matches!(value, Val::Ref { .. })
         && matches!(
             ctx.schema.field(field),
@@ -362,7 +358,7 @@ pub(crate) fn resolve_owning_ident(
 }
 
 /// Resolve a Ref value, honoring a planned constrained fetch
-pub(crate) fn resolve_ident_value(
+pub(super) fn resolve_ident_value(
     ctx: &mut EvalCtx,
     node: NodeId,
     field: FieldId,
@@ -394,7 +390,7 @@ pub(crate) fn resolve_ident_value(
 }
 
 /// Owning Ref fields referenced by an expression
-pub(crate) fn owning_refs_in(
+pub(super) fn owning_refs_in(
     expr: &TypedExpr,
     schema: &ValidatedSchema,
     skip: &HashSet<FieldId>,
@@ -405,7 +401,7 @@ pub(crate) fn owning_refs_in(
 }
 
 /// Resolve the given owning Ref fields across values before per-element work
-pub(crate) fn prefetch_owning(
+pub(super) fn prefetch_owning(
     ctx: &mut EvalCtx,
     values: &mut [Val],
     fields: &HashSet<FieldId>,
@@ -417,7 +413,7 @@ pub(crate) fn prefetch_owning(
 }
 
 /// Collect owning Ref fields referenced by an expression
-pub(crate) fn collect_owning_refs_in(
+pub(super) fn collect_owning_refs_in(
     expr: &TypedExpr,
     schema: &ValidatedSchema,
     skip: &HashSet<FieldId>,
@@ -562,7 +558,7 @@ fn rooted_frame(expr: &TypedExpr, schema: &ValidatedSchema, frames: &[bool]) -> 
 }
 
 /// Perform a record field access
-pub(crate) fn exec_field(
+pub(super) fn exec_field(
     base: &TypedExpr,
     name: &str,
     opt_depth: usize,
@@ -626,7 +622,7 @@ pub(crate) fn exec_field(
 }
 
 /// Resolve a bare Ref base before navigation
-pub(crate) fn resolve_base_link(ctx: &mut EvalCtx, base: Val) -> Result<Val, ExecError> {
+pub(super) fn resolve_base_link(ctx: &mut EvalCtx, base: Val) -> Result<Val, ExecError> {
     match base {
         Val::Ref { field, parent } => {
             let mut resolved = resolve_field(ctx, field, &[parent], &FetchConstraints::EMPTY)?;
@@ -751,7 +747,7 @@ fn lookup_ref(
 }
 
 /// Resolve Refs at projection output positions one level
-pub(crate) fn resolve_projection_refs(ctx: &mut EvalCtx, value: Val) -> Result<Val, ExecError> {
+pub(super) fn resolve_projection_refs(ctx: &mut EvalCtx, value: Val) -> Result<Val, ExecError> {
     let mut by_field: HashMap<FieldId, Vec<Key>> = HashMap::new();
     let mut order: Vec<FieldId> = Vec::new();
     collect_projection_refs(&value, &mut by_field, &mut order);

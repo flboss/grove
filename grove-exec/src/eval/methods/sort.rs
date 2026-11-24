@@ -32,15 +32,15 @@ impl SortKind {
         })
     }
 
-    pub(super) fn is_keyed(&self) -> bool {
+    fn is_keyed(&self) -> bool {
         matches!(self, SortKind::AscKeyed | SortKind::DescKeyed)
     }
 
-    pub(super) fn is_desc(&self) -> bool {
+    fn is_desc(&self) -> bool {
         matches!(self, SortKind::Desc | SortKind::DescKeyed)
     }
 
-    pub(super) fn sort_dir(&self) -> SortDir {
+    fn sort_dir(&self) -> SortDir {
         match self {
             SortKind::Asc | SortKind::AscKeyed => SortDir::Asc,
             SortKind::Desc | SortKind::DescKeyed => SortDir::Desc,

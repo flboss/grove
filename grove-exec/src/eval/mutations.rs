@@ -13,7 +13,7 @@ use crate::value::{CollectionOrigin, RecordVal, RowOrigin, Val, unwrap_optional_
 use super::{EvalCtx, eval};
 
 /// Dispatch typed mutation statement to its executor
-pub(crate) fn exec_mutation(
+pub(super) fn exec_mutation(
     stmt: &TypedMutationStmt,
     ctx: &mut EvalCtx<'_>,
     write: &mut dyn WriteTxn,
