@@ -7,34 +7,34 @@ use grove_schema::validated::{ScalarType, ValidatedSchema};
 use rusqlite::{Connection, OpenFlags};
 
 #[derive(Args, Debug, Clone)]
-pub struct BackendArgs {
+pub(crate) struct BackendArgs {
     /// Storage backend
     #[arg(long, value_enum, default_value = "sqlite")]
-    pub backend: BackendKind,
+    backend: BackendKind,
 
     /// Database file (sqlite backend only)
     #[arg(long, alias = "db", value_name = "PATH")]
-    pub file: Option<PathBuf>,
+    file: Option<PathBuf>,
 
     /// Open the database read-only (sqlite backend only)
     #[arg(long)]
-    pub readonly: bool,
+    readonly: bool,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BackendKind {
+pub(crate) enum BackendKind {
     Sqlite,
     Memory,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConnectionSpec {
+pub(crate) enum ConnectionSpec {
     Sqlite { file: PathBuf, readonly: bool },
     Memory,
 }
 
 impl BackendArgs {
-    pub fn resolve(&self) -> Result<ConnectionSpec, String> {
+    pub(crate) fn resolve(&self) -> Result<ConnectionSpec, String> {
         match self.backend {
             BackendKind::Sqlite => {
                 let file = self
@@ -60,14 +60,14 @@ impl BackendArgs {
 }
 
 impl ConnectionSpec {
-    pub fn is_read_only(&self) -> bool {
+    pub(crate) fn is_read_only(&self) -> bool {
         match self {
             ConnectionSpec::Sqlite { readonly, .. } => *readonly,
             ConnectionSpec::Memory => false,
         }
     }
 
-    pub fn description(&self) -> String {
+    pub(crate) fn description(&self) -> String {
         match self {
             ConnectionSpec::Sqlite { file, readonly } => {
                 let mode = if *readonly { " (read-only)" } else { "" };
@@ -77,7 +77,7 @@ impl ConnectionSpec {
         }
     }
 
-    pub fn open<'a>(
+    pub(crate) fn open<'a>(
         &self,
         schema: &'a ValidatedSchema,
     ) -> Result<Box<dyn Storage + 'a>, ExecError> {
@@ -103,20 +103,20 @@ impl ConnectionSpec {
         }
     }
 
-    pub fn repl_commands(&self) -> &'static [ReplCommandSpec] {
+    pub(crate) fn repl_commands(&self) -> &'static [ReplCommandSpec] {
         match self {
             ConnectionSpec::Sqlite { .. } => &[OPEN_FILE_CMD, CLOSE_CMD],
             ConnectionSpec::Memory => &[OPEN_FILE_CMD],
         }
     }
 
-    pub fn repl_command(&self, cmd: &str) -> Option<&'static ReplCommandSpec> {
+    pub(crate) fn repl_command(&self, cmd: &str) -> Option<&'static ReplCommandSpec> {
         self.repl_commands()
             .iter()
             .find(|spec_cmd| spec_cmd.name == cmd)
     }
 
-    pub fn apply_repl_action(
+    pub(crate) fn apply_repl_action(
         &self,
         action: BackendReplAction,
     ) -> Result<BackendCommandOutcome, String> {
@@ -146,13 +146,13 @@ impl ConnectionSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BackendCommandOutcome {
-    pub spec: ConnectionSpec,
-    pub schema: Option<PathBuf>,
+pub(crate) struct BackendCommandOutcome {
+    pub(crate) spec: ConnectionSpec,
+    pub(crate) schema: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BackendReplAction {
+pub(crate) enum BackendReplAction {
     OpenFile {
         file: PathBuf,
         schema: Option<PathBuf>,
@@ -160,11 +160,11 @@ pub enum BackendReplAction {
     Close,
 }
 
-pub struct ReplCommandSpec {
-    pub name: &'static str,
-    pub usage: &'static str,
-    pub description: &'static str,
-    pub parse: fn(&str) -> Result<BackendReplAction, String>,
+pub(crate) struct ReplCommandSpec {
+    pub(crate) name: &'static str,
+    pub(crate) usage: &'static str,
+    pub(crate) description: &'static str,
+    pub(crate) parse: fn(&str) -> Result<BackendReplAction, String>,
 }
 
 const OPEN_FILE_CMD: ReplCommandSpec = ReplCommandSpec {

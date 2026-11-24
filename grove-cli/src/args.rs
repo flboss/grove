@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-pub use crate::backend::{BackendArgs, ConnectionSpec};
+pub(crate) use crate::backend::{BackendArgs, ConnectionSpec};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -13,23 +13,23 @@ pub use crate::backend::{BackendArgs, ConnectionSpec};
     args_conflicts_with_subcommands = true,
     arg_required_else_help = true
 )]
-pub struct Cli {
+pub(crate) struct Cli {
     /// Schema file for the default REPL
     #[arg(value_name = "SCHEMA")]
-    pub schema: Option<PathBuf>,
+    pub(crate) schema: Option<PathBuf>,
 
     #[command(flatten)]
-    pub backend: BackendArgs,
+    pub(crate) backend: BackendArgs,
 
     #[command(flatten)]
-    pub output: OutputArgs,
+    pub(crate) output: OutputArgs,
 
     #[command(subcommand)]
-    pub command: Option<Command>,
+    pub(crate) command: Option<Command>,
 }
 
 #[derive(Subcommand, Debug)]
-pub enum Command {
+pub(crate) enum Command {
     /// Compile and execute one query
     Query(QueryArgs),
     /// Compile one query without opening storage
@@ -39,112 +39,112 @@ pub enum Command {
 }
 
 #[derive(Args, Debug)]
-pub struct QueryArgs {
+pub(crate) struct QueryArgs {
     /// Schema file
     #[arg(value_name = "SCHEMA")]
-    pub schema: PathBuf,
+    pub(crate) schema: PathBuf,
 
     #[command(flatten)]
-    pub input: QueryInputArgs,
+    pub(crate) input: QueryInputArgs,
 
     #[command(flatten)]
-    pub backend: BackendArgs,
+    pub(crate) backend: BackendArgs,
 
     #[command(flatten)]
-    pub output: OutputArgs,
+    pub(crate) output: OutputArgs,
 
     /// Debug: Disable operation pushdown and always evaluate in Rust
     #[arg(long)]
-    pub no_pushdown: bool,
+    pub(crate) no_pushdown: bool,
 }
 
 #[derive(Args, Debug)]
-pub struct CheckArgs {
+pub(crate) struct CheckArgs {
     /// Schema file
     #[arg(value_name = "SCHEMA")]
-    pub schema: PathBuf,
+    pub(crate) schema: PathBuf,
 
     #[command(flatten)]
-    pub input: QueryInputArgs,
+    pub(crate) input: QueryInputArgs,
 }
 
 #[derive(Args, Debug)]
-pub struct ReplArgs {
+pub(crate) struct ReplArgs {
     /// Schema file
     #[arg(value_name = "SCHEMA")]
-    pub schema: PathBuf,
+    pub(crate) schema: PathBuf,
 
     #[command(flatten)]
-    pub backend: BackendArgs,
+    pub(crate) backend: BackendArgs,
 
     #[command(flatten)]
-    pub output: OutputArgs,
+    pub(crate) output: OutputArgs,
 
     /// Debug: Disable operation pushdown and always evaluate in Rust
     #[arg(long)]
-    pub no_pushdown: bool,
+    pub(crate) no_pushdown: bool,
 }
 
 #[derive(Args, Debug)]
-pub struct QueryInputArgs {
+pub(crate) struct QueryInputArgs {
     /// Query source, or `-` to read stdin
     #[arg(value_name = "QUERY")]
-    pub query: Option<String>,
+    pub(crate) query: Option<String>,
 
     /// Read query source from a file
     #[arg(long, value_name = "PATH", conflicts_with = "query")]
-    pub query_file: Option<PathBuf>,
+    pub(crate) query_file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug, Clone)]
-pub struct OutputArgs {
+pub(crate) struct OutputArgs {
     /// Result format
     #[arg(long, value_enum, default_value = "auto")]
-    pub format: Format,
+    pub(crate) format: Format,
 
     /// Color output
     #[arg(long, value_enum, default_value = "auto")]
-    pub color: ColorChoice,
+    pub(crate) color: ColorChoice,
 
     /// Render width (defaults to the terminal width)
     #[arg(long, value_name = "N")]
-    pub width: Option<usize>,
+    pub(crate) width: Option<usize>,
 
     /// Maximum rows to render (0 = unlimited)
     #[arg(long, value_name = "N", default_value_t = 0)]
-    pub max_rows: usize,
+    pub(crate) max_rows: usize,
 
     /// Maximum nested depth to render
     #[arg(long, value_name = "N", default_value_t = 6)]
-    pub max_depth: usize,
+    pub(crate) max_depth: usize,
 
     /// Maximum cell width before truncation
     #[arg(long, value_name = "N", default_value_t = 60)]
-    pub max_cell_width: usize,
+    pub(crate) max_cell_width: usize,
 
     /// Disable depth and cell truncation
     #[arg(long)]
-    pub full: bool,
+    pub(crate) full: bool,
 
     /// Omit table headers
     #[arg(long)]
-    pub no_headers: bool,
+    pub(crate) no_headers: bool,
 
     /// Hide unresolved non-owning reference values in output
     #[arg(long)]
-    pub hide_refs: bool,
+    pub(crate) hide_refs: bool,
 
     /// Write results to a file instead of stdout
     #[arg(long, value_name = "PATH")]
-    pub output: Option<PathBuf>,
+    pub(crate) output: Option<PathBuf>,
 
     /// Print phase timings to stderr
     #[arg(long)]
-    pub stats: bool,
+    pub(crate) stats: bool,
 }
 
 impl OutputArgs {
-    pub fn output_color_enabled(&self) -> bool {
+    pub(crate) fn output_color_enabled(&self) -> bool {
         match self.color {
             ColorChoice::Always => true,
             ColorChoice::Never => false,
@@ -156,7 +156,7 @@ impl OutputArgs {
         }
     }
 
-    pub fn repl_color_enabled(&self) -> bool {
+    pub(crate) fn repl_color_enabled(&self) -> bool {
         match self.color {
             ColorChoice::Always => true,
             ColorChoice::Never => false,
@@ -168,7 +168,7 @@ impl OutputArgs {
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Format {
+pub(crate) enum Format {
     Auto,
     Inline,
     Raw,
@@ -177,7 +177,7 @@ pub enum Format {
 }
 
 impl Format {
-    pub fn parse(value: &str) -> Option<Self> {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
         match value {
             "auto" => Some(Format::Auto),
             "inline" => Some(Format::Inline),
@@ -188,7 +188,7 @@ impl Format {
         }
     }
 
-    pub fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Format::Auto => "auto",
             Format::Inline => "inline",
@@ -200,7 +200,7 @@ impl Format {
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ColorChoice {
+pub(crate) enum ColorChoice {
     Auto,
     Always,
     Never,

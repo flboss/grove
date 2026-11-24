@@ -1,7 +1,7 @@
 use ariadne::{Color, Config, IndexType, Label, Report, ReportKind, Source};
 use grove_types::{Diagnostic, LabelStyle, Severity, Span};
 
-pub fn print(source: &str, name: &str, diagnostics: &[Diagnostic]) {
+pub(crate) fn print(source: &str, name: &str, diagnostics: &[Diagnostic]) {
     if diagnostics.is_empty() {
         return;
     }
@@ -52,6 +52,6 @@ pub fn print(source: &str, name: &str, diagnostics: &[Diagnostic]) {
     }
 }
 
-pub fn abort(message: String, span: Span) -> Diagnostic {
+pub(crate) fn abort(message: String, span: Span) -> Diagnostic {
     Diagnostic::error("R0001", message, span, "query aborted here")
 }

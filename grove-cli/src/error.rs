@@ -9,27 +9,27 @@ pub(crate) const EXIT_COMPILE: i32 = 3;
 
 #[derive(Debug)]
 pub(crate) struct CliError {
-    pub code: i32,
-    pub message: Option<String>,
+    pub(crate) code: i32,
+    pub(crate) message: Option<String>,
 }
 
 impl CliError {
     /// Reports an already-rendered failure without adding another message.
-    pub fn reported(code: i32) -> Self {
+    pub(crate) fn reported(code: i32) -> Self {
         CliError {
             code,
             message: None,
         }
     }
 
-    pub fn usage(message: impl Into<String>) -> Self {
+    pub(crate) fn usage(message: impl Into<String>) -> Self {
         CliError {
             code: EXIT_USAGE,
             message: Some(message.into()),
         }
     }
 
-    pub fn runtime(message: impl Into<String>) -> Self {
+    pub(crate) fn runtime(message: impl Into<String>) -> Self {
         CliError {
             code: EXIT_FAILURE,
             message: Some(message.into()),

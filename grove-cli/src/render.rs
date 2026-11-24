@@ -42,19 +42,19 @@ const BRANCH_LAST: &str = "└─";
 const BRANCH_MIDDLE: &str = "├─";
 const RECORD_ABBREVIATION: &str = "{…}";
 
-pub struct RenderOptions {
-    pub format: Format,
-    pub color: bool,
-    pub width: usize,
-    pub max_rows: usize,
-    pub max_depth: usize,
-    pub max_cell_width: usize,
-    pub headers: bool,
-    pub hide_refs: bool,
+pub(crate) struct RenderOptions {
+    pub(crate) format: Format,
+    pub(crate) color: bool,
+    pub(crate) width: usize,
+    pub(crate) max_rows: usize,
+    pub(crate) max_depth: usize,
+    pub(crate) max_cell_width: usize,
+    pub(crate) headers: bool,
+    pub(crate) hide_refs: bool,
 }
 
 impl RenderOptions {
-    pub fn from_args(args: &OutputArgs, color: bool) -> Self {
+    pub(crate) fn from_args(args: &OutputArgs, color: bool) -> Self {
         let width = args
             .width
             .or_else(terminal_width)
@@ -102,7 +102,7 @@ fn terminal_width() -> Option<usize> {
     None
 }
 
-pub fn render(
+pub(crate) fn render(
     value: &mut Val,
     ty: Option<&QueryType>,
     schema: &ValidatedSchema,
@@ -952,7 +952,11 @@ fn truncate_styled(styled: Styled, max_width: usize) -> Styled {
     Styled { styled: out, width }
 }
 
-pub fn paint<'a>(text: impl Into<Cow<'a, str>>, style: Option<&str>, color: bool) -> Cow<'a, str> {
+pub(crate) fn paint<'a>(
+    text: impl Into<Cow<'a, str>>,
+    style: Option<&str>,
+    color: bool,
+) -> Cow<'a, str> {
     let text = text.into();
     match (color, style) {
         (true, Some(style)) => Cow::Owned(format!("\x1b[{style}m{text}{ANSI_RESET}")),

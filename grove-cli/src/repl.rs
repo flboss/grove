@@ -47,7 +47,7 @@ struct ReplSession<'a> {
     turn: &'a mut usize,
 }
 
-pub fn run(args: ReplArgs) -> CliResult<()> {
+pub(crate) fn run(args: ReplArgs) -> CliResult<()> {
     let ReplArgs {
         schema: mut schema_path,
         backend,
