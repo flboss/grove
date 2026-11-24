@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use grove_query::typecheck::types::{CollectionOriginKind, TypedExpr, TypedMutationStmt};
+use grove_query::{CollectionOriginKind, TypedExpr, TypedMutationStmt};
 use grove_schema::validated::{
     Field, FieldId, Relation, RelationId, StructId, ValidatedSchema, ValueType,
 };
@@ -856,7 +856,7 @@ mod tests {
     use crate::storage::Storage;
     use crate::value::Scalar;
     use chrono::Utc;
-    use grove_query::typecheck::types::TypedQueryFile;
+    use grove_query::TypedQueryFile;
     use rusqlite::Connection;
     use std::rc::Rc;
 

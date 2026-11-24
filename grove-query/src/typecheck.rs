@@ -1,9 +1,13 @@
 pub mod bindings;
-pub mod error;
+pub(crate) mod error;
 pub mod types;
 
 pub use bindings::TypeBindings;
-pub use types::TypedQueryFile;
+pub use types::{
+    CollectionOriginKind, IdentBinding, ProjectionField, QueryType, RecordSource, TargetProvenance,
+    TypedExpr, TypedExprKind, TypedLetStmt, TypedMethodArg, TypedMutationStmt, TypedProjectionItem,
+    TypedQueryFile, TypedStatement,
+};
 
 use std::collections::{HashMap, HashSet};
 
@@ -14,7 +18,6 @@ use crate::ast::{
 use crate::casts::{self, CastMode};
 use crate::methods::{self, ArgCount, ArgSpec, MethodId, ScopeSpec};
 use crate::typecheck::error::TypeError;
-use crate::typecheck::types::*;
 use grove_schema::validated::{Field, FieldId, ScalarType, StructId, ValidatedSchema, ValueType};
 use grove_types::{Diagnostic, NodeId, Severity, Span, Spanned};
 

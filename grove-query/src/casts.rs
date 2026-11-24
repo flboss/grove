@@ -2,7 +2,7 @@ use crate::typecheck::types::QueryType;
 use grove_schema::validated::{EnumId, EnumUnderlying, ScalarType, ValidatedSchema};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CastMode {
+pub(crate) enum CastMode {
     Infallible,
     Fallible,
 }
@@ -88,7 +88,7 @@ impl CastKind {
     }
 }
 
-pub fn lookup(
+pub(crate) fn lookup(
     from: &QueryType,
     to: &QueryType,
     mode: CastMode,

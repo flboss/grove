@@ -2,9 +2,9 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::fmt;
 
+use grove_query::TypedMethodArg;
 use grove_query::ast::SortDir;
 use grove_query::methods::MethodId;
-use grove_query::typecheck::types::TypedMethodArg;
 use grove_types::Span;
 
 use super::{pop_element_scope, push_element_scope};

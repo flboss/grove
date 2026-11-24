@@ -1,8 +1,8 @@
 use std::fmt;
 
 use chrono::TimeDelta;
+use grove_query::TypedMethodArg;
 use grove_query::methods::MethodId;
-use grove_query::typecheck::types::TypedMethodArg;
 use grove_schema::validated::Config;
 use grove_types::Span;
 use rust_decimal::Decimal;

@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use grove_query::ast::{BinaryOp, Literal, SortDir, UnaryOp};
 use grove_query::methods::MethodId;
-use grove_query::typecheck::types::{
+use grove_query::{
     IdentBinding, QueryType, RecordSource, TypedExpr, TypedExprKind, TypedMethodArg,
     TypedMutationStmt, TypedQueryFile, TypedStatement,
 };

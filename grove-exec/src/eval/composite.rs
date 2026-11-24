@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::rc::Rc;
 
-use grove_query::typecheck::types::{TypedExpr, TypedProjectionItem};
+use grove_query::{TypedExpr, TypedProjectionItem};
 use grove_types::Spanned;
 
 use super::{EvalCtx, eval};

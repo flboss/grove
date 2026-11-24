@@ -1,7 +1,7 @@
 use std::fmt;
 
+use grove_query::TypedMethodArg;
 use grove_query::methods::MethodId;
-use grove_query::typecheck::types::TypedMethodArg;
 use grove_types::Span;
 
 use crate::error::ExecError;

@@ -1,7 +1,7 @@
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+use grove_query::TypedExpr;
 use grove_query::ast::{BinaryOp, UnaryOp};
 use grove_query::casts::CastKind;
-use grove_query::typecheck::types::TypedExpr;
 use grove_schema::validated::{EnumId, EnumUnderlying, EnumValue, IntArithmetic, ValidatedSchema};
 use grove_types::{Span, Spanned};
 use num_traits::{FromPrimitive, ToPrimitive};

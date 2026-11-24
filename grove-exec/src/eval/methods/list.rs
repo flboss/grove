@@ -1,5 +1,5 @@
+use grove_query::TypedMethodArg;
 use grove_query::methods::{self, MethodId};
-use grove_query::typecheck::types::TypedMethodArg;
 use grove_types::Span;
 
 use super::{pop_element_scope, push_element_scope};
@@ -15,7 +15,7 @@ pub(super) fn eval_list_slice(
     span: Span,
 ) -> Result<Val, ExecError> {
     let name = methods::method(id)
-        .names
+        .names()
         .first()
         .copied()
         .unwrap_or("<list-method>");

@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::rc::Rc;
 
 use grove_exec::value::{Scalar, Val};
-use grove_query::typecheck::types::{QueryType, RecordSource};
+use grove_query::{QueryType, RecordSource};
 use grove_schema::ValidatedSchema;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 

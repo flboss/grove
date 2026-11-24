@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use grove_query::typecheck::types::{TypedQueryFile, TypedStatement};
+use grove_query::{TypedQueryFile, TypedStatement};
 use grove_schema::validated::ValidatedSchema;
 
 use crate::error::ExecError;

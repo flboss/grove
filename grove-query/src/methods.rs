@@ -83,16 +83,16 @@ pub enum MethodId {
 
 #[derive(Debug, Clone, Copy)]
 pub struct MethodDef {
-    pub id: MethodId,
-    pub names: &'static [&'static str],
-    pub receiver: ReceiverSpec,
-    pub args: ArgSpec,
-    pub scope: ScopeSpec,
-    pub returns: ReturnSpec,
+    pub(crate) id: MethodId,
+    pub(crate) names: &'static [&'static str],
+    pub(crate) receiver: ReceiverSpec,
+    pub(crate) args: ArgSpec,
+    pub(crate) scope: ScopeSpec,
+    pub(crate) returns: ReturnSpec,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum ReceiverSpec {
+pub(crate) enum ReceiverSpec {
     Scalar(ScalarType),
     Optional,
     OptionalOfOptional,
@@ -106,7 +106,7 @@ pub enum ReceiverSpec {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum ArgSpec {
+pub(crate) enum ArgSpec {
     Fixed(&'static [ArgType]),
     Scoped {
         count: ArgCount,
@@ -115,27 +115,27 @@ pub enum ArgSpec {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum ArgType {
+pub(crate) enum ArgType {
     Scalar(ScalarType),
     Inner,
     ListOfInner,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum ArgCount {
+pub(crate) enum ArgCount {
     Exact(usize),
     AtLeast(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScopeSpec {
+pub(crate) enum ScopeSpec {
     None,
     ElementOfReceiver,
     FieldsOrElement,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum ReturnSpec {
+pub(crate) enum ReturnSpec {
     Scalar(ScalarType),
     ListOfScalar(ScalarType),
     Inner,
@@ -195,7 +195,7 @@ impl ReceiverSpec {
 }
 
 impl MethodDef {
-    pub fn fixed_arg_types(&self, receiver: &QueryType) -> Vec<QueryType> {
+    pub(crate) fn fixed_arg_types(&self, receiver: &QueryType) -> Vec<QueryType> {
         match &self.args {
             ArgSpec::Fixed(args) => args
                 .iter()
@@ -206,7 +206,11 @@ impl MethodDef {
         }
     }
 
-    pub fn return_type(&self, receiver: &QueryType, first_arg: Option<&QueryType>) -> QueryType {
+    pub(crate) fn return_type(
+        &self,
+        receiver: &QueryType,
+        first_arg: Option<&QueryType>,
+    ) -> QueryType {
         match self.returns {
             ReturnSpec::Scalar(scalar) => QueryType::Scalar(scalar),
             ReturnSpec::ListOfScalar(scalar) => {
@@ -229,6 +233,10 @@ impl MethodDef {
                 .unwrap_or(QueryType::Unknown)
                 .wrap_optional(),
         }
+    }
+
+    pub fn names(&self) -> &'static [&'static str] {
+        self.names
     }
 
     pub fn is_scalar_method(&self) -> bool {
@@ -958,7 +966,7 @@ static METHODS: &[MethodDef] = &[
     },
 ];
 
-pub fn resolve(base: &QueryType, name: &str) -> Option<&'static MethodDef> {
+pub(crate) fn resolve(base: &QueryType, name: &str) -> Option<&'static MethodDef> {
     METHODS
         .iter()
         .find(|def| def.names.contains(&name) && def.receiver.accepts(base))
@@ -969,10 +977,6 @@ pub fn method(id: MethodId) -> &'static MethodDef {
         .iter()
         .find(|def| def.id == id)
         .expect("every MethodId has exactly one definition")
-}
-
-pub fn methods() -> &'static [MethodDef] {
-    METHODS
 }
 
 #[cfg(test)]

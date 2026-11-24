@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use grove_query::methods;
-use grove_query::typecheck::types::{IdentBinding, TypedExpr, TypedExprKind};
+use grove_query::{IdentBinding, TypedExpr, TypedExprKind};
 use grove_schema::validated::{Field, FieldId, StructId, ValidatedSchema};
 use grove_types::NodeId;
 

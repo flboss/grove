@@ -9,7 +9,7 @@ use crate::lex::Lexer;
 use crate::token::{Token, TokenKind};
 use grove_types::{Diagnostic, Severity, Span, Spanned};
 
-pub struct Parser<'src> {
+pub(crate) struct Parser<'src> {
     lexer: Lexer<'src>,
     current: Token,
     diagnostics: Vec<Diagnostic>,
@@ -18,7 +18,7 @@ pub struct Parser<'src> {
 }
 
 impl<'src> Parser<'src> {
-    pub fn new(source: &'src str) -> Self {
+    pub(crate) fn new(source: &'src str) -> Self {
         let mut lexer = Lexer::new(source);
         let current = lexer.next_token();
         let mut parser = Parser {
@@ -32,7 +32,7 @@ impl<'src> Parser<'src> {
         parser
     }
 
-    pub fn parse_query(mut self) -> (Option<QueryFile>, Vec<Diagnostic>) {
+    pub(crate) fn parse_query(mut self) -> (Option<QueryFile>, Vec<Diagnostic>) {
         let mut result = self.parse_file().ok();
         self.drain_lexer_diagnostics();
         let mut diagnostics = self.diagnostics;
@@ -43,7 +43,7 @@ impl<'src> Parser<'src> {
         (result, diagnostics)
     }
 
-    pub fn parse_query_repl(mut self) -> crate::ParseOutcome {
+    pub(crate) fn parse_query_repl(mut self) -> crate::ParseOutcome {
         let file = self.parse_file().ok();
         self.drain_lexer_diagnostics();
         let mut diagnostics = self.diagnostics;

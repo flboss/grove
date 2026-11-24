@@ -2,9 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use chrono::{DateTime, Utc};
-use grove_query::typecheck::types::{
-    IdentBinding, TypedExpr, TypedExprKind, TypedLetStmt, TypedQueryFile,
-};
+use grove_query::{IdentBinding, TypedExpr, TypedExprKind, TypedLetStmt, TypedQueryFile};
 use grove_schema::validated::ValidatedSchema;
 use grove_types::NodeId;
 
@@ -576,7 +574,7 @@ mod tests {
     use crate::testdata;
     use crate::value::{CollectionOrigin, RowOrigin, Val};
     use grove_query::TypeBindings;
-    use grove_query::typecheck::types::{
+    use grove_query::{
         IdentBinding, QueryType, RecordSource, TargetProvenance, TypedExpr, TypedExprKind,
         TypedQueryFile,
     };

@@ -11,7 +11,11 @@ use grove_types::Diagnostic;
 
 use ast::QueryFile;
 
-pub use typecheck::{TypeBindings, TypedQueryFile, typecheck, typecheck_with_bindings};
+pub use typecheck::{
+    CollectionOriginKind, IdentBinding, ProjectionField, QueryType, RecordSource, TargetProvenance,
+    TypeBindings, TypedExpr, TypedExprKind, TypedLetStmt, TypedMethodArg, TypedMutationStmt,
+    TypedProjectionItem, TypedQueryFile, TypedStatement, typecheck, typecheck_with_bindings,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParseOutcome {

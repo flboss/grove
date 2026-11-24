@@ -1,4 +1,4 @@
-use grove_query::typecheck::types::TypedMethodArg;
+use grove_query::TypedMethodArg;
 
 use super::{pop_map_scope, push_map_scope};
 use crate::error::ExecError;

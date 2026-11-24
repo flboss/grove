@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use grove_query::methods::{self, MethodId};
-use grove_query::typecheck::types::{TypedExpr, TypedExprKind, TypedMethodArg};
+use grove_query::{TypedExpr, TypedExprKind, TypedMethodArg};
 
 use self::filter::eval_filter;
 use self::list::{
