@@ -283,7 +283,7 @@ fn collect_owning_refs(
             }
             Ok(())
         }
-        Val::None | Val::Scalar(_) | Val::Enum(_, _) => Ok(()),
+        Val::None | Val::Scalar(_) | Val::Enum(_, _) | Val::RowRef(_) => Ok(()),
     }
 }
 
@@ -321,7 +321,7 @@ fn splice_owning_refs(
             }
             Ok(())
         }
-        Val::None | Val::Scalar(_) | Val::Enum(_, _) => Ok(()),
+        Val::None | Val::Scalar(_) | Val::Enum(_, _) | Val::RowRef(_) => Ok(()),
     }
 }
 
@@ -658,7 +658,8 @@ pub(crate) fn resolve_base_link(ctx: &mut EvalCtx, base: Val) -> Result<Val, Exe
         | Val::None
         | Val::Scalar(_)
         | Val::Enum(_, _)
-        | Val::Tuple(_) => Ok(base),
+        | Val::Tuple(_)
+        | Val::RowRef(_) => Ok(base),
     }
 }
 
@@ -706,7 +707,8 @@ fn collect_refs(
         | Val::None
         | Val::Scalar(_)
         | Val::Enum(_, _)
-        | Val::Tuple(_) => Ok(()),
+        | Val::Tuple(_)
+        | Val::RowRef(_) => Ok(()),
     }
 }
 
@@ -791,7 +793,8 @@ fn collect_projection_refs(
         | Val::None
         | Val::Scalar(_)
         | Val::Enum(_, _)
-        | Val::Tuple(_) => {}
+        | Val::Tuple(_)
+        | Val::RowRef(_) => {}
     }
 }
 
@@ -815,7 +818,8 @@ fn collect_item_refs(
         | Val::None
         | Val::Scalar(_)
         | Val::Enum(_, _)
-        | Val::Tuple(_) => {}
+        | Val::Tuple(_)
+        | Val::RowRef(_) => {}
     }
 }
 

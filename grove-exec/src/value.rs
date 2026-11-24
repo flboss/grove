@@ -303,6 +303,8 @@ pub enum Val {
     List(ListVal),
     Tuple(Vec<Val>),
     Record(RecordVal),
+    /// Reference to an existing in-storage row
+    RowRef(RowOrigin),
     /// Unresolved navigation link of the `parent` row
     Ref {
         field: FieldId,
@@ -338,6 +340,13 @@ impl Val {
     pub fn row_origin(&self) -> Option<&RowOrigin> {
         match self {
             Val::Record(record) => record.origin.as_ref(),
+            _ => None,
+        }
+    }
+
+    pub fn row_ref_origin(&self) -> Option<&RowOrigin> {
+        match self {
+            Val::RowRef(origin) => Some(origin),
             _ => None,
         }
     }
@@ -411,6 +420,7 @@ impl Val {
                 })
             }
             (Val::Ref { .. }, Val::Ref { .. }) => Some(true),
+            (Val::RowRef(left), Val::RowRef(right)) => Some(left == right),
             _ => None,
         }
     }
@@ -421,7 +431,7 @@ impl Val {
             Val::List(vals) => vals.iter().any(Val::contains_ref),
             Val::Tuple(vals) => vals.iter().any(Val::contains_ref),
             Val::Record(items) => items.iter().any(|(_, val)| val.contains_ref()),
-            Val::Ref { .. } => true,
+            Val::Ref { .. } | Val::RowRef(_) => true,
             _ => false,
         }
     }
@@ -650,6 +660,9 @@ impl fmt::Display for Val {
             Val::Ref { field, .. } => {
                 write!(f, "ref({}:{})", field.struct_id().index(), field.local())
             }
+            Val::RowRef(origin) => {
+                write!(f, "&Struct#{}@{}", origin.struct_id.index(), origin.key.0)
+            }
         }
     }
 }
@@ -725,6 +738,12 @@ impl Val {
                     (false, false) => write!(f, "{}", target.name)?,
                 }
                 write!(f, "#{}", parent.0)
+            }
+            Val::RowRef(origin) => {
+                let Some(struct_) = schema.structs.get(origin.struct_id.index()) else {
+                    return write!(f, "&Struct#{}@{}", origin.struct_id.index(), origin.key.0);
+                };
+                write!(f, "&{}#{}", struct_.name, origin.key.0)
             }
         }
     }
@@ -1028,5 +1047,28 @@ mod tests {
             ),
             Val::list(vec![int(1)])
         );
+    }
+
+    #[test]
+    fn row_ref_value() {
+        let schema = testdata::schema();
+        let user = testdata::struct_id(&schema, "User");
+        let origin = RowOrigin {
+            struct_id: user,
+            key: Key(7),
+        };
+        let other = RowOrigin {
+            struct_id: user,
+            key: Key(8),
+        };
+        let value = Val::RowRef(origin);
+
+        assert_eq!(value.to_string(), format!("&Struct#{}@7", user.index()));
+        assert_eq!(value.formatter(&schema).to_string(), "&User#7");
+        assert_eq!(value.row_ref_origin(), Some(&origin));
+        assert_eq!(value.row_origin(), None);
+        assert_eq!(value.eq(&Val::RowRef(origin)), Some(true));
+        assert_eq!(value.eq(&Val::RowRef(other)), Some(false));
+        assert!(value.contains_ref());
     }
 }

@@ -301,6 +301,10 @@ fn compact(ctx: &RenderCtx<'_>, value: &Val, depth: usize) -> Styled {
             let text = value.formatter(ctx.schema).to_string();
             Styled::painted(text, ANSI_DIM, ctx.options.color)
         }
+        Val::RowRef(_) => {
+            let text = value.formatter(ctx.schema).to_string();
+            Styled::painted(text, ANSI_DIM, ctx.options.color)
+        }
     }
 }
 
