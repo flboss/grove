@@ -1860,15 +1860,7 @@ fn relation_has_owning_endpoint(schema: &ValidatedSchema, field: FieldId) -> boo
     let Some(relation) = schema.relation_of_field(field) else {
         return false;
     };
-    schema.relations[relation.index()]
-        .endpoints()
-        .iter()
-        .any(|endpoint| {
-            matches!(
-                schema.field(*endpoint),
-                Some(Field::Ref { owning: true, .. })
-            )
-        })
+    schema.relation_has_owning_endpoint(&schema.relations[relation.index()])
 }
 
 /// returns the required RowRef shape for a non-owning field

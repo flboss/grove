@@ -798,7 +798,7 @@ fn cleanup_non_owned_links(
             Relation::OneToOne { pk, .. }
             | Relation::ManyToOne { pk, .. }
             | Relation::OneToMany { pk, .. } => {
-                if pk.table_id() == table && !relation_has_owning_endpoint(schema, relation) {
+                if pk.table_id() == table && !schema.relation_has_owning_endpoint(relation) {
                     write.clear_foreign_keys(rel, keys)?;
                 }
             }
@@ -813,13 +813,6 @@ fn cleanup_non_owned_links(
         }
     }
     Ok(())
-}
-
-fn relation_has_owning_endpoint(schema: &ValidatedSchema, relation: &Relation) -> bool {
-    relation
-        .endpoints()
-        .iter()
-        .any(|field| matches!(schema.field(*field), Some(Field::Ref { owning: true, .. })))
 }
 
 #[cfg(test)]

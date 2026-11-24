@@ -16,8 +16,8 @@ use rusqlite::{Connection, OptionalExtension, Statement, Transaction, Transactio
 use crate::codec;
 use crate::error::ExecError;
 use crate::pushdown::{CmpOp, FetchConstraints, PushExpr, StringOp};
-use crate::storage::{Key, Row, Storage, WriteTxn};
-use crate::value::{Scalar, Val, enum_variant_scalar};
+use crate::storage::{Key, LinkMode, Row, Storage, WriteTxn};
+use crate::value::{RowOrigin, Scalar, Val, enum_variant_scalar};
 
 pub struct SqliteBackend<'a> {
     conn: Connection,
@@ -1469,23 +1469,156 @@ impl SqliteWriteTxn<'_, '_> {
 
     /// Read and validate a parent row's join-key value
     fn fetch_parent_key(&self, pk: ColumnId, parent: Key) -> Result<Value, ExecError> {
-        let table = quote(&self.schema.tables[pk.table_id().index()].name);
-        let column = quote(self.schema.column_name(pk));
-        let sql = format!("SELECT {column} FROM {table} WHERE _rowid_ = ?");
+        self.fetch_row_key(pk, parent, "insert parent")
+    }
+
+    fn fetch_row_key(&self, column: ColumnId, row: Key, role: &str) -> Result<Value, ExecError> {
+        let table = quote(&self.schema.tables[column.table_id().index()].name);
+        let column_name = quote(self.schema.column_name(column));
+        let sql = format!("SELECT {column_name} FROM {table} WHERE _rowid_ = ?");
         let txn = self.txn()?;
         let value: Option<Value> = txn
-            .query_row(&sql, [parent.0], |row| row.get(0))
+            .query_row(&sql, [row.0], |row| row.get(0))
             .optional()
-            .map_err(|err| SqliteBackend::storage_error("fetch parent key", err))?;
+            .map_err(|err| SqliteBackend::storage_error("fetch row key", err))?;
         match value {
             Some(Value::Null) | None => Err(ExecError::Integrity {
                 message: format!(
-                    "insert parent row {} has no join key in column `{}`",
-                    parent.0,
-                    self.schema.column_name(pk)
+                    "{role} row {} has no join key in column `{}`",
+                    row.0,
+                    self.schema.column_name(column)
                 ),
             }),
             Some(value) => Ok(value),
+        }
+    }
+
+    fn link_direct(
+        &mut self,
+        rel: RelationId,
+        field: FieldId,
+        owner: Key,
+        targets: &[RowOrigin],
+        mode: LinkMode,
+    ) -> Result<(), ExecError> {
+        let relation =
+            self.schema
+                .relations
+                .get(rel.index())
+                .ok_or_else(|| ExecError::Integrity {
+                    message: format!("unknown relation id {} (internal error)", rel.index()),
+                })?;
+        if self.schema.relation_has_owning_endpoint(relation) {
+            return Err(ExecError::Integrity {
+                message: "link_row_refs requires a non-owning relation (internal error)"
+                    .to_string(),
+            });
+        }
+        let (fk, pk) = match relation {
+            Relation::OneToOne { fk, pk, .. }
+            | Relation::ManyToOne { fk, pk, .. }
+            | Relation::OneToMany { fk, pk, .. } => (*fk, *pk),
+            Relation::ManyToMany { .. } => {
+                return Err(ExecError::Unsupported {
+                    message: "many-to-many links are not implemented yet".to_string(),
+                });
+            }
+        };
+        let Some(Field::Ref {
+            target, is_list, ..
+        }) = self.schema.field(field)
+        else {
+            return Err(ExecError::Integrity {
+                message: "link field is not a ref (internal error)".to_string(),
+            });
+        };
+        if targets.iter().any(|origin| origin.struct_id != *target) {
+            return Err(ExecError::Integrity {
+                message: "link target struct mismatch (internal error)".to_string(),
+            });
+        }
+
+        if *is_list {
+            let owner_pk = self.fetch_row_key(pk, owner, "link owner")?;
+            if mode == LinkMode::Replace {
+                self.clear_foreign_keys(rel, &[owner])?;
+            }
+            if targets.is_empty() {
+                return Ok(());
+            }
+            let table = quote(&self.schema.tables[fk.table_id().index()].name);
+            let fk_column = quote(self.schema.column_name(fk));
+            let txn = self.txn()?;
+            for chunk in targets.chunks(500) {
+                let placeholders = vec!["?"; chunk.len()].join(", ");
+                let count_sql =
+                    format!("SELECT COUNT(*) FROM {table} WHERE _rowid_ IN ({placeholders})");
+                let param_values = chunk.iter().map(|target| Value::Integer(target.key.0));
+                let count: i64 = txn
+                    .query_row(&count_sql, params_from_iter(param_values), |row| row.get(0))
+                    .map_err(|err| SqliteBackend::storage_error("count link targets", err))?;
+                if count as usize != chunk.len() {
+                    return Err(ExecError::Integrity {
+                        message: "link target row was not found".to_string(),
+                    });
+                }
+
+                let sql =
+                    format!("UPDATE {table} SET {fk_column} = ? WHERE _rowid_ IN ({placeholders})");
+                let mut params = Vec::with_capacity(chunk.len() + 1);
+                params.push(owner_pk.clone());
+                params.extend(chunk.iter().map(|target| Value::Integer(target.key.0)));
+                let mut stmt = txn
+                    .prepare_cached(&sql)
+                    .map_err(|err| SqliteBackend::storage_error("link rows (prepare)", err))?;
+                stmt.execute(params_from_iter(params.iter()))
+                    .map_err(|err| SqliteBackend::storage_error("link rows (execute)", err))?;
+            }
+            Ok(())
+        } else {
+            let table = quote(&self.schema.tables[fk.table_id().index()].name);
+            let fk_column = quote(self.schema.column_name(fk));
+            match targets {
+                [] if mode == LinkMode::Replace => {
+                    let sql = format!("UPDATE {table} SET {fk_column} = NULL WHERE _rowid_ = ?");
+                    let txn = self.txn()?;
+                    let mut stmt = txn.prepare_cached(&sql).map_err(|err| {
+                        SqliteBackend::storage_error("clear link row (prepare)", err)
+                    })?;
+                    let changed = stmt.execute([owner.0]).map_err(|err| {
+                        SqliteBackend::storage_error("clear link row (execute)", err)
+                    })?;
+                    if changed != 1 {
+                        return Err(ExecError::Integrity {
+                            message: "link owner row was not found".to_string(),
+                        });
+                    }
+                }
+                [] => {}
+                [target] => {
+                    let target_pk = self.fetch_row_key(pk, target.key, "link target")?;
+                    let sql = format!("UPDATE {table} SET {fk_column} = ? WHERE _rowid_ = ?");
+                    let txn = self.txn()?;
+                    let mut stmt = txn
+                        .prepare_cached(&sql)
+                        .map_err(|err| SqliteBackend::storage_error("link row (prepare)", err))?;
+                    let changed = stmt
+                        .execute(params_from_iter([target_pk, Value::Integer(owner.0)]))
+                        .map_err(|err| SqliteBackend::storage_error("link row (execute)", err))?;
+                    if changed != 1 {
+                        return Err(ExecError::Integrity {
+                            message: "link owner row was not found".to_string(),
+                        });
+                    }
+                }
+                _ => {
+                    return Err(ExecError::Integrity {
+                        message: "single link field received multiple targets (internal error)"
+                            .to_string(),
+                    });
+                }
+            };
+            Ok(())
         }
     }
 

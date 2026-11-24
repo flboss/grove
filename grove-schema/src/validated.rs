@@ -183,6 +183,13 @@ impl ValidatedSchema {
         };
         Some(*owning)
     }
+
+    pub fn relation_has_owning_endpoint(&self, relation: &Relation) -> bool {
+        relation
+            .endpoints()
+            .iter()
+            .any(|endpoint| matches!(self.field(*endpoint), Some(Field::Ref { owning: true, .. })))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

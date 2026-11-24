@@ -2,7 +2,7 @@ use grove_schema::validated::{FieldId, RelationId, StructId};
 
 use crate::error::ExecError;
 use crate::pushdown::FetchConstraints;
-use crate::value::Val;
+use crate::value::{RowOrigin, Val};
 
 /// A decoded storage row
 #[derive(Debug, Clone, PartialEq)]
@@ -40,6 +40,12 @@ pub trait Storage {
             message: "storage backend does not support mutations".to_string(),
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkMode {
+    Append,
+    Replace,
 }
 
 /// A transaction-scoped mutation interface
@@ -94,6 +100,18 @@ pub trait WriteTxn {
         key: Key,
         values: &[(FieldId, Val)],
     ) -> Result<(), ExecError>;
+
+    fn link_row_refs(
+        &mut self,
+        _field: FieldId,
+        _owner: Key,
+        _targets: &[RowOrigin],
+        _mode: LinkMode,
+    ) -> Result<(), ExecError> {
+        Err(ExecError::Unsupported {
+            message: "backend does not support linking row references".to_string(),
+        })
+    }
 
     fn delete_rows(&mut self, struct_id: StructId, keys: &[Key]) -> Result<(), ExecError>;
 
