@@ -166,50 +166,50 @@ pub fn eval(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
             name,
             binding,
             depth,
-        } => match binding {
-            IdentBinding::Let => {
-                ctx.env
-                    .lookup(name, *depth)
-                    .cloned()
-                    .ok_or_else(|| ExecError::Integrity {
-                        message: format!("unbound variable `{}` (internal error)", name.value),
-                    })
-            }
-            IdentBinding::Root { root_idx } => exec_root(ctx, *root_idx, expr.id),
-            IdentBinding::Field(field) => {
-                let value =
+        } => {
+            match binding {
+                IdentBinding::Let => {
                     ctx.env
                         .lookup(name, *depth)
                         .cloned()
-                        .ok_or_else(|| ExecError::Integrity {
-                            message: format!("unbound field `{}` (internal error)", name.value),
-                        })?;
-                resolve_ident_value(ctx, expr.id, *field, value)
-            }
-            IdentBinding::ProjectedField { .. } => ctx
-                .env
-                .lookup(name, *depth)
-                .cloned()
-                .ok_or_else(|| ExecError::Integrity {
-                    message: format!("unbound field `{}` (internal error)", name.value),
-                }),
-            IdentBinding::ListElement => {
-                ctx.env
+                        .ok_or_else(|| ExecError::Internal {
+                            message: format!("unbound variable `{}`", name.value),
+                        })
+                }
+                IdentBinding::Root { root_idx } => exec_root(ctx, *root_idx, expr.id),
+                IdentBinding::Field(field) => {
+                    let value = ctx.env.lookup(name, *depth).cloned().ok_or_else(|| {
+                        ExecError::Internal {
+                            message: format!("unbound field `{}`", name.value),
+                        }
+                    })?;
+                    resolve_ident_value(ctx, expr.id, *field, value)
+                }
+                IdentBinding::ProjectedField { .. } => ctx
+                    .env
                     .lookup(name, *depth)
                     .cloned()
-                    .ok_or_else(|| ExecError::Integrity {
-                        message: format!("unbound element `{}` (internal error)", name.value),
-                    })
+                    .ok_or_else(|| ExecError::Internal {
+                        message: format!("unbound field `{}`", name.value),
+                    }),
+                IdentBinding::ListElement => {
+                    ctx.env
+                        .lookup(name, *depth)
+                        .cloned()
+                        .ok_or_else(|| ExecError::Internal {
+                            message: format!("unbound element `{}`", name.value),
+                        })
+                }
+                IdentBinding::Prev { .. } => {
+                    ctx.env
+                        .lookup(name, *depth)
+                        .cloned()
+                        .ok_or_else(|| ExecError::Internal {
+                            message: format!("unbound `prev` for `{}`", name.value),
+                        })
+                }
             }
-            IdentBinding::Prev { .. } => {
-                ctx.env
-                    .lookup(name, *depth)
-                    .cloned()
-                    .ok_or_else(|| ExecError::Integrity {
-                        message: format!("unbound `prev` (internal error) for `{}`", name.value),
-                    })
-            }
-        },
+        }
         TypedExprKind::EnumVariant { enum_id, variant } => Ok(Val::Enum(*enum_id, *variant)),
         TypedExprKind::Some { value } => eval(value, ctx).map(|v| Val::Some(Box::new(v))),
         TypedExprKind::TypeConstant { ty, name } => Ok(eval_type_constant(ty.value, name.value)),
@@ -219,8 +219,8 @@ pub fn eval(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val, ExecError> {
                     Val::Scalar(Scalar::Bool(true)) => return eval(value, ctx),
                     Val::Scalar(Scalar::Bool(false)) => {}
                     _ => {
-                        return Err(ExecError::Integrity {
-                            message: "if condition must be a Bool (internal error)".to_string(),
+                        return Err(ExecError::Internal {
+                            message: "if condition must be a Bool".to_string(),
                         });
                     }
                 }
@@ -261,9 +261,8 @@ fn eval_row_ref(value: Val) -> Result<Val, ExecError> {
         Val::Record(record) => record
             .origin
             .map(Val::RowRef)
-            .ok_or_else(|| ExecError::Integrity {
-                message: "row reference source record has no row origin (internal error)"
-                    .to_string(),
+            .ok_or_else(|| ExecError::Internal {
+                message: "row reference source record has no row origin".to_string(),
             }),
         Val::Some(inner) => eval_row_ref(*inner).map(|value| Val::Some(Box::new(value))),
         Val::None => Ok(Val::None),
@@ -273,10 +272,8 @@ fn eval_row_ref(value: Val) -> Result<Val, ExecError> {
             .map(eval_row_ref)
             .collect::<Result<Vec<_>, _>>()
             .map(Val::list),
-        other => Err(ExecError::Integrity {
-            message: format!(
-                "row reference source is not a record, list, or optional: {other} (internal error)"
-            ),
+        other => Err(ExecError::Internal {
+            message: format!("row reference source is not a record, list, or optional: {other}"),
         }),
     }
 }
@@ -299,13 +296,13 @@ pub fn eval_tuple_access(
             elements
                 .into_iter()
                 .nth(index)
-                .ok_or_else(|| ExecError::Integrity {
-                    message: format!("tuple index {index} out of range (internal error)"),
+                .ok_or_else(|| ExecError::Internal {
+                    message: format!("tuple index {index} out of range"),
                 })?
         }
         other => {
-            return Err(ExecError::Integrity {
-                message: format!("tuple access on non-tuple value: {other} (internal error)"),
+            return Err(ExecError::Internal {
+                message: format!("tuple access on non-tuple value: {other}"),
             });
         }
     };
@@ -512,8 +509,8 @@ pub(crate) mod harness {
             _fields: &[grove_schema::validated::FieldId],
             _constraints: &crate::pushdown::FetchConstraints,
         ) -> Result<Vec<crate::storage::Row>, ExecError> {
-            Err(ExecError::Integrity {
-                message: "NoStorage backend cannot provide storage (internal error)".to_string(),
+            Err(ExecError::Internal {
+                message: "NoStorage backend cannot provide storage".to_string(),
             })
         }
 
@@ -525,8 +522,8 @@ pub(crate) mod harness {
             _fields: &[grove_schema::validated::FieldId],
             _constraints: &crate::pushdown::FetchConstraints,
         ) -> Result<Vec<Vec<crate::storage::Row>>, ExecError> {
-            Err(ExecError::Integrity {
-                message: "NoStorage backend cannot provide storage (internal error)".to_string(),
+            Err(ExecError::Internal {
+                message: "NoStorage backend cannot provide storage".to_string(),
             })
         }
     }
@@ -1154,6 +1151,6 @@ mod tests {
             QueryType::Record(RecordSource::Schema(user)),
             QueryType::RowRef(user),
         );
-        assert!(matches!(result, Err(ExecError::Integrity { .. })));
+        assert!(matches!(result, Err(ExecError::Internal { .. })));
     }
 }

@@ -23,8 +23,8 @@ pub(crate) fn exec_root(
         .schema
         .roots
         .get(root_idx)
-        .ok_or_else(|| ExecError::Integrity {
-            message: format!("unknown root {root_idx} (internal error)"),
+        .ok_or_else(|| ExecError::Internal {
+            message: format!("unknown root {root_idx}"),
         })?;
     let fields = ctx.plan.fields_for(root.struct_id).to_vec();
     let rows = if let Some(constraints) = ctx.plan.constraints_for(node) {
@@ -55,16 +55,16 @@ fn resolve_field(
         match &ctx.schema.structs[field.struct_id().index()].fields[field.local()] {
             Field::Ref { target, name, .. } => (*target, name),
             Field::Value { name, .. } | Field::Array { name, .. } => {
-                return Err(ExecError::Integrity {
-                    message: format!("Ref link names a non-Ref field `{name}` (internal error)"),
+                return Err(ExecError::Internal {
+                    message: format!("Ref link names a non-Ref field `{name}`"),
                 });
             }
         };
     let relation = ctx
         .schema
         .relation_of_field(field)
-        .ok_or_else(|| ExecError::Integrity {
-            message: format!("Ref field `{field_name}` has no relation (internal error)"),
+        .ok_or_else(|| ExecError::Internal {
+            message: format!("Ref field `{field_name}` has no relation"),
         })?;
     let fetch_from_first = ctx.schema.relations[relation.index()].endpoints()[0] == field;
     let fields = ctx.plan.fields_for(target).to_vec();
@@ -106,8 +106,8 @@ fn wrap_fetched(
                 ..
             } => (*optional, *is_list, name),
             _ => {
-                return Err(ExecError::Integrity {
-                    message: "Ref link names a non-Ref field (internal error)".to_string(),
+                return Err(ExecError::Internal {
+                    message: "Ref link names a non-Ref field".to_string(),
                 });
             }
         };
@@ -127,8 +127,8 @@ fn wrap_fetched(
                     ),
                 }),
             },
-            other => Err(ExecError::Integrity {
-                message: format!("optional Ref resolved to {other} (internal error)"),
+            other => Err(ExecError::Internal {
+                message: format!("optional Ref resolved to {other}"),
             }),
         };
     }
@@ -142,8 +142,8 @@ fn wrap_fetched(
                 ),
             }),
         },
-        other => Err(ExecError::Integrity {
-            message: format!("required Ref resolved to {other} (internal error)"),
+        other => Err(ExecError::Internal {
+            message: format!("required Ref resolved to {other}"),
         }),
     }
 }
@@ -193,9 +193,8 @@ fn materialize(
                     if next_field < fields.len() && fields[next_field].local() == local {
                         record.push((
                             name,
-                            values.next().ok_or_else(|| ExecError::Integrity {
-                                message: "row has fewer values than fields (internal error)"
-                                    .to_string(),
+                            values.next().ok_or_else(|| ExecError::Internal {
+                                message: "row has fewer values than fields".to_string(),
                             })?,
                         ));
                         next_field += 1;
@@ -204,13 +203,13 @@ fn materialize(
             }
         }
         if next_field != fields.len() {
-            return Err(ExecError::Integrity {
-                message: "row is missing requested fields (internal error)".to_string(),
+            return Err(ExecError::Internal {
+                message: "row is missing requested fields".to_string(),
             });
         }
         if values.next().is_some() {
-            return Err(ExecError::Integrity {
-                message: "row has more values than fields (internal error)".to_string(),
+            return Err(ExecError::Internal {
+                message: "row has more values than fields".to_string(),
             });
         }
         items.push(Val::record_at(
@@ -231,19 +230,16 @@ fn is_owning_ref(schema: &ValidatedSchema, field: FieldId) -> Result<bool, ExecE
     let struct_ = schema
         .structs
         .get(field.struct_id().index())
-        .ok_or_else(|| ExecError::Integrity {
-            message: format!(
-                "unknown struct id {} (internal error)",
-                field.struct_id().index()
-            ),
+        .ok_or_else(|| ExecError::Internal {
+            message: format!("unknown struct id {}", field.struct_id().index()),
         })?;
     match struct_.fields.get(field.local()) {
         Some(Field::Ref { owning, .. }) => Ok(*owning),
-        Some(Field::Value { name, .. } | Field::Array { name, .. }) => Err(ExecError::Integrity {
-            message: format!("Ref link names a non-Ref field `{name}` (internal error)"),
+        Some(Field::Value { name, .. } | Field::Array { name, .. }) => Err(ExecError::Internal {
+            message: format!("Ref link names a non-Ref field `{name}`"),
         }),
-        None => Err(ExecError::Integrity {
-            message: format!("unknown field {field:?} (internal error)"),
+        None => Err(ExecError::Internal {
+            message: format!("unknown field {field:?}"),
         }),
     }
 }
@@ -386,9 +382,8 @@ pub(crate) fn resolve_ident_value(
                 ctx.applied_triggers.insert(node);
                 match resolved.pop() {
                     Some((_, value)) => Ok(value),
-                    None => Err(ExecError::Integrity {
-                        message: "constrained Ref resolved to no value (internal error)"
-                            .to_string(),
+                    None => Err(ExecError::Internal {
+                        message: "constrained Ref resolved to no value".to_string(),
                     }),
                 }
             }
@@ -594,9 +589,8 @@ pub(crate) fn exec_field(
                     let value = match resolved.pop() {
                         Some((_, value)) => value,
                         None => {
-                            return Err(ExecError::Integrity {
-                                message: "constrained Ref resolved to no value (internal error)"
-                                    .to_string(),
+                            return Err(ExecError::Internal {
+                                message: "constrained Ref resolved to no value".to_string(),
                             });
                         }
                     };
@@ -613,10 +607,8 @@ pub(crate) fn exec_field(
                     Val::Record(fields) => mapped.push(record_field(fields, name)?),
                     Val::None => mapped.push(Val::None),
                     other => {
-                        return Err(ExecError::Integrity {
-                            message: format!(
-                                "field `{name}` on non-record list element: {other} (internal error)"
-                            ),
+                        return Err(ExecError::Internal {
+                            message: format!("field `{name}` on non-record list element: {other}"),
                         });
                     }
                 }
@@ -624,8 +616,8 @@ pub(crate) fn exec_field(
             Val::list_with_origin(mapped, origin)
         }
         _ => {
-            return Err(ExecError::Integrity {
-                message: format!("field `{name}` on non-record value (internal error)"),
+            return Err(ExecError::Internal {
+                message: format!("field `{name}` on non-record value"),
             });
         }
     };
@@ -640,8 +632,8 @@ pub(crate) fn resolve_base_link(ctx: &mut EvalCtx, base: Val) -> Result<Val, Exe
             let mut resolved = resolve_field(ctx, field, &[parent], &FetchConstraints::EMPTY)?;
             match resolved.pop() {
                 Some((_, value)) => Ok(value),
-                None => Err(ExecError::Integrity {
-                    message: "base Ref resolved to no value (internal error)".to_string(),
+                None => Err(ExecError::Internal {
+                    message: "base Ref resolved to no value".to_string(),
                 }),
             }
         }
@@ -671,8 +663,8 @@ fn record_field(
         .into_iter()
         .find(|(field_name, _)| field_name.as_ref() == name)
         .map(|(_, value)| value)
-        .ok_or_else(|| ExecError::Integrity {
-            message: format!("unknown field `{name}` (internal error)"),
+        .ok_or_else(|| ExecError::Internal {
+            message: format!("unknown field `{name}`"),
         })
 }
 
@@ -753,8 +745,8 @@ fn lookup_ref(
     resolved
         .get(&(field, parent))
         .cloned()
-        .ok_or_else(|| ExecError::Integrity {
-            message: "Ref data missing from batch fetch result (internal error)".to_string(),
+        .ok_or_else(|| ExecError::Internal {
+            message: "Ref data missing from batch fetch result".to_string(),
         })
 }
 

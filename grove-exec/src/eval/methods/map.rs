@@ -14,14 +14,14 @@ pub(super) fn eval_list_map(
     let mut items = match base {
         Val::List(items) => items,
         other => {
-            return Err(ExecError::Integrity {
-                message: format!("`map()` called on non-list value: {other} (internal error)"),
+            return Err(ExecError::Internal {
+                message: format!("`map()` called on non-list value: {other}"),
             });
         }
     };
     let [arg] = args else {
-        return Err(ExecError::Integrity {
-            message: "`map()` expects one argument (internal error)".to_string(),
+        return Err(ExecError::Internal {
+            message: "`map()` expects one argument".to_string(),
         });
     };
     let fields = owning_refs_in(&arg.expr, ctx.schema, ctx.plan.prefetch_skip());
@@ -42,16 +42,16 @@ pub(super) fn eval_optional_map(
     ctx: &mut EvalCtx<'_>,
 ) -> Result<Val, ExecError> {
     let [arg] = args else {
-        return Err(ExecError::Integrity {
-            message: "`map()` expects one argument (internal error)".to_string(),
+        return Err(ExecError::Internal {
+            message: "`map()` expects one argument".to_string(),
         });
     };
     let value = match base {
         Val::None => return Ok(Val::None),
         Val::Some(value) => *value,
         other => {
-            return Err(ExecError::Integrity {
-                message: format!("`map()` called on non-optional value: {other} (internal error)"),
+            return Err(ExecError::Internal {
+                message: format!("`map()` called on non-optional value: {other}"),
             });
         }
     };

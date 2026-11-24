@@ -86,8 +86,8 @@ pub(super) fn eval_reduce(
     let items = match base {
         Val::List(items) => items.items,
         other => {
-            return Err(ExecError::Integrity {
-                message: format!("`{kind}()` called on non-list value: {other} (internal error)"),
+            return Err(ExecError::Internal {
+                message: format!("`{kind}()` called on non-list value: {other}"),
             });
         }
     };
@@ -127,14 +127,14 @@ pub(super) fn eval_reduce_over(
     let mut items = match base {
         Val::List(items) => items,
         other => {
-            return Err(ExecError::Integrity {
-                message: format!("`{kind}()` called on non-list value: {other} (internal error)"),
+            return Err(ExecError::Internal {
+                message: format!("`{kind}()` called on non-list value: {other}"),
             });
         }
     };
     let [arg] = args else {
-        return Err(ExecError::Integrity {
-            message: format!("`{kind}()` expects one key argument (internal error)"),
+        return Err(ExecError::Internal {
+            message: format!("`{kind}()` expects one key argument"),
         });
     };
     let fields = owning_refs_in(&arg.expr, ctx.schema, ctx.plan.prefetch_skip());
@@ -153,10 +153,8 @@ pub(super) fn eval_reduce_over(
                     match key? {
                         Val::Scalar(scalar) => keys.push(scalar),
                         other => {
-                            return Err(ExecError::Integrity {
-                                message: format!(
-                                    "`{kind}()` key evaluated to non-scalar: {other} (internal error)"
-                                ),
+                            return Err(ExecError::Internal {
+                                message: format!("`{kind}()` key evaluated to non-scalar: {other}"),
                             });
                         }
                     }
@@ -202,8 +200,8 @@ fn collect_reduction_scalars(items: Vec<Val>, kind: ReduceKind) -> Result<Vec<Sc
         .into_iter()
         .map(|item| match item {
             Val::Scalar(scalar) => Ok(scalar),
-            other => Err(ExecError::Integrity {
-                message: format!("`{kind}()` over non-scalar element: {other} (internal error)"),
+            other => Err(ExecError::Internal {
+                message: format!("`{kind}()` over non-scalar element: {other}"),
             }),
         })
         .collect()
@@ -211,8 +209,8 @@ fn collect_reduction_scalars(items: Vec<Val>, kind: ReduceKind) -> Result<Vec<Sc
 
 fn extremum(mut items: Vec<Val>, want: std::cmp::Ordering, span: Span) -> Result<Val, ExecError> {
     if items.is_empty() {
-        return Err(ExecError::Integrity {
-            message: "extremum over no values (internal error)".to_string(),
+        return Err(ExecError::Internal {
+            message: "extremum over no values".to_string(),
         });
     }
     let mut best_index = 0;
@@ -226,12 +224,9 @@ fn extremum(mut items: Vec<Val>, want: std::cmp::Ordering, span: Span) -> Result
 
 /// Sum non-empty same-typed scalars with config arithmetic
 fn sum_scalars(values: &[Scalar], config: &Config, span: Span) -> Result<Scalar, ExecError> {
-    let mut total = values
-        .first()
-        .cloned()
-        .ok_or_else(|| ExecError::Integrity {
-            message: "`sum()` over no values (internal error)".to_string(),
-        })?;
+    let mut total = values.first().cloned().ok_or_else(|| ExecError::Internal {
+        message: "`sum()` over no values".to_string(),
+    })?;
     for value in &values[1..] {
         total = match (total, value) {
             (Scalar::Int(a), Scalar::Int(b)) => {
@@ -250,8 +245,8 @@ fn sum_scalars(values: &[Scalar], config: &Config, span: Span) -> Result<Scalar,
                 })?)
             }
             _ => {
-                return Err(ExecError::Integrity {
-                    message: "`sum()` over mismatched values (internal error)".to_string(),
+                return Err(ExecError::Internal {
+                    message: "`sum()` over mismatched values".to_string(),
                 });
             }
         };
@@ -261,8 +256,8 @@ fn sum_scalars(values: &[Scalar], config: &Config, span: Span) -> Result<Scalar,
 
 /// Average non-empty same-typed scalars with config arithmetic
 fn avg_scalars(values: &[Scalar], config: &Config, span: Span) -> Result<Scalar, ExecError> {
-    let first = values.first().ok_or_else(|| ExecError::Integrity {
-        message: "`avg()` over no values (internal error)".to_string(),
+    let first = values.first().ok_or_else(|| ExecError::Internal {
+        message: "`avg()` over no values".to_string(),
     })?;
     let n = values.len();
     match first {
@@ -271,8 +266,8 @@ fn avg_scalars(values: &[Scalar], config: &Config, span: Span) -> Result<Scalar,
             let mut total = *first as i128;
             for value in &values[1..] {
                 let Scalar::Int(summand) = value else {
-                    return Err(ExecError::Integrity {
-                        message: "`avg()` over mismatched values (internal error)".to_string(),
+                    return Err(ExecError::Internal {
+                        message: "`avg()` over mismatched values".to_string(),
                     });
                 };
                 total += *summand as i128;
@@ -295,8 +290,8 @@ fn avg_scalars(values: &[Scalar], config: &Config, span: Span) -> Result<Scalar,
             span,
         ),
         Scalar::Duration(total) => scale_duration(total, Decimal::from(n as u64), true, span),
-        _ => Err(ExecError::Integrity {
-            message: "`avg()` over mismatched values (internal error)".to_string(),
+        _ => Err(ExecError::Internal {
+            message: "`avg()` over mismatched values".to_string(),
         }),
     }
 }
@@ -304,15 +299,15 @@ fn avg_scalars(values: &[Scalar], config: &Config, span: Span) -> Result<Scalar,
 /// Average instants by computing average offset from first
 fn avg_instants(values: &[Scalar], span: Span) -> Result<Scalar, ExecError> {
     let Some(Scalar::Instant(start)) = values.first() else {
-        return Err(ExecError::Integrity {
-            message: "`avg()` over no values (internal error)".to_string(),
+        return Err(ExecError::Internal {
+            message: "`avg()` over no values".to_string(),
         });
     };
     let mut total_offset = TimeDelta::zero();
     for value in &values[1..] {
         let Scalar::Instant(instant) = value else {
-            return Err(ExecError::Integrity {
-                message: "`avg()` over mismatched values (internal error)".to_string(),
+            return Err(ExecError::Internal {
+                message: "`avg()` over mismatched values".to_string(),
             });
         };
         total_offset = total_offset
@@ -325,8 +320,8 @@ fn avg_instants(values: &[Scalar], span: Span) -> Result<Scalar, ExecError> {
     let Scalar::Duration(mean_offset) =
         scale_duration(total_offset, Decimal::from(values.len() as u64), true, span)?
     else {
-        return Err(ExecError::Integrity {
-            message: "`avg()` offset duration was not a duration (internal error)".to_string(),
+        return Err(ExecError::Internal {
+            message: "`avg()` offset duration was not a duration".to_string(),
         });
     };
     start

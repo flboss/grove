@@ -70,8 +70,8 @@ pub(super) fn eval_sort(
     let mut items = match base {
         Val::List(items) => items,
         other => {
-            return Err(ExecError::Integrity {
-                message: format!("`{kind}()` called on non-list value: {other} (internal error)"),
+            return Err(ExecError::Internal {
+                message: format!("`{kind}()` called on non-list value: {other}"),
             });
         }
     };
@@ -83,8 +83,8 @@ pub(super) fn eval_sort(
         prefetch_owning(ctx, &mut items, &fields)?;
         sort_by_keys(&mut items.items, kind, args, ctx, span)?;
     } else if !args.is_empty() {
-        return Err(ExecError::Integrity {
-            message: format!("`{kind}()` takes no key arguments (internal error)"),
+        return Err(ExecError::Internal {
+            message: format!("`{kind}()` takes no key arguments"),
         });
     } else {
         sort_keyless(&mut items, kind, span)?;

@@ -386,8 +386,8 @@ fn decode_enum(
     let enum_def = schema
         .enums
         .get(enum_id.index())
-        .ok_or_else(|| ExecError::Integrity {
-            message: format!("unknown enum id {} (internal error)", enum_id.index()),
+        .ok_or_else(|| ExecError::Internal {
+            message: format!("unknown enum id {}", enum_id.index()),
         })?;
     let invalid = |found: &str| ExecError::Integrity {
         message: format!("invalid value {found} for enum `{}`", enum_def.name),
@@ -548,7 +548,7 @@ fn node_scope(
                     .storage
                     .value
                     .get(pos)
-                    .ok_or_else(|| ExecError::Integrity {
+                    .ok_or_else(|| ExecError::Internal {
                         message: format!("array storage for `{ptable}` names no column {pos}"),
                     })?;
             let plink = format!("{palias}.{}", quote(schema.column_name(*pcol)));
@@ -832,9 +832,9 @@ impl SqliteBackend<'_> {
         field: FieldId,
     ) -> Result<(String, ScalarType), ExecError> {
         if field.struct_id() != struct_id {
-            return Err(ExecError::Integrity {
+            return Err(ExecError::Internal {
                 message: format!(
-                    "pushdown field {:?} does not belong to struct {} (internal error)",
+                    "pushdown field {:?} does not belong to struct {}",
                     field,
                     struct_id.index()
                 ),
@@ -844,8 +844,8 @@ impl SqliteBackend<'_> {
             self.schema
                 .structs
                 .get(struct_id.index())
-                .ok_or_else(|| ExecError::Integrity {
-                    message: format!("unknown struct id {} (internal error)", struct_id.index()),
+                .ok_or_else(|| ExecError::Internal {
+                    message: format!("unknown struct id {}", struct_id.index()),
                 })?;
         match struct_def.fields.get(field.local()) {
             Some(Field::Value {
@@ -862,23 +862,23 @@ impl SqliteBackend<'_> {
                     self.schema
                         .enums
                         .get(id.index())
-                        .ok_or_else(|| ExecError::Integrity {
-                            message: format!("unknown enum id {} (internal error)", id.index()),
+                        .ok_or_else(|| ExecError::Internal {
+                            message: format!("unknown enum id {}", id.index()),
                         })?;
                 Ok((
                     quote(self.schema.column_name(columns[0])),
                     enum_def.underlying.scalar_type(),
                 ))
             }
-            Some(other) => Err(ExecError::Integrity {
+            Some(other) => Err(ExecError::Internal {
                 message: format!(
-                    "pushdown field `{}.{}` is not a single-column scalar (internal error)",
+                    "pushdown field `{}.{}` is not a single-column scalar",
                     struct_def.name,
                     other.name()
                 ),
             }),
-            None => Err(ExecError::Integrity {
-                message: format!("unknown field {field:?} (internal error)"),
+            None => Err(ExecError::Internal {
+                message: format!("unknown field {field:?}"),
             }),
         }
     }
@@ -982,14 +982,14 @@ impl SqliteBackend<'_> {
             self.schema
                 .structs
                 .get(struct_id.index())
-                .ok_or_else(|| ExecError::Integrity {
+                .ok_or_else(|| ExecError::Internal {
                     message: format!("unknown struct id {}", struct_id.index()),
                 })?;
         let struct_name = &struct_def.name;
         let mut slots = Vec::with_capacity(fields.len());
         for field_id in fields {
             if field_id.struct_id() != struct_id {
-                return Err(ExecError::Integrity {
+                return Err(ExecError::Internal {
                     message: format!("fetch field {field_id:?} belongs to another struct"),
                 });
             }
@@ -997,7 +997,7 @@ impl SqliteBackend<'_> {
                 struct_def
                     .fields
                     .get(field_id.local())
-                    .ok_or_else(|| ExecError::Integrity {
+                    .ok_or_else(|| ExecError::Internal {
                         message: format!("unknown field {field_id:?} on struct `{struct_name}`"),
                     })?;
             match field {
@@ -1065,7 +1065,7 @@ impl SqliteBackend<'_> {
                     }));
                 }
                 Field::Ref { name, .. } => {
-                    return Err(ExecError::Integrity {
+                    return Err(ExecError::Internal {
                         message: format!(
                             "cannot fetch Ref field `{struct_name}.{name}`: navigation uses fetch_related"
                         ),
@@ -1161,8 +1161,8 @@ impl SqliteWriteTxn<'_, '_> {
             self.schema
                 .structs
                 .get(struct_id.index())
-                .ok_or_else(|| ExecError::Integrity {
-                    message: format!("unknown struct id {} (internal error)", struct_id.index()),
+                .ok_or_else(|| ExecError::Internal {
+                    message: format!("unknown struct id {}", struct_id.index()),
                 })?;
         Ok(quote(&self.schema.tables[struct_def.table.index()].name))
     }
@@ -1178,34 +1178,30 @@ impl SqliteWriteTxn<'_, '_> {
             self.schema
                 .structs
                 .get(struct_id.index())
-                .ok_or_else(|| ExecError::Integrity {
-                    message: format!("unknown struct id {} (internal error)", struct_id.index()),
+                .ok_or_else(|| ExecError::Internal {
+                    message: format!("unknown struct id {}", struct_id.index()),
                 })?;
         let mut seen = HashSet::with_capacity(values.len());
         let mut columns = Vec::new();
         let mut params = Vec::new();
         for (field_id, value) in values {
             if field_id.struct_id() != struct_id {
-                return Err(ExecError::Integrity {
-                    message: format!(
-                        "write field {field_id:?} belongs to another struct (internal error)"
-                    ),
+                return Err(ExecError::Internal {
+                    message: format!("write field {field_id:?} belongs to another struct"),
                 });
             }
             if !seen.insert(field_id.local()) {
-                return Err(ExecError::Integrity {
-                    message: format!(
-                        "write field {field_id:?} specified more than once (internal error)"
-                    ),
+                return Err(ExecError::Internal {
+                    message: format!("write field {field_id:?} specified more than once"),
                 });
             }
             let field =
                 struct_def
                     .fields
                     .get(field_id.local())
-                    .ok_or_else(|| ExecError::Integrity {
+                    .ok_or_else(|| ExecError::Internal {
                         message: format!(
-                            "unknown field {field_id:?} on struct `{}` (internal error)",
+                            "unknown field {field_id:?} on struct `{}`",
                             struct_def.name
                         ),
                     })?;
@@ -1218,9 +1214,9 @@ impl SqliteWriteTxn<'_, '_> {
                     let mut encoded = Vec::new();
                     self.encode_value_write(ty, value, &mut encoded)?;
                     if encoded.len() != field_columns.len() {
-                        return Err(ExecError::Integrity {
+                        return Err(ExecError::Internal {
                             message: format!(
-                                "field {field_id:?} encoded to {} values for {} columns (internal error)",
+                                "field {field_id:?} encoded to {} values for {} columns",
                                 encoded.len(),
                                 field_columns.len()
                             ),
@@ -1238,7 +1234,7 @@ impl SqliteWriteTxn<'_, '_> {
                     ..
                 } => {
                     let Val::List(list) = value else {
-                        return Err(ExecError::Integrity {
+                        return Err(ExecError::Internal {
                             message: format!("expected list value, got {value}"),
                         });
                     };
@@ -1252,9 +1248,9 @@ impl SqliteWriteTxn<'_, '_> {
                     }
                 }
                 Field::Ref { name, .. } => {
-                    return Err(ExecError::Integrity {
+                    return Err(ExecError::Internal {
                         message: format!(
-                            "attempted to write directly to referennce field `{}.{name}` (internal error)",
+                            "attempted to write directly to referennce field `{}.{name}`",
                             struct_def.name
                         ),
                     });
@@ -1282,18 +1278,18 @@ impl SqliteWriteTxn<'_, '_> {
                     Ok(())
                 }
                 Val::Some(value) => self.encode_value_write(inner, value, out),
-                other => Err(ExecError::Integrity {
+                other => Err(ExecError::Internal {
                     message: format!("expected optional value, got {other}"),
                 }),
             },
             ValueType::Tuple(elements) => {
                 let Val::Tuple(values) = value else {
-                    return Err(ExecError::Integrity {
+                    return Err(ExecError::Internal {
                         message: format!("expected tuple value, got {value}"),
                     });
                 };
                 if values.len() != elements.len() {
-                    return Err(ExecError::Integrity {
+                    return Err(ExecError::Internal {
                         message: format!(
                             "tuple has {} values for {} element types",
                             values.len(),
@@ -1308,7 +1304,7 @@ impl SqliteWriteTxn<'_, '_> {
             }
             ValueType::Array { element, storage } => {
                 let Val::List(list) = value else {
-                    return Err(ExecError::Integrity {
+                    return Err(ExecError::Internal {
                         message: format!("expected list value, got {value}"),
                     });
                 };
@@ -1356,9 +1352,9 @@ impl SqliteWriteTxn<'_, '_> {
             let mut cells = Vec::new();
             self.encode_value_write(element, &value, &mut cells)?;
             if cells.len() != storage.value.len() {
-                return Err(ExecError::Integrity {
+                return Err(ExecError::Internal {
                     message: format!(
-                        "array element encoded to {} values for {} storage columns (internal error)",
+                        "array element encoded to {} values for {} storage columns",
                         cells.len(),
                         storage.value.len()
                     ),
@@ -1461,8 +1457,8 @@ impl SqliteWriteTxn<'_, '_> {
                         .to_string(),
                 })
             }
-            None => Err(ExecError::Integrity {
-                message: format!("unknown relation id {} (internal error)", rel.index()),
+            None => Err(ExecError::Internal {
+                message: format!("unknown relation id {}", rel.index()),
             }),
         }
     }
@@ -1630,8 +1626,8 @@ impl SqliteWriteTxn<'_, '_> {
             .relations
             .get(rel.index())
             .cloned()
-            .ok_or_else(|| ExecError::Integrity {
-                message: format!("unknown relation id {} (internal error)", rel.index()),
+            .ok_or_else(|| ExecError::Internal {
+                message: format!("unknown relation id {}", rel.index()),
             })?;
         let Relation::ManyToMany {
             join_table,
@@ -1643,27 +1639,26 @@ impl SqliteWriteTxn<'_, '_> {
             b_ref,
         } = relation
         else {
-            return Err(ExecError::Integrity {
-                message: "many-to-many link requires a many-to-many relation (internal error)"
-                    .to_string(),
+            return Err(ExecError::Internal {
+                message: "many-to-many link requires a many-to-many relation".to_string(),
             });
         };
         let Some(Field::Ref {
             target, is_list, ..
         }) = self.schema.field(field)
         else {
-            return Err(ExecError::Integrity {
-                message: "link field is not a ref (internal error)".to_string(),
+            return Err(ExecError::Internal {
+                message: "link field is not a ref".to_string(),
             });
         };
         if !*is_list {
-            return Err(ExecError::Integrity {
-                message: "many-to-many link field must be a list (internal error)".to_string(),
+            return Err(ExecError::Internal {
+                message: "many-to-many link field must be a list".to_string(),
             });
         }
         if targets.iter().any(|origin| origin.struct_id != *target) {
-            return Err(ExecError::Integrity {
-                message: "link target struct mismatch (internal error)".to_string(),
+            return Err(ExecError::Internal {
+                message: "link target struct mismatch".to_string(),
             });
         }
 
@@ -1673,9 +1668,8 @@ impl SqliteWriteTxn<'_, '_> {
         } else if field == b_ref {
             (b_col, b_pk, a_col, a_pk)
         } else {
-            return Err(ExecError::Integrity {
-                message: "link field is not an endpoint of its relation (internal error)"
-                    .to_string(),
+            return Err(ExecError::Internal {
+                message: "link field is not an endpoint of its relation".to_string(),
             });
         };
 
@@ -1707,13 +1701,12 @@ impl SqliteWriteTxn<'_, '_> {
             self.schema
                 .relations
                 .get(rel.index())
-                .ok_or_else(|| ExecError::Integrity {
-                    message: format!("unknown relation id {} (internal error)", rel.index()),
+                .ok_or_else(|| ExecError::Internal {
+                    message: format!("unknown relation id {}", rel.index()),
                 })?;
         if self.schema.relation_has_owning_endpoint(relation) {
-            return Err(ExecError::Integrity {
-                message: "link_row_refs requires a non-owning relation (internal error)"
-                    .to_string(),
+            return Err(ExecError::Internal {
+                message: "link_row_refs requires a non-owning relation".to_string(),
             });
         }
         let (fk, pk) = match relation {
@@ -1730,13 +1723,13 @@ impl SqliteWriteTxn<'_, '_> {
             target, is_list, ..
         }) = self.schema.field(field)
         else {
-            return Err(ExecError::Integrity {
-                message: "link field is not a ref (internal error)".to_string(),
+            return Err(ExecError::Internal {
+                message: "link field is not a ref".to_string(),
             });
         };
         if targets.iter().any(|origin| origin.struct_id != *target) {
-            return Err(ExecError::Integrity {
-                message: "link target struct mismatch (internal error)".to_string(),
+            return Err(ExecError::Internal {
+                message: "link target struct mismatch".to_string(),
             });
         }
 
@@ -1814,9 +1807,8 @@ impl SqliteWriteTxn<'_, '_> {
                     }
                 }
                 _ => {
-                    return Err(ExecError::Integrity {
-                        message: "single link field received multiple targets (internal error)"
-                            .to_string(),
+                    return Err(ExecError::Internal {
+                        message: "single link field received multiple targets".to_string(),
                     });
                 }
             };
@@ -1840,9 +1832,8 @@ impl SqliteWriteTxn<'_, '_> {
             let parent_link = storage
                 .value
                 .get(child_pos)
-                .ok_or_else(|| ExecError::Integrity {
-                    message: "nested array position has no storage column (internal error)"
-                        .to_string(),
+                .ok_or_else(|| ExecError::Internal {
+                    message: "nested array position has no storage column".to_string(),
                 })?;
             let parent_link = quote(self.schema.column_name(*parent_link));
             let nested_select = format!(
@@ -1864,8 +1855,8 @@ impl SqliteWriteTxn<'_, '_> {
     }
 
     fn txn(&self) -> Result<&Transaction<'_>, ExecError> {
-        self.txn.as_ref().ok_or_else(|| ExecError::Integrity {
-            message: "write transaction is already finished (internal error)".to_string(),
+        self.txn.as_ref().ok_or_else(|| ExecError::Internal {
+            message: "write transaction is already finished".to_string(),
         })
     }
 }
@@ -1880,7 +1871,7 @@ fn encode_value(
     match ty {
         ValueType::Scalar(scalar_ty) => {
             let Val::Scalar(scalar) = value else {
-                return Err(ExecError::Integrity {
+                return Err(ExecError::Internal {
                     message: format!("expected scalar value, got {value}"),
                 });
             };
@@ -1894,7 +1885,7 @@ fn encode_value(
                 (ScalarType::Instant, Scalar::Instant(t)) => scalar_value(&Scalar::Instant(*t)),
                 (ScalarType::Duration, Scalar::Duration(d)) => scalar_value(&Scalar::Duration(*d)),
                 _ => {
-                    return Err(ExecError::Integrity {
+                    return Err(ExecError::Internal {
                         message: format!("value {value} does not match column type {scalar_ty:?}"),
                     });
                 }
@@ -1903,12 +1894,12 @@ fn encode_value(
         }
         ValueType::Enum(id) => {
             let Val::Enum(found, variant) = value else {
-                return Err(ExecError::Integrity {
+                return Err(ExecError::Internal {
                     message: format!("expected enum value, got {value}"),
                 });
             };
             if found != id {
-                return Err(ExecError::Integrity {
+                return Err(ExecError::Internal {
                     message: format!(
                         "enum id {} does not match target {}",
                         found.index(),
@@ -1919,11 +1910,11 @@ fn encode_value(
             let enum_def = schema
                 .enums
                 .get(id.index())
-                .ok_or_else(|| ExecError::Integrity {
-                    message: format!("unknown enum id {} (internal error)", id.index()),
+                .ok_or_else(|| ExecError::Internal {
+                    message: format!("unknown enum id {}", id.index()),
                 })?;
             let scalar =
-                enum_variant_scalar(enum_def, *variant).ok_or_else(|| ExecError::Integrity {
+                enum_variant_scalar(enum_def, *variant).ok_or_else(|| ExecError::Internal {
                     message: format!("enum `{}` has no variant index {variant}", enum_def.name),
                 })?;
             out.push(scalar_value(&scalar));
@@ -1936,19 +1927,19 @@ fn encode_value(
             }
             Val::Some(value) => encode_value(inner, value, schema, out)?,
             other => {
-                return Err(ExecError::Integrity {
+                return Err(ExecError::Internal {
                     message: format!("expected optional value, got {other}"),
                 });
             }
         },
         ValueType::Tuple(elements) => {
             let Val::Tuple(values) = value else {
-                return Err(ExecError::Integrity {
+                return Err(ExecError::Internal {
                     message: format!("expected tuple value, got {value}"),
                 });
             };
             if values.len() != elements.len() {
-                return Err(ExecError::Integrity {
+                return Err(ExecError::Internal {
                     message: format!(
                         "tuple has {} values for {} element types",
                         values.len(),
@@ -2106,12 +2097,12 @@ impl<'conn, 'schema> WriteTxn for SqliteWriteTxn<'conn, 'schema> {
         targets: &[RowOrigin],
         mode: LinkMode,
     ) -> Result<(), ExecError> {
-        let relation =
-            self.schema
-                .relation_of_field(field)
-                .ok_or_else(|| ExecError::Integrity {
-                    message: "link field has no relation (internal error)".to_string(),
-                })?;
+        let relation = self
+            .schema
+            .relation_of_field(field)
+            .ok_or_else(|| ExecError::Internal {
+                message: "link field has no relation".to_string(),
+            })?;
         let mut unique_targets = Vec::with_capacity(targets.len());
         for target in targets {
             if !unique_targets.contains(target) {
@@ -2182,17 +2173,16 @@ impl<'conn, 'schema> WriteTxn for SqliteWriteTxn<'conn, 'schema> {
             self.schema
                 .relations
                 .get(rel.index())
-                .ok_or_else(|| ExecError::Integrity {
-                    message: format!("unknown relation id {} (internal error)", rel.index()),
+                .ok_or_else(|| ExecError::Internal {
+                    message: format!("unknown relation id {}", rel.index()),
                 })?;
         let (fk, pk) = match relation {
             Relation::OneToOne { fk, pk, .. }
             | Relation::ManyToOne { fk, pk, .. }
             | Relation::OneToMany { fk, pk, .. } => (*fk, *pk),
             Relation::ManyToMany { .. } => {
-                return Err(ExecError::Integrity {
-                    message: "many-to-many relations do not use FK cleanup (internal error)"
-                        .to_string(),
+                return Err(ExecError::Internal {
+                    message: "many-to-many relations do not use FK cleanup".to_string(),
                 });
             }
         };
@@ -2230,8 +2220,8 @@ impl<'conn, 'schema> WriteTxn for SqliteWriteTxn<'conn, 'schema> {
             self.schema
                 .relations
                 .get(rel.index())
-                .ok_or_else(|| ExecError::Integrity {
-                    message: format!("unknown relation id {} (internal error)", rel.index()),
+                .ok_or_else(|| ExecError::Internal {
+                    message: format!("unknown relation id {}", rel.index()),
                 })?;
         let Relation::ManyToMany {
             join_table,
@@ -2242,9 +2232,8 @@ impl<'conn, 'schema> WriteTxn for SqliteWriteTxn<'conn, 'schema> {
             ..
         } = relation
         else {
-            return Err(ExecError::Integrity {
-                message: "join cleanup requires a many-to-many relation (internal error)"
-                    .to_string(),
+            return Err(ExecError::Internal {
+                message: "join cleanup requires a many-to-many relation".to_string(),
             });
         };
         let (join_col, pk) = if endpoint_is_first {
@@ -2282,16 +2271,15 @@ impl<'conn, 'schema> WriteTxn for SqliteWriteTxn<'conn, 'schema> {
             self.schema
                 .structs
                 .get(struct_id.index())
-                .ok_or_else(|| ExecError::Integrity {
-                    message: format!("unknown struct id {} (internal error)", struct_id.index()),
+                .ok_or_else(|| ExecError::Internal {
+                    message: format!("unknown struct id {}", struct_id.index()),
                 })?;
-        let field =
-            struct_def
-                .fields
-                .get(field_id.local())
-                .ok_or_else(|| ExecError::Integrity {
-                    message: format!("unknown field {field_id:?} (internal error)"),
-                })?;
+        let field = struct_def
+            .fields
+            .get(field_id.local())
+            .ok_or_else(|| ExecError::Internal {
+                message: format!("unknown field {field_id:?}"),
+            })?;
         let table = quote(&self.schema.tables[struct_def.table.index()].name);
         match field {
             Field::Array {
@@ -2320,9 +2308,8 @@ impl<'conn, 'schema> WriteTxn for SqliteWriteTxn<'conn, 'schema> {
                     let params: Vec<Value> =
                         chunk.iter().map(|key| Value::Integer(key.0)).collect();
                     for (storage, element, node_pos) in &nodes {
-                        let link = columns.get(*node_pos).ok_or_else(|| ExecError::Integrity {
-                            message: "array position has no owner column (internal error)"
-                                .to_string(),
+                        let link = columns.get(*node_pos).ok_or_else(|| ExecError::Internal {
+                            message: "array position has no owner column".to_string(),
                         })?;
                         let link = quote(self.schema.column_name(*link));
                         let parent_select = format!(
@@ -2338,16 +2325,16 @@ impl<'conn, 'schema> WriteTxn for SqliteWriteTxn<'conn, 'schema> {
     }
 
     fn commit(&mut self) -> Result<(), ExecError> {
-        let txn = self.txn.take().ok_or_else(|| ExecError::Integrity {
-            message: "write transaction is already finished (internal error)".to_string(),
+        let txn = self.txn.take().ok_or_else(|| ExecError::Internal {
+            message: "write transaction is already finished".to_string(),
         })?;
         txn.commit()
             .map_err(|err| SqliteBackend::storage_error("commit write transaction", err))
     }
 
     fn rollback(&mut self) -> Result<(), ExecError> {
-        let txn = self.txn.take().ok_or_else(|| ExecError::Integrity {
-            message: "write transaction is already finished (internal error)".to_string(),
+        let txn = self.txn.take().ok_or_else(|| ExecError::Internal {
+            message: "write transaction is already finished".to_string(),
         })?;
         txn.rollback()
             .map_err(|err| SqliteBackend::storage_error("rollback write transaction", err))
@@ -2383,7 +2370,7 @@ impl Storage for SqliteBackend<'_> {
             self.schema
                 .structs
                 .get(struct_id.index())
-                .ok_or_else(|| ExecError::Integrity {
+                .ok_or_else(|| ExecError::Internal {
                     message: format!("unknown struct id {}", struct_id.index()),
                 })?;
         let struct_name = &struct_def.name;
@@ -2463,7 +2450,7 @@ impl Storage for SqliteBackend<'_> {
         let relation = schema
             .relations
             .get(rel.index())
-            .ok_or_else(|| ExecError::Integrity {
+            .ok_or_else(|| ExecError::Internal {
                 message: format!("unknown relation id {}", rel.index()),
             })?;
         let fetch_ep = if fetch_from_first {
@@ -2478,7 +2465,7 @@ impl Storage for SqliteBackend<'_> {
         let (target, field_name) = match parent_def.fields.get(fetch_ep.local()) {
             Some(Field::Ref { target, name, .. }) => (*target, name.clone()),
             _ => {
-                return Err(ExecError::Integrity {
+                return Err(ExecError::Internal {
                     message: format!("relation endpoint {fetch_ep:?} is not a reference"),
                 });
             }
@@ -3162,7 +3149,7 @@ mod tests {
                 &FetchConstraints::EMPTY,
             )
             .unwrap_err();
-        assert!(matches!(err, ExecError::Integrity { .. }), "{err:?}");
+        assert!(matches!(err, ExecError::Internal { .. }), "{err:?}");
         assert!(err.to_string().contains("Ref field `S.r`"), "{err}");
     }
 
@@ -3216,7 +3203,7 @@ mod tests {
             backend
                 .fetch(StructId::new(99), &[], &FetchConstraints::EMPTY)
                 .unwrap_err(),
-            ExecError::Integrity { .. }
+            ExecError::Internal { .. }
         ));
         assert!(matches!(
             backend
@@ -3226,7 +3213,7 @@ mod tests {
                     &FetchConstraints::EMPTY
                 )
                 .unwrap_err(),
-            ExecError::Integrity { .. }
+            ExecError::Internal { .. }
         ));
     }
 
@@ -4040,7 +4027,7 @@ mod tests {
                 &FetchConstraints::EMPTY,
             )
             .unwrap_err();
-        assert!(matches!(err, ExecError::Integrity { .. }), "{err:?}");
+        assert!(matches!(err, ExecError::Internal { .. }), "{err:?}");
     }
 
     fn push_field(schema: &ValidatedSchema, name: &str) -> PushExpr {
@@ -4617,7 +4604,7 @@ mod tests {
                 },
             )
             .unwrap_err();
-        assert!(matches!(err, ExecError::Integrity { .. }), "{err:?}");
+        assert!(matches!(err, ExecError::Internal { .. }), "{err:?}");
 
         let pos = user_field(&schema, sid, "pos");
         let err = backend
@@ -4633,7 +4620,7 @@ mod tests {
                 },
             )
             .unwrap_err();
-        assert!(matches!(err, ExecError::Integrity { .. }), "{err:?}");
+        assert!(matches!(err, ExecError::Internal { .. }), "{err:?}");
 
         let err = backend
             .fetch(
@@ -4651,7 +4638,7 @@ mod tests {
                 },
             )
             .unwrap_err();
-        assert!(matches!(err, ExecError::Integrity { .. }), "{err:?}");
+        assert!(matches!(err, ExecError::Internal { .. }), "{err:?}");
     }
 
     fn write_schema() -> ValidatedSchema {

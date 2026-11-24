@@ -48,20 +48,20 @@ pub(super) fn eval_optional(
     span: Span,
 ) -> Result<Val, ExecError> {
     if !args.is_empty() && kind != OptMethodKind::UnwrapOr {
-        return Err(ExecError::Integrity {
-            message: format!("`{kind}()` takes no arguments (internal error)"),
+        return Err(ExecError::Internal {
+            message: format!("`{kind}()` takes no arguments"),
         });
     }
     if kind == OptMethodKind::UnwrapOr && args.len() != 1 {
-        return Err(ExecError::Integrity {
-            message: "`unwrap_or()` expects one argument (internal error)".to_string(),
+        return Err(ExecError::Internal {
+            message: "`unwrap_or()` expects one argument".to_string(),
         });
     }
     match base {
         Val::None => eval_opt_absent(kind, args, ctx, span),
         Val::Some(v) => Ok(eval_opt_present(kind, *v)),
-        _ => Err(ExecError::Integrity {
-            message: format!("`{kind}()` called on non-optional value: {base} (internal error)"),
+        _ => Err(ExecError::Internal {
+            message: format!("`{kind}()` called on non-optional value: {base}"),
         }),
     }
 }
@@ -89,8 +89,8 @@ fn eval_opt_absent(
         }),
         OptMethodKind::UnwrapOr => {
             let [arg] = args else {
-                return Err(ExecError::Integrity {
-                    message: "`unwrap_or()` expects one argument (internal error)".to_string(),
+                return Err(ExecError::Internal {
+                    message: "`unwrap_or()` expects one argument".to_string(),
                 });
             };
             Ok(eval_opt_present(kind, eval(&arg.expr, ctx)?))
@@ -105,12 +105,12 @@ pub(super) fn eval_optional_flatten(base: Val) -> Result<Val, ExecError> {
         Val::Some(inner) => match *inner {
             Val::None => Ok(Val::None),
             Val::Some(value) => Ok(Val::Some(value)),
-            other => Err(ExecError::Integrity {
-                message: format!("`flatten()` over non-optional value: {other} (internal error)"),
+            other => Err(ExecError::Internal {
+                message: format!("`flatten()` over non-optional value: {other}"),
             }),
         },
-        other => Err(ExecError::Integrity {
-            message: format!("`flatten()` on non-optional value: {other} (internal error)"),
+        other => Err(ExecError::Internal {
+            message: format!("`flatten()` on non-optional value: {other}"),
         }),
     }
 }

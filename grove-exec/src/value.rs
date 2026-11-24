@@ -363,8 +363,8 @@ impl Val {
             (Val::Scalar(x), Val::Scalar(y)) => x.cmp(y, span),
             (Val::Tuple(xs), Val::Tuple(ys)) => {
                 if xs.len() != ys.len() {
-                    return Err(ExecError::Integrity {
-                        message: "mismatched tuple comparison (internal error)".to_string(),
+                    return Err(ExecError::Internal {
+                        message: "mismatched tuple comparison".to_string(),
                     });
                 }
                 for (x, y) in xs.iter().zip(ys) {
@@ -375,8 +375,8 @@ impl Val {
                 }
                 Ok(std::cmp::Ordering::Equal)
             }
-            _ => Err(ExecError::Integrity {
-                message: "mismatched comparison operands (internal error)".to_string(),
+            _ => Err(ExecError::Internal {
+                message: "mismatched comparison operands".to_string(),
             }),
         }
     }
@@ -457,10 +457,8 @@ pub(crate) fn unwrap_optional_depth(
             }
             Val::None => return Ok((Val::None, peeled)),
             other => {
-                return Err(ExecError::Integrity {
-                    message: format!(
-                        "optional access expected {depth} layer(s), found {other} (internal error)"
-                    ),
+                return Err(ExecError::Internal {
+                    message: format!("optional access expected {depth} layer(s), found {other}"),
                 });
             }
         }
@@ -498,8 +496,8 @@ impl Scalar {
             (Scalar::Bool(x), Scalar::Bool(y)) => Ok(x.cmp(y)),
             (Scalar::Instant(x), Scalar::Instant(y)) => Ok(x.cmp(y)),
             (Scalar::Duration(x), Scalar::Duration(y)) => Ok(x.cmp(y)),
-            _ => Err(ExecError::Integrity {
-                message: "mismatched comparison operands (internal error)".to_string(),
+            _ => Err(ExecError::Internal {
+                message: "mismatched comparison operands".to_string(),
             }),
         }
     }

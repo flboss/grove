@@ -14,15 +14,15 @@ pub(super) fn eval_filter(
     let mut items = match base {
         Val::List(items) => items,
         other => {
-            return Err(ExecError::Integrity {
-                message: format!("`filter()` called on non-list value: {other} (internal error)"),
+            return Err(ExecError::Internal {
+                message: format!("`filter()` called on non-list value: {other}"),
             });
         }
     };
     let origin = items.origin;
     let [arg] = args else {
-        return Err(ExecError::Integrity {
-            message: "`filter()` expects one argument (internal error)".to_string(),
+        return Err(ExecError::Internal {
+            message: "`filter()` expects one argument".to_string(),
         });
     };
     let fields = owning_refs_in(&arg.expr, ctx.schema, ctx.plan.prefetch_skip());
@@ -36,10 +36,8 @@ pub(super) fn eval_filter(
             Val::Scalar(Scalar::Bool(true)) => kept.push(item),
             Val::Scalar(Scalar::Bool(false)) => {}
             other => {
-                return Err(ExecError::Integrity {
-                    message: format!(
-                        "`filter()` predicate evaluated to non-Bool: {other} (internal error)"
-                    ),
+                return Err(ExecError::Internal {
+                    message: format!("`filter()` predicate evaluated to non-Bool: {other}"),
                 });
             }
         }

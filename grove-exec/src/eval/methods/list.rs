@@ -22,21 +22,21 @@ pub(super) fn eval_list_slice(
     let mut items = match base {
         Val::List(items) => items,
         other => {
-            return Err(ExecError::Integrity {
-                message: format!("`{name}()` on non-list value: {other} (internal error)"),
+            return Err(ExecError::Internal {
+                message: format!("`{name}()` on non-list value: {other}"),
             });
         }
     };
     let index_arg = || -> Result<i64, ExecError> {
         let [arg] = args else {
-            return Err(ExecError::Integrity {
-                message: format!("`{name}()` expects one argument (internal error)"),
+            return Err(ExecError::Internal {
+                message: format!("`{name}()` expects one argument"),
             });
         };
         match arg {
             Val::Scalar(Scalar::Int(n)) => Ok(*n),
-            _ => Err(ExecError::Integrity {
-                message: format!("`{name}()` expects an Int argument (internal error)"),
+            _ => Err(ExecError::Internal {
+                message: format!("`{name}()` expects an Int argument"),
             }),
         }
     };
@@ -94,8 +94,8 @@ pub(super) fn eval_list_slice(
             }
         }
         _ => {
-            return Err(ExecError::Integrity {
-                message: format!("unknown slice method `{name}` (internal error)"),
+            return Err(ExecError::Internal {
+                message: format!("unknown slice method `{name}`"),
             });
         }
     };
@@ -105,8 +105,8 @@ pub(super) fn eval_list_slice(
 /// Element count of a List
 pub(super) fn eval_list_len(base: Val) -> Result<Val, ExecError> {
     let Val::List(items) = base else {
-        return Err(ExecError::Integrity {
-            message: format!("`.len()` on non-list value: {base} (internal error)"),
+        return Err(ExecError::Internal {
+            message: format!("`.len()` on non-list value: {base}"),
         });
     };
     Ok(Val::Scalar(Scalar::Int(items.len() as i64)))
@@ -122,8 +122,8 @@ pub(super) fn eval_list_contains(
     resolve_owning_values(ctx, &mut operands, None)?;
     let [base, needle] = operands;
     let Val::List(items) = base else {
-        return Err(ExecError::Integrity {
-            message: format!("`.contains()` on non-list value: {base} (internal error)"),
+        return Err(ExecError::Internal {
+            message: format!("`.contains()` on non-list value: {base}"),
         });
     };
     Ok(Val::Scalar(Scalar::Bool(
@@ -134,23 +134,23 @@ pub(super) fn eval_list_contains(
 /// Join a list of strings with a separator
 pub(super) fn eval_list_join(base: Val, args: &[Val]) -> Result<Val, ExecError> {
     let Val::List(items) = base else {
-        return Err(ExecError::Integrity {
-            message: format!("`join()` on non-list value: {base} (internal error)"),
+        return Err(ExecError::Internal {
+            message: format!("`join()` on non-list value: {base}"),
         });
     };
     let separator = match args {
         [Val::Scalar(Scalar::String(separator))] => separator,
         _ => {
-            return Err(ExecError::Integrity {
-                message: "`join()` expects one String argument (internal error)".to_string(),
+            return Err(ExecError::Internal {
+                message: "`join()` expects one String argument".to_string(),
             });
         }
     };
     let mut parts = Vec::with_capacity(items.len());
     for item in items {
         let Val::Scalar(Scalar::String(part)) = item else {
-            return Err(ExecError::Integrity {
-                message: format!("`join()` over non-String element: {item} (internal error)"),
+            return Err(ExecError::Internal {
+                message: format!("`join()` over non-String element: {item}"),
             });
         };
         parts.push(part);
@@ -161,8 +161,8 @@ pub(super) fn eval_list_join(base: Val, args: &[Val]) -> Result<Val, ExecError> 
 /// Drop `none` values from a List<?T>
 pub(super) fn eval_list_compact(base: Val) -> Result<Val, ExecError> {
     let Val::List(items) = base else {
-        return Err(ExecError::Integrity {
-            message: format!("`compact()` on non-list value: {base} (internal error)"),
+        return Err(ExecError::Internal {
+            message: format!("`compact()` on non-list value: {base}"),
         });
     };
     let origin = items.origin;
@@ -172,10 +172,8 @@ pub(super) fn eval_list_compact(base: Val) -> Result<Val, ExecError> {
             Val::Some(value) => compacted.push(*value),
             Val::None => {}
             other => {
-                return Err(ExecError::Integrity {
-                    message: format!(
-                        "`compact()` over non-optional element: {other} (internal error)"
-                    ),
+                return Err(ExecError::Internal {
+                    message: format!("`compact()` over non-optional element: {other}"),
                 });
             }
         }
@@ -186,8 +184,8 @@ pub(super) fn eval_list_compact(base: Val) -> Result<Val, ExecError> {
 /// Turn List<?T> into ?List<T>
 pub(super) fn eval_list_transpose(base: Val) -> Result<Val, ExecError> {
     let Val::List(items) = base else {
-        return Err(ExecError::Integrity {
-            message: format!("`transpose()` on non-list value: {base} (internal error)"),
+        return Err(ExecError::Internal {
+            message: format!("`transpose()` on non-list value: {base}"),
         });
     };
     let origin = items.origin;
@@ -197,10 +195,8 @@ pub(super) fn eval_list_transpose(base: Val) -> Result<Val, ExecError> {
             Val::Some(value) => transposed.push(*value),
             Val::None => return Ok(Val::None),
             other => {
-                return Err(ExecError::Integrity {
-                    message: format!(
-                        "`transpose()` over non-optional element: {other} (internal error)"
-                    ),
+                return Err(ExecError::Internal {
+                    message: format!("`transpose()` over non-optional element: {other}"),
                 });
             }
         }
@@ -212,8 +208,8 @@ pub(super) fn eval_list_transpose(base: Val) -> Result<Val, ExecError> {
 
 pub(super) fn eval_list_unique(base: Val) -> Result<Val, ExecError> {
     let Val::List(items) = base else {
-        return Err(ExecError::Integrity {
-            message: format!("`unique()` on non-list value: {base} (internal error)"),
+        return Err(ExecError::Internal {
+            message: format!("`unique()` on non-list value: {base}"),
         });
     };
     let origin = items.origin;
@@ -232,14 +228,14 @@ pub(super) fn eval_list_unique_over(
     ctx: &mut EvalCtx<'_>,
 ) -> Result<Val, ExecError> {
     let Val::List(mut items) = base else {
-        return Err(ExecError::Integrity {
-            message: format!("`unique_over()` on non-list value: {base} (internal error)"),
+        return Err(ExecError::Internal {
+            message: format!("`unique_over()` on non-list value: {base}"),
         });
     };
     let origin = items.origin;
     let [arg] = args else {
-        return Err(ExecError::Integrity {
-            message: "`unique_over()` expects one argument (internal error)".to_string(),
+        return Err(ExecError::Internal {
+            message: "`unique_over()` expects one argument".to_string(),
         });
     };
     let fields = owning_refs_in(&arg.expr, ctx.schema, ctx.plan.prefetch_skip());
@@ -261,8 +257,8 @@ pub(super) fn eval_list_unique_over(
 
 pub(super) fn eval_list_is_unique(base: Val) -> Result<Val, ExecError> {
     let Val::List(items) = base else {
-        return Err(ExecError::Integrity {
-            message: format!("`is_unique()` on non-list value: {base} (internal error)"),
+        return Err(ExecError::Internal {
+            message: format!("`is_unique()` on non-list value: {base}"),
         });
     };
     for (index, item) in items.iter().enumerate() {
@@ -278,8 +274,8 @@ pub(super) fn eval_list_is_unique(base: Val) -> Result<Val, ExecError> {
 
 pub(super) fn eval_list_reverse(base: Val) -> Result<Val, ExecError> {
     let Val::List(mut items) = base else {
-        return Err(ExecError::Integrity {
-            message: format!("`reverse()` on non-list value: {base} (internal error)"),
+        return Err(ExecError::Internal {
+            message: format!("`reverse()` on non-list value: {base}"),
         });
     };
     items.reverse();
@@ -344,13 +340,13 @@ fn predicate_items(
     ctx: &mut EvalCtx<'_>,
 ) -> Result<Vec<Val>, ExecError> {
     let Val::List(mut items) = base else {
-        return Err(ExecError::Integrity {
-            message: format!("`{method}()` on non-list value: {base} (internal error)"),
+        return Err(ExecError::Internal {
+            message: format!("`{method}()` on non-list value: {base}"),
         });
     };
     let [arg] = args else {
-        return Err(ExecError::Integrity {
-            message: format!("`{method}()` expects one argument (internal error)"),
+        return Err(ExecError::Internal {
+            message: format!("`{method}()` expects one argument"),
         });
     };
     let fields = owning_refs_in(&arg.expr, ctx.schema, ctx.plan.prefetch_skip());
@@ -368,16 +364,16 @@ fn eval_scoped_predicate(
     pop_element_scope(ctx, map_element);
     match pred? {
         Val::Scalar(Scalar::Bool(value)) => Ok(value),
-        other => Err(ExecError::Integrity {
-            message: format!("predicate evaluated to non-Bool: {other} (internal error)"),
+        other => Err(ExecError::Internal {
+            message: format!("predicate evaluated to non-Bool: {other}"),
         }),
     }
 }
 
 pub(super) fn eval_list_flatten(base: Val) -> Result<Val, ExecError> {
     let Val::List(items) = base else {
-        return Err(ExecError::Integrity {
-            message: format!("`flatten()` on non-list value: {base} (internal error)"),
+        return Err(ExecError::Internal {
+            message: format!("`flatten()` on non-list value: {base}"),
         });
     };
     let mut flat = Vec::new();
@@ -385,8 +381,8 @@ pub(super) fn eval_list_flatten(base: Val) -> Result<Val, ExecError> {
         match item {
             Val::List(inner) => flat.extend(inner),
             other => {
-                return Err(ExecError::Integrity {
-                    message: format!("`flatten()` over non-list element: {other} (internal error)"),
+                return Err(ExecError::Internal {
+                    message: format!("`flatten()` over non-list element: {other}"),
                 });
             }
         }
@@ -399,14 +395,14 @@ pub(super) fn eval_list_extend(base: Val, mut args: Vec<Val>) -> Result<Val, Exe
     let mut items = match base {
         Val::List(items) => items,
         other => {
-            return Err(ExecError::Integrity {
-                message: format!("`extend()` on non-list value: {other} (internal error)"),
+            return Err(ExecError::Internal {
+                message: format!("`extend()` on non-list value: {other}"),
             });
         }
     };
     let Some(Val::List(other)) = args.pop() else {
-        return Err(ExecError::Integrity {
-            message: "`extend()` expects one list argument (internal error)".to_string(),
+        return Err(ExecError::Internal {
+            message: "`extend()` expects one list argument".to_string(),
         });
     };
     items.extend(other);

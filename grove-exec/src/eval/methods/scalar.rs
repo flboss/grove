@@ -37,8 +37,8 @@ fn duration_as(total_nanos: Decimal, divisor: i64) -> Scalar {
 
 pub(super) fn eval_string_split(base: &Val, args: &[Val]) -> Result<Val, ExecError> {
     let Val::Scalar(Scalar::String(s)) = base else {
-        return Err(ExecError::Integrity {
-            message: format!("`split()` on non-String value: {base} (internal error)"),
+        return Err(ExecError::Internal {
+            message: format!("`split()` on non-String value: {base}"),
         });
     };
     let pattern = method_string_arg(args, "split")?;
@@ -63,8 +63,8 @@ pub(super) fn eval_scalar_method(
     span: Span,
 ) -> Result<Scalar, ExecError> {
     let Val::Scalar(base) = base else {
-        return Err(ExecError::Integrity {
-            message: format!("method `{name}` on unsupported value (internal error)"),
+        return Err(ExecError::Internal {
+            message: format!("method `{name}` on unsupported value"),
         });
     };
     match method {
@@ -299,9 +299,9 @@ fn duration_method(
 }
 
 fn scalar_method_integrity<T>(method: MethodId, name: &str, base: &Scalar) -> Result<T, ExecError> {
-    Err(ExecError::Integrity {
+    Err(ExecError::Internal {
         message: format!(
-            "unknown method `{name}` ({method:?}) for {} (internal error)",
+            "unknown method `{name}` ({method:?}) for {}",
             base.kind_str(),
         ),
     })

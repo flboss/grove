@@ -163,8 +163,8 @@ pub(super) fn eval_method(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val
         MethodId::ListContains => {
             let mut arg_vals = eval_args(args, ctx)?;
             let Some(needle) = arg_vals.pop() else {
-                return Err(ExecError::Integrity {
-                    message: "`contains()` expects one argument (internal error)".to_string(),
+                return Err(ExecError::Internal {
+                    message: "`contains()` expects one argument".to_string(),
                 });
             };
             eval_list_contains(ctx, base, needle)
@@ -175,8 +175,8 @@ pub(super) fn eval_method(expr: &TypedExpr, ctx: &mut EvalCtx<'_>) -> Result<Val
             eval_scalar_method(method, name, &base, &arg_vals, &ctx.schema.config, span)
                 .map(Val::Scalar)
         }
-        _ => Err(ExecError::Integrity {
-            message: format!("unknown method `{name}` (internal error)"),
+        _ => Err(ExecError::Internal {
+            message: format!("unknown method `{name}`"),
         }),
     };
 
@@ -192,22 +192,22 @@ fn eval_args(args: &[TypedMethodArg], ctx: &mut EvalCtx<'_>) -> Result<Vec<Val>,
 fn list_is_empty(base: &Val) -> Result<bool, ExecError> {
     match base {
         Val::List(items) => Ok(items.is_empty()),
-        other => Err(ExecError::Integrity {
-            message: format!("list rewrite applied to non-list value: {other} (internal error)"),
+        other => Err(ExecError::Internal {
+            message: format!("list rewrite applied to non-list value: {other}"),
         }),
     }
 }
 
 fn method_arg<'a>(args: &'a [Val], method: &str, index: usize) -> Result<&'a Val, ExecError> {
-    args.get(index).ok_or_else(|| ExecError::Integrity {
-        message: format!("missing argument {index} for `{method}` (internal error)"),
+    args.get(index).ok_or_else(|| ExecError::Internal {
+        message: format!("missing argument {index} for `{method}`"),
     })
 }
 
 pub(super) fn method_string_arg<'a>(args: &'a [Val], method: &str) -> Result<&'a str, ExecError> {
     let Val::Scalar(Scalar::String(s)) = method_arg(args, method, 0)? else {
-        return Err(ExecError::Integrity {
-            message: format!("`{method}` expects a String argument (internal error)"),
+        return Err(ExecError::Internal {
+            message: format!("`{method}` expects a String argument"),
         });
     };
     Ok(s.as_str())
@@ -215,8 +215,8 @@ pub(super) fn method_string_arg<'a>(args: &'a [Val], method: &str) -> Result<&'a
 
 pub(super) fn method_int_arg(args: &[Val], method: &str) -> Result<i64, ExecError> {
     let Val::Scalar(Scalar::Int(n)) = method_arg(args, method, 0)? else {
-        return Err(ExecError::Integrity {
-            message: format!("`{method}` expects an Int argument (internal error)"),
+        return Err(ExecError::Internal {
+            message: format!("`{method}` expects an Int argument"),
         });
     };
     Ok(*n)

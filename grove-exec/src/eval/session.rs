@@ -154,9 +154,8 @@ fn execute_inner<'s>(
             TypedStatement::Expr(_) => {}
             TypedStatement::Mutation(mutation) => {
                 let Some(txn) = write.as_deref_mut() else {
-                    return Err(ExecError::Integrity {
-                        message: "mutation executed without a write transaction (internal error)"
-                            .to_string(),
+                    return Err(ExecError::Internal {
+                        message: "mutation executed without a write transaction".to_string(),
                     });
                 };
                 mutations::exec_mutation(mutation, &mut ctx, txn)?;

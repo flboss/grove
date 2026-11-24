@@ -109,8 +109,8 @@ fn resolve_insert_target(
                 .schema
                 .roots
                 .get(root_idx)
-                .ok_or_else(|| ExecError::Integrity {
-                    message: format!("unknown root {root_idx} (internal error)"),
+                .ok_or_else(|| ExecError::Internal {
+                    message: format!("unknown root {root_idx}"),
                 })?;
             if opt_depth > 0 {
                 let target = eval(base, ctx)?;
@@ -135,18 +135,18 @@ fn resolve_insert_target(
                 target
             };
             let Val::List(list) = target else {
-                return Err(ExecError::Integrity {
+                return Err(ExecError::Internal {
                     message: "nested insert target did not evaluate to a list".to_string(),
                 });
             };
             let Some(CollectionOrigin::Ref { field, parent }) = list.origin else {
-                return Err(ExecError::Integrity {
+                return Err(ExecError::Internal {
                     message: "nested insert target has no ref collection origin".to_string(),
                 });
             };
             if field != field_id {
-                return Err(ExecError::Integrity {
-                    message: "nested insert origin field mismatch (internal error)".to_string(),
+                return Err(ExecError::Internal {
+                    message: "nested insert origin field mismatch".to_string(),
                 });
             }
             let Some(Field::Ref {
@@ -156,25 +156,23 @@ fn resolve_insert_target(
                 ..
             }) = ctx.schema.field(field)
             else {
-                return Err(ExecError::Unsupported {
-                    message: "insert through unsupported reference (internal error)".to_string(),
+                return Err(ExecError::Internal {
+                    message: "insert through unsupported reference".to_string(),
                 });
             };
             if !*owning {
                 let relation =
                     ctx.schema
                         .relation_of_field(field)
-                        .ok_or_else(|| ExecError::Integrity {
-                            message: "insert target Ref has no relation (internal error)"
-                                .to_string(),
+                        .ok_or_else(|| ExecError::Internal {
+                            message: "insert target Ref has no relation".to_string(),
                         })?;
                 if ctx
                     .schema
                     .relation_has_owning_endpoint(&ctx.schema.relations[relation.index()])
                 {
-                    return Err(ExecError::Integrity {
-                        message: "cannot insert through owning-relation backref (internal error)"
-                            .to_string(),
+                    return Err(ExecError::Internal {
+                        message: "cannot insert through owning-relation backref".to_string(),
                     });
                 }
                 return Ok(Some(InsertTarget::Link {
@@ -186,8 +184,8 @@ fn resolve_insert_target(
             let relation =
                 ctx.schema
                     .relation_of_field(field)
-                    .ok_or_else(|| ExecError::Integrity {
-                        message: "insert target Ref has no relation (internal error)".to_string(),
+                    .ok_or_else(|| ExecError::Internal {
+                        message: "insert target Ref has no relation".to_string(),
                     })?;
             let parent_is_first = ctx.schema.relations[relation.index()].endpoints()[0] == field;
             Ok(Some(InsertTarget::Ref {
@@ -236,13 +234,13 @@ fn insert_group(
             *parent_is_first,
         )?,
         InsertTarget::Link { .. } => {
-            return Err(ExecError::Integrity {
-                message: "link target reached record insertion (internal error)".to_string(),
+            return Err(ExecError::Internal {
+                message: "link target reached record insertion".to_string(),
             });
         }
     };
     if keys.len() != values.len() {
-        return Err(ExecError::Integrity {
+        return Err(ExecError::Internal {
             message: "insert returned an unexpected number of row keys".to_string(),
         });
     }
@@ -263,10 +261,8 @@ fn collect_insert_records(value: Val) -> Result<Vec<RecordVal>, ExecError> {
     match value {
         Val::Record(record) => Ok(vec![record]),
         Val::List(list) => list.into_iter().map(record_from_value).collect(),
-        other => Err(ExecError::Integrity {
-            message: format!(
-                "insert argument is not a record or list of records: {other} (internal error)"
-            ),
+        other => Err(ExecError::Internal {
+            message: format!("insert argument is not a record or list of records: {other}"),
         }),
     }
 }
@@ -274,8 +270,8 @@ fn collect_insert_records(value: Val) -> Result<Vec<RecordVal>, ExecError> {
 fn record_from_value(value: Val) -> Result<RecordVal, ExecError> {
     match value {
         Val::Record(record) => Ok(record),
-        other => Err(ExecError::Integrity {
-            message: format!("expected record value, got {other} (internal error)"),
+        other => Err(ExecError::Internal {
+            message: format!("expected record value, got {other}"),
         }),
     }
 }
@@ -295,8 +291,8 @@ fn record_parts(
     let struct_def = schema
         .structs
         .get(struct_id.index())
-        .ok_or_else(|| ExecError::Integrity {
-            message: format!("unknown struct id {} (internal error)", struct_id.index()),
+        .ok_or_else(|| ExecError::Internal {
+            message: format!("unknown struct id {}", struct_id.index()),
         })?;
     let mut values = Vec::new();
     let mut owned = Vec::new();
@@ -318,11 +314,8 @@ fn record_parts(
                         owned.push((field_id, value));
                     }
                 } else if !*optional {
-                    return Err(ExecError::Integrity {
-                        message: format!(
-                            "missing insert field `{}` (internal error)",
-                            field.name()
-                        ),
+                    return Err(ExecError::Internal {
+                        message: format!("missing insert field `{}`", field.name()),
                     });
                 }
             }
@@ -338,11 +331,8 @@ fn record_parts(
                 } else if matches!(ty, ValueType::Optional(_)) {
                     values.push((field_id, Val::None));
                 } else {
-                    return Err(ExecError::Integrity {
-                        message: format!(
-                            "missing insert field `{}` (internal error)",
-                            field.name()
-                        ),
+                    return Err(ExecError::Internal {
+                        message: format!("missing insert field `{}`", field.name()),
                     });
                 }
             }
@@ -374,17 +364,15 @@ fn collect_link_targets(
     targets: &mut Vec<RowOrigin>,
 ) -> Result<(), ExecError> {
     let Some(Field::Ref { name, target, .. }) = schema.field(field_id) else {
-        return Err(ExecError::Integrity {
-            message: "link field is not a ref (internal error)".to_string(),
+        return Err(ExecError::Internal {
+            message: "link field is not a ref".to_string(),
         });
     };
     match value {
         Val::RowRef(origin) => {
             if origin.struct_id != *target {
-                return Err(ExecError::Integrity {
-                    message: format!(
-                        "row reference target mismatch for field `{name}` (internal error)"
-                    ),
+                return Err(ExecError::Internal {
+                    message: format!("row reference target mismatch for field `{name}`"),
                 });
             }
             targets.push(origin);
@@ -398,8 +386,8 @@ fn collect_link_targets(
             }
             Ok(())
         }
-        other => Err(ExecError::Integrity {
-            message: format!("link field contains non-RowRef value {other} (internal error)"),
+        other => Err(ExecError::Internal {
+            message: format!("link field contains non-RowRef value {other}"),
         }),
     }
 }
@@ -420,20 +408,19 @@ fn insert_owned_field(
         ..
     }) = schema.field(field_id)
     else {
-        return Err(ExecError::Integrity {
-            message: "owned insert field is not a ref (internal error)".to_string(),
+        return Err(ExecError::Internal {
+            message: "owned insert field is not a ref".to_string(),
         });
     };
     if !*owning {
-        return Err(ExecError::Integrity {
-            message: "attempted recursive insert through non-owning ref (internal error)"
-                .to_string(),
+        return Err(ExecError::Internal {
+            message: "attempted recursive insert through non-owning ref".to_string(),
         });
     }
     let records = if *is_list {
         let Val::List(list) = value else {
-            return Err(ExecError::Integrity {
-                message: "list ref field did not contain a list (internal error)".to_string(),
+            return Err(ExecError::Internal {
+                message: "list ref field did not contain a list".to_string(),
             });
         };
         list.into_iter()
@@ -444,8 +431,8 @@ fn insert_owned_field(
             Val::None => Vec::new(),
             Val::Some(value) => vec![record_from_value(*value)?],
             other => {
-                return Err(ExecError::Integrity {
-                    message: format!("optional ref field contained {other} (internal error)"),
+                return Err(ExecError::Internal {
+                    message: format!("optional ref field contained {other}"),
                 });
             }
         }
@@ -457,8 +444,8 @@ fn insert_owned_field(
     }
     let relation = schema
         .relation_of_field(field_id)
-        .ok_or_else(|| ExecError::Integrity {
-            message: "owned insert field has no relation (internal error)".to_string(),
+        .ok_or_else(|| ExecError::Internal {
+            message: "owned insert field has no relation".to_string(),
         })?;
     let parent_is_first = schema.relations[relation.index()].endpoints()[0] == field_id;
     insert_group(
@@ -562,15 +549,15 @@ fn delete_owned_children(
         ..
     }) = ctx.schema.field(field_id)
     else {
-        return Err(ExecError::Integrity {
-            message: "update ref field is not an owning ref (internal error)".to_string(),
+        return Err(ExecError::Internal {
+            message: "update ref field is not an owning ref".to_string(),
         });
     };
     let relation = ctx
         .schema
         .relation_of_field(field_id)
-        .ok_or_else(|| ExecError::Integrity {
-            message: "update ref field has no relation (internal error)".to_string(),
+        .ok_or_else(|| ExecError::Internal {
+            message: "update ref field has no relation".to_string(),
         })?;
     let fetch_from_first = ctx.schema.relations[relation.index()].endpoints()[0] == field_id;
     let groups = ctx.storage.fetch_related(
@@ -601,8 +588,8 @@ fn collect_update_target_records(value: Val) -> Result<Vec<(RowOrigin, Val)>, Ex
     let mut targets = Vec::new();
     match value {
         Val::Record(record) => {
-            let origin = record.origin.ok_or_else(|| ExecError::Integrity {
-                message: "update target record has no row origin (internal error)".to_string(),
+            let origin = record.origin.ok_or_else(|| ExecError::Internal {
+                message: "update target record has no row origin".to_string(),
             })?;
             if seen.insert(origin) {
                 targets.push((origin, Val::Record(record)));
@@ -611,13 +598,12 @@ fn collect_update_target_records(value: Val) -> Result<Vec<(RowOrigin, Val)>, Ex
         Val::List(list) => {
             for item in list {
                 let Val::Record(record) = item else {
-                    return Err(ExecError::Integrity {
-                        message: "update target list contains non-record value (internal error)"
-                            .to_string(),
+                    return Err(ExecError::Internal {
+                        message: "update target list contains non-record value".to_string(),
                     });
                 };
-                let origin = record.origin.ok_or_else(|| ExecError::Integrity {
-                    message: "update target record has no row origin (internal error)".to_string(),
+                let origin = record.origin.ok_or_else(|| ExecError::Internal {
+                    message: "update target record has no row origin".to_string(),
                 })?;
                 if seen.insert(origin) {
                     targets.push((origin, Val::Record(record)));
@@ -625,10 +611,8 @@ fn collect_update_target_records(value: Val) -> Result<Vec<(RowOrigin, Val)>, Ex
             }
         }
         other => {
-            return Err(ExecError::Integrity {
-                message: format!(
-                    "update target is not a record or list of records: {other} (internal error)"
-                ),
+            return Err(ExecError::Internal {
+                message: format!("update target is not a record or list of records: {other}"),
             });
         }
     }
@@ -644,8 +628,8 @@ fn resolve_update_parts(
     let struct_def = schema
         .structs
         .get(struct_id.index())
-        .ok_or_else(|| ExecError::Integrity {
-            message: format!("unknown struct id {} (internal error)", struct_id.index()),
+        .ok_or_else(|| ExecError::Internal {
+            message: format!("unknown struct id {}", struct_id.index()),
         })?;
     let mut base = Vec::new();
     let mut arrays = Vec::new();
@@ -720,25 +704,22 @@ fn collect_delete_target_origins(value: Val) -> Result<HashSet<RowOrigin>, ExecE
     let mut seen = HashSet::new();
     match value {
         Val::Record(record) => {
-            seen.insert(record.origin.ok_or_else(|| ExecError::Integrity {
-                message: "delete target record has no row origin (internal error)".to_string(),
+            seen.insert(record.origin.ok_or_else(|| ExecError::Internal {
+                message: "delete target record has no row origin".to_string(),
             })?);
         }
         Val::List(list) => {
             for item in list {
                 match item {
                     Val::Record(record) => {
-                        seen.insert(record.origin.ok_or_else(|| {
-                            ExecError::Integrity {
-                                message: "delete target record has no row origin (internal error)"
-                                    .to_string(),
-                            }
+                        seen.insert(record.origin.ok_or_else(|| ExecError::Internal {
+                            message: "delete target record has no row origin".to_string(),
                         })?);
                     }
                     other => {
-                        return Err(ExecError::Integrity {
+                        return Err(ExecError::Internal {
                             message: format!(
-                                "delete target list contains non-record value {other} (internal error)"
+                                "delete target list contains non-record value {other}"
                             ),
                         });
                     }
@@ -746,10 +727,8 @@ fn collect_delete_target_origins(value: Val) -> Result<HashSet<RowOrigin>, ExecE
             }
         }
         other => {
-            return Err(ExecError::Integrity {
-                message: format!(
-                    "delete target is not a record or list of records: {other} (internal error)"
-                ),
+            return Err(ExecError::Internal {
+                message: format!("delete target is not a record or list of records: {other}"),
             });
         }
     }
@@ -771,8 +750,8 @@ fn delete_owned_cascade(
         ctx.schema
             .structs
             .get(struct_id.index())
-            .ok_or_else(|| ExecError::Integrity {
-                message: format!("unknown struct id {} (internal error)", struct_id.index()),
+            .ok_or_else(|| ExecError::Internal {
+                message: format!("unknown struct id {}", struct_id.index()),
             })?;
     let owned_fields: Vec<(FieldId, StructId)> = struct_def
         .fields
@@ -792,8 +771,8 @@ fn delete_owned_cascade(
         let relation =
             ctx.schema
                 .relation_of_field(field_id)
-                .ok_or_else(|| ExecError::Integrity {
-                    message: "owning delete field has no relation (internal error)".to_string(),
+                .ok_or_else(|| ExecError::Internal {
+                    message: "owning delete field has no relation".to_string(),
                 })?;
         let fetch_from_first = ctx.schema.relations[relation.index()].endpoints()[0] == field_id;
         let groups = ctx.storage.fetch_related(
@@ -1886,7 +1865,7 @@ mod tests {
         let record = RecordVal::new(vec![(Rc::from("manager"), some(Val::RowRef(wrong)))]);
         assert!(matches!(
             resolve_update_parts(&schema, user, record),
-            Err(ExecError::Integrity { .. })
+            Err(ExecError::Internal { .. })
         ));
     }
 

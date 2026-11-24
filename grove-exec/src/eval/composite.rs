@@ -68,18 +68,16 @@ pub(crate) fn eval_projection(
                     Val::Record(record) => projected.push(project_record(record, items, ctx)?),
                     Val::None => projected.push(Val::None),
                     other => {
-                        return Err(ExecError::Integrity {
-                            message: format!(
-                                "projection over non-record list element: {other} (internal error)"
-                            ),
+                        return Err(ExecError::Internal {
+                            message: format!("projection over non-record list element: {other}"),
                         });
                     }
                 }
             }
             resolve_projection_refs(ctx, Val::list(projected))
         }
-        other => Err(ExecError::Integrity {
-            message: format!("projection over non-record value: {other} (internal error)"),
+        other => Err(ExecError::Internal {
+            message: format!("projection over non-record value: {other}"),
         }),
     }
 }

@@ -214,8 +214,8 @@ pub(super) fn eval_binary(
             }
         }
         (op, lhs, rhs) => {
-            return Err(ExecError::Integrity {
-                message: format!("mismatched binary operands: {lhs} {op} {rhs} (internal error)"),
+            return Err(ExecError::Internal {
+                message: format!("mismatched binary operands: {lhs} {op} {rhs}"),
             });
         }
     };
@@ -257,18 +257,15 @@ pub(super) fn eval_unary(
         }
         (UnaryOp::Neg, Val::Scalar(Scalar::Duration(d))) => Ok(Val::Scalar(Scalar::Duration(-d))),
         (UnaryOp::Not, Val::Scalar(Scalar::Bool(b))) => Ok(Val::Scalar(Scalar::Bool(!b))),
-        (op, operand) => Err(ExecError::Integrity {
-            message: format!("mismatched unary operand: {op}{operand} (internal error)"),
+        (op, operand) => Err(ExecError::Internal {
+            message: format!("mismatched unary operand: {op}{operand}"),
         }),
     }
 }
 
 fn eval_equality(op: &Spanned<BinaryOp>, l: &Val, r: &Val) -> Result<Val, ExecError> {
-    let eq = l.eq(r).ok_or_else(|| ExecError::Integrity {
-        message: format!(
-            "mismatched equality operands: {l} {} {r} (internal error)",
-            op.value
-        ),
+    let eq = l.eq(r).ok_or_else(|| ExecError::Internal {
+        message: format!("mismatched equality operands: {l} {} {r}", op.value),
     })?;
     let result = matches!((op.value, eq), (BinaryOp::Eq, true) | (BinaryOp::Ne, false));
     Ok(Val::Scalar(Scalar::Bool(result)))
@@ -282,8 +279,8 @@ fn eval_ordering(op: &Spanned<BinaryOp>, l: &Val, r: &Val, span: Span) -> Result
         BinaryOp::Gt => ord == std::cmp::Ordering::Greater,
         BinaryOp::Ge => ord != std::cmp::Ordering::Less,
         _ => {
-            return Err(ExecError::Integrity {
-                message: "non-ordering operator in ordered dispatch (internal error)".to_string(),
+            return Err(ExecError::Internal {
+                message: "non-ordering operator in ordered dispatch".to_string(),
             });
         }
     };
@@ -299,8 +296,8 @@ fn eval_logic(
 ) -> Result<Val, ExecError> {
     let l = eval(lhs, ctx)?;
     let Val::Scalar(Scalar::Bool(l)) = l else {
-        return Err(ExecError::Integrity {
-            message: format!("non-Bool logic operand: {l} (internal error)"),
+        return Err(ExecError::Internal {
+            message: format!("non-Bool logic operand: {l}"),
         });
     };
     let decided = matches!((op.value, l), (BinaryOp::And, false) | (BinaryOp::Or, true));
@@ -309,8 +306,8 @@ fn eval_logic(
     }
     let r = eval(rhs, ctx)?;
     let Val::Scalar(Scalar::Bool(r)) = r else {
-        return Err(ExecError::Integrity {
-            message: format!("non-Bool logic operand: {r} (internal error)"),
+        return Err(ExecError::Internal {
+            message: format!("non-Bool logic operand: {r}"),
         });
     };
     Ok(Val::Scalar(Scalar::Bool(r)))
@@ -372,10 +369,8 @@ pub(super) fn eval_cast(
             enum_cast_scalar(schema, id, index, EnumUnderlying::String)?
         }
         (kind, value) => {
-            return Err(ExecError::Integrity {
-                message: format!(
-                    "mismatched infallible cast operands: {value} via {kind:?} (internal error)"
-                ),
+            return Err(ExecError::Internal {
+                message: format!("mismatched infallible cast operands: {value} via {kind:?}"),
             });
         }
     };
@@ -449,10 +444,8 @@ fn eval_fallible_cast(
                 .map(|index| Val::Enum(enum_id, index))
         }
         (kind, value) => {
-            return Err(ExecError::Integrity {
-                message: format!(
-                    "mismatched fallible cast operands: {value} via {kind:?} (internal error)"
-                ),
+            return Err(ExecError::Internal {
+                message: format!("mismatched fallible cast operands: {value} via {kind:?}"),
             });
         }
     };
@@ -489,15 +482,12 @@ fn enum_variant_index_by_value(
     let enum_def = schema
         .enums
         .get(id.index())
-        .ok_or_else(|| ExecError::Integrity {
-            message: format!("unknown enum id {} (internal error)", id.index()),
+        .ok_or_else(|| ExecError::Internal {
+            message: format!("unknown enum id {}", id.index()),
         })?;
     if enum_def.underlying != value.enum_underlying() {
-        return Err(ExecError::Integrity {
-            message: format!(
-                "enum cast source does not match enum `{}` (internal error)",
-                enum_def.name
-            ),
+        return Err(ExecError::Internal {
+            message: format!("enum cast source does not match enum `{}`", enum_def.name),
         });
     }
     Ok(enum_def.variant_index_by_value(&value))
@@ -521,22 +511,16 @@ fn enum_cast_scalar(
     let enum_def = schema
         .enums
         .get(id.index())
-        .ok_or_else(|| ExecError::Integrity {
-            message: format!("unknown enum id {} (internal error)", id.index()),
+        .ok_or_else(|| ExecError::Internal {
+            message: format!("unknown enum id {}", id.index()),
         })?;
     if enum_def.underlying != expected {
-        return Err(ExecError::Integrity {
-            message: format!(
-                "enum cast target does not match enum `{}` (internal error)",
-                enum_def.name
-            ),
+        return Err(ExecError::Internal {
+            message: format!("enum cast target does not match enum `{}`", enum_def.name),
         });
     }
-    enum_variant_scalar(enum_def, index).ok_or_else(|| ExecError::Integrity {
-        message: format!(
-            "unknown variant {index} for enum `{}` (internal error)",
-            enum_def.name
-        ),
+    enum_variant_scalar(enum_def, index).ok_or_else(|| ExecError::Internal {
+        message: format!("unknown variant {index} for enum `{}`", enum_def.name),
     })
 }
 
