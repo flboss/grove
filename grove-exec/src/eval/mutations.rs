@@ -7,7 +7,7 @@ use grove_schema::validated::{
 
 use crate::error::ExecError;
 use crate::pushdown::FetchConstraints;
-use crate::storage::{Key, WriteTxn};
+use crate::storage::{Key, LinkMode, WriteTxn};
 use crate::value::{CollectionOrigin, RecordVal, RowOrigin, Val, unwrap_optional_depth};
 
 use super::{EvalCtx, eval};
@@ -47,9 +47,22 @@ fn exec_insert(
     let Some(target) = resolve_insert_target(base, opt_depth, ctx)? else {
         return Ok(());
     };
-    let arg = eval(arg, ctx)?;
-    let records = collect_insert_records(arg)?;
-    insert_group(ctx.schema, target, records, write)
+    match target {
+        InsertTarget::Link {
+            struct_id: _,
+            field,
+            owner,
+        } => {
+            let arg = eval(arg, ctx)?;
+            let targets = link_targets(ctx.schema, field, arg)?;
+            write.link_row_refs(field, owner.key, &targets, LinkMode::Append)
+        }
+        target => {
+            let arg = eval(arg, ctx)?;
+            let records = collect_insert_records(arg)?;
+            insert_group(ctx.schema, target, records, write)
+        }
+    }
 }
 
 enum InsertTarget {
@@ -62,12 +75,19 @@ enum InsertTarget {
         parent: Key,
         parent_is_first: bool,
     },
+    Link {
+        struct_id: StructId,
+        field: FieldId,
+        owner: RowOrigin,
+    },
 }
 
 impl InsertTarget {
     fn struct_id(&self) -> StructId {
         match self {
-            InsertTarget::Root { struct_id } | InsertTarget::Ref { struct_id, .. } => *struct_id,
+            InsertTarget::Root { struct_id }
+            | InsertTarget::Ref { struct_id, .. }
+            | InsertTarget::Link { struct_id, .. } => *struct_id,
         }
     }
 }
@@ -132,7 +152,7 @@ fn resolve_insert_target(
             let Some(Field::Ref {
                 target: struct_id,
                 is_list: true,
-                owning: true,
+                owning,
                 ..
             }) = ctx.schema.field(field)
             else {
@@ -140,6 +160,29 @@ fn resolve_insert_target(
                     message: "insert through unsupported reference (internal error)".to_string(),
                 });
             };
+            if !*owning {
+                let relation =
+                    ctx.schema
+                        .relation_of_field(field)
+                        .ok_or_else(|| ExecError::Integrity {
+                            message: "insert target Ref has no relation (internal error)"
+                                .to_string(),
+                        })?;
+                if ctx
+                    .schema
+                    .relation_has_owning_endpoint(&ctx.schema.relations[relation.index()])
+                {
+                    return Err(ExecError::Integrity {
+                        message: "cannot insert through owning-relation backref (internal error)"
+                            .to_string(),
+                    });
+                }
+                return Ok(Some(InsertTarget::Link {
+                    struct_id: *struct_id,
+                    field,
+                    owner: parent,
+                }));
+            }
             let relation =
                 ctx.schema
                     .relation_of_field(field)
@@ -177,11 +220,6 @@ fn insert_group(
         owned.push(parts.owned);
         links.push(parts.links);
     }
-    if links.iter().any(|links| !links.is_empty()) {
-        return Err(ExecError::Unsupported {
-            message: "non-owning links are not implemented yet".to_string(),
-        });
-    }
 
     let keys = match &target {
         InsertTarget::Root { .. } => write.insert_rows(struct_id, &values)?,
@@ -197,6 +235,11 @@ fn insert_group(
             *parent,
             *parent_is_first,
         )?,
+        InsertTarget::Link { .. } => {
+            return Err(ExecError::Integrity {
+                message: "link target reached record insertion (internal error)".to_string(),
+            });
+        }
     };
     if keys.len() != values.len() {
         return Err(ExecError::Integrity {
@@ -204,9 +247,12 @@ fn insert_group(
         });
     }
 
-    for (children, key) in owned.into_iter().zip(keys) {
+    for ((children, links), key) in owned.into_iter().zip(links).zip(keys) {
         for (field_id, value) in children {
             insert_owned_field(schema, field_id, value, key, write)?;
+        }
+        for (field_id, targets) in links {
+            write.link_row_refs(field_id, key, &targets, LinkMode::Append)?;
         }
     }
     Ok(())
@@ -283,9 +329,7 @@ fn record_parts(
             Field::Ref { owning: false, .. } => {
                 if let Some(index) = index {
                     let value = record.fields.swap_remove(index).1;
-                    let mut targets = Vec::new();
-                    link_targets(schema, field_id, value, &mut targets)?;
-                    links.push((field_id, targets));
+                    links.push((field_id, link_targets(schema, field_id, value)?));
                 }
             }
             Field::Value { ty, .. } | Field::Array { element: ty, .. } => {
@@ -315,6 +359,18 @@ fn link_targets(
     schema: &ValidatedSchema,
     field_id: FieldId,
     value: Val,
+) -> Result<Vec<RowOrigin>, ExecError> {
+    let mut targets = Vec::new();
+    collect_link_targets(schema, field_id, value, &mut targets)?;
+    let mut seen = HashSet::new();
+    targets.retain(|origin| seen.insert(*origin));
+    Ok(targets)
+}
+
+fn collect_link_targets(
+    schema: &ValidatedSchema,
+    field_id: FieldId,
+    value: Val,
     targets: &mut Vec<RowOrigin>,
 ) -> Result<(), ExecError> {
     let Some(Field::Ref { name, target, .. }) = schema.field(field_id) else {
@@ -335,10 +391,10 @@ fn link_targets(
             Ok(())
         }
         Val::None => Ok(()),
-        Val::Some(inner) => link_targets(schema, field_id, *inner, targets),
+        Val::Some(inner) => collect_link_targets(schema, field_id, *inner, targets),
         Val::List(list) => {
             for item in list.items {
-                link_targets(schema, field_id, item, targets)?;
+                collect_link_targets(schema, field_id, item, targets)?;
             }
             Ok(())
         }
@@ -473,11 +529,6 @@ fn apply_update(
     origin: RowOrigin,
     parts: UpdateParts,
 ) -> Result<(), ExecError> {
-    if !parts.links.is_empty() {
-        return Err(ExecError::Unsupported {
-            message: "non-owning links are not implemented yet".to_string(),
-        });
-    }
     let mut seen = HashSet::new();
     for (field_id, _) in &parts.owned {
         delete_owned_children(ctx, write, *field_id, origin.key, &mut seen)?;
@@ -487,6 +538,9 @@ fn apply_update(
     }
     if !parts.base.is_empty() {
         write.update_row(origin.struct_id, origin.key, &parts.base)?;
+    }
+    for (field_id, targets) in &parts.links {
+        write.link_row_refs(*field_id, origin.key, targets, LinkMode::Replace)?;
     }
     for (field_id, value) in parts.owned {
         insert_owned_field(ctx.schema, field_id, value, origin.key, write)?;
@@ -618,9 +672,7 @@ fn resolve_update_parts(
             }
             Field::Ref { owning: true, .. } => owned.push((field_id, value)),
             Field::Ref { owning: false, .. } => {
-                let mut targets = Vec::new();
-                link_targets(schema, field_id, value, &mut targets)?;
-                links.push((field_id, targets));
+                links.push((field_id, link_targets(schema, field_id, value)?));
             }
         }
     }
@@ -1776,6 +1828,208 @@ mod tests {
             resolve_update_parts(&schema, user, record),
             Err(ExecError::Integrity { .. })
         ));
+    }
+
+    #[test]
+    fn update_non_owning_link() {
+        let schema = one_to_many_schema();
+        let backend = one_to_many_backend(&schema);
+
+        let result = run(
+            r#"
+            children.insert({ id = 11, name = "child2", parent = none });
+            children[id == 11].update({ parent = some(&parents.first().unwrap()) });
+            children[id == 11].first().unwrap().parent?.id
+            "#,
+            &schema,
+            &backend,
+        );
+        assert_eq!(result, Some(some(int(1))));
+
+        let result = run(
+            r#"
+            children[id == 11].update({ parent = none });
+            children[id == 11].first().unwrap().parent?.id
+            "#,
+            &schema,
+            &backend,
+        );
+        assert_eq!(result, Some(Val::None));
+    }
+
+    #[test]
+    fn insert_non_owning_link_nested() {
+        let schema = one_to_many_schema();
+        let backend = one_to_many_backend(&schema);
+
+        let result = run(
+            r#"
+            children.insert({
+                id = 11,
+                name = "child2",
+                parent = some(&parents.first().unwrap()),
+            });
+            children.find(id == 11).unwrap().parent?.id
+            "#,
+            &schema,
+            &backend,
+        );
+        assert_eq!(result, Some(some(int(1))));
+    }
+
+    #[test]
+    fn insert_non_owning_list() {
+        let schema = one_to_many_schema();
+        let backend = one_to_many_backend(&schema);
+
+        let result = run(
+            r#"
+            children.insert({ id = 11, name = "child2", parent = none });
+            parents.first().unwrap().children.insert(&children[id == 11]);
+            (children.len(), parents.first().unwrap().children.len())
+            "#,
+            &schema,
+            &backend,
+        );
+        assert_eq!(result, Some(Val::Tuple(vec![int(2), int(2)])));
+    }
+
+    #[test]
+    fn update_non_owning_list() {
+        let schema = one_to_many_schema();
+        let backend = one_to_many_backend(&schema);
+
+        let result = run(
+            r#"
+            children.insert({ id = 11, name = "child2", parent = none });
+            parents.first().unwrap().update({ children = &children });
+            children.map($.parent?.id)
+            "#,
+            &schema,
+            &backend,
+        );
+        assert_eq!(result, Some(Val::list(vec![some(int(1)), some(int(1))])));
+
+        let result = run(
+            r#"
+            parents.first().unwrap().update({ children = [&children.find(id == 11).unwrap()] });
+            (children.len(), children.map($.parent?.id))
+            "#,
+            &schema,
+            &backend,
+        );
+        assert_eq!(
+            result,
+            Some(Val::Tuple(vec![
+                int(2),
+                Val::list(vec![Val::None, some(int(1))]),
+            ]))
+        );
+    }
+
+    #[test]
+    fn link_targets_deduplication() {
+        let schema = one_to_many_schema();
+        let parent = schema.struct_by_name("Parent").unwrap().0;
+        let child = schema.struct_by_name("Child").unwrap().0;
+        let field = schema.struct_field(parent, "children").unwrap().0;
+        let first = RowOrigin {
+            struct_id: child,
+            key: Key(10),
+        };
+        let second = RowOrigin {
+            struct_id: child,
+            key: Key(11),
+        };
+        let targets = link_targets(
+            &schema,
+            field,
+            Val::list(vec![
+                Val::RowRef(first),
+                Val::RowRef(second),
+                Val::RowRef(first),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(targets, vec![first, second]);
+    }
+
+    #[test]
+    fn self_ref_non_owning_mutations() {
+        let schema = self_ref_schema();
+        let backend = self_ref_backend(&schema);
+
+        let result = run(
+            r#"
+            users.insert({ id = 3, name = "third", manager = none });
+            users[id == 1].update({ subordinates = &users[id == 2] });
+            (
+                users.find(id == 1).unwrap().subordinates.len(),
+                users.find(id == 3).unwrap().manager?.id
+            )
+            "#,
+            &schema,
+            &backend,
+        );
+        assert_eq!(result, Some(Val::Tuple(vec![int(1), Val::None])));
+
+        let result = run(
+            r#"
+            users.find(id == 1).unwrap().subordinates.insert(&users[id == 3]);
+            (
+                users[id == 1].first().unwrap().subordinates.len(),
+                users[id == 3].first().unwrap().manager?.id
+            )
+            "#,
+            &schema,
+            &backend,
+        );
+        assert_eq!(result, Some(Val::Tuple(vec![int(2), some(int(1))])));
+
+        let result = run(
+            r#"
+            users.find(id == 3)?.update({ manager = some(&users.find(id == 1).unwrap()) });
+            users.find(id == 3)?.manager??.id
+            "#,
+            &schema,
+            &backend,
+        );
+        assert_eq!(result, Some(some(int(1))));
+
+        let result = run(
+            r#"
+            users[id == 3].update({ manager = none });
+            users.find(id == 3).unwrap().manager?.id
+            "#,
+            &schema,
+            &backend,
+        );
+        assert_eq!(result, Some(Val::None));
+    }
+
+    #[test]
+    fn link_api_missing_targets_rejected() {
+        let schema = one_to_many_schema();
+        let backend = one_to_many_backend(&schema);
+        let parent = schema.struct_by_name("Parent").unwrap().0;
+        let child = schema.struct_by_name("Child").unwrap().0;
+        let parent_field = schema.struct_field(child, "parent").unwrap().0;
+        let children_field = schema.struct_field(parent, "children").unwrap().0;
+        let missing = RowOrigin {
+            struct_id: child,
+            key: Key(999),
+        };
+
+        let mut txn = backend.begin_write().unwrap();
+        assert!(matches!(
+            txn.link_row_refs(parent_field, Key(1), &[missing], LinkMode::Append),
+            Err(ExecError::Integrity { .. })
+        ));
+        assert!(matches!(
+            txn.link_row_refs(children_field, Key(1), &[missing], LinkMode::Append),
+            Err(ExecError::Integrity { .. })
+        ));
+        txn.rollback().unwrap();
     }
 
     #[test]

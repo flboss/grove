@@ -1897,6 +1897,22 @@ impl<'conn, 'schema> WriteTxn for SqliteWriteTxn<'conn, 'schema> {
         self.insert_encoded_rows(&table, &columns, &encoded_rows)
     }
 
+    fn link_row_refs(
+        &mut self,
+        field: FieldId,
+        owner: Key,
+        targets: &[RowOrigin],
+        mode: LinkMode,
+    ) -> Result<(), ExecError> {
+        let relation =
+            self.schema
+                .relation_of_field(field)
+                .ok_or_else(|| ExecError::Integrity {
+                    message: "link field has no relation (internal error)".to_string(),
+                })?;
+        self.link_direct(relation, field, owner, targets, mode)
+    }
+
     fn update_row(
         &mut self,
         struct_id: StructId,
