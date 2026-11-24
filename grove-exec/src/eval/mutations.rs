@@ -1696,6 +1696,66 @@ mod tests {
         SqliteBackend::new(conn, schema).unwrap()
     }
 
+    fn nested_link_schema() -> ValidatedSchema {
+        grove_schema::validate(
+            grove_schema::parse_schema(
+                r#"
+                root users: User;
+                root images: Image;
+                root tags: Tag;
+                struct User {
+                    id: Int,
+                    name: String,
+                    favorite: &?Image,
+                    orders: List<Order>,
+                }
+                struct Order {
+                    id: Int,
+                    total: Int,
+                    user: &User,
+                    image: &?Image,
+                    tags: &List<Tag>,
+                }
+                struct Image {
+                    id: Int,
+                    title: String,
+                    users: &List<User>,
+                    orders: &List<Order>,
+                }
+                struct Tag {
+                    id: Int,
+                    label: String,
+                    orders: &List<Order>,
+                }
+                rel Order.user <<-> User.orders (orders.user_id -> users.id);
+                rel Image.users <->> User.favorite (users.favorite_id -> images.id);
+                rel Image.orders <->> Order.image (orders.image_id -> images.id);
+                rel Tag.orders <<->> Order.tags
+                    via order_tags[tag_id -> tags.id, order_id -> orders.id];
+                "#,
+            )
+            .0
+            .expect("invalid nested-link schema"),
+        )
+        .0
+        .expect("invalid nested-link schema")
+    }
+
+    fn nested_link_backend(schema: &ValidatedSchema) -> SqliteBackend<'_> {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE users(id INTEGER, name TEXT, favorite_id INTEGER);
+             CREATE TABLE images(id INTEGER, title TEXT);
+             CREATE TABLE tags(id INTEGER, label TEXT);
+             CREATE TABLE orders(id INTEGER, total INTEGER, user_id INTEGER, image_id INTEGER);
+             CREATE TABLE order_tags(tag_id INTEGER, order_id INTEGER);
+             INSERT INTO images(id, title) VALUES (1, 'i1'), (2, 'i2');
+             INSERT INTO tags(id, label) VALUES (1, 't1'), (2, 't2');",
+        )
+        .unwrap();
+        SqliteBackend::new(conn, schema).unwrap()
+    }
+
     fn mutation_parts_schema() -> ValidatedSchema {
         grove_schema::validate(
             grove_schema::parse_schema(
@@ -2137,6 +2197,139 @@ mod tests {
             &backend,
         );
         assert_eq!(result, Some(Val::Tuple(vec![int(0), int(2), int(2)])));
+    }
+
+    #[test]
+    fn owned_insert_nested_non_owning() {
+        let schema = nested_link_schema();
+        let backend = nested_link_backend(&schema);
+
+        let result = run(
+            r#"
+            users.insert({
+                id = 1,
+                name = "u",
+                favorite = some(&images[id == 1].first().unwrap()),
+                orders = [{
+                    id = 10,
+                    total = 1,
+                    image = some(&images[id == 1].first().unwrap()),
+                    tags = &tags,
+                }],
+            });
+            (
+                users.find(id == 1).unwrap().favorite?.id,
+                users.find(id == 1).unwrap().orders.first().unwrap().image?.id,
+                users.find(id == 1).unwrap().orders.first().unwrap().tags.id,
+            )
+            "#,
+            &schema,
+            &backend,
+        );
+        assert_eq!(
+            result,
+            Some(Val::Tuple(vec![
+                some(int(1)),
+                some(int(1)),
+                Val::list(vec![int(1), int(2)]),
+            ]))
+        );
+    }
+
+    #[test]
+    fn owned_update_nested_non_owning() {
+        let schema = nested_link_schema();
+        let backend = nested_link_backend(&schema);
+
+        let result = run(
+            r#"
+            users.insert({
+                id = 1,
+                name = "u",
+                favorite = some(&images[id == 1].first().unwrap()),
+                orders = [{
+                    id = 10,
+                    total = 1,
+                    image = some(&images[id == 1].first().unwrap()),
+                    tags = &tags,
+                }],
+            });
+            users.find(id == 1).unwrap().update({
+                name = "u2",
+                favorite = some(&images[id == 2].first().unwrap()),
+                orders = [{
+                    id = 11,
+                    total = 2,
+                    image = some(&images[id == 2].first().unwrap()),
+                    tags = &tags[id == 1],
+                }],
+            });
+            (
+                users.find(id == 1).unwrap().name,
+                users.find(id == 1).unwrap().favorite?.id,
+                users.find(id == 1).unwrap().orders.id,
+                users.find(id == 1).unwrap().orders.first().unwrap().image?.id,
+                users.find(id == 1).unwrap().orders.first().unwrap().tags.id,
+                images.len(),
+            )
+            "#,
+            &schema,
+            &backend,
+        );
+        assert_eq!(
+            result,
+            Some(Val::Tuple(vec![
+                str("u2"),
+                some(int(2)),
+                Val::list(vec![int(11)]),
+                some(int(2)),
+                Val::list(vec![int(1)]),
+                int(2),
+            ]))
+        );
+    }
+
+    #[test]
+    fn owning_delete_nested_non_owning_cleaned() {
+        let schema = nested_link_schema();
+        let backend = nested_link_backend(&schema);
+
+        let result = run(
+            r#"
+            users.insert({
+                id = 1,
+                name = "u",
+                favorite = some(&images[id == 1].first().unwrap()),
+                orders = [{
+                    id = 10,
+                    total = 1,
+                    image = some(&images[id == 1].first().unwrap()),
+                    tags = &tags,
+                }],
+            });
+            images[id == 1].first().unwrap().delete();
+            tags[id == 1].first().unwrap().delete();
+            (
+                users.find(id == 1).unwrap().favorite?.id,
+                users.find(id == 1).unwrap().orders.first().unwrap().image?.id,
+                users.find(id == 1).unwrap().orders.first().unwrap().tags.id,
+                users.len(),
+                images.len(),
+            )
+            "#,
+            &schema,
+            &backend,
+        );
+        assert_eq!(
+            result,
+            Some(Val::Tuple(vec![
+                Val::None,
+                Val::None,
+                Val::list(vec![int(2)]),
+                int(1),
+                int(1),
+            ]))
+        );
     }
 
     #[test]
