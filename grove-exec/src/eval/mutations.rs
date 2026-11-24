@@ -12,9 +12,6 @@ use crate::value::{CollectionOrigin, RecordVal, RowOrigin, Val, unwrap_optional_
 
 use super::{EvalCtx, eval};
 
-type FieldValues = Vec<(FieldId, Val)>;
-type RecordParts = (FieldValues, FieldValues);
-
 /// Dispatch typed mutation statement to its executor
 pub(crate) fn exec_mutation(
     stmt: &TypedMutationStmt,
@@ -173,10 +170,17 @@ fn insert_group(
     let struct_id = target.struct_id();
     let mut values = Vec::with_capacity(records.len());
     let mut owned = Vec::with_capacity(records.len());
+    let mut links = Vec::with_capacity(records.len());
     for record in records {
-        let (base, children) = record_parts(schema, struct_id, record)?;
-        values.push(base);
-        owned.push(children);
+        let parts = record_parts(schema, struct_id, record)?;
+        values.push(parts.base);
+        owned.push(parts.owned);
+        links.push(parts.links);
+    }
+    if links.iter().any(|links| !links.is_empty()) {
+        return Err(ExecError::Unsupported {
+            message: "non-owning links are not implemented yet".to_string(),
+        });
     }
 
     let keys = match &target {
@@ -230,7 +234,13 @@ fn record_from_value(value: Val) -> Result<RecordVal, ExecError> {
     }
 }
 
-/// Split a record into base column values and owned ref values
+struct RecordParts {
+    base: Vec<(FieldId, Val)>,
+    owned: Vec<(FieldId, Val)>,
+    links: Vec<(FieldId, Vec<RowOrigin>)>,
+}
+
+/// Split a record into base column values, owned ref values, and non-owning links
 fn record_parts(
     schema: &ValidatedSchema,
     struct_id: StructId,
@@ -244,6 +254,7 @@ fn record_parts(
         })?;
     let mut values = Vec::new();
     let mut owned = Vec::new();
+    let mut links = Vec::new();
     for (local, field) in struct_def.fields.iter().enumerate() {
         let field_id = FieldId::new(struct_id, local);
         let index = record
@@ -270,13 +281,11 @@ fn record_parts(
                 }
             }
             Field::Ref { owning: false, .. } => {
-                if index.is_some() {
-                    return Err(ExecError::Integrity {
-                        message: format!(
-                            "non-owning ref `{}` cannot be inserted (internal error)",
-                            field.name()
-                        ),
-                    });
+                if let Some(index) = index {
+                    let value = record.fields.swap_remove(index).1;
+                    let mut targets = Vec::new();
+                    link_targets(schema, field_id, value, &mut targets)?;
+                    links.push((field_id, targets));
                 }
             }
             Field::Value { ty, .. } | Field::Array { element: ty, .. } => {
@@ -295,7 +304,48 @@ fn record_parts(
             }
         }
     }
-    Ok((values, owned))
+    Ok(RecordParts {
+        base: values,
+        owned,
+        links,
+    })
+}
+
+fn link_targets(
+    schema: &ValidatedSchema,
+    field_id: FieldId,
+    value: Val,
+    targets: &mut Vec<RowOrigin>,
+) -> Result<(), ExecError> {
+    let Some(Field::Ref { name, target, .. }) = schema.field(field_id) else {
+        return Err(ExecError::Integrity {
+            message: "link field is not a ref (internal error)".to_string(),
+        });
+    };
+    match value {
+        Val::RowRef(origin) => {
+            if origin.struct_id != *target {
+                return Err(ExecError::Integrity {
+                    message: format!(
+                        "row reference target mismatch for field `{name}` (internal error)"
+                    ),
+                });
+            }
+            targets.push(origin);
+            Ok(())
+        }
+        Val::None => Ok(()),
+        Val::Some(inner) => link_targets(schema, field_id, *inner, targets),
+        Val::List(list) => {
+            for item in list.items {
+                link_targets(schema, field_id, item, targets)?;
+            }
+            Ok(())
+        }
+        other => Err(ExecError::Integrity {
+            message: format!("link field contains non-RowRef value {other} (internal error)"),
+        }),
+    }
 }
 
 /// Insert one owning ref field's records beneath a parent row
@@ -407,11 +457,13 @@ fn exec_update(
 
 struct UpdateParts {
     /// ids and new values of modified base and array fields
-    base: FieldValues,
+    base: Vec<(FieldId, Val)>,
     /// ids of modified array fields (values in `base`)
     arrays: Vec<FieldId>,
     /// ids and new values of modified owning ref fields
     owned: Vec<(FieldId, Val)>,
+    /// ids and target row references of modified non-owning fields
+    links: Vec<(FieldId, Vec<RowOrigin>)>,
 }
 
 /// Apply a prepared update after all argument values have been computed
@@ -421,6 +473,11 @@ fn apply_update(
     origin: RowOrigin,
     parts: UpdateParts,
 ) -> Result<(), ExecError> {
+    if !parts.links.is_empty() {
+        return Err(ExecError::Unsupported {
+            message: "non-owning links are not implemented yet".to_string(),
+        });
+    }
     let mut seen = HashSet::new();
     for (field_id, _) in &parts.owned {
         delete_owned_children(ctx, write, *field_id, origin.key, &mut seen)?;
@@ -539,6 +596,7 @@ fn resolve_update_parts(
     let mut base = Vec::new();
     let mut arrays = Vec::new();
     let mut owned = Vec::new();
+    let mut links = Vec::new();
     for (local, field) in struct_def.fields.iter().enumerate() {
         let field_id = FieldId::new(struct_id, local);
         let Some(index) = record
@@ -560,9 +618,9 @@ fn resolve_update_parts(
             }
             Field::Ref { owning: true, .. } => owned.push((field_id, value)),
             Field::Ref { owning: false, .. } => {
-                return Err(ExecError::Unsupported {
-                    message: "updating non-owning ref fields is not implemented".to_string(),
-                });
+                let mut targets = Vec::new();
+                link_targets(schema, field_id, value, &mut targets)?;
+                links.push((field_id, targets));
             }
         }
     }
@@ -570,6 +628,7 @@ fn resolve_update_parts(
         base,
         arrays,
         owned,
+        links,
     })
 }
 
@@ -775,6 +834,7 @@ mod tests {
     use chrono::Utc;
     use grove_query::typecheck::types::TypedQueryFile;
     use rusqlite::Connection;
+    use std::rc::Rc;
 
     fn test_schema() -> ValidatedSchema {
         grove_schema::validate(
@@ -1589,6 +1649,140 @@ mod tests {
         )
         .unwrap();
         SqliteBackend::new(conn, schema).unwrap()
+    }
+
+    fn mutation_parts_schema() -> ValidatedSchema {
+        grove_schema::validate(
+            grove_schema::parse_schema(
+                r#"
+                root users: User;
+                root tags: Tag;
+                struct User {
+                    id: Int,
+                    name: String,
+                    manager: &?User,
+                    subordinates: &List<User>,
+                    tags: &List<Tag>,
+                    orders: List<Order>,
+                }
+                struct Order {
+                    id: Int,
+                    total: Int,
+                    user: &User,
+                }
+                struct Tag {
+                    id: Int,
+                    label: String,
+                    users: &List<User>,
+                }
+                rel User.manager <<-> User.subordinates (users.manager_id -> users.id);
+                rel Order.user <<-> User.orders (orders.user_id -> users.id);
+                rel Tag.users <<->> User.tags
+                    via user_tags[tag_id -> tags.id, user_id -> users.id];
+                "#,
+            )
+            .0
+            .expect("invalid split mutation schema"),
+        )
+        .0
+        .expect("invalid split mutation schema")
+    }
+
+    fn mutation_parts_ids(schema: &ValidatedSchema) -> (StructId, StructId, StructId) {
+        (
+            schema.struct_by_name("User").unwrap().0,
+            schema.struct_by_name("Order").unwrap().0,
+            schema.struct_by_name("Tag").unwrap().0,
+        )
+    }
+
+    #[test]
+    fn insert_parts_split_base_owned_links() {
+        let schema = mutation_parts_schema();
+        let (user, _, tag) = mutation_parts_ids(&schema);
+        let manager = RowOrigin {
+            struct_id: user,
+            key: Key(99),
+        };
+        let tag_link = RowOrigin {
+            struct_id: tag,
+            key: Key(7),
+        };
+        let manager_field = schema.struct_field(user, "manager").unwrap().0;
+        let tags_field = schema.struct_field(user, "tags").unwrap().0;
+        let orders_field = schema.struct_field(user, "orders").unwrap().0;
+        let id_field = schema.struct_field(user, "id").unwrap().0;
+        let name_field = schema.struct_field(user, "name").unwrap().0;
+
+        let record = RecordVal::new(vec![
+            (Rc::from("id"), int(1)),
+            (Rc::from("name"), str("A")),
+            (Rc::from("manager"), some(Val::RowRef(manager))),
+            (Rc::from("tags"), Val::list(vec![Val::RowRef(tag_link)])),
+            (
+                Rc::from("orders"),
+                Val::list(vec![rec(vec![("id", int(10)), ("total", int(100))])]),
+            ),
+        ]);
+        let parts = record_parts(&schema, user, record).unwrap();
+
+        assert_eq!(parts.base, vec![(id_field, int(1)), (name_field, str("A"))]);
+        assert_eq!(parts.owned.len(), 1);
+        assert_eq!(parts.owned[0].0, orders_field);
+        assert!(matches!(parts.owned[0].1, Val::List(_)));
+        assert_eq!(
+            parts.links,
+            vec![(manager_field, vec![manager]), (tags_field, vec![tag_link]),]
+        );
+    }
+
+    #[test]
+    fn update_parts_split_base_owned_links() {
+        let schema = mutation_parts_schema();
+        let (user, _, tag) = mutation_parts_ids(&schema);
+        let tag_link = RowOrigin {
+            struct_id: tag,
+            key: Key(7),
+        };
+        let manager_field = schema.struct_field(user, "manager").unwrap().0;
+        let tags_field = schema.struct_field(user, "tags").unwrap().0;
+        let orders_field = schema.struct_field(user, "orders").unwrap().0;
+        let name_field = schema.struct_field(user, "name").unwrap().0;
+
+        let record = RecordVal::new(vec![
+            (Rc::from("name"), str("B")),
+            (Rc::from("manager"), Val::None),
+            (Rc::from("tags"), Val::list(vec![Val::RowRef(tag_link)])),
+            (
+                Rc::from("orders"),
+                Val::list(vec![rec(vec![("id", int(10)), ("total", int(100))])]),
+            ),
+        ]);
+        let parts = resolve_update_parts(&schema, user, record).unwrap();
+
+        assert_eq!(parts.base, vec![(name_field, str("B"))]);
+        assert!(parts.arrays.is_empty());
+        assert_eq!(parts.owned.len(), 1);
+        assert_eq!(parts.owned[0].0, orders_field);
+        assert_eq!(
+            parts.links,
+            vec![(manager_field, Vec::new()), (tags_field, vec![tag_link])]
+        );
+    }
+
+    #[test]
+    fn link_split_mismatched_target_rejected() {
+        let schema = mutation_parts_schema();
+        let (user, order, _) = mutation_parts_ids(&schema);
+        let wrong = RowOrigin {
+            struct_id: order,
+            key: Key(1),
+        };
+        let record = RecordVal::new(vec![(Rc::from("manager"), some(Val::RowRef(wrong)))]);
+        assert!(matches!(
+            resolve_update_parts(&schema, user, record),
+            Err(ExecError::Integrity { .. })
+        ));
     }
 
     #[test]
