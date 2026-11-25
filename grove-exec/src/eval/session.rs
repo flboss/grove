@@ -7,7 +7,7 @@ use crate::pushdown::PushdownPlan;
 use crate::storage::{Storage, WriteTxn};
 use crate::value::Val;
 
-use crate::eval::{self, Env, EvalCtx, ExecOptions, mutations};
+use crate::eval::{self, Env, EvalCtx, ExecOptions, data, mutations};
 
 /// Persistent executor state for a sequence of query turns
 pub struct ExecSession<'a> {
@@ -165,7 +165,7 @@ fn execute_inner<'s>(
 
     let result = if let Some(expr) = &file.result {
         let mut result = eval::eval(expr, &mut ctx)?;
-        eval::resolve_owning_values(&mut ctx, std::slice::from_mut(&mut result), None)?;
+        data::resolve_owning_values(&mut ctx, std::slice::from_mut(&mut result), None)?;
         Some(result)
     } else {
         None
