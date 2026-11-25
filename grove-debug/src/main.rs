@@ -213,31 +213,25 @@ fn query_typecheck(query_path: &PathBuf, schema_path: &PathBuf, raw: bool) {
     let (query_name, query_source) = read_input(query_path, "query");
     let (schema_name, schema_source) = read_input(schema_path, "schema");
 
-    let (schema, schema_parse_diagnostics) = grove_schema::parse_schema(&schema_source);
-    let Some(schema) = schema else {
-        println!("No validated schema. (parse failed)");
-        print_diagnostics(
-            &schema_source,
-            &schema_name,
-            &schema_parse_diagnostics,
-            raw,
-            "Schema Parse ",
-        );
-        return;
-    };
-
-    let (validated_schema, schema_validation_diagnostics) = grove_schema::validate(schema);
+    let (validated_schema, schema_diagnostics) = grove_schema::compile_schema(&schema_source);
     let Some(validated_schema) = validated_schema else {
-        println!("No validated schema. (validation failed)");
+        println!("No validated schema. (compilation failed)");
         print_diagnostics(
             &schema_source,
             &schema_name,
-            &schema_validation_diagnostics,
+            &schema_diagnostics,
             raw,
-            "Schema Validation ",
+            "Schema ",
         );
         return;
     };
+    print_diagnostics(
+        &schema_source,
+        &schema_name,
+        &schema_diagnostics,
+        raw,
+        "Schema ",
+    );
 
     let (file, parse_diagnostics) = grove_query::parse_query(&query_source);
     let Some(file) = file else {
@@ -280,22 +274,16 @@ fn schema_parse(path: &PathBuf, raw: bool) {
 fn schema_validate(path: &PathBuf, raw: bool) {
     let (name, source) = read_input(path, "schema");
 
-    let (schema, parse_diagnostics) = grove_schema::parse_schema(&source);
-    let Some(schema) = schema else {
-        println!("No validated schema. (parse failed)");
-        print_diagnostics(&source, &name, &parse_diagnostics, raw, "");
+    let (validated, diagnostics) = grove_schema::compile_schema(&source);
+    let Some(validated) = validated else {
+        println!("No validated schema. (compilation failed)");
+        print_diagnostics(&source, &name, &diagnostics, raw, "");
         return;
     };
 
-    let (validated, validation_diagnostics) = grove_schema::validate(schema);
-
     println!("=== ValidatedSchema ===");
-    match &validated {
-        Some(schema) => println!("{schema:#?}"),
-        None => println!("No validated schema. (validation failed)"),
-    }
-
-    print_diagnostics(&source, &name, &validation_diagnostics, raw, "");
+    println!("{validated:#?}");
+    print_diagnostics(&source, &name, &diagnostics, raw, "");
 }
 
 fn print_diagnostics(
@@ -374,31 +362,25 @@ fn exec_run(
     let (query_name, query_source) = read_input(query_path, "query");
     let (schema_name, schema_source) = read_input(schema_path, "schema");
 
-    let (schema, schema_parse_diagnostics) = grove_schema::parse_schema(&schema_source);
-    let Some(schema) = schema else {
-        println!("No validated schema. (parse failed)");
-        print_diagnostics(
-            &schema_source,
-            &schema_name,
-            &schema_parse_diagnostics,
-            raw,
-            "Schema Parse ",
-        );
-        return;
-    };
-
-    let (validated_schema, schema_validation_diagnostics) = grove_schema::validate(schema);
+    let (validated_schema, schema_diagnostics) = grove_schema::compile_schema(&schema_source);
     let Some(validated_schema) = validated_schema else {
-        println!("No validated schema. (validation failed)");
+        println!("No validated schema. (compilation failed)");
         print_diagnostics(
             &schema_source,
             &schema_name,
-            &schema_validation_diagnostics,
+            &schema_diagnostics,
             raw,
-            "Schema Validation ",
+            "Schema ",
         );
         return;
     };
+    print_diagnostics(
+        &schema_source,
+        &schema_name,
+        &schema_diagnostics,
+        raw,
+        "Schema ",
+    );
 
     let (file, parse_diagnostics) = grove_query::parse_query(&query_source);
     let Some(file) = file else {

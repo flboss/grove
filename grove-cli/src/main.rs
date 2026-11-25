@@ -137,11 +137,7 @@ fn run_implicit_repl(
 }
 
 pub(crate) fn compile_schema(name: &str, source: &str) -> Option<grove_schema::ValidatedSchema> {
-    let (schema, diagnostics) = grove_schema::parse_schema(source);
-    diagnostics::print(source, name, &diagnostics);
-    let schema = schema?;
-
-    let (validated, diagnostics) = grove_schema::validate(schema);
+    let (validated, diagnostics) = grove_schema::compile_schema(source);
     diagnostics::print(source, name, &diagnostics);
     validated
 }
