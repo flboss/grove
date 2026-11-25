@@ -516,7 +516,7 @@ pub(crate) mod harness {
             &self,
             _rel: grove_schema::validated::RelationId,
             _fetch_from_first: bool,
-            _parents: &[crate::storage::Key],
+            _parents: &[crate::value::Key],
             _fields: &[grove_schema::validated::FieldId],
             _constraints: &crate::pushdown::FetchConstraints,
         ) -> Result<Vec<Vec<crate::storage::Row>>, ExecError> {
@@ -570,8 +570,8 @@ mod tests {
     use super::{Env, EvalCtx, ExecOptions, ExecSession, eval};
     use crate::error::ExecError;
     use crate::pushdown::PushdownPlan;
-    use crate::storage::Key;
     use crate::testdata;
+    use crate::value::Key;
     use crate::value::{CollectionOrigin, RowOrigin, Val};
     use grove_query::TypeBindings;
     use grove_query::{

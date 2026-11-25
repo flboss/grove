@@ -10,7 +10,10 @@ use grove_types::Span;
 use rust_decimal::Decimal;
 
 use crate::error::ExecError;
-use crate::storage::Key;
+
+/// An opaque unique row identifier (SQLite rowid)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Key(pub i64);
 
 /// A scalar Grove value
 #[derive(Debug, Clone, PartialEq)]

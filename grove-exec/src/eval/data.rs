@@ -10,8 +10,8 @@ use crate::error::ExecError;
 use crate::eval::{EvalCtx, eval};
 use crate::method_meta;
 use crate::pushdown::FetchConstraints;
-use crate::storage::{Key, Row};
-use crate::value::{CollectionOrigin, RowOrigin, Val, rewrap_optional, unwrap_optional_depth};
+use crate::storage::Row;
+use crate::value::{CollectionOrigin, Key, RowOrigin, Val, rewrap_optional, unwrap_optional_depth};
 
 /// Read root table into a List<Record> (owning Refs resolved)
 pub(super) fn exec_root(

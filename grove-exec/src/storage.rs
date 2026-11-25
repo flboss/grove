@@ -2,7 +2,7 @@ use grove_schema::validated::{FieldId, RelationId, StructId};
 
 use crate::error::ExecError;
 use crate::pushdown::FetchConstraints;
-use crate::value::{RowOrigin, Val};
+use crate::value::{Key, RowOrigin, Val};
 
 /// A decoded storage row
 #[derive(Debug, Clone, PartialEq)]
@@ -10,10 +10,6 @@ pub struct Row {
     pub rowid: Key,
     pub values: Vec<Val>,
 }
-
-/// An opaque unique row identifier (SQLite rowid)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Key(pub i64);
 
 pub trait Storage {
     /// Read `fields` of every row of the struct's table

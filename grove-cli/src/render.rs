@@ -986,7 +986,7 @@ fn is_numeric(value: &Val) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grove_exec::storage::Key;
+    use grove_exec::value::Key;
     use grove_schema::validated::{FieldId, ScalarType, StructId};
 
     fn schema() -> ValidatedSchema {

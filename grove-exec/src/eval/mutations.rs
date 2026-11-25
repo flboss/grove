@@ -7,8 +7,8 @@ use grove_schema::validated::{
 
 use crate::error::ExecError;
 use crate::pushdown::FetchConstraints;
-use crate::storage::{Key, LinkMode, WriteTxn};
-use crate::value::{CollectionOrigin, RecordVal, RowOrigin, Val, unwrap_optional_depth};
+use crate::storage::{LinkMode, WriteTxn};
+use crate::value::{Key, CollectionOrigin, RecordVal, RowOrigin, Val, unwrap_optional_depth};
 
 use super::{EvalCtx, eval};
 
