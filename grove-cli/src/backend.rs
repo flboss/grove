@@ -298,7 +298,7 @@ mod tests {
                 .fetch(
                     schema.roots[0].struct_id,
                     &[],
-                    &grove_exec::pushdown::FetchConstraints::EMPTY,
+                    &grove_exec::storage::FetchConstraints::EMPTY,
                 )
                 .is_ok()
         );

@@ -505,7 +505,7 @@ pub(crate) mod harness {
             &self,
             _struct_id: grove_schema::validated::StructId,
             _fields: &[grove_schema::validated::FieldId],
-            _constraints: &crate::pushdown::FetchConstraints,
+            _constraints: &crate::storage::FetchConstraints,
         ) -> Result<Vec<crate::storage::Row>, ExecError> {
             Err(ExecError::Internal {
                 message: "NoStorage backend cannot provide storage".to_string(),
@@ -518,7 +518,7 @@ pub(crate) mod harness {
             _fetch_from_first: bool,
             _parents: &[crate::value::Key],
             _fields: &[grove_schema::validated::FieldId],
-            _constraints: &crate::pushdown::FetchConstraints,
+            _constraints: &crate::storage::FetchConstraints,
         ) -> Result<Vec<Vec<crate::storage::Row>>, ExecError> {
             Err(ExecError::Internal {
                 message: "NoStorage backend cannot provide storage".to_string(),

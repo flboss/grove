@@ -9,8 +9,7 @@ use grove_types::NodeId;
 use crate::error::ExecError;
 use crate::eval::{EvalCtx, eval};
 use crate::method_meta;
-use crate::pushdown::FetchConstraints;
-use crate::storage::Row;
+use crate::storage::{FetchConstraints, Row};
 use crate::value::{CollectionOrigin, Key, RowOrigin, Val, rewrap_optional, unwrap_optional_depth};
 
 /// Read root table into a List<Record> (owning Refs resolved)
@@ -879,9 +878,9 @@ mod tests {
 
     use crate::{
         eval::{Env, ExecOptions, harness::*},
-        pushdown::{PushdownPlan, SortKey},
+        pushdown::PushdownPlan,
         sqlite::SqliteBackend,
-        storage::Storage,
+        storage::{FetchConstraints, SortKey, Storage},
         testdata,
         value::{CollectionOrigin, RowOrigin, Scalar},
     };

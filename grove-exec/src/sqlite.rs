@@ -15,8 +15,9 @@ use rusqlite::{Connection, OptionalExtension, Statement, Transaction, Transactio
 
 use crate::codec;
 use crate::error::ExecError;
-use crate::pushdown::{CmpOp, FetchConstraints, PushExpr, StringOp};
-use crate::storage::{LinkMode, Row, Storage, WriteTxn};
+use crate::storage::{
+    CmpOp, FetchConstraints, LinkMode, PushExpr, Row, Storage, StringOp, WriteTxn,
+};
 use crate::value::{Key, RowOrigin, Scalar, Val, enum_variant_scalar};
 
 pub struct SqliteBackend<'a> {
@@ -2636,7 +2637,7 @@ impl Storage for SqliteBackend<'_> {
 
 #[cfg(test)]
 mod tests {
-    use crate::pushdown::SortKey;
+    use crate::storage::SortKey;
     use crate::testdata;
 
     use super::*;

@@ -11,10 +11,11 @@ use rust_decimal::Decimal;
 
 use crate::error::ExecError;
 
+pub(crate) mod literal;
+
 /// An opaque unique row identifier (SQLite rowid)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Key(pub i64);
-pub(crate) mod literal;
 
 /// A scalar Grove value
 #[derive(Debug, Clone, PartialEq)]

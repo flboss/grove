@@ -6,9 +6,8 @@ use grove_schema::validated::{
 };
 
 use crate::error::ExecError;
-use crate::pushdown::FetchConstraints;
-use crate::storage::{LinkMode, WriteTxn};
-use crate::value::{Key, CollectionOrigin, RecordVal, RowOrigin, Val, unwrap_optional_depth};
+use crate::storage::{FetchConstraints, LinkMode, WriteTxn};
+use crate::value::{CollectionOrigin, Key, RecordVal, RowOrigin, Val, unwrap_optional_depth};
 
 use super::{EvalCtx, eval};
 
@@ -851,8 +850,8 @@ mod tests {
     use super::*;
     use crate::eval::harness::*;
     use crate::eval::{ExecOptions, exec_file_with_options};
-    use crate::pushdown::FetchConstraints;
     use crate::sqlite::SqliteBackend;
+    use crate::storage::FetchConstraints;
     use crate::storage::Storage;
     use crate::value::Scalar;
     use chrono::Utc;

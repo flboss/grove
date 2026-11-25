@@ -176,8 +176,8 @@ fn execute_inner<'s>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pushdown::FetchConstraints;
     use crate::sqlite::SqliteBackend;
+    use crate::storage::FetchConstraints;
     use crate::value::{Scalar, Val};
     use grove_schema::validated::{FieldId, StructId};
     use grove_types::Span;

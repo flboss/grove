@@ -1,8 +1,11 @@
 use grove_schema::validated::{FieldId, RelationId, StructId};
 
 use crate::error::ExecError;
-use crate::pushdown::FetchConstraints;
 use crate::value::{Key, RowOrigin, Val};
+
+mod constraint;
+
+pub use constraint::{CmpOp, FetchConstraints, PushExpr, SortKey, StringOp};
 
 /// A decoded storage row
 #[derive(Debug, Clone, PartialEq)]
