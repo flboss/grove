@@ -1,9 +1,11 @@
 use chrono::{DateTime, NaiveDate, NaiveTime, TimeDelta, Utc};
 use rust_decimal::Decimal;
 
-use crate::error::QueryLexError;
+use crate::lex::error::QueryLexError;
 use crate::token::{Token, TokenKind};
 use grove_types::{Diagnostic, Span, Spanned};
+
+mod error;
 
 pub struct Lexer<'src> {
     source: &'src str,

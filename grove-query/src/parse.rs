@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 
+mod error;
+
 use crate::ast::{
     Arg, BinaryOp, ConstantName, Expr, LetStmt, Literal, MutationKind, MutationStmt,
     ProjectionItem, QueryFile, SortDir, Statement, TypeExpr, TypeName, UnaryOp,
 };
-use crate::error::QueryParseError;
 use crate::lex::Lexer;
+use crate::parse::error::QueryParseError;
 use crate::token::{Token, TokenKind};
 use grove_types::{Diagnostic, Severity, Span, Spanned};
 
