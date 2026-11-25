@@ -1,5 +1,5 @@
 use super::*;
-use grove_schema::validated::{FieldId, StructId};
+use grove_schema::validated::{FieldId, ScalarType, StructId};
 use grove_types::NodeId;
 
 const TEST_SCHEMA_SRC: &str = r#"
