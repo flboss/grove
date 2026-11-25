@@ -2,10 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use grove_types::Span;
 
-use crate::{
-    validated::{Relation, StructId},
-    validation_error::SchemaValidationError,
-};
+use super::error::SchemaValidationError;
+use crate::validated::{Relation, StructId};
 
 use super::Builder;
 

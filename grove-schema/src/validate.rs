@@ -1,4 +1,5 @@
 mod enums;
+mod error;
 mod identity;
 mod ownership;
 mod physical;
@@ -7,6 +8,7 @@ mod structs;
 
 use std::collections::{HashMap, HashSet};
 
+use self::error::SchemaValidationError;
 use crate::ast::{
     BuiltinType, ColumnMapping, ConfigBlock, DecArithmetic, Field as FieldDecl, IntArithmetic,
     ListStorage, Schema, TypeExpr,
@@ -15,7 +17,6 @@ use crate::validated::{
     ColumnId, Config, Enum, EnumId, FieldId, Relation, Root, ScalarType, Struct, StructId, Table,
     TableId, ValidatedSchema,
 };
-use crate::validation_error::SchemaValidationError;
 use grove_types::{Diagnostic, Span};
 
 pub(crate) struct Builder<'s> {
@@ -243,10 +244,9 @@ fn builtin_scalar(builtin: &BuiltinType) -> ScalarType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arithmetic::{DecArithmetic, IntArithmetic};
     use crate::parse_schema;
-    use crate::validated::{
-        DecArithmetic, EnumId, EnumUnderlying, Field, IntArithmetic, ValueType,
-    };
+    use crate::validated::{EnumId, EnumUnderlying, Field, ValueType};
 
     fn codes(diags: &[Diagnostic]) -> Vec<&str> {
         diags.iter().map(|d| d.code.as_ref()).collect()

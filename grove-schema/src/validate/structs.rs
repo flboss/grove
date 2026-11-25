@@ -1,12 +1,9 @@
 use grove_types::Span;
 
-use super::Builder;
-use crate::{
-    ast::{ColumnMapping, Field as FieldDecl, ListStorage, TypeExpr},
-    validated::{Field, FieldId, StorageTable, Struct, TableId, ValueType},
-    validation::FieldKind,
-    validation_error::SchemaValidationError,
-};
+use super::error::SchemaValidationError;
+use super::{Builder, FieldKind};
+use crate::ast::{ColumnMapping, Field as FieldDecl, ListStorage, TypeExpr};
+use crate::validated::{Field, FieldId, StorageTable, Struct, TableId, ValueType};
 
 impl<'s> Builder<'s> {
     pub(super) fn stage_structs(&mut self) {

@@ -2,7 +2,8 @@ use std::collections::HashMap;
 
 use grove_types::Span;
 
-use crate::{ast::TypeExpr, validation_error::SchemaValidationError};
+use super::error::SchemaValidationError;
+use crate::ast::TypeExpr;
 
 use super::Builder;
 

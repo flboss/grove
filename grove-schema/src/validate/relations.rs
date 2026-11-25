@@ -1,8 +1,6 @@
-use crate::{
-    ast::{FkMapping, RelationArrow},
-    validated::{ColumnId, Field, FieldId, Relation, StructId, TableId},
-    validation_error::SchemaValidationError,
-};
+use super::error::SchemaValidationError;
+use crate::ast::{FkMapping, RelationArrow};
+use crate::validated::{ColumnId, Field, FieldId, Relation, StructId, TableId};
 
 use super::Builder;
 

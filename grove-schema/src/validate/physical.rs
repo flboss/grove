@@ -2,14 +2,12 @@ use std::collections::{HashMap, HashSet};
 
 use grove_types::Span;
 
-use crate::{
-    ast::{ColumnMapping, Field as FieldDecl, FkMapping, ListStorage, RelationArrow, TypeExpr},
-    validated::{Column, ColumnId, Root, ScalarType, StructId, Table, TableId},
-    validation::FieldKind,
-    validation_error::SchemaValidationError,
-};
-
 use super::Builder;
+use super::{FieldKind, error::SchemaValidationError};
+use crate::ast::{
+    ColumnMapping, Field as FieldDecl, FkMapping, ListStorage, RelationArrow, TypeExpr,
+};
+use crate::validated::{Column, ColumnId, Root, ScalarType, StructId, Table, TableId};
 
 impl<'s> Builder<'s> {
     pub(super) fn stage_physical(&mut self) {

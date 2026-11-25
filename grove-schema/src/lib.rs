@@ -3,9 +3,8 @@ mod error;
 pub mod lex;
 mod parse;
 pub mod token;
+mod validate;
 pub mod validated;
-mod validation;
-mod validation_error;
 
 use grove_types::Diagnostic;
 
@@ -17,4 +16,4 @@ pub fn parse_schema(source: &str) -> (Option<Schema>, Vec<Diagnostic>) {
     parser.parse_schema()
 }
 
-pub use validation::validate;
+pub use validate::validate;
