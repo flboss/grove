@@ -2,7 +2,7 @@ use grove_types::{Diagnostic, Span};
 
 #[rustfmt::skip] // preserve one-line-per-variant formatting
 #[derive(Debug, Clone)]
-pub(crate) enum SchemaParseError {
+pub(crate) enum SchemaSyntaxError {
     UnexpectedChar { span: Span, ch: char },
     UnclosedString { span: Span },
     UnclosedBacktickIdent { span: Span },
@@ -40,12 +40,7 @@ pub(crate) enum SchemaParseError {
     ExpectedStructCommaOrRBrace { span: Span, struct_name: String },
     UnclosedStruct { span: Span },
     DuplicateStruct { span: Span, name: String, previous: Span },
-    DuplicateStructField {
-        span: Span,
-        struct_name: String,
-        field: String,
-        previous: Span,
-    },
+    DuplicateStructField { span: Span, struct_name: String, field: String, previous: Span },
     ExpectedColumn { span: Span },
     ExpectedColumnCommaOrRParen { span: Span },
 
@@ -59,46 +54,15 @@ pub(crate) enum SchemaParseError {
     ExpectedEnumName { span: Span },
     ExpectedEnumLBrace { span: Span, name: String },
     ExpectedEnumVariantName { span: Span, enum_name: String },
-    ExpectedEnumArrow {
-        span: Span,
-        enum_name: String,
-        variant: String,
-    },
-    ExpectedEnumValue {
-        span: Span,
-        enum_name: String,
-        variant: String,
-    },
+    ExpectedEnumArrow { span: Span, enum_name: String, variant: String },
+    ExpectedEnumValue { span: Span, enum_name: String, variant: String },
     ExpectedEnumCommaOrRBrace { span: Span, enum_name: String },
     UnclosedEnum { span: Span },
-    DuplicateEnum {
-        span: Span,
-        name: String,
-        previous: Span,
-    },
-    DuplicateEnumVariant {
-        span: Span,
-        enum_name: String,
-        variant: String,
-        previous: Span,
-    },
-    DuplicateEnumValue {
-        span: Span,
-        enum_name: String,
-        value: String,
-        previous: Span,
-    },
-    MixedEnumValueTypes {
-        span: Span,
-        enum_name: String,
-        expected: String,
-        found: String,
-    },
-    DuplicateTypeName {
-        span: Span,
-        name: String,
-        previous: Span,
-    },
+    DuplicateEnum { span: Span, name: String, previous: Span },
+    DuplicateEnumVariant { span: Span, enum_name: String, variant: String, previous: Span },
+    DuplicateEnumValue { span: Span, enum_name: String, value: String, previous: Span },
+    MixedEnumValueTypes { span: Span, enum_name: String, expected: String, found: String },
+    DuplicateTypeName { span: Span, name: String, previous: Span },
     EmptyEnum { span: Span, name: String },
 
     ExpectedRelEndpointStruct { span: Span },
@@ -125,9 +89,9 @@ pub(crate) enum SchemaParseError {
     ExpectedRelViaCommaOrRBracket { span: Span },
 }
 
-impl From<SchemaParseError> for Diagnostic {
-    fn from(err: SchemaParseError) -> Self {
-        use SchemaParseError::*;
+impl From<SchemaSyntaxError> for Diagnostic {
+    fn from(err: SchemaSyntaxError) -> Self {
+        use SchemaSyntaxError::*;
 
         match err {
             UnexpectedChar { span, ch } => Diagnostic::error(

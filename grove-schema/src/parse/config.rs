@@ -1,5 +1,5 @@
 use crate::ast::{ConfigBlock, DecArithmetic, IntArithmetic};
-use crate::error::SchemaParseError;
+use crate::error::SchemaSyntaxError;
 use crate::token::{Token, TokenKind};
 use grove_types::{Span, Spanned};
 
@@ -15,7 +15,7 @@ impl<'src> Parser<'src> {
         let lbrace = match self.expect(TokenKind::LBrace) {
             Ok(tok) => tok,
             Err(found) => {
-                self.emit_error(SchemaParseError::ExpectedConfigLBrace { span: found.span });
+                self.emit_error(SchemaSyntaxError::ExpectedConfigLBrace { span: found.span });
                 self.sync_to_statement_boundary();
                 return Err(());
             }
@@ -32,7 +32,7 @@ impl<'src> Parser<'src> {
                 TokenKind::RBrace => break self.advance(),
                 TokenKind::Eof => {
                     let block_span = Span::new(lbrace.span.start, self.peek().span.start);
-                    self.emit_error(SchemaParseError::UnclosedConfig { span: block_span });
+                    self.emit_error(SchemaSyntaxError::UnclosedConfig { span: block_span });
                     return Err(());
                 }
                 _ => self.parse_config_entry(&mut block)?,
@@ -49,7 +49,7 @@ impl<'src> Parser<'src> {
             TokenKind::Ident(_) => self.advance(),
             _ => {
                 let span = self.peek().span;
-                self.emit_error(SchemaParseError::ExpectedConfigKey { span });
+                self.emit_error(SchemaSyntaxError::ExpectedConfigKey { span });
                 return self.sync_to_config_key_or_statement_boundary();
             }
         };
@@ -58,7 +58,7 @@ impl<'src> Parser<'src> {
         };
 
         if !CONFIG_BLOCK_KEYS.contains(&key.as_str()) {
-            self.emit_error(SchemaParseError::UnknownConfigKey {
+            self.emit_error(SchemaSyntaxError::UnknownConfigKey {
                 span: key_tok.span,
                 key,
             });
@@ -66,7 +66,7 @@ impl<'src> Parser<'src> {
         }
 
         if let Err(found) = self.expect(TokenKind::Equals) {
-            self.emit_error(SchemaParseError::ExpectedConfigEquals {
+            self.emit_error(SchemaSyntaxError::ExpectedConfigEquals {
                 span: found.span,
                 key,
             });
@@ -91,7 +91,7 @@ impl<'src> Parser<'src> {
             TokenKind::RBrace | TokenKind::Eof => {}
             _ => {
                 let span = self.peek().span;
-                self.emit_error(SchemaParseError::ExpectedConfigCommaOrRBrace { span, key });
+                self.emit_error(SchemaSyntaxError::ExpectedConfigCommaOrRBrace { span, key });
                 return self.sync_to_config_key_or_statement_boundary();
             }
         }
@@ -102,7 +102,7 @@ impl<'src> Parser<'src> {
         match self.peek().value {
             TokenKind::Comma | TokenKind::RBrace | TokenKind::Eof => {
                 let span = self.peek().span;
-                self.emit_error(SchemaParseError::ExpectedConfigValue {
+                self.emit_error(SchemaSyntaxError::ExpectedConfigValue {
                     span,
                     key: key.to_string(),
                 });
@@ -204,7 +204,7 @@ impl<'src> Parser<'src> {
     }
 
     fn invalid_config_value(&mut self, span: Span, key: &str, value: String, valid: &str) {
-        self.emit_error(SchemaParseError::InvalidConfigValue {
+        self.emit_error(SchemaSyntaxError::InvalidConfigValue {
             span,
             key: key.to_string(),
             value,
@@ -220,7 +220,7 @@ impl<'src> Parser<'src> {
         key: &str,
     ) {
         if let Some(previous) = slot {
-            self.emit_error(SchemaParseError::DuplicateConfigKey {
+            self.emit_error(SchemaSyntaxError::DuplicateConfigKey {
                 span: tok.span,
                 key: key.to_string(),
                 previous: previous.span,

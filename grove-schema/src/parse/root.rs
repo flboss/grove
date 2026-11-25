@@ -1,5 +1,5 @@
 use crate::ast::RootCollection;
-use crate::error::SchemaParseError;
+use crate::error::SchemaSyntaxError;
 use crate::token::TokenKind;
 use grove_types::Spanned;
 
@@ -10,14 +10,14 @@ impl<'src> Parser<'src> {
         let name = match self.expect_ident() {
             Ok(name) => name,
             Err(found) => {
-                self.emit_error(SchemaParseError::ExpectedRootName { span: found.span });
+                self.emit_error(SchemaSyntaxError::ExpectedRootName { span: found.span });
                 self.sync_to_statement_boundary();
                 return Err(());
             }
         };
 
         if let Err(found) = self.expect(TokenKind::Colon) {
-            self.emit_error(SchemaParseError::ExpectedRootColon {
+            self.emit_error(SchemaSyntaxError::ExpectedRootColon {
                 span: found.span,
                 name: name.value,
             });
@@ -28,7 +28,7 @@ impl<'src> Parser<'src> {
         let struct_name = match self.expect_ident() {
             Ok(name) => name,
             Err(found) => {
-                self.emit_error(SchemaParseError::ExpectedRootStructName { span: found.span });
+                self.emit_error(SchemaSyntaxError::ExpectedRootStructName { span: found.span });
                 self.sync_to_statement_boundary();
                 return Err(());
             }
@@ -39,7 +39,7 @@ impl<'src> Parser<'src> {
             match self.expect_ident() {
                 Ok(table) => Some(table),
                 Err(found) => {
-                    self.emit_error(SchemaParseError::ExpectedRootUnderlyingTable {
+                    self.emit_error(SchemaSyntaxError::ExpectedRootUnderlyingTable {
                         span: found.span,
                     });
                     self.sync_to_statement_boundary();
@@ -53,7 +53,7 @@ impl<'src> Parser<'src> {
         let semicolon = match self.expect(TokenKind::Semicolon) {
             Ok(semi) => semi,
             Err(found) => {
-                self.emit_error(SchemaParseError::ExpectedRootSemicolon { span: found.span });
+                self.emit_error(SchemaSyntaxError::ExpectedRootSemicolon { span: found.span });
                 self.sync_to_statement_boundary();
                 return Err(());
             }

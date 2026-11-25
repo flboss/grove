@@ -5,7 +5,7 @@ mod root;
 mod r#struct;
 
 use crate::ast::Schema;
-use crate::error::SchemaParseError;
+use crate::error::SchemaSyntaxError;
 use crate::lex::Lexer;
 use crate::token::{Token, TokenKind};
 use grove_types::{Diagnostic, Span, Spanned};
@@ -50,10 +50,12 @@ impl<'src> Parser<'src> {
                     block.span.start = span.start;
 
                     match config_span {
-                        Some(previous) => self.emit_error(SchemaParseError::DuplicateConfigBlock {
-                            span: block.span,
-                            previous,
-                        }),
+                        Some(previous) => {
+                            self.emit_error(SchemaSyntaxError::DuplicateConfigBlock {
+                                span: block.span,
+                                previous,
+                            })
+                        }
                         None => {
                             config_span = Some(block.span);
                             schema.config = Some(block);
@@ -69,7 +71,7 @@ impl<'src> Parser<'src> {
 
                     let name = root.name.value.clone();
                     match root_spans.iter().find(|(n, _)| n == &name) {
-                        Some((_, previous)) => self.emit_error(SchemaParseError::DuplicateRoot {
+                        Some((_, previous)) => self.emit_error(SchemaSyntaxError::DuplicateRoot {
                             span: root.span,
                             name,
                             previous: *previous,
@@ -90,7 +92,7 @@ impl<'src> Parser<'src> {
                     let name = struct_def.name.value.clone();
                     match struct_spans.iter().find(|(n, _)| n == &name) {
                         Some((_, previous)) => {
-                            self.emit_error(SchemaParseError::DuplicateStruct {
+                            self.emit_error(SchemaSyntaxError::DuplicateStruct {
                                 span: struct_def.span,
                                 name,
                                 previous: *previous,
@@ -98,7 +100,7 @@ impl<'src> Parser<'src> {
                         }
                         None => match enum_spans.iter().find(|(n, _)| n == &name) {
                             Some((_, previous)) => {
-                                self.emit_error(SchemaParseError::DuplicateTypeName {
+                                self.emit_error(SchemaSyntaxError::DuplicateTypeName {
                                     span: struct_def.span,
                                     name,
                                     previous: *previous,
@@ -121,7 +123,7 @@ impl<'src> Parser<'src> {
                     let name = enum_def.name.value.clone();
                     match enum_spans.iter().find(|(n, _)| n == &name) {
                         Some((_, previous)) => {
-                            self.emit_error(SchemaParseError::DuplicateEnum {
+                            self.emit_error(SchemaSyntaxError::DuplicateEnum {
                                 span: enum_def.span,
                                 name,
                                 previous: *previous,
@@ -129,7 +131,7 @@ impl<'src> Parser<'src> {
                         }
                         None => match struct_spans.iter().find(|(n, _)| n == &name) {
                             Some((_, previous)) => {
-                                self.emit_error(SchemaParseError::DuplicateTypeName {
+                                self.emit_error(SchemaSyntaxError::DuplicateTypeName {
                                     span: enum_def.span,
                                     name,
                                     previous: *previous,
@@ -148,7 +150,7 @@ impl<'src> Parser<'src> {
                     }
                 }
                 _ => {
-                    self.emit_error(SchemaParseError::ExpectedTopLevelStmt { span });
+                    self.emit_error(SchemaSyntaxError::ExpectedTopLevelStmt { span });
                     self.sync_to_statement_boundary();
                 }
             }
@@ -160,7 +162,7 @@ impl<'src> Parser<'src> {
         (diagnostics.is_empty().then_some(schema), diagnostics)
     }
 
-    fn emit_error(&mut self, error: SchemaParseError) {
+    fn emit_error(&mut self, error: SchemaSyntaxError) {
         self.diagnostics.push(error.into())
     }
 
@@ -201,7 +203,7 @@ impl<'src> Parser<'src> {
     fn expect_or_sync(
         &mut self,
         kind: TokenKind,
-        err: impl FnOnce(Span) -> SchemaParseError,
+        err: impl FnOnce(Span) -> SchemaSyntaxError,
     ) -> PResult<Token> {
         let span = self.peek().span;
         if self.peek().value == kind {
@@ -223,7 +225,7 @@ impl<'src> Parser<'src> {
 
     fn expect_ident_or_sync(
         &mut self,
-        err: impl FnOnce(Span) -> SchemaParseError,
+        err: impl FnOnce(Span) -> SchemaSyntaxError,
     ) -> PResult<Spanned<String>> {
         let span = self.peek().span;
         match self.peek().value {

@@ -1,5 +1,5 @@
 use crate::ast::{BuiltinType, ColumnMapping, Field, ListStorage, StructDef, TypeExpr};
-use crate::error::SchemaParseError;
+use crate::error::SchemaSyntaxError;
 use crate::token::TokenKind;
 use grove_types::{Span, Spanned};
 
@@ -10,14 +10,14 @@ impl<'src> Parser<'src> {
         let name = match self.expect_ident() {
             Ok(name) => name,
             Err(found) => {
-                self.emit_error(SchemaParseError::ExpectedStructName { span: found.span });
+                self.emit_error(SchemaSyntaxError::ExpectedStructName { span: found.span });
                 self.sync_to_statement_boundary();
                 return Err(());
             }
         };
 
         if let Err(found) = self.expect(TokenKind::LBrace) {
-            self.emit_error(SchemaParseError::ExpectedStructLBrace {
+            self.emit_error(SchemaSyntaxError::ExpectedStructLBrace {
                 span: found.span,
                 name: name.value,
             });
@@ -33,7 +33,7 @@ impl<'src> Parser<'src> {
                 TokenKind::RBrace => break self.advance(),
                 TokenKind::Eof => {
                     let struct_span = Span::new(name.span.start, self.peek().span.start);
-                    self.emit_error(SchemaParseError::UnclosedStruct { span: struct_span });
+                    self.emit_error(SchemaSyntaxError::UnclosedStruct { span: struct_span });
                     return Err(());
                 }
                 _ => self.parse_field(&name.value, &mut fields, &mut field_spans)?,
@@ -55,7 +55,7 @@ impl<'src> Parser<'src> {
         let name = match self.expect_ident() {
             Ok(name) => name,
             Err(found) => {
-                self.emit_error(SchemaParseError::ExpectedStructFieldName {
+                self.emit_error(SchemaSyntaxError::ExpectedStructFieldName {
                     span: found.span,
                     struct_name: struct_name.to_string(),
                 });
@@ -64,7 +64,7 @@ impl<'src> Parser<'src> {
         };
 
         if let Err(found) = self.expect(TokenKind::Colon) {
-            self.emit_error(SchemaParseError::ExpectedStructFieldColon {
+            self.emit_error(SchemaSyntaxError::ExpectedStructFieldColon {
                 span: found.span,
                 field: name.value,
                 struct_name: struct_name.to_string(),
@@ -103,7 +103,7 @@ impl<'src> Parser<'src> {
 
             match &mut exposed_type {
                 TypeExpr::List { via, .. } => *via = Some(storage),
-                _ => self.emit_error(SchemaParseError::ExpectedListForVia {
+                _ => self.emit_error(SchemaSyntaxError::ExpectedListForVia {
                     span: exposed_type.span(),
                 }),
             }
@@ -111,7 +111,7 @@ impl<'src> Parser<'src> {
 
         match field_spans.iter().find(|(f, _)| f == &name.value) {
             Some((_, previous)) => {
-                self.emit_error(SchemaParseError::DuplicateStructField {
+                self.emit_error(SchemaSyntaxError::DuplicateStructField {
                     span: name.span,
                     struct_name: struct_name.to_string(),
                     field: name.value.clone(),
@@ -136,7 +136,7 @@ impl<'src> Parser<'src> {
             TokenKind::RBrace | TokenKind::Eof => {}
             _ => {
                 let span = self.peek().span;
-                self.emit_error(SchemaParseError::ExpectedStructCommaOrRBrace {
+                self.emit_error(SchemaSyntaxError::ExpectedStructCommaOrRBrace {
                     span,
                     struct_name: struct_name.to_string(),
                 });
@@ -166,7 +166,7 @@ impl<'src> Parser<'src> {
                     }
                     _ => {
                         let span = self.peek().span;
-                        self.emit_error(SchemaParseError::ExpectedColumnCommaOrRParen { span });
+                        self.emit_error(SchemaSyntaxError::ExpectedColumnCommaOrRParen { span });
                         return Err(());
                     }
                 }
@@ -176,7 +176,7 @@ impl<'src> Parser<'src> {
             match self.expect_ident() {
                 Ok(col) => Ok(ColumnMapping::Single(col)),
                 Err(found) => {
-                    self.emit_error(SchemaParseError::ExpectedColumns { span: found.span });
+                    self.emit_error(SchemaSyntaxError::ExpectedColumns { span: found.span });
                     Err(())
                 }
             }
@@ -187,7 +187,7 @@ impl<'src> Parser<'src> {
         match self.expect_ident() {
             Ok(col) => Ok(col),
             Err(found) => {
-                self.emit_error(SchemaParseError::ExpectedColumn { span: found.span });
+                self.emit_error(SchemaSyntaxError::ExpectedColumn { span: found.span });
                 Err(())
             }
         }
@@ -242,7 +242,7 @@ impl<'src> Parser<'src> {
             TokenKind::LParen => self.parse_paren_tuple(),
             _ => {
                 let span = self.peek().span;
-                self.emit_error(SchemaParseError::ExpectedType { span });
+                self.emit_error(SchemaSyntaxError::ExpectedType { span });
                 Err(())
             }
         }
@@ -251,14 +251,14 @@ impl<'src> Parser<'src> {
     fn parse_list_type(&mut self, skip_via: bool) -> PResult<TypeExpr> {
         let kw_tok = self.advance();
         if let Err(found) = self.expect(TokenKind::LAngle) {
-            self.emit_error(SchemaParseError::ExpectedListLAngle { span: found.span });
+            self.emit_error(SchemaSyntaxError::ExpectedListLAngle { span: found.span });
             return Err(());
         }
         let element = Box::new(self.parse_type_expr(false)?);
         let rangle = match self.expect(TokenKind::RAngle) {
             Ok(tok) => tok,
             Err(found) => {
-                self.emit_error(SchemaParseError::ExpectedListRAngle { span: found.span });
+                self.emit_error(SchemaSyntaxError::ExpectedListRAngle { span: found.span });
                 return Err(());
             }
         };
@@ -280,28 +280,28 @@ impl<'src> Parser<'src> {
         let table = match self.expect_ident() {
             Ok(table) => table,
             Err(found) => {
-                self.emit_error(SchemaParseError::ExpectedListViaTable { span: found.span });
+                self.emit_error(SchemaSyntaxError::ExpectedListViaTable { span: found.span });
                 return Err(());
             }
         };
         if let Err(found) = self.expect(TokenKind::LBracket) {
-            self.emit_error(SchemaParseError::ExpectedListViaLBracket { span: found.span });
+            self.emit_error(SchemaSyntaxError::ExpectedListViaLBracket { span: found.span });
             return Err(());
         }
         let key_col = match self.expect_ident() {
             Ok(key_col) => key_col,
             Err(found) => {
-                self.emit_error(SchemaParseError::ExpectedListViaKeyCol { span: found.span });
+                self.emit_error(SchemaSyntaxError::ExpectedListViaKeyCol { span: found.span });
                 return Err(());
             }
         };
         if let Err(found) = self.expect(TokenKind::Comma) {
-            self.emit_error(SchemaParseError::ExpectedListViaComma { span: found.span });
+            self.emit_error(SchemaSyntaxError::ExpectedListViaComma { span: found.span });
             return Err(());
         }
         let value = self.parse_column_mapping()?;
         if let Err(found) = self.expect(TokenKind::RBracket) {
-            self.emit_error(SchemaParseError::ExpectedListViaRBracket { span: found.span });
+            self.emit_error(SchemaSyntaxError::ExpectedListViaRBracket { span: found.span });
             return Err(());
         }
         Ok(ListStorage {
@@ -319,12 +319,12 @@ impl<'src> Parser<'src> {
                 TokenKind::RParen => break self.advance(),
                 TokenKind::Eof => {
                     let span = self.peek().span;
-                    self.emit_error(SchemaParseError::ExpectedTupleCommaOrRParen { span });
+                    self.emit_error(SchemaSyntaxError::ExpectedTupleCommaOrRParen { span });
                     return Err(());
                 }
                 _ => {
                     if let Err(found) = self.expect(TokenKind::Comma) {
-                        self.emit_error(SchemaParseError::ExpectedTupleCommaOrRParen {
+                        self.emit_error(SchemaSyntaxError::ExpectedTupleCommaOrRParen {
                             span: found.span,
                         });
                         return Err(());

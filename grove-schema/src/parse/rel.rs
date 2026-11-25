@@ -1,5 +1,5 @@
 use crate::ast::{ColumnRef, FkMapping, JoinColumn, Relation, RelationArrow, RelationEndpoint};
-use crate::error::SchemaParseError;
+use crate::error::SchemaSyntaxError;
 use crate::token::TokenKind;
 use grove_types::{Span, Spanned};
 
@@ -19,7 +19,7 @@ impl<'src> Parser<'src> {
         };
 
         self.expect_or_sync(TokenKind::Semicolon, |span| {
-            SchemaParseError::ExpectedRelSemicolon { span }
+            SchemaSyntaxError::ExpectedRelSemicolon { span }
         })?;
 
         Ok(Relation {
@@ -31,13 +31,13 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_endpoint(&mut self) -> PResult<RelationEndpoint> {
-        let struct_name =
-            self.expect_ident_or_sync(|span| SchemaParseError::ExpectedRelEndpointStruct { span })?;
+        let struct_name = self
+            .expect_ident_or_sync(|span| SchemaSyntaxError::ExpectedRelEndpointStruct { span })?;
         self.expect_or_sync(TokenKind::Dot, |span| {
-            SchemaParseError::ExpectedRelEndpointDot { span }
+            SchemaSyntaxError::ExpectedRelEndpointDot { span }
         })?;
         let field_name =
-            self.expect_ident_or_sync(|span| SchemaParseError::ExpectedRelEndpointField { span })?;
+            self.expect_ident_or_sync(|span| SchemaSyntaxError::ExpectedRelEndpointField { span })?;
         Ok(RelationEndpoint {
             struct_name,
             field_name,
@@ -52,7 +52,7 @@ impl<'src> Parser<'src> {
             TokenKind::OneToMany => RelationArrow::OneToMany,
             TokenKind::ManyToMany => RelationArrow::ManyToMany,
             _ => {
-                self.emit_error(SchemaParseError::ExpectedRelArrow { span: token.span });
+                self.emit_error(SchemaSyntaxError::ExpectedRelArrow { span: token.span });
                 self.sync_to_statement_boundary();
                 return Err(());
             }
@@ -62,27 +62,27 @@ impl<'src> Parser<'src> {
 
     fn parse_fk_direct(&mut self) -> PResult<FkMapping> {
         self.expect_or_sync(TokenKind::LParen, |span| {
-            SchemaParseError::ExpectedRelLParen { span }
+            SchemaSyntaxError::ExpectedRelLParen { span }
         })?;
 
         let child = self.parse_column_ref(
-            |span| SchemaParseError::ExpectedRelLinkTable { span },
-            |span| SchemaParseError::ExpectedRelLinkDot { span },
-            |span| SchemaParseError::ExpectedRelLinkColumn { span },
+            |span| SchemaSyntaxError::ExpectedRelLinkTable { span },
+            |span| SchemaSyntaxError::ExpectedRelLinkDot { span },
+            |span| SchemaSyntaxError::ExpectedRelLinkColumn { span },
         )?;
 
         self.expect_or_sync(TokenKind::Arrow, |span| {
-            SchemaParseError::ExpectedRelLinkArrow { span }
+            SchemaSyntaxError::ExpectedRelLinkArrow { span }
         })?;
 
         let parent = self.parse_column_ref(
-            |span| SchemaParseError::ExpectedRelPKTable { span },
-            |span| SchemaParseError::ExpectedRelPKDot { span },
-            |span| SchemaParseError::ExpectedRelPKColumn { span },
+            |span| SchemaSyntaxError::ExpectedRelPKTable { span },
+            |span| SchemaSyntaxError::ExpectedRelPKDot { span },
+            |span| SchemaSyntaxError::ExpectedRelPKColumn { span },
         )?;
 
         self.expect_or_sync(TokenKind::RParen, |span| {
-            SchemaParseError::ExpectedRelRParen { span }
+            SchemaSyntaxError::ExpectedRelRParen { span }
         })?;
 
         Ok(FkMapping::Direct { child, parent })
@@ -90,22 +90,22 @@ impl<'src> Parser<'src> {
 
     fn parse_fk_indirect(&mut self) -> PResult<FkMapping> {
         let join_table =
-            self.expect_ident_or_sync(|span| SchemaParseError::ExpectedRelViaTable { span })?;
+            self.expect_ident_or_sync(|span| SchemaSyntaxError::ExpectedRelViaTable { span })?;
 
         self.expect_or_sync(TokenKind::LBracket, |span| {
-            SchemaParseError::ExpectedRelViaLBracket { span }
+            SchemaSyntaxError::ExpectedRelViaLBracket { span }
         })?;
 
         let a = self.parse_join_table_column()?;
 
         self.expect_or_sync(TokenKind::Comma, |span| {
-            SchemaParseError::ExpectedRelViaCommaOrRBracket { span }
+            SchemaSyntaxError::ExpectedRelViaCommaOrRBracket { span }
         })?;
 
         let b = self.parse_join_table_column()?;
 
         self.expect_or_sync(TokenKind::RBracket, |span| {
-            SchemaParseError::ExpectedRelViaCommaOrRBracket { span }
+            SchemaSyntaxError::ExpectedRelViaCommaOrRBracket { span }
         })?;
 
         Ok(FkMapping::Indirect { join_table, a, b })
@@ -113,16 +113,16 @@ impl<'src> Parser<'src> {
 
     fn parse_join_table_column(&mut self) -> PResult<JoinColumn> {
         let join_col =
-            self.expect_ident_or_sync(|span| SchemaParseError::ExpectedRelViaColumn { span })?;
+            self.expect_ident_or_sync(|span| SchemaSyntaxError::ExpectedRelViaColumn { span })?;
 
         self.expect_or_sync(TokenKind::Arrow, |span| {
-            SchemaParseError::ExpectedRelViaArrow { span }
+            SchemaSyntaxError::ExpectedRelViaArrow { span }
         })?;
 
         let target = self.parse_column_ref(
-            |span| SchemaParseError::ExpectedRelViaTargetTable { span },
-            |span| SchemaParseError::ExpectedRelViaTargetDot { span },
-            |span| SchemaParseError::ExpectedRelViaTargetColumn { span },
+            |span| SchemaSyntaxError::ExpectedRelViaTargetTable { span },
+            |span| SchemaSyntaxError::ExpectedRelViaTargetDot { span },
+            |span| SchemaSyntaxError::ExpectedRelViaTargetColumn { span },
         )?;
 
         Ok(JoinColumn { join_col, target })
@@ -130,9 +130,9 @@ impl<'src> Parser<'src> {
 
     fn parse_column_ref(
         &mut self,
-        table_err: impl FnOnce(Span) -> SchemaParseError,
-        dot_err: impl FnOnce(Span) -> SchemaParseError,
-        col_err: impl FnOnce(Span) -> SchemaParseError,
+        table_err: impl FnOnce(Span) -> SchemaSyntaxError,
+        dot_err: impl FnOnce(Span) -> SchemaSyntaxError,
+        col_err: impl FnOnce(Span) -> SchemaSyntaxError,
     ) -> PResult<ColumnRef> {
         let table = self.expect_ident_or_sync(table_err)?;
         self.expect_or_sync(TokenKind::Dot, dot_err)?;

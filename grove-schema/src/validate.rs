@@ -244,7 +244,6 @@ fn builtin_scalar(builtin: &BuiltinType) -> ScalarType {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arithmetic::{DecArithmetic, IntArithmetic};
     use crate::parse_schema;
     use crate::validated::{EnumId, EnumUnderlying, Field, ValueType};
 

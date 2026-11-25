@@ -1,7 +1,7 @@
 use std::fmt;
 
 use crate::ast::{EnumDef, EnumValue, EnumVariantDef};
-use crate::error::SchemaParseError;
+use crate::error::SchemaSyntaxError;
 use crate::token::TokenKind;
 use grove_types::{Span, Spanned};
 
@@ -27,14 +27,14 @@ impl<'src> Parser<'src> {
         let name = match self.expect_ident() {
             Ok(name) => name,
             Err(found) => {
-                self.emit_error(SchemaParseError::ExpectedEnumName { span: found.span });
+                self.emit_error(SchemaSyntaxError::ExpectedEnumName { span: found.span });
                 self.sync_to_statement_boundary();
                 return Err(());
             }
         };
 
         if let Err(found) = self.expect(TokenKind::LBrace) {
-            self.emit_error(SchemaParseError::ExpectedEnumLBrace {
+            self.emit_error(SchemaSyntaxError::ExpectedEnumLBrace {
                 span: found.span,
                 name: name.value,
             });
@@ -53,7 +53,7 @@ impl<'src> Parser<'src> {
                 TokenKind::RBrace => break self.advance(),
                 TokenKind::Eof => {
                     let span = Span::new(name.span.start, self.peek().span.start);
-                    self.emit_error(SchemaParseError::UnclosedEnum { span });
+                    self.emit_error(SchemaSyntaxError::UnclosedEnum { span });
                     return Err(());
                 }
                 _ => self.parse_enum_variant(
@@ -68,7 +68,7 @@ impl<'src> Parser<'src> {
 
         let span = name.span.merge(rbrace.span);
         if variants.is_empty() && self.diagnostics.len() == diagnostics_before {
-            self.emit_error(SchemaParseError::EmptyEnum {
+            self.emit_error(SchemaSyntaxError::EmptyEnum {
                 span,
                 name: name.value.clone(),
             });
@@ -88,7 +88,7 @@ impl<'src> Parser<'src> {
         let name = match self.expect_ident() {
             Ok(name) => name,
             Err(found) => {
-                self.emit_error(SchemaParseError::ExpectedEnumVariantName {
+                self.emit_error(SchemaSyntaxError::ExpectedEnumVariantName {
                     span: found.span,
                     enum_name: enum_name.to_string(),
                 });
@@ -97,7 +97,7 @@ impl<'src> Parser<'src> {
         };
 
         if let Err(found) = self.expect(TokenKind::FatArrow) {
-            self.emit_error(SchemaParseError::ExpectedEnumArrow {
+            self.emit_error(SchemaSyntaxError::ExpectedEnumArrow {
                 span: found.span,
                 enum_name: enum_name.to_string(),
                 variant: name.value,
@@ -117,7 +117,7 @@ impl<'src> Parser<'src> {
             }
             _ => {
                 let span = self.peek().span;
-                self.emit_error(SchemaParseError::ExpectedEnumValue {
+                self.emit_error(SchemaSyntaxError::ExpectedEnumValue {
                     span,
                     enum_name: enum_name.to_string(),
                     variant: name.value,
@@ -127,7 +127,7 @@ impl<'src> Parser<'src> {
         };
 
         if let Some((_, previous)) = variant_spans.iter().find(|(n, _)| n == &name.value) {
-            self.emit_error(SchemaParseError::DuplicateEnumVariant {
+            self.emit_error(SchemaSyntaxError::DuplicateEnumVariant {
                 span: name.span,
                 enum_name: enum_name.to_string(),
                 variant: name.value,
@@ -141,7 +141,7 @@ impl<'src> Parser<'src> {
             .find(|(v, _)| v == &value)
             .map(|(_, span)| *span);
         if let Some(previous) = duplicate_value {
-            self.emit_error(SchemaParseError::DuplicateEnumValue {
+            self.emit_error(SchemaSyntaxError::DuplicateEnumValue {
                 span: value_span,
                 enum_name: enum_name.to_string(),
                 value: value.to_string(),
@@ -151,7 +151,7 @@ impl<'src> Parser<'src> {
 
         match underlying {
             Some(expected) if *expected != kind => {
-                self.emit_error(SchemaParseError::MixedEnumValueTypes {
+                self.emit_error(SchemaSyntaxError::MixedEnumValueTypes {
                     span: value_span,
                     enum_name: enum_name.to_string(),
                     expected: expected.to_string(),
@@ -177,7 +177,7 @@ impl<'src> Parser<'src> {
             TokenKind::RBrace | TokenKind::Eof => Ok(()),
             _ => {
                 let span = self.peek().span;
-                self.emit_error(SchemaParseError::ExpectedEnumCommaOrRBrace {
+                self.emit_error(SchemaSyntaxError::ExpectedEnumCommaOrRBrace {
                     span,
                     enum_name: enum_name.to_string(),
                 });
