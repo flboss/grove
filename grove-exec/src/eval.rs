@@ -14,7 +14,6 @@ use crate::value::{Interner, Scalar, Val, rewrap_optional, unwrap_optional_depth
 mod arithmetic;
 mod composite;
 mod data;
-pub(crate) mod literals;
 mod methods;
 mod mutations;
 mod operators;
@@ -24,9 +23,10 @@ pub use session::ExecSession;
 
 use composite::{eval_array, eval_projection, eval_struct, eval_tuple};
 use data::{exec_field, exec_root, resolve_base_link, resolve_ident_value, resolve_owning_values};
-use literals::{decode_literal, eval_type_constant};
 use methods::eval_method;
 use operators::{eval_binary, eval_cast, eval_unary};
+
+use crate::value::literal::{decode_literal, eval_type_constant};
 
 /// Lexical value scope chain
 #[derive(Debug, Default)]

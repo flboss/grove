@@ -10,7 +10,6 @@ use grove_query::{
 use grove_schema::validated::{Field, FieldId, ScalarType, StructId, ValidatedSchema, ValueType};
 use grove_types::NodeId;
 
-use crate::eval::literals::{decode_literal, eval_type_constant};
 use crate::method_meta::{self, BaseNeed};
 use crate::value::{Scalar, Val, enum_variant_scalar};
 
@@ -93,6 +92,7 @@ pub enum StringOp {
     StartsWith,
     EndsWith,
 }
+use crate::value::literal::{decode_literal, eval_type_constant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeRewrite {
