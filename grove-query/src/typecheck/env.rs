@@ -149,29 +149,8 @@ impl<'s> TypeEnv<'s> {
                 Field::Ref { .. } => TargetProvenance::ref_collection(field_id),
                 _ => TargetProvenance::NONE,
             };
-            let (name, ty) = match field {
-                Field::Value { name, ty, .. } => (name.clone(), ty.into()),
-                Field::Array { name, element, .. } => {
-                    (name.clone(), QueryType::List(Box::new(element.into())))
-                }
-                Field::Ref {
-                    name,
-                    target,
-                    optional,
-                    is_list,
-                    ..
-                } => {
-                    let inner = QueryType::Record(RecordSource::Schema(*target));
-                    let ty = if *is_list {
-                        QueryType::List(Box::new(inner))
-                    } else if *optional {
-                        inner.wrap_optional()
-                    } else {
-                        inner
-                    };
-                    (name.clone(), ty)
-                }
-            };
+            let name = field.name().to_owned();
+            let ty = QueryType::from(field);
             self.define_with_provenance(name, ty, binding, provenance);
         }
     }

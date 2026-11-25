@@ -7,10 +7,12 @@ use crate::typecheck::types::{
 };
 use grove_types::Span;
 
-pub(super) fn check_mutation_base(
+/// Unwrap an optional mutation target, classify it, and require traceable rows
+fn traceable_mutation_target<T>(
     typed_base: &TypedExpr,
     opt_depth: usize,
-) -> Result<StructId, TypeError> {
+    classify: impl FnOnce(&QueryType) -> Result<T, TypeError>,
+) -> Result<T, TypeError> {
     let Some(ty) = typed_base.ty.unwrap_optional_depth(opt_depth) else {
         return Err(TypeError::OptionalDepthMismatch {
             depth: opt_depth,
@@ -24,11 +26,38 @@ pub(super) fn check_mutation_base(
             span: typed_base.span,
         });
     }
+    let target = classify(ty)?;
+    if !typed_base.provenance.rows {
+        return Err(TypeError::MutationTargetNotTraceable {
+            got: typed_base.ty.to_string(),
+            span: typed_base.span,
+        });
+    }
+    Ok(target)
+}
 
-    let struct_id = match ty {
-        QueryType::Record(RecordSource::Schema(id)) => *id,
-        QueryType::List(inner) => match inner.as_ref() {
+/// Validate an update/delete base and returns the target struct
+pub(super) fn check_mutation_base(
+    typed_base: &TypedExpr,
+    opt_depth: usize,
+) -> Result<StructId, TypeError> {
+    traceable_mutation_target(typed_base, opt_depth, |ty| {
+        let struct_id = match ty {
             QueryType::Record(RecordSource::Schema(id)) => *id,
+            QueryType::List(inner) => match inner.as_ref() {
+                QueryType::Record(RecordSource::Schema(id)) => *id,
+                QueryType::Record(RecordSource::Projection(_)) => {
+                    return Err(TypeError::MutationOnProjection {
+                        span: typed_base.span,
+                    });
+                }
+                _ => {
+                    return Err(TypeError::MutationOnNonList {
+                        got: typed_base.ty.to_string(),
+                        span: typed_base.span,
+                    });
+                }
+            },
             QueryType::Record(RecordSource::Projection(_)) => {
                 return Err(TypeError::MutationOnProjection {
                     span: typed_base.span,
@@ -40,27 +69,9 @@ pub(super) fn check_mutation_base(
                     span: typed_base.span,
                 });
             }
-        },
-        QueryType::Record(RecordSource::Projection(_)) => {
-            return Err(TypeError::MutationOnProjection {
-                span: typed_base.span,
-            });
-        }
-        _ => {
-            return Err(TypeError::MutationOnNonList {
-                got: typed_base.ty.to_string(),
-                span: typed_base.span,
-            });
-        }
-    };
-
-    if !typed_base.provenance.rows {
-        return Err(TypeError::MutationTargetNotTraceable {
-            got: typed_base.ty.to_string(),
-            span: typed_base.span,
-        });
-    }
-    Ok(struct_id)
+        };
+        Ok(struct_id)
+    })
 }
 
 /// Classifies insert target collection ownership
@@ -77,25 +88,26 @@ pub(super) fn check_insert_base(
     opt_depth: usize,
     schema: &ValidatedSchema,
 ) -> Result<(StructId, InsertTargetSource), TypeError> {
-    let Some(ty) = typed_base.ty.unwrap_optional_depth(opt_depth) else {
-        return Err(TypeError::OptionalDepthMismatch {
-            depth: opt_depth,
-            ty: typed_base.ty.to_string(),
-            span: typed_base.span,
-        });
-    };
-    if ty.is_optional() {
-        return Err(TypeError::MutationOnOptional {
-            got: typed_base.ty.to_string(),
-            span: typed_base.span,
-        });
-    }
-
-    let struct_id = match ty {
-        QueryType::List(inner) => match inner.as_ref() {
-            QueryType::Record(RecordSource::Schema(id)) => *id,
-            QueryType::Record(RecordSource::Projection(_)) => {
-                return Err(TypeError::MutationOnProjection {
+    let struct_id = traceable_mutation_target(typed_base, opt_depth, |ty| {
+        let struct_id = match ty {
+            QueryType::List(inner) => match inner.as_ref() {
+                QueryType::Record(RecordSource::Schema(id)) => *id,
+                QueryType::Record(RecordSource::Projection(_)) => {
+                    return Err(TypeError::MutationOnProjection {
+                        span: typed_base.span,
+                    });
+                }
+                _ => {
+                    return Err(TypeError::MutationOnNonList {
+                        got: typed_base.ty.to_string(),
+                        span: typed_base.span,
+                    });
+                }
+            },
+            QueryType::Record(RecordSource::Schema(_))
+            | QueryType::Record(RecordSource::Projection(_)) => {
+                return Err(TypeError::InsertOnRecord {
+                    got: typed_base.ty.to_string(),
                     span: typed_base.span,
                 });
             }
@@ -105,28 +117,9 @@ pub(super) fn check_insert_base(
                     span: typed_base.span,
                 });
             }
-        },
-        QueryType::Record(RecordSource::Schema(_))
-        | QueryType::Record(RecordSource::Projection(_)) => {
-            return Err(TypeError::InsertOnRecord {
-                got: typed_base.ty.to_string(),
-                span: typed_base.span,
-            });
-        }
-        _ => {
-            return Err(TypeError::MutationOnNonList {
-                got: typed_base.ty.to_string(),
-                span: typed_base.span,
-            });
-        }
-    };
-
-    if !typed_base.provenance.rows {
-        return Err(TypeError::MutationTargetNotTraceable {
-            got: typed_base.ty.to_string(),
-            span: typed_base.span,
-        });
-    }
+        };
+        Ok(struct_id)
+    })?;
 
     let Some(collection) = typed_base.provenance.collection else {
         return Err(TypeError::InsertTargetNotCollection {
