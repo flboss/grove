@@ -1,0 +1,379 @@
+use chrono::{DateTime, NaiveDate, NaiveTime, TimeDelta, Utc};
+
+use super::number::should_round_up;
+use crate::lex::Lexer;
+use crate::lex::error::QueryLexError;
+use crate::token::{Token, TokenKind};
+use grove_types::Span;
+
+impl<'src> Lexer<'src> {
+    pub(super) fn scan_instant(&mut self, start: usize) -> Token {
+        let kind = match self.scan_instant_value() {
+            Ok(kind) => kind,
+            Err(()) => return self.advance(),
+        };
+        if self.instant_has_stray_suffix() {
+            return self.advance();
+        }
+        self.make_token(start, kind)
+    }
+
+    fn scan_instant_value(&mut self) -> Result<TokenKind, ()> {
+        match self.peek_char() {
+            Some(c) if c.is_ascii_alphabetic() => self.scan_instant_name(),
+            Some(c) if c.is_ascii_digit() || c == '-' => self.scan_instant_date(),
+            Some(_) => {
+                let span = self.span_current();
+                self.emit_error(QueryLexError::InstantExpected { span });
+                self.bump();
+                Err(())
+            }
+            None => {
+                let span = self.span_current();
+                self.emit_error(QueryLexError::InstantExpected { span });
+                Err(())
+            }
+        }
+    }
+
+    fn scan_instant_name(&mut self) -> Result<TokenKind, ()> {
+        let name_start = self.pos;
+        let mut name = String::new();
+        while let Some(c) = self.peek_char() {
+            if c.is_ascii_alphabetic() {
+                self.bump();
+                name.push(c);
+            } else {
+                break;
+            }
+        }
+
+        match name.as_str() {
+            "now" => {
+                if matches!(self.peek_char(), Some(c) if c.is_ascii_alphanumeric() || c == '_') {
+                    self.emit_error(QueryLexError::InstantNameInvalid {
+                        span: self.span_from(name_start),
+                        name,
+                    });
+                    return Err(());
+                }
+                Ok(TokenKind::Now)
+            }
+            "today" => {
+                if self.peek_char() == Some('_') {
+                    self.bump();
+                    let time_start = self.pos;
+                    let (secs_of_day, nanos) = self.scan_time_part()?;
+                    let Some(time) =
+                        NaiveTime::from_num_seconds_from_midnight_opt(secs_of_day, nanos)
+                    else {
+                        self.emit_error(QueryLexError::InstantSecondInvalid {
+                            span: self.span_from(time_start),
+                        });
+                        return Err(());
+                    };
+                    Ok(TokenKind::Today(Some(time)))
+                } else if matches!(
+                    self.peek_char(),
+                    Some(c) if c.is_ascii_alphanumeric() || c == '_'
+                ) {
+                    self.emit_error(QueryLexError::InstantNameInvalid {
+                        span: self.span_from(name_start),
+                        name,
+                    });
+                    Err(())
+                } else {
+                    Ok(TokenKind::Today(None))
+                }
+            }
+            "unix" => {
+                if self.peek_char() != Some('_') {
+                    self.emit_error(QueryLexError::InstantNameInvalid {
+                        span: self.span_from(name_start),
+                        name,
+                    });
+                    return Err(());
+                }
+                self.bump();
+                let unix_seconds_start = self.pos;
+                let mut sign = 1i64;
+                match self.peek_char() {
+                    Some('-') => {
+                        self.bump();
+                        sign = -1;
+                    }
+                    Some('+') => self.bump(),
+                    _ => {}
+                }
+                let secs_digits = self.scan_ascii_digits();
+                if secs_digits.is_empty() {
+                    self.emit_error(QueryLexError::InstantUnixSecondsMissing {
+                        span: self.span_from(name_start),
+                    });
+                    return Err(());
+                }
+                let mut nanos: u32 = 0;
+                let mut carry = false;
+                if self.peek_char() == Some('.')
+                    && matches!(self.peek_char2(), Some(c) if c.is_ascii_digit())
+                {
+                    let frac_start = self.pos;
+                    self.bump();
+                    let frac = self.scan_ascii_digits();
+                    (nanos, carry) = self.fraction_nanos(frac_start, &frac);
+                }
+                let secs = match secs_digits.parse::<i64>() {
+                    Ok(n) => sign
+                        .checked_mul(n)
+                        .and_then(|s| s.checked_add(carry as i64)),
+                    Err(_) => None,
+                };
+                let Some(secs) = secs else {
+                    self.emit_error(QueryLexError::InstantUnixOverflow {
+                        span: self.span_from(unix_seconds_start),
+                    });
+                    return Err(());
+                };
+                match DateTime::<Utc>::from_timestamp(secs, nanos) {
+                    Some(dt) => Ok(TokenKind::InstantLit(dt)),
+                    None => {
+                        self.emit_error(QueryLexError::InstantUnixOverflow {
+                            span: self.span_from(unix_seconds_start),
+                        });
+                        Err(())
+                    }
+                }
+            }
+            _ => {
+                self.emit_error(QueryLexError::InstantNameInvalid {
+                    span: self.span_from(name_start),
+                    name,
+                });
+                Err(())
+            }
+        }
+    }
+
+    fn scan_instant_date(&mut self) -> Result<TokenKind, ()> {
+        let mut year_sign = 1i32;
+        if self.peek_char() == Some('-') {
+            self.bump();
+            year_sign = -1;
+        }
+        let year_start = self.pos;
+        let year_digits = self.scan_ascii_digits();
+        if year_digits.len() < 4 {
+            self.emit_error(QueryLexError::InstantYearInvalid {
+                span: self.span_from(year_start),
+            });
+            return Err(());
+        }
+        let year = match year_digits.parse::<i32>() {
+            Ok(y) => year_sign * y,
+            Err(_) => {
+                self.emit_error(QueryLexError::InstantYearInvalid {
+                    span: self.span_from(year_start),
+                });
+                return Err(());
+            }
+        };
+
+        let mut month: u32 = 1;
+        let mut day: u32 = 1;
+        let mut day_start = 0usize;
+        if self.peek_char() == Some('-') {
+            self.bump();
+            let month_start = self.pos;
+            let Some(m) = self.scan_exact_2_digits() else {
+                self.emit_error(QueryLexError::InstantMonthInvalid {
+                    span: self.span_from(month_start),
+                });
+                return Err(());
+            };
+            if !(1..=12).contains(&m) {
+                self.emit_error(QueryLexError::InstantMonthInvalid {
+                    span: self.span_from(month_start),
+                });
+                return Err(());
+            }
+            month = m;
+            if self.peek_char() == Some('-') {
+                self.bump();
+                day_start = self.pos;
+                let Some(d) = self.scan_exact_2_digits() else {
+                    self.emit_error(QueryLexError::InstantDayInvalid {
+                        span: self.span_from(day_start),
+                    });
+                    return Err(());
+                };
+                day = d;
+            }
+        }
+
+        let Some(date) = NaiveDate::from_ymd_opt(year, month, day) else {
+            // Day 1 is valid for every month and month is already proven 1..=12,
+            // so a second failure can only mean the year is out of chrono's range
+            let year_bad = NaiveDate::from_ymd_opt(year, month, 1).is_none();
+            self.emit_error(if year_bad {
+                QueryLexError::InstantYearInvalid {
+                    span: Span::new(year_start, year_start + year_digits.len()),
+                }
+            } else {
+                QueryLexError::InstantDayInvalid {
+                    span: self.span_from(day_start),
+                }
+            });
+            return Err(());
+        };
+
+        let mut time_start = self.pos;
+        let (secs_of_day, nanos) = if self.peek_char() == Some('_') {
+            self.bump();
+            time_start = self.pos;
+            self.scan_time_part()?
+        } else {
+            (0, 0)
+        };
+
+        let midnight = date.and_hms_opt(0, 0, 0).unwrap();
+        let Some(naive) =
+            midnight.checked_add_signed(TimeDelta::new(secs_of_day as i64, nanos).unwrap())
+        else {
+            self.emit_error(QueryLexError::InstantSecondInvalid {
+                span: self.span_from(time_start),
+            });
+            return Err(());
+        };
+        let dt = DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc);
+        Ok(TokenKind::InstantLit(dt))
+    }
+
+    fn scan_time_part(&mut self) -> Result<(u32, u32), ()> {
+        let hour_start = self.pos;
+        let hh = match self.scan_exact_2_digits() {
+            Some(d) => d,
+            None => {
+                self.emit_error(QueryLexError::InstantHourInvalid {
+                    span: self.span_from(hour_start),
+                });
+                return Err(());
+            }
+        };
+        if hh > 23 {
+            self.emit_error(QueryLexError::InstantHourInvalid {
+                span: self.span_from(hour_start),
+            });
+            return Err(());
+        }
+        if self.peek_char() != Some(':') {
+            self.emit_error(QueryLexError::InstantTimeColonExpected {
+                span: self.span_current(),
+            });
+            return Err(());
+        }
+        self.bump();
+        let minute_start = self.pos;
+        let mm = match self.scan_exact_2_digits() {
+            Some(d) => d,
+            None => {
+                self.emit_error(QueryLexError::InstantMinuteInvalid {
+                    span: self.span_from(minute_start),
+                });
+                return Err(());
+            }
+        };
+        if mm > 59 {
+            self.emit_error(QueryLexError::InstantMinuteInvalid {
+                span: self.span_from(minute_start),
+            });
+            return Err(());
+        }
+        let mut secs_of_day = hh * 3600 + mm * 60;
+        if self.peek_char() == Some(':') {
+            self.bump();
+            let second_start = self.pos;
+            let ss = match self.scan_exact_2_digits() {
+                Some(d) => d,
+                None => {
+                    self.emit_error(QueryLexError::InstantSecondInvalid {
+                        span: self.span_from(second_start),
+                    });
+                    return Err(());
+                }
+            };
+            if ss > 59 {
+                self.emit_error(QueryLexError::InstantSecondInvalid {
+                    span: self.span_from(second_start),
+                });
+                return Err(());
+            }
+            secs_of_day += ss;
+            if self.peek_char() == Some('.')
+                && matches!(self.peek_char2(), Some(c) if c.is_ascii_digit())
+            {
+                let frac_start = self.pos;
+                self.bump();
+                let frac = self.scan_ascii_digits();
+                let (nanos, carry) = self.fraction_nanos(frac_start, &frac);
+                return Ok((secs_of_day + carry as u32, nanos));
+            }
+        }
+        Ok((secs_of_day, 0))
+    }
+
+    fn scan_exact_2_digits(&mut self) -> Option<u32> {
+        let digits = self.scan_ascii_digits();
+        if digits.len() != 2 {
+            return None;
+        }
+        digits.parse::<u32>().ok()
+    }
+
+    pub(super) fn fraction_nanos(&mut self, frac_start: usize, frac: &str) -> (u32, bool) {
+        let mut nanos: u32 = 0;
+        for (i, ch) in frac.chars().enumerate() {
+            if i == 9 {
+                break;
+            }
+            nanos = nanos * 10 + ch.to_digit(10).unwrap();
+        }
+        if frac.len() < 9 {
+            nanos *= 10u32.pow((9 - frac.len()) as u32);
+        }
+        let mut carry = false;
+        if frac.len() > 9 {
+            let (kept, dropped) = frac.split_at(9);
+            if should_round_up(dropped, kept) {
+                nanos += 1;
+            }
+            if dropped.bytes().any(|b| b != b'0') {
+                self.emit_warning(QueryLexError::FractionRounded {
+                    span: self.span_from(frac_start),
+                });
+            }
+        }
+        if nanos >= 1_000_000_000 {
+            carry = true;
+            nanos = 0;
+        }
+        (nanos, carry)
+    }
+
+    fn instant_has_stray_suffix(&mut self) -> bool {
+        match self.peek_char() {
+            Some(c) if c.is_ascii_alphanumeric() || c == '_' => {
+                let span = self.span_current();
+                self.emit_error(QueryLexError::InstantSuffixInvalid { span });
+                while let Some(c) = self.peek_char() {
+                    if c.is_ascii_alphanumeric() || c == '_' {
+                        self.bump();
+                    } else {
+                        break;
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+}
