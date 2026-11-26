@@ -79,3 +79,101 @@ impl SqliteBackend<'_> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use grove_schema::validated::ValidatedSchema;
+    use rusqlite::Connection;
+
+    #[test]
+    fn open_in_memory_constructor() {
+        assert!(SqliteBackend::open_in_memory(&ValidatedSchema::default()).is_ok());
+    }
+
+    fn verify_backend(tables: &[(&str, &[&str])], ddl: &str) -> Result<(), ExecError> {
+        use grove_schema::validated::{Column, Table};
+        let schema = ValidatedSchema {
+            tables: tables
+                .iter()
+                .map(|(name, cols)| Table {
+                    name: name.to_string(),
+                    columns: cols
+                        .iter()
+                        .map(|c| Column {
+                            name: c.to_string(),
+                            ty: None,
+                        })
+                        .collect(),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(ddl).unwrap();
+        SqliteBackend::new(conn, &schema).map(|_| ())
+    }
+
+    #[test]
+    fn verify_missing_table() {
+        let err = verify_backend(&[("t", &["a"])], "CREATE TABLE other(x);").unwrap_err();
+        assert!(matches!(err, ExecError::Storage { .. }), "{err:?}");
+        assert!(err.to_string().contains("unknown table `t`"), "{err}");
+    }
+
+    #[test]
+    fn verify_view_instead_of_table() {
+        let err = verify_backend(
+            &[("t", &["a"])],
+            "CREATE TABLE base(x); CREATE VIEW t AS SELECT x AS a FROM base;",
+        )
+        .unwrap_err();
+        assert!(matches!(err, ExecError::Storage { .. }), "{err:?}");
+        assert!(err.to_string().contains("is a view"), "{err}");
+    }
+
+    #[test]
+    fn verify_without_rowid_table() {
+        let err = verify_backend(
+            &[("t", &["a"])],
+            "CREATE TABLE t(a INTEGER PRIMARY KEY) WITHOUT ROWID;",
+        )
+        .unwrap_err();
+        assert!(matches!(err, ExecError::Storage { .. }), "{err:?}");
+        assert!(err.to_string().contains("WITHOUT ROWID"), "{err}");
+    }
+
+    #[test]
+    fn verify_missing_column() {
+        let err = verify_backend(&[("t", &["a", "b"])], "CREATE TABLE t(a INTEGER);").unwrap_err();
+        assert!(matches!(err, ExecError::Storage { .. }), "{err:?}");
+        assert!(err.to_string().contains("missing column `b`"), "{err}");
+    }
+
+    #[test]
+    fn verify_ignores_unknown_and_affinity() {
+        assert!(
+            verify_backend(
+                &[("t", &["a"])],
+                "CREATE TABLE t(a TEXT, extra BLOB); CREATE TABLE other(x);"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn verify_case_insensitive_names() {
+        assert!(verify_backend(&[("Users", &["A"])], "CREATE TABLE users(a INTEGER);").is_ok());
+    }
+
+    #[test]
+    fn verify_rowid_shadow_column() {
+        let err = verify_backend(&[("t", &["a"])], "CREATE TABLE t(a INTEGER, _rowid_ TEXT);")
+            .unwrap_err();
+        assert!(matches!(err, ExecError::Storage { .. }), "{err:?}");
+        assert!(
+            err.to_string().contains("shadowing the rowid alias"),
+            "{err}"
+        );
+    }
+}

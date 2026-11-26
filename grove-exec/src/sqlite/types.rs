@@ -198,3 +198,137 @@ pub(super) fn encode_value(
 pub(super) fn value_write_width(ty: &ValueType) -> usize {
     type_width(ty, 1)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sqlite::tests::*;
+    use chrono::{DateTime, TimeDelta};
+    use rust_decimal::dec;
+
+    #[test]
+    fn decode_int_float_string() {
+        assert_eq!(
+            decode_scalar(ScalarType::Int, ValueRef::Integer(-7), false, true),
+            Ok(int(-7))
+        );
+        assert_eq!(
+            decode_scalar(ScalarType::Float, ValueRef::Real(1.5), false, true),
+            Ok(float(1.5))
+        );
+        assert_eq!(
+            decode_scalar(ScalarType::String, ValueRef::Text(b"hi"), false, true),
+            Ok(str("hi"))
+        );
+        assert!(decode_scalar(ScalarType::String, ValueRef::Text(b"\xFF"), false, true).is_err());
+    }
+
+    #[test]
+    fn decode_bool_strict() {
+        assert_eq!(
+            decode_scalar(ScalarType::Bool, ValueRef::Integer(0), false, true),
+            Ok(bool(false))
+        );
+        assert_eq!(
+            decode_scalar(ScalarType::Bool, ValueRef::Integer(1), false, true),
+            Ok(bool(true))
+        );
+        assert!(decode_scalar(ScalarType::Bool, ValueRef::Integer(2), false, true).is_err());
+        assert!(decode_scalar(ScalarType::Bool, ValueRef::Real(1.0), false, true).is_err());
+    }
+
+    #[test]
+    fn decode_null() {
+        assert_eq!(
+            decode_scalar(ScalarType::Int, ValueRef::Null, true, true),
+            Ok(Val::None)
+        );
+        assert!(decode_scalar(ScalarType::Int, ValueRef::Null, false, true).is_err());
+    }
+
+    #[test]
+    fn decode_null_float_nan() {
+        assert_eq!(
+            decode_scalar(ScalarType::Float, ValueRef::Null, true, true),
+            Ok(Val::None)
+        );
+        assert_eq!(
+            decode_scalar(ScalarType::Float, ValueRef::Null, true, false),
+            Ok(Val::None)
+        );
+        match decode_scalar(ScalarType::Float, ValueRef::Null, false, false) {
+            Ok(Val::Scalar(Scalar::Float(x))) => assert!(x.is_nan()),
+            other => panic!("expected NaN, got {other:?}"),
+        }
+        assert!(decode_scalar(ScalarType::Float, ValueRef::Null, false, true).is_err());
+    }
+
+    #[test]
+    fn decode_bytes_blob() {
+        let raw = [0x00, 0x01, 0xfe, 0xff];
+        assert_eq!(
+            decode_scalar(ScalarType::Bytes, ValueRef::Blob(&raw), false, true),
+            Ok(bytes(raw))
+        );
+        assert_eq!(
+            decode_scalar(ScalarType::Bytes, ValueRef::Blob(&[]), false, true),
+            Ok(bytes([]))
+        );
+        assert_eq!(
+            scalar_value(&Scalar::Bytes(raw.to_vec())),
+            Value::Blob(raw.to_vec())
+        );
+        assert!(decode_scalar(ScalarType::Bytes, ValueRef::Text(b"x"), false, true).is_err());
+        assert_eq!(
+            decode_scalar(ScalarType::Bytes, ValueRef::Null, true, true),
+            Ok(Val::None)
+        );
+        assert!(decode_scalar(ScalarType::Bytes, ValueRef::Null, false, true).is_err());
+    }
+
+    #[test]
+    fn decode_storage_class_mismatch() {
+        assert!(decode_scalar(ScalarType::String, ValueRef::Integer(1), false, true).is_err());
+        assert!(decode_scalar(ScalarType::Int, ValueRef::Real(1.0), false, true).is_err());
+        assert!(decode_scalar(ScalarType::Float, ValueRef::Integer(1), false, true).is_err());
+        assert!(decode_scalar(ScalarType::Dec, ValueRef::Text(b"1.5"), false, true).is_err());
+        assert!(decode_scalar(ScalarType::Instant, ValueRef::Integer(0), false, true).is_err());
+    }
+
+    #[test]
+    fn decode_blobs_round_trip() {
+        let d = dec!(30.00);
+        assert_eq!(
+            decode_scalar(
+                ScalarType::Dec,
+                ValueRef::Blob(&codec::encode_dec(d)),
+                false,
+                true
+            ),
+            Ok(dec(d.normalize()))
+        );
+        let t = DateTime::from_timestamp(1_700_000_000, 500).unwrap();
+        assert_eq!(
+            decode_scalar(
+                ScalarType::Instant,
+                ValueRef::Blob(&codec::encode_instant(t)),
+                false,
+                true
+            ),
+            Ok(Val::Scalar(Scalar::Instant(t)))
+        );
+        let span = TimeDelta::milliseconds(-1500);
+        match decode_scalar(
+            ScalarType::Duration,
+            ValueRef::Blob(&codec::encode_duration(span)),
+            false,
+            true,
+        ) {
+            Ok(Val::Scalar(Scalar::Duration(back))) => {
+                assert_eq!(back.num_seconds(), span.num_seconds());
+                assert_eq!(back.subsec_nanos(), span.subsec_nanos());
+            }
+            other => panic!("unexpected decode result: {other:?}"),
+        }
+    }
+}

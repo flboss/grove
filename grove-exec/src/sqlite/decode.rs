@@ -258,7 +258,7 @@ pub(super) enum SemiVal {
 }
 
 /// Decode one level row
-pub(super) fn semi(
+pub(super) fn decode_semi(
     plan: &ElemPlan,
     cells: &[ValueRef<'_>],
     float_checks: bool,
@@ -273,7 +273,7 @@ pub(super) fn semi(
             let mut items = Vec::with_capacity(plans.len());
             let mut used = 0;
             for plan in plans {
-                let (v, n) = semi(plan, &cells[used..], float_checks, schema)?;
+                let (v, n) = decode_semi(plan, &cells[used..], float_checks, schema)?;
                 items.push(v);
                 used += n;
             }
@@ -284,7 +284,7 @@ pub(super) fn semi(
             if cells[..width].iter().all(|v| matches!(v, ValueRef::Null)) {
                 Ok((SemiVal::Done(Val::None), width))
             } else {
-                semi(inner, cells, float_checks, schema).map(|(s, n)| match s {
+                decode_semi(inner, cells, float_checks, schema).map(|(s, n)| match s {
                     SemiVal::Done(v) => (SemiVal::Done(Val::Some(Box::new(v))), n),
                     other => (SemiVal::Some(Box::new(other)), n),
                 })
@@ -425,7 +425,7 @@ impl SqliteBackend<'_> {
                             .map_err(|err| Self::storage_error(ctx, err))?,
                     );
                 }
-                let (semival, _) = semi(
+                let (semival, _) = decode_semi(
                     &nodes[n].plan,
                     &cells,
                     self.schema.config.float_checks,
@@ -447,8 +447,7 @@ impl SqliteBackend<'_> {
         }
         Ok(items)
     }
-}
-impl SqliteBackend<'_> {
+
     pub(super) fn decode_row(
         &self,
         slots: &mut [Slot<'_, '_>],
@@ -498,7 +497,7 @@ impl SqliteBackend<'_> {
                                 .map_err(|err| Self::storage_error(ctx, err))?,
                         );
                     }
-                    let (tree, _) = semi(&slot.plan, &cells, float_checks, self.schema)
+                    let (tree, _) = decode_semi(&slot.plan, &cells, float_checks, self.schema)
                         .map_err(|err| err.context(&slot.label))?;
                     let mut resolved: HashMap<usize, Val> = HashMap::new();
                     for (root, sub) in &slot.subtrees {
@@ -519,5 +518,420 @@ impl SqliteBackend<'_> {
             }
         }
         Ok((Key(rowid), values))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sqlite::tests::*;
+    use crate::storage::{FetchConstraints, Storage};
+    use crate::testdata;
+    use crate::value::Scalar;
+    use rusqlite::Connection;
+
+    #[test]
+    fn decode_node_nested_tuples() {
+        let ty = ValueType::Tuple(vec![
+            ValueType::Scalar(ScalarType::Int),
+            ValueType::Tuple(vec![
+                ValueType::Scalar(ScalarType::String),
+                ValueType::Scalar(ScalarType::Bool),
+            ]),
+        ]);
+        let vals = [
+            ValueRef::Integer(1),
+            ValueRef::Text(b"a"),
+            ValueRef::Integer(1),
+        ];
+        let (v, used) = decode_node(&ty, &vals, true, &ValidatedSchema::default()).unwrap();
+        assert_eq!(used, 3);
+        assert_eq!(
+            v,
+            Val::Tuple(vec![int(1), Val::Tuple(vec![str("a"), bool(true)]),])
+        );
+    }
+
+    #[test]
+    fn fetch_optional_and_tuples() {
+        let schema = testdata::schema();
+        let backend = test_backend(&schema);
+        let sid = user_struct(&schema);
+        let rows = backend
+            .fetch(
+                sid,
+                &[
+                    user_field(&schema, sid, "id"),
+                    user_field(&schema, sid, "nickname"),
+                    user_field(&schema, sid, "pos"),
+                    user_field(&schema, sid, "home"),
+                ],
+                &FetchConstraints::EMPTY,
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 5);
+        assert_eq!(
+            rows[0].values,
+            vec![
+                int(1),
+                some(Val::Scalar(Scalar::String("A".to_string()))),
+                Val::Tuple(vec![float(1.5), float(-2.5)]),
+                some(Val::Tuple(vec![float(3.0), float(4.0)])),
+            ]
+        );
+        assert_eq!(
+            rows[1].values,
+            vec![
+                int(2),
+                Val::None,
+                Val::Tuple(vec![float(0.0), float(0.0)]),
+                Val::None,
+            ]
+        );
+    }
+
+    #[test]
+    fn fetch_partial_null_tuple_error() {
+        let schema = testdata::schema();
+        let backend = test_backend(&schema);
+        backend
+            .conn
+            .execute("UPDATE users SET hx = 3.0 WHERE id = 3", [])
+            .unwrap();
+        let sid = user_struct(&schema);
+        let err = backend
+            .fetch(
+                sid,
+                &[user_field(&schema, sid, "home")],
+                &FetchConstraints::EMPTY,
+            )
+            .unwrap_err();
+        assert!(matches!(err, ExecError::Integrity { .. }), "{err:?}");
+        assert!(err.to_string().contains("User.home"), "{err}");
+    }
+
+    #[test]
+    fn fetch_arrays_grouped_by_link_in_side_rowid_order() {
+        let schema = testdata::schema();
+        let backend = test_backend(&schema);
+        let sid = user_struct(&schema);
+        let rows = backend
+            .fetch(
+                sid,
+                &[
+                    user_field(&schema, sid, "id"),
+                    user_field(&schema, sid, "tags"),
+                    user_field(&schema, sid, "scores"),
+                    user_field(&schema, sid, "lucky"),
+                ],
+                &FetchConstraints::EMPTY,
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 5);
+        let str_list = |ss: &[&str]| Val::list(ss.iter().map(|s| str(s)).collect());
+        assert_eq!(
+            rows[0].values,
+            vec![
+                int(1),
+                str_list(&["a1", "a2"]),
+                Val::list(vec![
+                    Val::Tuple(vec![int(1), str("one")]),
+                    Val::Tuple(vec![int(2), str("two")]),
+                ]),
+                Val::list(vec![some(int(5)), Val::None]),
+            ]
+        );
+        assert_eq!(
+            rows[1].values,
+            vec![
+                int(2),
+                str_list(&["b2", "b1"]),
+                Val::list(vec![]),
+                Val::list(vec![]),
+            ]
+        );
+        assert_eq!(
+            rows[2].values,
+            vec![
+                int(3),
+                Val::list(vec![]),
+                Val::list(vec![]),
+                Val::list(vec![])
+            ]
+        );
+        assert_eq!(
+            rows[3].values,
+            vec![
+                int(4),
+                Val::list(vec![]),
+                Val::list(vec![Val::Tuple(vec![int(3), str("three")])]),
+                Val::list(vec![]),
+            ]
+        );
+        assert_eq!(
+            rows[4].values,
+            vec![
+                int(5),
+                str_list(&["a1", "a2"]),
+                Val::list(vec![]),
+                Val::list(vec![]),
+            ]
+        );
+    }
+
+    #[test]
+    fn fetch_nested_via_array() {
+        let schema = testdata::schema();
+        let backend = test_backend(&schema);
+        let sid = user_struct(&schema);
+        let rows = backend
+            .fetch(
+                sid,
+                &[user_field(&schema, sid, "matrix")],
+                &FetchConstraints::EMPTY,
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 5);
+        assert_eq!(
+            rows[0].values,
+            vec![Val::list(vec![
+                Val::list(vec![int(1), int(2)]),
+                Val::list(vec![]),
+            ])]
+        );
+        for row in &rows[1..] {
+            assert_eq!(row.values, vec![Val::list(vec![])]);
+        }
+    }
+
+    #[test]
+    fn fetch_deep_branched_via_array() {
+        let schema = testdata::schema();
+        let backend = test_backend(&schema);
+        let sid = user_struct(&schema);
+        let rows = backend
+            .fetch(
+                sid,
+                &[
+                    user_field(&schema, sid, "id"),
+                    user_field(&schema, sid, "deep_branches"),
+                ],
+                &FetchConstraints::EMPTY,
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 5);
+        assert_eq!(
+            rows[0].values,
+            vec![
+                int(1),
+                Val::list(vec![Val::Tuple(vec![
+                    Val::list(vec![Val::list(vec![int(1), int(2)]), Val::list(vec![])]),
+                    Val::list(vec![float(2.5)]),
+                    bool(true),
+                ])]),
+            ]
+        );
+        for row in &rows[1..] {
+            assert_eq!(row.values[1], Val::list(vec![]));
+        }
+    }
+
+    #[test]
+    fn fetch_tuple_embedded_array() {
+        let schema = testdata::schema();
+        let backend = test_backend(&schema);
+        let sid = user_struct(&schema);
+        let rows = backend
+            .fetch(
+                sid,
+                &[
+                    user_field(&schema, sid, "id"),
+                    user_field(&schema, sid, "extra"),
+                ],
+                &FetchConstraints::EMPTY,
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 5);
+        assert_eq!(
+            rows[0].values,
+            vec![
+                int(1),
+                Val::Tuple(vec![int(1), Val::list(vec![str("x"), str("y")])]),
+            ]
+        );
+        assert_eq!(
+            rows[1].values,
+            vec![int(2), Val::Tuple(vec![int(3), Val::list(vec![])])]
+        );
+        assert_eq!(
+            rows[2].values,
+            vec![int(3), Val::Tuple(vec![int(4), Val::list(vec![])])]
+        );
+        assert_eq!(
+            rows[3].values,
+            vec![int(4), Val::Tuple(vec![int(2), Val::list(vec![str("z")])])]
+        );
+        assert_eq!(
+            rows[4].values,
+            vec![int(5), Val::Tuple(vec![int(5), Val::list(vec![])])]
+        );
+    }
+
+    #[test]
+    fn fetch_optional_tuple_embedded_array() {
+        let schema = testdata::schema();
+        let backend = test_backend(&schema);
+        let sid = user_struct(&schema);
+        let rows = backend
+            .fetch(
+                sid,
+                &[
+                    user_field(&schema, sid, "id"),
+                    user_field(&schema, sid, "opt_extra"),
+                ],
+                &FetchConstraints::EMPTY,
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 5);
+        assert_eq!(
+            rows[0].values,
+            vec![
+                int(1),
+                some(Val::Tuple(vec![int(5), Val::list(vec![str("p")])])),
+            ]
+        );
+        assert_eq!(rows[1].values, vec![int(2), Val::None]);
+        assert_eq!(rows[2].values, vec![int(3), Val::None]);
+        assert_eq!(
+            rows[3].values,
+            vec![int(4), some(Val::Tuple(vec![int(7), Val::list(vec![])]))]
+        );
+        assert_eq!(rows[4].values, vec![int(5), Val::None]);
+    }
+
+    #[test]
+    fn fetch_enums_optional_array_tuple() {
+        let schema = testdata::schema();
+        let sid = testdata::struct_id(&schema, "Setting");
+        let priority = testdata::enum_id(&schema, "Priority");
+        let level = testdata::enum_id(&schema, "Level");
+        let fields = [
+            testdata::field_id(&schema, sid, "name"),
+            testdata::field_id(&schema, sid, "priority"),
+            testdata::field_id(&schema, sid, "level"),
+            testdata::field_id(&schema, sid, "fallback"),
+            testdata::field_id(&schema, sid, "history"),
+            testdata::field_id(&schema, sid, "pair"),
+        ];
+        let rows = test_backend(&schema)
+            .fetch(sid, &fields, &FetchConstraints::EMPTY)
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[0].values,
+            vec![
+                str("alpha"),
+                Val::Enum(priority, 2),
+                Val::Enum(level, 2),
+                some(Val::Enum(priority, 0)),
+                Val::list(vec![Val::Enum(priority, 0), Val::Enum(priority, 2)]),
+                Val::Tuple(vec![Val::Enum(priority, 2), Val::Enum(level, 2)]),
+            ]
+        );
+        assert_eq!(
+            rows[1].values,
+            vec![
+                str("beta"),
+                Val::Enum(priority, 0),
+                Val::Enum(level, 0),
+                Val::None,
+                Val::list(vec![Val::Enum(priority, 2)]),
+                Val::Tuple(vec![Val::Enum(priority, 0), Val::Enum(level, 0)]),
+            ]
+        );
+        assert_eq!(
+            rows[2].values,
+            vec![
+                str("gamma"),
+                Val::Enum(priority, 1),
+                Val::Enum(level, 1),
+                some(Val::Enum(priority, 1)),
+                Val::list(vec![]),
+                Val::Tuple(vec![Val::Enum(priority, 1), Val::Enum(level, 1)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn fetch_invalid_enum_value() {
+        let schema = testdata::schema();
+        let sid = testdata::struct_id(&schema, "Setting");
+        let priority = testdata::field_id(&schema, sid, "priority");
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        testdata::seed(&mut conn).unwrap();
+        conn.execute(
+            "UPDATE settings SET priority = 'urgent' WHERE name = 'alpha'",
+            [],
+        )
+        .unwrap();
+        let backend = SqliteBackend::new(conn, &schema).unwrap();
+        let err = backend
+            .fetch(sid, &[priority], &FetchConstraints::EMPTY)
+            .unwrap_err();
+        match err {
+            ExecError::Integrity { message } => {
+                assert!(message.contains("Priority"), "{message}");
+                assert!(message.contains("urgent"), "{message}");
+            }
+            other => panic!("expected integrity error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fetch_enum_mismatched_storage_class() {
+        let schema = testdata::schema();
+        let sid = testdata::struct_id(&schema, "Setting");
+        let level = testdata::field_id(&schema, sid, "level");
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        testdata::seed(&mut conn).unwrap();
+        conn.execute(
+            "UPDATE settings SET level = 'high' WHERE name = 'alpha'",
+            [],
+        )
+        .unwrap();
+        let backend = SqliteBackend::new(conn, &schema).unwrap();
+        let err = backend
+            .fetch(sid, &[level], &FetchConstraints::EMPTY)
+            .unwrap_err();
+        assert!(matches!(err, ExecError::Integrity { .. }), "{err:?}");
+        assert!(err.to_string().contains("expected Int"), "{err}");
+    }
+
+    #[test]
+    fn fetch_invalid_enum_array_value() {
+        let schema = testdata::schema();
+        let sid = testdata::struct_id(&schema, "Setting");
+        let history = testdata::field_id(&schema, sid, "history");
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        testdata::seed(&mut conn).unwrap();
+        conn.execute(
+            "UPDATE setting_history SET priority = 'urgent' WHERE setting_key = 700",
+            [],
+        )
+        .unwrap();
+        let backend = SqliteBackend::new(conn, &schema).unwrap();
+        let err = backend
+            .fetch(sid, &[history], &FetchConstraints::EMPTY)
+            .unwrap_err();
+        match err {
+            ExecError::Integrity { message } => {
+                assert!(message.contains("Priority"), "{message}");
+                assert!(message.contains("urgent"), "{message}");
+            }
+            other => panic!("expected integrity error, got {other:?}"),
+        }
     }
 }

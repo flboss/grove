@@ -1108,3 +1108,217 @@ impl<'conn, 'schema> WriteTxn for SqliteWriteTxn<'conn, 'schema> {
             .map_err(|err| SqliteBackend::storage_error("rollback write transaction", err))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sqlite::tests::*;
+    use crate::storage::{FetchConstraints, Storage};
+    use rusqlite::Connection;
+
+    fn write_schema() -> ValidatedSchema {
+        grove_schema::validate(
+            grove_schema::parse_schema(
+                r#"
+                    root items: Item;
+                    struct Item {
+                        id: Int,
+                        name: String,
+                        maybe: ?Int,
+                    }
+                    "#,
+            )
+            .0
+            .expect("invalid write schema"),
+        )
+        .0
+        .expect("invalid write schema")
+    }
+
+    fn write_item_fields(schema: &ValidatedSchema) -> (StructId, FieldId, FieldId, FieldId) {
+        let item = schema.roots[0].struct_id;
+        (
+            item,
+            schema.struct_field(item, "id").unwrap().0,
+            schema.struct_field(item, "name").unwrap().0,
+            schema.struct_field(item, "maybe").unwrap().0,
+        )
+    }
+
+    fn write_test_backend(schema: &ValidatedSchema) -> Result<SqliteBackend<'_>, rusqlite::Error> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch("CREATE TABLE items(id INTEGER, name TEXT, maybe INTEGER)")?;
+        Ok(SqliteBackend::new(conn, schema).expect("write test backend should pass verification"))
+    }
+
+    #[test]
+    fn write_txn_insert_commit_read() {
+        let schema = write_schema();
+        let backend = write_test_backend(&schema).unwrap();
+        let (item, id, name, maybe) = write_item_fields(&schema);
+
+        let mut txn = backend.begin_write().unwrap();
+        let key = txn
+            .insert_row(
+                item,
+                &[(id, int(1)), (name, str("alpha")), (maybe, Val::None)],
+            )
+            .unwrap();
+        txn.commit().unwrap();
+
+        let rows = backend
+            .fetch(item, &[id, name, maybe], &FetchConstraints::EMPTY)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].rowid, key);
+        assert_eq!(rows[0].values, vec![int(1), str("alpha"), Val::None]);
+    }
+
+    #[test]
+    fn write_txn_drop_rollback() {
+        let schema = write_schema();
+        let backend = write_test_backend(&schema).unwrap();
+        let (item, id, name, maybe) = write_item_fields(&schema);
+
+        let mut txn = backend.begin_write().unwrap();
+        txn.insert_row(
+            item,
+            &[(id, int(1)), (name, str("alpha")), (maybe, Val::None)],
+        )
+        .unwrap();
+        drop(txn);
+
+        let rows = backend
+            .fetch(item, &[id, name, maybe], &FetchConstraints::EMPTY)
+            .unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn write_txn_update_delete_batch_insert() {
+        let schema = write_schema();
+        let backend = write_test_backend(&schema).unwrap();
+        let (item, id, name, maybe) = write_item_fields(&schema);
+
+        let mut txn = backend.begin_write().unwrap();
+        let keys = txn
+            .insert_rows(
+                item,
+                &[
+                    vec![(id, int(1)), (name, str("alpha")), (maybe, Val::None)],
+                    vec![(id, int(2)), (name, str("beta")), (maybe, Val::None)],
+                ],
+            )
+            .unwrap();
+        assert_eq!(keys.len(), 2);
+
+        txn.update_row(item, keys[0], &[(name, str("gamma"))])
+            .unwrap();
+        txn.commit().unwrap();
+
+        let rows = backend
+            .fetch(item, &[id, name, maybe], &FetchConstraints::EMPTY)
+            .unwrap();
+        assert_eq!(rows[0].values, vec![int(1), str("gamma"), Val::None]);
+        assert_eq!(rows[1].values, vec![int(2), str("beta"), Val::None]);
+
+        let mut txn = backend.begin_write().unwrap();
+        txn.delete_rows(item, &keys).unwrap();
+        txn.commit().unwrap();
+
+        let rows = backend
+            .fetch(item, &[id, name, maybe], &FetchConstraints::EMPTY)
+            .unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn write_txn_readonly_connection_rejected() {
+        let schema = write_schema();
+        let path = std::env::temp_dir().join(format!(
+            "grove-write-txn-readonly-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE items(id INTEGER, name TEXT, maybe INTEGER)")
+                .unwrap();
+        }
+        let conn =
+            Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let backend = SqliteBackend::new(conn, &schema).unwrap();
+        assert!(matches!(
+            backend.begin_write(),
+            Err(ExecError::ReadOnly { .. })
+        ));
+        drop(backend);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_txn_delete_array_field_recursive() {
+        let schema = grove_schema::validate(
+            grove_schema::parse_schema(
+                "root rows: Row;
+                struct Row {
+                    id: Int,
+                    tags: List<String>@tags_ref via row_tags[row_key, tag],
+                    nums: List<Int>@nums_ref via row_nums[row_key, num],
+                    matrix: List<List<Int> via inner_nums[inner_key, val]>@matrix_ref
+                        via outer_nums[outer_key, inner_key],
+                    extra: (Int, List<String> via extra_tags[ekey, eval])@(eid, elink),
+                }",
+            )
+            .0
+            .unwrap(),
+        )
+        .0
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE rows(id INTEGER, tags_ref INTEGER, nums_ref INTEGER,
+                matrix_ref INTEGER, eid INTEGER, elink INTEGER);
+            CREATE TABLE row_tags(row_key INTEGER, tag TEXT);
+            CREATE TABLE row_nums(row_key INTEGER, num INTEGER);
+            CREATE TABLE outer_nums(outer_key INTEGER, inner_key INTEGER);
+            CREATE TABLE inner_nums(inner_key INTEGER, val INTEGER);
+            CREATE TABLE extra_tags(ekey INTEGER, eval TEXT);
+            INSERT INTO rows VALUES (1, 100, 110, 200, 7, 300);
+            INSERT INTO row_tags VALUES (100, 'a'), (100, 'b');
+            INSERT INTO row_nums VALUES (110, 1), (110, 2);
+            INSERT INTO outer_nums VALUES (200, 20);
+            INSERT INTO inner_nums VALUES (20, 1), (20, 2);
+            INSERT INTO extra_tags VALUES (300, 'x');",
+        )
+        .unwrap();
+        let backend = SqliteBackend::new(conn, &schema).unwrap();
+        let row = schema.roots[0].struct_id;
+        let tags = schema.struct_field(row, "tags").unwrap().0;
+        let nums = schema.struct_field(row, "nums").unwrap().0;
+        let matrix = schema.struct_field(row, "matrix").unwrap().0;
+        let extra = schema.struct_field(row, "extra").unwrap().0;
+
+        let mut txn = backend.begin_write().unwrap();
+        for field in [tags, nums, matrix, extra] {
+            txn.delete_array_field(field, &[Key(1)]).unwrap();
+        }
+        txn.commit().unwrap();
+
+        for table in [
+            "row_tags",
+            "row_nums",
+            "outer_nums",
+            "inner_nums",
+            "extra_tags",
+        ] {
+            let count: i64 = backend
+                .conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "{table}");
+        }
+    }
+}
