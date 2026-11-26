@@ -357,3 +357,348 @@ impl<'src> Parser<'src> {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::{BinaryOp, TypeName};
+    use crate::parse::tests::{codes, parse_ok};
+    use crate::parse_query;
+    use rust_decimal::dec;
+
+    #[test]
+    fn decimal_literal_expr() {
+        match parse_ok("1e10") {
+            Expr::Literal(lit) => {
+                let Literal::Dec(d) = lit.value else {
+                    panic!("expected Dec literal");
+                };
+                assert_eq!(d, dec!(1e10));
+            }
+            other => panic!("expected literal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn instant_literal_expr() {
+        match parse_ok("@now") {
+            Expr::Literal(lit) => assert_eq!(lit.value, Literal::Now),
+            other => panic!("expected literal, got {other:?}"),
+        }
+
+        match parse_ok("@2024-01-15") {
+            Expr::Literal(lit) => {
+                let Literal::Instant(_) = lit.value else {
+                    panic!("expected Instant literal");
+                };
+            }
+            other => panic!("expected literal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bytes_literal_expr() {
+        let src = r#"hex"DEAD_be ef""#;
+        match parse_ok(src) {
+            Expr::Literal(lit) => {
+                assert_eq!(lit.value, Literal::Bytes(vec![0xde, 0xad, 0xbe, 0xef]));
+                assert_eq!(lit.span.start, 0);
+                assert_eq!(lit.span.end, src.len());
+            }
+            other => panic!("expected literal, got {other:?}"),
+        }
+
+        match parse_ok(r#"b64"Zm9v""#) {
+            Expr::Literal(lit) => assert_eq!(lit.value, Literal::Bytes(b"foo".to_vec())),
+            other => panic!("expected literal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ident_expr() {
+        match parse_ok("users") {
+            Expr::Ident(name) => assert_eq!(name.value, "users"),
+            other => panic!("expected ident, got {other:?}"),
+        }
+        match parse_ok("prev") {
+            Expr::Ident(name) => assert_eq!(name.value, "prev"),
+            other => panic!("expected ident, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn grouping_parens_dropped() {
+        assert!(matches!(parse_ok("(42)"),
+            Expr::Literal(lit) if lit.value== Literal::Int(42),
+        ));
+        assert!(matches!(parse_ok("((true))"),
+            Expr::Literal(lit) if lit.value== Literal::Bool(true),
+        ));
+    }
+
+    #[test]
+    fn tuple_expr() {
+        match parse_ok("(1, 2)") {
+            Expr::Tuple { elements, .. } => {
+                assert_eq!(elements.len(), 2);
+                let Expr::Literal(lit) = &elements[0] else {
+                    panic!("expected literal");
+                };
+                assert_eq!(lit.value, Literal::Int(1));
+            }
+            other => panic!("expected tuple, got {other:?}"),
+        }
+        match parse_ok("(1, 2,)") {
+            Expr::Tuple { elements, .. } => assert_eq!(elements.len(), 2),
+            other => panic!("expected tuple, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn single_element_tuple() {
+        match parse_ok("(1,)") {
+            Expr::Tuple { elements, .. } => {
+                assert_eq!(elements.len(), 1);
+                let Expr::Literal(lit) = &elements[0] else {
+                    panic!("expected literal");
+                };
+                assert_eq!(lit.value, Literal::Int(1));
+            }
+            other => panic!("expected tuple, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unclosed_tuple() {
+        let (file, diags) = parse_query("(1, 2");
+        assert!(file.is_none());
+        assert_eq!(codes(&diags), vec!["QP0003"]);
+    }
+
+    #[test]
+    fn array_expr() {
+        match parse_ok("[]") {
+            Expr::Array { elements, .. } => assert!(elements.is_empty()),
+            other => panic!("expected array, got {other:?}"),
+        }
+        match parse_ok("[{ name = \"a\" }]") {
+            Expr::Array { elements, .. } => {
+                assert_eq!(elements.len(), 1);
+                let Expr::Struct { fields, .. } = &elements[0] else {
+                    panic!("expected struct literal");
+                };
+                assert_eq!(fields.len(), 1);
+                assert_eq!(fields[0].0.value, "name");
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unclosed_array() {
+        let (file, diags) = parse_query("[1, 2");
+        assert!(file.is_none());
+        assert_eq!(codes(&diags), vec!["QP0005"]);
+    }
+
+    #[test]
+    fn some_expr() {
+        match parse_ok("some(42)") {
+            Expr::Some { value, .. } => {
+                let Expr::Literal(lit) = &*value else {
+                    panic!("expected literal");
+                };
+                assert_eq!(lit.value, Literal::Int(42));
+            }
+            other => panic!("expected some, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_some_expr() {
+        let (file, diags) = parse_query("some 42");
+        assert!(file.is_none());
+        assert_eq!(codes(&diags), vec!["QP0006"]);
+
+        let (file, diags) = parse_query("some(42");
+        assert!(file.is_none());
+        assert_eq!(codes(&diags), vec!["QP0007"]);
+    }
+
+    #[test]
+    fn type_constants() {
+        match parse_ok("Int::MIN") {
+            Expr::TypeConstant { ty, name } => {
+                assert_eq!(ty.value, TypeName::Int);
+                assert_eq!(name.value, ConstantName::Min);
+            }
+            other => panic!("expected type constant, got {other:?}"),
+        }
+        match parse_ok("Float::MAX") {
+            Expr::TypeConstant { ty, name } => {
+                assert_eq!(ty.value, TypeName::Float);
+                assert_eq!(name.value, ConstantName::Max);
+            }
+            other => panic!("expected type constant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_type_constants() {
+        let (file, diags) = parse_query("Int FOO");
+        assert!(file.is_none());
+        assert_eq!(codes(&diags), vec!["QP0008"]);
+
+        let (file, diags) = parse_query("Int::FOO");
+        assert!(file.is_none());
+        assert_eq!(codes(&diags), vec!["QP0009"]);
+    }
+
+    #[test]
+    fn if_else_expr() {
+        let src = "if active { 1 } else if retired { 2 } else { 3 }";
+        match parse_ok(src) {
+            Expr::If {
+                arms,
+                default,
+                span,
+            } => {
+                assert_eq!(arms.len(), 2);
+                let Expr::Literal(lit) = &*default else {
+                    panic!("expected literal in else");
+                };
+                assert_eq!(lit.value, Literal::Int(3));
+                assert_eq!(span.start, 0);
+                assert_eq!(span.end, src.len());
+            }
+            other => panic!("expected if, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_else() {
+        let src = "if active { 1 }";
+        let (file, diags) = parse_query(src);
+        assert!(file.is_none());
+        assert_eq!(codes(&diags), vec!["QP0012"]);
+        let diag = &diags[0];
+        let label = &diag.labels[0];
+        assert_eq!(label.span.start, 0);
+        assert_eq!(label.span.end, src.len());
+    }
+
+    #[test]
+    fn malformed_if_blocks() {
+        let (file, diags) = parse_query("if active 1 else { 2 }");
+        assert!(file.is_none());
+        assert_eq!(codes(&diags), vec!["QP0010"]);
+
+        let (file, diags) = parse_query("if active { 1");
+        assert!(file.is_none());
+        assert_eq!(codes(&diags), vec!["QP0011"]);
+
+        let (file, diags) = parse_query("if active { 1 } else 2");
+        assert!(file.is_none());
+        assert_eq!(codes(&diags), vec!["QP0013"]);
+    }
+
+    #[test]
+    fn parenthesized_if_condition() {
+        match parse_ok("if (true) { 1 } else { 2 }") {
+            Expr::If { arms, .. } => {
+                let Expr::Literal(lit) = &arms[0].0 else {
+                    panic!("expected literal condition");
+                };
+                assert_eq!(lit.value, Literal::Bool(true));
+            }
+            other => panic!("expected if, got {other:?}"),
+        }
+        parse_ok("if ((true)) { 1 } else { 2 }");
+        let (file, diags) = parse_query("if (true { 1 } else { 2 }");
+        assert!(file.is_none());
+        assert_eq!(codes(&diags), vec!["QP0022", "QP0003"]);
+    }
+
+    #[test]
+    fn struct_literal_expr() {
+        match parse_ok("{ name = 1 }") {
+            Expr::Struct { fields, span } => {
+                assert_eq!(fields.len(), 1);
+                assert_eq!(fields[0].0.value, "name");
+                assert_eq!(span.start, 0);
+                assert_eq!(span.end, 12);
+            }
+            other => panic!("expected struct literal, got {other:?}"),
+        }
+
+        match parse_ok("if { name = 1 } { 2 } else { 3 }") {
+            Expr::If { arms, .. } => {
+                assert!(matches!(&arms[0].0, Expr::Struct { .. }));
+            }
+            other => panic!("expected if, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_struct_literal() {
+        let (file, diags) = parse_query("{ }");
+        assert!(file.is_none());
+        assert_eq!(codes(&diags), vec!["QP0014"]);
+
+        let (file, diags) = parse_query("{ name }");
+        assert!(file.is_none());
+        assert_eq!(codes(&diags), vec!["QP0015"]);
+
+        let (file, diags) = parse_query("{ name = }");
+        assert!(file.is_none());
+        assert_eq!(codes(&diags), vec!["QP0001"]);
+    }
+
+    #[test]
+    fn enum_variant_expr() {
+        let expr = parse_ok("Priority::High");
+        match expr {
+            Expr::EnumVariant {
+                enum_name,
+                variant,
+                span,
+            } => {
+                assert_eq!(enum_name.value, "Priority");
+                assert_eq!(variant.value, "High");
+                assert_eq!(span.start, 0);
+                assert_eq!(span.end, "Priority::High".len());
+            }
+            other => panic!("expected enum variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bare_ident_not_enum_variant() {
+        let expr = parse_ok("Priority");
+        assert!(matches!(expr, Expr::Ident(name) if name.value == "Priority"));
+    }
+
+    #[test]
+    fn enum_variant_missing_name() {
+        let (file, diags) = parse_query("Priority::");
+        assert!(file.is_none());
+        assert_eq!(codes(&diags), vec!["QP0030"]);
+    }
+
+    #[test]
+    fn if_condition_expr() {
+        match parse_ok("if x == 0 { 1 } else { 2 }") {
+            Expr::If { arms, .. } => {
+                assert!(matches!(&arms[0].0, Expr::Binary { op, .. } if op.value == BinaryOp::Eq));
+            }
+            other => panic!("expected if, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_recovery_array_elements() {
+        let (file, diags) = parse_query("[,]");
+        assert!(file.is_none());
+        assert_eq!(codes(&diags), vec!["QP0001"]);
+    }
+}

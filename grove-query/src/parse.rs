@@ -137,4 +137,102 @@ impl<'src> Parser<'src> {
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    use crate::ast::{Expr, TypeExpr};
+    use crate::{ParseOutcome, parse_query, parse_query_repl};
+    use grove_types::Diagnostic;
+
+    pub(super) fn codes(diags: &[Diagnostic]) -> Vec<&str> {
+        diags.iter().map(|d| d.code.as_ref()).collect()
+    }
+
+    pub(super) fn parse_ok(src: &str) -> Expr {
+        let (file, diags) = parse_query(src);
+        assert!(diags.is_empty(), "unexpected diags for `{src}`: {diags:?}");
+        file.expect("file should parse")
+            .into_statements_and_output()
+            .1
+            .expect("file should have output")
+    }
+
+    pub(super) fn cast_type(src: &str) -> TypeExpr {
+        match parse_ok(src) {
+            Expr::Cast { ty, .. } => ty.value,
+            other => panic!("expected cast, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_valid_without_output() {
+        let (file, diags) = parse_query("");
+        let file = file.expect("empty file should parse");
+        assert!(file.statements.is_empty());
+        assert!(file.output().is_none());
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn comment_valid_without_output() {
+        let (file, diags) = parse_query("// nothing here");
+        let file = file.expect("comment-only file should parse");
+        assert!(file.statements.is_empty());
+        assert!(file.output().is_none());
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn repl_parse_complete() {
+        for src in ["let x = 1;", "users", "users;", "let x = 1; x"] {
+            assert!(
+                matches!(parse_query_repl(src), ParseOutcome::Complete { .. }),
+                "expected complete parse for `{src}`"
+            );
+        }
+    }
+
+    #[test]
+    fn repl_parse_incomplete() {
+        for src in [
+            "users[",
+            "1 +",
+            "let x = 1",
+            "if true {",
+            "\"unclosed",
+            "/* unclosed",
+        ] {
+            assert!(
+                matches!(parse_query_repl(src), ParseOutcome::Incomplete { .. }),
+                "expected incomplete parse for `{src}`"
+            );
+        }
+    }
+
+    #[test]
+    fn repl_parse_invalid() {
+        for src in [";", "let x 1;", "42 \"leftover\""] {
+            assert!(
+                matches!(parse_query_repl(src), ParseOutcome::Invalid { .. }),
+                "expected invalid parse for `{src}`"
+            );
+        }
+    }
+
+    #[test]
+    fn error_recovery_projection_items() {
+        let (file, diags) = parse_query("users { orders { total }, 42 }");
+        assert!(file.is_none());
+        assert_eq!(codes(&diags), vec!["QP0022", "QP0002"]);
+    }
+
+    #[test]
+    fn error_recovery_synchronization_semicolon() {
+        let src = "users.sort(bad; 42";
+        let (file, diags) = parse_query(src);
+        assert!(file.is_none());
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == grove_types::Severity::Error)
+            .collect();
+        assert!(!errors.is_empty());
+    }
+}

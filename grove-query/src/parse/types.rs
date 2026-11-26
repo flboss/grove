@@ -183,3 +183,107 @@ impl<'src> Parser<'src> {
         Ok(Spanned::new(span, TypeExpr::Record { fields, span }))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parse::tests::{cast_type, codes};
+    use crate::parse_query;
+
+    #[test]
+    fn type_annotation_optional_list_tuple_record() {
+        assert!(matches!(
+            cast_type("none as ?String"),
+            TypeExpr::Optional { inner, .. }
+                if inner.value == TypeExpr::Scalar(TypeName::String)
+        ));
+        assert!(matches!(
+            cast_type("some(none) as ??String"),
+            TypeExpr::Optional { inner, .. }
+                if matches!(
+                    &inner.value,
+                    TypeExpr::Optional { inner, .. }
+                        if inner.value == TypeExpr::Scalar(TypeName::String)
+                )
+        ));
+        assert!(matches!(
+            cast_type("[] as List<Int>"),
+            TypeExpr::List { element, .. }
+                if element.value == TypeExpr::Scalar(TypeName::Int)
+        ));
+        assert!(matches!(
+            cast_type("(1,) as (Int)"),
+            TypeExpr::Tuple { ref elements, .. } if elements.len() == 1
+        ));
+        assert!(matches!(
+            cast_type("(1, \"\") as (Int, String)"),
+            TypeExpr::Tuple { ref elements, .. } if elements.len() == 2
+        ));
+
+        let record = cast_type("1 as {a: Int, b: List<String>,}");
+        let TypeExpr::Record { fields, .. } = record else {
+            panic!("expected record type");
+        };
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].0.value, "a");
+        assert_eq!(fields[0].1.value, TypeExpr::Scalar(TypeName::Int));
+        assert_eq!(fields[1].0.value, "b");
+        assert!(matches!(
+            fields[1].1.value,
+            TypeExpr::List { ref element, .. }
+                if element.value == TypeExpr::Scalar(TypeName::String)
+        ));
+    }
+
+    #[test]
+    fn type_annotation_complex() {
+        let ty = cast_type("[] as List<(?Int, List<Duration>, ??String, {a: Instant, d: Dec})>");
+        let TypeExpr::List { element, .. } = ty else {
+            panic!("expected list type");
+        };
+        let TypeExpr::Tuple { elements, .. } = element.value else {
+            panic!("expected tuple type");
+        };
+        assert_eq!(elements.len(), 4);
+        assert!(matches!(
+            elements[0].value,
+            TypeExpr::Optional { ref inner, .. }
+                if inner.value == TypeExpr::Scalar(TypeName::Int)
+        ));
+        assert!(matches!(
+            elements[1].value,
+            TypeExpr::List { ref element, .. }
+                if element.value == TypeExpr::Scalar(TypeName::Duration)
+        ));
+        assert!(matches!(
+            elements[2].value,
+            TypeExpr::Optional { ref inner, .. }
+                if matches!(&inner.value, TypeExpr::Optional { inner, .. }
+                    if inner.value == TypeExpr::Scalar(TypeName::String))
+        ));
+        assert!(matches!(
+            elements[3].value,
+            TypeExpr::Record { ref fields, .. } if fields.len() == 2
+        ));
+    }
+
+    #[test]
+    fn type_annotation_errors() {
+        for (source, code) in [
+            ("1 as", "QP0021"),
+            ("1 as ()", "QP0031"),
+            ("1 as {}", "QP0032"),
+            ("1 as {,}", "QP0033"),
+            ("1 as {a Int}", "QP0034"),
+            ("1 as {a: Int b: String}", "QP0035"),
+            ("1 as List Int", "QP0036"),
+            ("1 as List<Int", "QP0037"),
+            ("1 as {a: Int, a: String}", "QP0038"),
+            ("1 as (Int String)", "QP0003"),
+        ] {
+            let (file, diags) = parse_query(source);
+            assert!(file.is_none(), "source: {source}");
+            assert_eq!(codes(&diags), vec![code], "source: {source}");
+        }
+    }
+}

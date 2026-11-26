@@ -230,3 +230,686 @@ fn binary_op(kind: &TokenKind) -> Option<(BinaryOp, u8)> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::{Literal, TypeExpr, TypeName};
+    use crate::parse::tests::{cast_type, codes, parse_ok};
+    use crate::parse_query;
+
+    #[test]
+    fn method_call_no_args() {
+        let expr = parse_ok("users.len()");
+        assert!(matches!(expr, Expr::Method {
+                name: Spanned { value: ref n, .. },
+                args,
+                ..
+            } if n == "len" && args.is_empty()));
+    }
+
+    #[test]
+    fn tuple_access_single() {
+        let expr = parse_ok("pos.1");
+        assert!(matches!(
+            expr,
+            Expr::TupleAccess {
+                index: Spanned { value: 1, .. },
+                opt_depth: 0,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn tuple_access_chained() {
+        let expr = parse_ok("trio.2.1");
+        assert!(matches!(expr, Expr::TupleAccess {
+            base,
+            index: Spanned { value: 1, .. },
+            ..
+        } if matches!(base.as_ref(), Expr::TupleAccess {
+            index: Spanned { value: 2, .. },
+            ..
+        })));
+    }
+
+    #[test]
+    fn tuple_access_optional() {
+        let expr = parse_ok("t?.2");
+        assert!(matches!(
+            expr,
+            Expr::TupleAccess {
+                index: Spanned { value: 2, .. },
+                opt_depth: 1,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn optional_access_depths() {
+        assert!(matches!(
+            parse_ok("foo??.bar"),
+            Expr::Field { opt_depth: 2, .. }
+        ));
+        assert!(matches!(
+            parse_ok("foo???.0"),
+            Expr::TupleAccess { opt_depth: 3, .. }
+        ));
+        assert!(matches!(
+            parse_ok("foo????.map($ + 1)"),
+            Expr::Method { opt_depth: 4, .. }
+        ));
+
+        let Expr::Projection { items, .. } = parse_ok("users { manager??.name }") else {
+            panic!("expected projection");
+        };
+        assert!(matches!(&items[0].value, Expr::Field { opt_depth: 2, .. }));
+    }
+
+    #[test]
+    fn dollar_as_ident() {
+        let expr = parse_ok("[1, 2].filter($ > 0)");
+        let Expr::Method { args, .. } = expr else {
+            panic!("expected method");
+        };
+        assert_eq!(args.len(), 1);
+        assert!(matches!(&args[0].expr, Expr::Binary { lhs, .. }
+                if matches!(lhs.as_ref(), Expr::Ident(name) if name.value == "$")));
+    }
+
+    #[test]
+    fn method_call_with_args() {
+        let expr = parse_ok("user.sort_asc(name)");
+        assert!(matches!(expr, Expr::Method {
+                name: Spanned { value: ref n, .. },
+                args,
+                ..
+            } if n == "sort_asc" && args.len() == 1));
+    }
+
+    #[test]
+    fn method_call_sort_directions() {
+        let expr = parse_ok("user.sort(asc name, desc age)");
+        let Expr::Method { args, .. } = expr else {
+            panic!()
+        };
+        assert_eq!(args.len(), 2);
+        assert!(args[0].direction.is_some());
+        assert!(args[1].direction.is_some());
+    }
+
+    #[test]
+    fn bracket_filter_method_desugar() {
+        let expr = parse_ok("users[active]");
+        assert!(matches!(expr, Expr::Method {
+                name: Spanned { value: ref n, .. },
+                args,
+                ..
+            } if n == "filter" && args.len() == 1));
+    }
+
+    #[test]
+    fn unclosed_filter() {
+        let (file, diags) = parse_query("users[active");
+        assert!(file.is_none());
+        assert_eq!(codes(&diags), vec!["QP0019"]);
+    }
+
+    #[test]
+    fn as_cast() {
+        let expr = parse_ok("1 as Int");
+        assert!(matches!(
+            expr,
+            Expr::Cast {
+                ty: Spanned {
+                    value: TypeExpr::Scalar(TypeName::Int),
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn as_cast_bytes() {
+        let expr = parse_ok(r#""abc" as Bytes"#);
+        assert!(matches!(
+            expr,
+            Expr::Cast {
+                ty: Spanned {
+                    value: TypeExpr::Scalar(TypeName::Bytes),
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn as_fallible_cast() {
+        let expr = parse_ok("1 as? Int");
+        assert!(matches!(
+            expr,
+            Expr::Cast {
+                fallible: true,
+                ty: Spanned {
+                    value: TypeExpr::Scalar(TypeName::Int),
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn as_fallible_cast_greedy_question() {
+        let expr = parse_ok("1 as??Int");
+        assert!(matches!(
+            expr,
+            Expr::Cast {
+                fallible: true,
+                ty: Spanned {
+                    value: TypeExpr::Optional { .. },
+                    ..
+                },
+                ..
+            }
+        ));
+        let expr = parse_ok("1 as ?Int");
+        assert!(matches!(
+            expr,
+            Expr::Cast {
+                fallible: false,
+                ty: Spanned {
+                    value: TypeExpr::Optional { .. },
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn enum_variant_cast_to_string() {
+        let expr = parse_ok("Priority::High as String");
+        assert!(matches!(
+            expr,
+            Expr::Cast {
+                expr,
+                ty: Spanned {
+                    value: TypeExpr::Scalar(TypeName::String),
+                    ..
+                },
+                ..
+            } if matches!(expr.as_ref(), Expr::EnumVariant { .. })
+        ));
+    }
+
+    #[test]
+    fn as_cast_named_type() {
+        let expr = parse_ok("1 as Something");
+        assert!(matches!(
+            expr,
+            Expr::Cast {
+                ty: Spanned {
+                    value: TypeExpr::Named(name),
+                    ..
+                },
+                ..
+            } if name == "Something"
+        ));
+    }
+
+    #[test]
+    fn as_cast_scalars_and_named() {
+        for (source, name) in [
+            ("1 as Int", TypeName::Int),
+            ("1 as Float", TypeName::Float),
+            ("1 as Dec", TypeName::Dec),
+            ("1 as String", TypeName::String),
+            ("1 as Bytes", TypeName::Bytes),
+            ("1 as Bool", TypeName::Bool),
+            ("1 as Instant", TypeName::Instant),
+            ("1 as Duration", TypeName::Duration),
+        ] {
+            assert_eq!(
+                cast_type(source),
+                TypeExpr::Scalar(name),
+                "source: {source}"
+            );
+        }
+        assert_eq!(cast_type("1 as User"), TypeExpr::Named("User".to_string()));
+    }
+
+    #[test]
+    fn missing_ident_after_dot() {
+        let (_, diags) = parse_query("user.");
+        assert_eq!(codes(&diags), vec!["QP0017"]);
+    }
+
+    #[test]
+    fn postfixes() {
+        let expr = parse_ok("users[x].sort(asc name).take(5) { total }");
+        let Expr::Projection { base, items, .. } = expr else {
+            panic!("expected projection");
+        };
+        assert!(items.len() == 1);
+        let Expr::Method { base, name, .. } = *base else {
+            panic!("expected method call");
+        };
+        assert_eq!(name.value, "take");
+        let Expr::Method {
+            base, name, args, ..
+        } = *base
+        else {
+            panic!("expected method call");
+        };
+        assert_eq!(name.value, "sort");
+        assert_eq!(
+            **args.first().unwrap().direction.as_ref().unwrap(),
+            SortDir::Asc
+        );
+        let Expr::Method {
+            base, name, args, ..
+        } = *base
+        else {
+            panic!("expected filter");
+        };
+        assert_eq!(name.value, "filter");
+        assert!(matches!(args.first().unwrap().expr, Expr::Ident(_)));
+        assert!(matches!(*base, Expr::Ident(_)));
+    }
+
+    #[test]
+    fn unary_neg() {
+        match parse_ok("-1") {
+            Expr::Unary { op, expr, .. } => {
+                assert_eq!(op.value, UnaryOp::Neg);
+                assert!(matches!(*expr, Expr::Literal(lit)
+                    if lit.value == Literal::Int(1)
+                ));
+            }
+            other => panic!("expected unary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unary_not() {
+        match parse_ok("!true") {
+            Expr::Unary { op, expr, .. } => {
+                assert_eq!(op.value, UnaryOp::Not);
+                assert!(matches!(*expr, Expr::Literal(lit)
+                    if lit.value == Literal::Bool(true)
+                ));
+            }
+            other => panic!("expected unary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn double_unary_neg() {
+        match parse_ok("--1") {
+            Expr::Unary { op, expr, .. } => {
+                assert_eq!(op.value, UnaryOp::Neg);
+                match *expr {
+                    Expr::Unary { op, expr, .. } => {
+                        assert_eq!(op.value, UnaryOp::Neg);
+                        assert!(matches!(*expr, Expr::Literal(lit)
+                            if lit.value == Literal::Int(1)
+                        ));
+                    }
+                    other => panic!("expected inner unary, got {other:?}"),
+                }
+            }
+            other => panic!("expected unary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn row_ref() {
+        match parse_ok("&users") {
+            Expr::RowRef { expr, .. } => {
+                assert!(matches!(*expr, Expr::Ident(name) if name.value == "users"));
+            }
+            other => panic!("expected row ref, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn row_ref_precedence_over_postfix_chain() {
+        match parse_ok("&users.first()") {
+            Expr::RowRef { expr, .. } => match *expr {
+                Expr::Method { base, name, .. } => {
+                    assert_eq!(name.value, "first");
+                    assert!(matches!(*base, Expr::Ident(name) if name.value == "users"));
+                }
+                other => panic!("expected method inside row ref, got {other:?}"),
+            },
+            other => panic!("expected row ref, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn row_ref_logical_and() {
+        match parse_ok("&a&&&b") {
+            Expr::Binary { op, lhs, rhs, .. } => {
+                assert_eq!(op.value, BinaryOp::And);
+                assert!(matches!(*lhs, Expr::RowRef { .. }));
+                assert!(matches!(*rhs, Expr::RowRef { .. }));
+            }
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_add() {
+        match parse_ok("1 + 2") {
+            Expr::Binary { op, lhs, rhs, .. } => {
+                assert_eq!(op.value, BinaryOp::Add);
+                assert!(matches!(*lhs, Expr::Literal(lit) if lit.value == Literal::Int(1)));
+                assert!(matches!(*rhs, Expr::Literal(lit) if lit.value == Literal::Int(2)));
+            }
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_sub() {
+        match parse_ok("1 - 2") {
+            Expr::Binary { op, .. } => assert_eq!(op.value, BinaryOp::Sub),
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_mul() {
+        match parse_ok("1 * 2") {
+            Expr::Binary { op, .. } => assert_eq!(op.value, BinaryOp::Mul),
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_div() {
+        match parse_ok("1 / 2") {
+            Expr::Binary { op, .. } => assert_eq!(op.value, BinaryOp::Div),
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_rem() {
+        match parse_ok("1 % 2") {
+            Expr::Binary { op, .. } => assert_eq!(op.value, BinaryOp::Rem),
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_mod() {
+        match parse_ok("1 mod 2") {
+            Expr::Binary { op, .. } => assert_eq!(op.value, BinaryOp::Mod),
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_eq() {
+        match parse_ok("a == b") {
+            Expr::Binary { op, .. } => assert_eq!(op.value, BinaryOp::Eq),
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_ne() {
+        match parse_ok("a != b") {
+            Expr::Binary { op, .. } => assert_eq!(op.value, BinaryOp::Ne),
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_lt() {
+        match parse_ok("a < b") {
+            Expr::Binary { op, .. } => assert_eq!(op.value, BinaryOp::Lt),
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_gt() {
+        match parse_ok("a > b") {
+            Expr::Binary { op, .. } => assert_eq!(op.value, BinaryOp::Gt),
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_le() {
+        match parse_ok("a <= b") {
+            Expr::Binary { op, .. } => assert_eq!(op.value, BinaryOp::Le),
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_ge() {
+        match parse_ok("a >= b") {
+            Expr::Binary { op, .. } => assert_eq!(op.value, BinaryOp::Ge),
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_and() {
+        match parse_ok("a && b") {
+            Expr::Binary { op, .. } => assert_eq!(op.value, BinaryOp::And),
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_or() {
+        match parse_ok("a || b") {
+            Expr::Binary { op, .. } => assert_eq!(op.value, BinaryOp::Or),
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_in() {
+        match parse_ok("a in (1, 2)") {
+            Expr::Binary { op, lhs, rhs, .. } => {
+                assert_eq!(op.value, BinaryOp::In);
+                assert!(matches!(*lhs, Expr::Ident(_)));
+                assert!(matches!(*rhs, Expr::Tuple { .. }));
+            }
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mul_add_precedence() {
+        match parse_ok("1 + 2 * 3") {
+            Expr::Binary { op, lhs, rhs, .. } => {
+                assert_eq!(op.value, BinaryOp::Add);
+                assert!(matches!(*lhs, Expr::Literal(lit) if lit.value == Literal::Int(1)));
+                match *rhs {
+                    Expr::Binary { op, lhs, rhs, .. } => {
+                        assert_eq!(op.value, BinaryOp::Mul);
+                        assert!(matches!(*lhs, Expr::Literal(lit) if lit.value == Literal::Int(2)));
+                        assert!(matches!(*rhs, Expr::Literal(lit) if lit.value == Literal::Int(3)));
+                    }
+                    other => panic!("expected mul, got {other:?}"),
+                }
+            }
+            other => panic!("expected add, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn left_associativity() {
+        match parse_ok("1 - 2 + 3") {
+            Expr::Binary { op, lhs, .. } => {
+                assert_eq!(op.value, BinaryOp::Add);
+                match *lhs {
+                    Expr::Binary { op, lhs, rhs, .. } => {
+                        assert_eq!(op.value, BinaryOp::Sub);
+                        assert!(matches!(*lhs, Expr::Literal(lit) if lit.value == Literal::Int(1)));
+                        assert!(matches!(*rhs, Expr::Literal(lit) if lit.value == Literal::Int(2)));
+                    }
+                    other => panic!("expected sub, got {other:?}"),
+                }
+            }
+            other => panic!("expected add, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parens_override_precedence() {
+        match parse_ok("(1 + 2) * 3") {
+            Expr::Binary { op, lhs, rhs, .. } => {
+                assert_eq!(op.value, BinaryOp::Mul);
+                match *lhs {
+                    Expr::Binary { op, .. } => {
+                        assert_eq!(op.value, BinaryOp::Add);
+                    }
+                    other => panic!("expected add, got {other:?}"),
+                }
+                assert!(matches!(*rhs, Expr::Literal(lit) if lit.value == Literal::Int(3)));
+            }
+            other => panic!("expected mul, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cast_binary_precedence() {
+        match parse_ok("1 + 2 as Int") {
+            Expr::Binary { op, lhs, rhs, .. } => {
+                assert_eq!(op.value, BinaryOp::Add);
+                assert!(matches!(*lhs, Expr::Literal(lit) if lit.value == Literal::Int(1)));
+                assert!(matches!(*rhs, Expr::Cast { .. }));
+            }
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unary_binary_precedence() {
+        match parse_ok("1 + -2") {
+            Expr::Binary { op, rhs, .. } => {
+                assert_eq!(op.value, BinaryOp::Add);
+                assert!(matches!(*rhs, Expr::Unary { op, .. } if op.value == UnaryOp::Neg));
+            }
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mixed_precedence() {
+        match parse_ok("1 + 2 * 3 <= 4.0 as Int - 5 / 6 % 7") {
+            Expr::Binary { op, lhs, rhs, .. } => {
+                assert_eq!(op.value, BinaryOp::Le);
+                match *lhs {
+                    Expr::Binary { op, lhs, rhs, .. } => {
+                        assert_eq!(op.value, BinaryOp::Add);
+                        assert!(matches!(*lhs, Expr::Literal(lit) if lit.value == Literal::Int(1)));
+                        match *rhs {
+                            Expr::Binary { op, .. } => assert_eq!(op.value, BinaryOp::Mul),
+                            other => panic!("expected mul, got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected add, got {other:?}"),
+                }
+                match *rhs {
+                    Expr::Binary { op, lhs, rhs, .. } => {
+                        assert_eq!(op.value, BinaryOp::Sub);
+                        match *lhs {
+                            Expr::Cast { ty, .. } => {
+                                assert_eq!(ty.value, TypeExpr::Scalar(TypeName::Int))
+                            }
+                            other => panic!("expected cast, got {other:?}"),
+                        }
+                        match *rhs {
+                            Expr::Binary { op, lhs, rhs, .. } => {
+                                assert_eq!(op.value, BinaryOp::Rem);
+                                match *lhs {
+                                    Expr::Binary { op, lhs, rhs, .. } => {
+                                        assert_eq!(op.value, BinaryOp::Div);
+                                        assert!(
+                                            matches!(*lhs, Expr::Literal(lit) if lit.value == Literal::Int(5))
+                                        );
+                                        assert!(
+                                            matches!(*rhs, Expr::Literal(lit) if lit.value == Literal::Int(6))
+                                        );
+                                    }
+                                    other => panic!("expected cast, got {other:?}"),
+                                }
+                                assert!(
+                                    matches!(*rhs, Expr::Literal(lit) if lit.value == Literal::Int(7))
+                                );
+                            }
+                            other => panic!("expected mul, got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected sub, got {other:?}"),
+                }
+            }
+            other => panic!("expected le, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_missing_rhs() {
+        let (file, diags) = parse_query("1 +");
+        assert!(file.is_none());
+        assert_eq!(codes(&diags), vec!["QP0001"]);
+    }
+
+    #[test]
+    fn binary_missing_lhs() {
+        let (file, diags) = parse_query("+ 1");
+        assert!(file.is_none());
+        assert_eq!(codes(&diags), vec!["QP0001"]);
+    }
+
+    #[test]
+    fn unary_neg_binary_sub() {
+        match parse_ok("a - -b") {
+            Expr::Binary { op, rhs, .. } => {
+                assert_eq!(op.value, BinaryOp::Sub);
+                assert!(matches!(*rhs, Expr::Unary { op, .. } if op.value == UnaryOp::Neg));
+            }
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn comparison_precedence() {
+        let expr = parse_ok("a < b && c >= d");
+        assert!(matches!(expr, Expr::Binary { op, .. } if op.value == BinaryOp::And));
+        match parse_ok("a < b && c >= d") {
+            Expr::Binary { op, lhs, rhs, .. } => {
+                assert_eq!(op.value, BinaryOp::And);
+                assert!(matches!(*lhs, Expr::Binary { op, .. } if op.value == BinaryOp::Lt));
+                assert!(matches!(*rhs, Expr::Binary { op, .. } if op.value == BinaryOp::Ge));
+            }
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_recovery_method_args() {
+        let (_, diags) = parse_query("users.sort(asc , asc )");
+        assert_eq!(codes(&diags), vec!["QP0001", "QP0001"]);
+    }
+
+    #[test]
+    fn error_recovery_synchronization_comma() {
+        let (_, diags) = parse_query("users.sort(name, , age)");
+        assert_eq!(codes(&diags), vec!["QP0001"]);
+    }
+}

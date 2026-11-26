@@ -123,3 +123,102 @@ impl<'src> Parser<'src> {
         Ok(expr)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parse::tests::{codes, parse_ok};
+    use crate::parse_query;
+
+    #[test]
+    fn empty_projection() {
+        let expr = parse_ok("users { }");
+        assert!(matches!(expr, Expr::Projection { items, .. } if items.is_empty()));
+    }
+
+    #[test]
+    fn projection_plain_fields() {
+        let expr = parse_ok("users { name, email }");
+        assert!(matches!(expr, Expr::Projection { items, .. }
+            if items.len() == 2 && items.iter().all(|i| i.alias.is_none())
+        ));
+    }
+
+    #[test]
+    fn projection_aliased_computed() {
+        let expr = parse_ok("users { total = some(1) }");
+        let Expr::Projection { items, .. } = expr else {
+            panic!()
+        };
+        assert_eq!(items.len(), 1);
+        assert!(items[0].alias.is_some());
+    }
+
+    #[test]
+    fn projection_nested_aliased() {
+        let expr = parse_ok("users { orders = orders { total } }");
+        let Expr::Projection { items, .. } = expr else {
+            panic!()
+        };
+        assert_eq!(items.len(), 1);
+        assert!(items[0].alias.is_some());
+    }
+
+    #[test]
+    fn projection_spread_only() {
+        let expr = parse_ok("users { ... }");
+        assert!(matches!(
+            expr,
+            Expr::Projection {
+                items,
+                spread: Some(_),
+                ..
+            } if items.is_empty()
+        ));
+    }
+
+    #[test]
+    fn projection_spread_last() {
+        let expr = parse_ok("users { name, ..., }");
+        let Expr::Projection {
+            items,
+            spread: Some(_),
+            ..
+        } = expr
+        else {
+            panic!("expected projection with spread");
+        };
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].alias, None);
+    }
+
+    #[test]
+    fn projection_spread_not_last() {
+        for source in ["users { ..., name }", "users { name, ..., age, }"] {
+            let (file, diags) = parse_query(source);
+            assert!(file.is_none(), "source: {source}");
+            assert_eq!(codes(&diags), vec!["QP0040"], "source: {source}");
+        }
+    }
+
+    #[test]
+    fn projection_nested_missing_alias() {
+        let (file, diags) = parse_query("users { orders { total } }");
+        assert!(file.is_none());
+        assert_eq!(codes(&diags), vec!["QP0022", "QP0002"]);
+    }
+
+    #[test]
+    fn unclosed_projection() {
+        let (file, diags) = parse_query("users { name");
+        assert!(file.is_none());
+        assert_eq!(codes(&diags), vec!["QP0020"]);
+    }
+
+    #[test]
+    fn error_recovery_comma_projection() {
+        let (file, diags) = parse_query("users { , name }");
+        assert!(file.is_none());
+        assert_eq!(codes(&diags), vec!["QP0022"]);
+    }
+}
