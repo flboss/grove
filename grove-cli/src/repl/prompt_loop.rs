@@ -167,3 +167,68 @@ pub(super) fn history_path() -> Option<PathBuf> {
         })?;
     Some(base.join("grove").join("history"))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use grove_exec::{ExecOptions, ExecSession, SqliteBackend};
+    use grove_query::TypeBindings;
+    use grove_schema::ValidatedSchema;
+
+    use crate::args::ConnectionSpec;
+    use crate::repl::ReplSession;
+    use crate::repl::tests::*;
+
+    #[test]
+    fn prompt_sqlite_backend_aligned_continuation() {
+        let schema = ValidatedSchema::default();
+        let backend = SqliteBackend::open_in_memory(&schema).expect("backend");
+        let spec = ConnectionSpec::Sqlite {
+            file: PathBuf::from("/tmp/db.sqlite3"),
+            readonly: false,
+        };
+        let mut settings = settings();
+        let mut turn = 0;
+
+        let session = ReplSession {
+            schema: &schema,
+            spec: &spec,
+            schema_path: PathBuf::from("/tmp/schema.gschema"),
+            exec: ExecSession::new(&backend, &schema),
+            types: TypeBindings::new(),
+            settings: &mut settings,
+            exec_options: ExecOptions::default(),
+            turn: &mut turn,
+        };
+
+        let (full, continuation) = session.prompts();
+        assert_eq!(full, "grove schema.gschema SQLite: db.sqlite3 > ");
+        assert_eq!(full.find('>'), continuation.find('>'));
+    }
+
+    #[test]
+    fn prompt_file_names_truncated() {
+        let schema = ValidatedSchema::default();
+        let backend = SqliteBackend::open_in_memory(&schema).expect("backend");
+        let spec = ConnectionSpec::Memory;
+        let mut settings = settings();
+        let mut turn = 0;
+        let long_schema = std::env::temp_dir().join(format!("{}-schema.gschema", "x".repeat(40)));
+        let session = ReplSession {
+            schema: &schema,
+            spec: &spec,
+            schema_path: long_schema,
+            exec: ExecSession::new(&backend, &schema),
+            types: TypeBindings::new(),
+            settings: &mut settings,
+            exec_options: ExecOptions::default(),
+            turn: &mut turn,
+        };
+
+        let (full, _) = session.prompts();
+        assert!(full.contains("in-memory"), "{full}");
+        assert!(full.contains('…'), "{full}");
+        assert!(!full.contains(&"x".repeat(40)), "{full}");
+    }
+}

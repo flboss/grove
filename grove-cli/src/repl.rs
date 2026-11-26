@@ -10,11 +10,9 @@ use crate::error::{CliError, CliResult, EXIT_COMPILE};
 
 mod execute;
 mod meta;
-mod session;
-#[cfg(test)]
-mod tests;
+mod prompt_loop;
 
-use self::session::history_path;
+use self::prompt_loop::history_path;
 
 #[derive(Debug)]
 enum ReplOutcome {
@@ -164,4 +162,67 @@ fn print_banner(spec: &ConnectionSpec, schema_path: &Path) {
         schema_path.display()
     );
     println!("Type \".help\" for a list of commands.");
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use grove_exec::SqliteBackend;
+    use grove_exec::{ExecOptions, ExecSession};
+    use grove_query::TypeBindings;
+    use grove_schema::ValidatedSchema;
+
+    use super::{ReplSession, ReplSettings};
+    use crate::args::{ColorChoice, ConnectionSpec, Format, OutputArgs};
+
+    pub(super) fn settings() -> ReplSettings {
+        ReplSettings {
+            output: OutputArgs {
+                format: Format::Auto,
+                color: ColorChoice::Never,
+                width: Some(80),
+                max_rows: 0,
+                max_depth: 6,
+                max_cell_width: 40,
+                full: false,
+                no_headers: false,
+                hide_refs: false,
+                output: None,
+                stats: false,
+            },
+            stats: false,
+        }
+    }
+
+    pub(super) fn spec() -> ConnectionSpec {
+        ConnectionSpec::Sqlite {
+            file: PathBuf::from("<test>"),
+            readonly: false,
+        }
+    }
+
+    pub(super) fn session<'a>(
+        schema: &'a ValidatedSchema,
+        spec: &'a ConnectionSpec,
+        backend: &'a SqliteBackend<'a>,
+        settings: &'a mut ReplSettings,
+        turn: &'a mut usize,
+    ) -> ReplSession<'a> {
+        ReplSession {
+            schema,
+            spec,
+            schema_path: PathBuf::from("<test>"),
+            exec: ExecSession::new(backend, schema),
+            types: TypeBindings::new(),
+            settings,
+            exec_options: ExecOptions {
+                pushdown: true,
+                materialize_lets: true,
+                read_only: false,
+                debug_rollback: false,
+            },
+            turn,
+        }
+    }
 }
