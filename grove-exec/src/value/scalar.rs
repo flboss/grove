@@ -116,3 +116,48 @@ impl Scalar {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::cmp::Ordering;
+    use std::hash::DefaultHasher;
+
+    use rust_decimal::dec;
+
+    use super::*;
+
+    #[test]
+    fn scalar_display() {
+        assert_eq!(Scalar::Int(-7).to_string(), "-7");
+        assert_eq!(Scalar::Float(1.0).to_string(), "1.0f");
+        assert_eq!(Scalar::Float(1.5).to_string(), "1.5f");
+        assert_eq!(Scalar::Bool(true).to_string(), "true");
+        assert_eq!(Scalar::String("a\"b".to_string()).to_string(), "\"a\\\"b\"");
+        assert_eq!(Scalar::Dec(dec!(30.00)).to_string(), "30.00");
+        assert_eq!(Scalar::Bytes(Vec::new()).to_string(), "hex\"\"");
+        assert_eq!(
+            Scalar::Bytes(vec![0x00, 0x01, 0xde, 0xff]).to_string(),
+            "hex\"0001deff\""
+        );
+    }
+
+    #[test]
+    fn scalar_bytes_compare_hash() {
+        let span = Span::new(0, 0);
+        let a = Scalar::Bytes(vec![0x01]);
+        let b = Scalar::Bytes(vec![0x02]);
+
+        assert_eq!(a.cmp(&b, span), Ok(Ordering::Less));
+        assert_eq!(a.eq(&a), Some(true));
+        assert_eq!(a.eq(&b), Some(false));
+        assert_eq!(a.eq(&Scalar::String("01".to_string())), None);
+
+        let hash = |value: &Scalar| {
+            let mut hasher = DefaultHasher::new();
+            value.hash(&mut hasher);
+            hasher.finish()
+        };
+        assert_eq!(hash(&a), hash(&a.clone()));
+        assert_ne!(hash(&a), hash(&Scalar::String("01".to_string())));
+    }
+}

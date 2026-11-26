@@ -209,3 +209,87 @@ impl<'a> IntoIterator for &'a mut ListVal {
         self.items.iter_mut()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::eval::harness::{int, rec};
+    use crate::testdata;
+
+    #[test]
+    fn record_eq_order_independent() {
+        assert_eq!(
+            rec(vec![("b", int(2)), ("a", int(1))]).eq(&rec(vec![("a", int(1)), ("b", int(2))])),
+            Some(true)
+        );
+        assert_eq!(
+            rec(vec![("b", int(2)), ("a", int(1))]).eq(&rec(vec![("a", int(9)), ("b", int(2))])),
+            Some(false)
+        );
+        assert_eq!(
+            rec(vec![("b", int(2)), ("a", int(1))]).eq(&rec(vec![("a", int(1)), ("c", int(2))])),
+            None
+        );
+        assert_eq!(
+            rec(vec![("a", int(1))]).eq(&rec(vec![("a", int(1)), ("b", int(2))])),
+            None
+        );
+        assert_eq!(
+            rec(vec![
+                ("outer", rec(vec![("y", int(2)), ("x", int(1))])),
+                ("z", int(3))
+            ])
+            .eq(&rec(vec![
+                ("z", int(3)),
+                ("outer", rec(vec![("x", int(1)), ("y", int(2))]))
+            ])),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn value_equality_unaffected_by_origin() {
+        let schema = testdata::schema();
+        let user = testdata::struct_id(&schema, "User");
+        let orders = testdata::field_id(&schema, user, "orders");
+        let fields = vec![(Rc::from("x"), int(1))];
+        let origin = RowOrigin {
+            struct_id: user,
+            key: Key(7),
+        };
+        assert_eq!(Val::record_at(fields.clone(), origin), Val::record(fields));
+        assert_eq!(
+            Val::list_at(
+                vec![int(1)],
+                CollectionOrigin::Ref {
+                    field: orders,
+                    parent: origin,
+                },
+            ),
+            Val::list(vec![int(1)])
+        );
+    }
+
+    #[test]
+    fn row_ref_value() {
+        let schema = testdata::schema();
+        let user = testdata::struct_id(&schema, "User");
+        let origin = RowOrigin {
+            struct_id: user,
+            key: Key(7),
+        };
+        let other = RowOrigin {
+            struct_id: user,
+            key: Key(8),
+        };
+        let value = Val::RowRef(origin);
+
+        assert_eq!(value.to_string(), format!("&Struct#{}@7", user.index()));
+        assert_eq!(value.formatter(&schema).to_string(), "&User#7");
+        assert_eq!(value.row_ref_origin(), Some(&origin));
+        assert_eq!(value.row_origin(), None);
+        assert_eq!(value.eq(&Val::RowRef(origin)), Some(true));
+        assert_eq!(value.eq(&Val::RowRef(other)), Some(false));
+        assert!(value.contains_ref());
+    }
+}

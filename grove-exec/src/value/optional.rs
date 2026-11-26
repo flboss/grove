@@ -29,3 +29,29 @@ pub(crate) fn unwrap_optional_depth(
     }
     Ok((value, peeled))
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::eval::harness::{int, some};
+
+    use super::*;
+
+    #[test]
+    fn option_display() {
+        assert_eq!(Val::None.to_string(), "none");
+        assert_eq!(some(int(3)).to_string(), "some(3)");
+        assert_eq!(some(some(int(3))).to_string(), "some(some(3))");
+    }
+
+    #[test]
+    fn optional_depth_helpers() {
+        let value = some(some(int(1)));
+        assert_eq!(unwrap_optional_depth(value, 2).unwrap(), (int(1), 2));
+        assert_eq!(
+            unwrap_optional_depth(some(Val::None), 2).unwrap(),
+            (Val::None, 1)
+        );
+        assert_eq!(rewrap_optional(2, int(1)), some(some(int(1))));
+        assert_eq!(rewrap_optional(1, Val::None), some(Val::None));
+    }
+}

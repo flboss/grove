@@ -200,4 +200,27 @@ pub(crate) fn enum_variant_scalar(enum_def: &Enum, index: usize) -> Option<Scala
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    use super::*;
+    use crate::eval::harness::{int, some};
+
+    #[test]
+    fn enum_equality() {
+        let high = Val::Enum(EnumId::new(0), 1);
+        assert_eq!(high.eq(&Val::Enum(EnumId::new(0), 1)), Some(true));
+        assert_eq!(high.eq(&Val::Enum(EnumId::new(0), 0)), Some(false));
+        assert_eq!(high.eq(&Val::Enum(EnumId::new(1), 1)), None);
+    }
+
+    #[test]
+    fn interner_record_field_names() {
+        let mut interner = Interner::default();
+        let a = interner.intern("a");
+        let b = interner.intern("b");
+        assert!(Rc::ptr_eq(&a, &interner.intern("a")));
+        assert!(!Rc::ptr_eq(&a, &b));
+        assert_eq!(interner.names.len(), 2);
+        let record = Val::record(vec![(a, int(2)), (b, some(int(3)))]);
+        assert_eq!(record.to_string(), "{a: 2, b: some(3)}");
+    }
+}
