@@ -178,4 +178,66 @@ impl<'src> Lexer<'src> {
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    use super::*;
+
+    macro_rules! assert_token {
+        ($lexer:expr, $kind:pat) => {
+            let tok = $lexer.next_token();
+            assert!(
+                matches!(tok.value, $kind),
+                "expected token kind {}, got {:?}",
+                stringify!($kind),
+                tok.value,
+            );
+        };
+    }
+
+    macro_rules! assert_ident {
+        ($lexer:expr, $name:expr) => {
+            let tok = $lexer.next_token();
+            match tok.value {
+                TokenKind::Ident(s) => assert_eq!(s, $name),
+                ref other => panic!("expected Ident({}), got {:?}", $name, other),
+            }
+        };
+    }
+
+    macro_rules! assert_eof {
+        ($lexer:expr) => {
+            assert_token!($lexer, TokenKind::Eof);
+        };
+    }
+
+    pub(super) use assert_eof;
+    pub(super) use assert_ident;
+    pub(super) use assert_token;
+
+    pub(super) fn drain(lex: &mut Lexer) {
+        while !matches!(lex.next_token().value, TokenKind::Eof) {}
+    }
+
+    #[test]
+    fn empty_input() {
+        let mut lex = Lexer::new("");
+        assert_eof!(lex);
+        assert!(lex.take_diagnostics().is_empty());
+    }
+
+    #[test]
+    fn invalid_char_error() {
+        let mut lex = Lexer::new("a \0 b");
+        assert_ident!(lex, "a");
+        assert_ident!(lex, "b");
+        assert_eq!(lex.take_diagnostics().len(), 1);
+    }
+
+    #[test]
+    fn span_offsets() {
+        let mut lex = Lexer::new("  foo  ");
+        let tok = lex.next_token();
+        assert_eq!(tok.span.start, 2);
+        assert_eq!(tok.span.end, 5);
+        assert!(matches!(tok.value, TokenKind::Ident(_)));
+    }
+}

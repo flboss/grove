@@ -194,3 +194,138 @@ impl<'src> Lexer<'src> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lex::tests::{assert_eof, assert_ident, assert_token};
+
+    #[test]
+    fn backtick_ident_escaped_keywords() {
+        let mut lex = Lexer::new("`prev` `true` `foo` `let`");
+        assert_ident!(lex, "prev");
+        assert_ident!(lex, "true");
+        assert_ident!(lex, "foo");
+        assert_ident!(lex, "let");
+        assert_eof!(lex);
+    }
+
+    #[test]
+    fn unclosed_backtick() {
+        let mut lex = Lexer::new("`prev");
+        assert_ident!(lex, "prev");
+        assert_eq!(lex.take_diagnostics().len(), 1);
+    }
+
+    #[test]
+    fn string_literal() {
+        let mut lex = Lexer::new(r#""hello world""#);
+        let tok = lex.next_token();
+        assert_eq!(tok.value, TokenKind::StringLit("hello world".into()));
+        assert_eof!(lex);
+    }
+
+    #[test]
+    fn string_escapes() {
+        let mut lex = Lexer::new(r#""a\n\t\r\\\"\0""#);
+        let tok = lex.next_token();
+        assert_eq!(tok.value, TokenKind::StringLit("a\n\t\r\\\"\0".into()));
+        assert!(lex.take_diagnostics().is_empty());
+    }
+
+    #[test]
+    fn string_hex_unicode_escapes() {
+        let mut lex = Lexer::new(r#""\x41\u{1F600}""#);
+        let tok = lex.next_token();
+        assert_eq!(tok.value, TokenKind::StringLit("A\u{1F600}".into()));
+        assert!(lex.take_diagnostics().is_empty());
+    }
+
+    #[test]
+    fn unclosed_string() {
+        let mut lex = Lexer::new(r#""hello"#);
+        let tok = lex.next_token();
+        assert_eq!(tok.value, TokenKind::StringLit("hello".into()));
+        assert_eq!(lex.take_diagnostics().len(), 1);
+    }
+
+    #[test]
+    fn string_across_lines_error() {
+        let mut lex = Lexer::new("\"abc\ndef\"");
+        let tok = lex.next_token();
+        assert_eq!(tok.value, TokenKind::StringLit("abc".into()));
+        assert_eq!(lex.take_diagnostics().len(), 1);
+    }
+
+    #[test]
+    fn non_ascii_hex_escape_error() {
+        let mut lex = Lexer::new(r#""\x80""#);
+        let tok = lex.next_token();
+        assert_eq!(tok.value, TokenKind::StringLit("".into()));
+        assert_eq!(lex.take_diagnostics().len(), 1);
+    }
+
+    #[test]
+    fn invalid_hex_escape_error() {
+        let mut lex = Lexer::new(r#""\xG1""#);
+        let tok = lex.next_token();
+        assert_eq!(tok.value, TokenKind::StringLit("G1".into()));
+        assert_eq!(lex.take_diagnostics().len(), 1);
+    }
+
+    #[test]
+    fn unknown_escape_error() {
+        let mut lex = Lexer::new(r#""\z""#);
+        let tok = lex.next_token();
+        assert_eq!(tok.value, TokenKind::StringLit("".into()));
+        assert_eq!(lex.take_diagnostics().len(), 1);
+    }
+
+    #[test]
+    fn unicode_escape_empty() {
+        let mut lex = Lexer::new(r#""\u{}""#);
+        let tok = lex.next_token();
+        assert_eq!(tok.value, TokenKind::StringLit("".into()));
+        assert_eq!(lex.take_diagnostics().len(), 1);
+    }
+
+    #[test]
+    fn unicode_escape_missing_lbrace() {
+        let mut lex = Lexer::new(r#""\u41""#);
+        let tok = lex.next_token();
+        assert_eq!(tok.value, TokenKind::StringLit("41".into()));
+        assert_eq!(lex.take_diagnostics().len(), 1);
+    }
+
+    #[test]
+    fn unicode_escape_invalid_digit() {
+        let mut lex = Lexer::new(r#""\u{41x}""#);
+        let tok = lex.next_token();
+        assert_eq!(tok.value, TokenKind::StringLit("".into()));
+        assert_eq!(lex.take_diagnostics().len(), 1);
+    }
+
+    #[test]
+    fn unicode_escape_too_many_digits() {
+        let mut lex = Lexer::new(r#""\u{1234567}""#);
+        let tok = lex.next_token();
+        assert_eq!(tok.value, TokenKind::StringLit("".into()));
+        assert_eq!(lex.take_diagnostics().len(), 1);
+    }
+
+    #[test]
+    fn unicode_escape_out_of_range() {
+        let mut lex = Lexer::new(r#""\u{110000}""#);
+        let tok = lex.next_token();
+        assert_eq!(tok.value, TokenKind::StringLit("".into()));
+        assert_eq!(lex.take_diagnostics().len(), 1);
+    }
+
+    #[test]
+    fn unicode_escape_surrogate() {
+        let mut lex = Lexer::new(r#""\u{D800}""#);
+        let tok = lex.next_token();
+        assert_eq!(tok.value, TokenKind::StringLit("".into()));
+        assert_eq!(lex.take_diagnostics().len(), 1);
+    }
+}

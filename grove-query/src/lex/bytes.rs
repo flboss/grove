@@ -218,3 +218,92 @@ fn base64_value(ch: char) -> Option<u8> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lex::tests::{assert_eof, assert_ident, assert_token};
+
+    #[test]
+    fn hex_bytes_literals() {
+        for (src, expected) in [
+            (
+                r#"hex"0E2E 4A68 795B 3D1F""#,
+                vec![0x0e, 0x2e, 0x4a, 0x68, 0x79, 0x5b, 0x3d, 0x1f],
+            ),
+            (r#"hex"DE AD_BE EF""#, vec![0xde, 0xad, 0xbe, 0xef]),
+            (r#"hex"""#, Vec::new()),
+        ] {
+            let mut lex = Lexer::new(src);
+            assert_eq!(
+                lex.next_token().value,
+                TokenKind::BytesLit(expected),
+                "for `{src}`"
+            );
+            assert!(lex.take_diagnostics().is_empty(), "for `{src}`");
+        }
+    }
+
+    #[test]
+    fn base64_bytes_literals() {
+        for (src, expected) in [
+            (r#"b64"Zg==""#, b"f".to_vec()),
+            (r#"b64"Zm8=""#, b"fo".to_vec()),
+            (r#"b64"Zm9v""#, b"foo".to_vec()),
+            (r#"b64"3q2+_7w==""#, vec![0xde, 0xad, 0xbe, 0xef]),
+            (r#"b64" Z m 8 = ""#, b"fo".to_vec()),
+            (r#"b64"IGhlbGxvLA==""#, b" hello,".to_vec()),
+            (r#"b64"""#, Vec::new()),
+        ] {
+            let mut lex = Lexer::new(src);
+            assert_eq!(
+                lex.next_token().value,
+                TokenKind::BytesLit(expected),
+                "for `{src}`"
+            );
+            assert!(lex.take_diagnostics().is_empty(), "for `{src}`");
+        }
+    }
+
+    #[test]
+    fn bytes_prefix_immediate() {
+        let mut lex = Lexer::new(r#"hex "41" b64 "Zg==" hexdata b64x"#);
+        assert_ident!(lex, "hex");
+        assert_eq!(lex.next_token().value, TokenKind::StringLit("41".into()));
+        assert_ident!(lex, "b64");
+        assert_eq!(lex.next_token().value, TokenKind::StringLit("Zg==".into()));
+        assert_ident!(lex, "hexdata");
+        assert_ident!(lex, "b64x");
+        assert_eof!(lex);
+        assert!(lex.take_diagnostics().is_empty());
+    }
+
+    #[test]
+    fn bytes_literal_errors() {
+        for (src, expected) in [
+            (r#"hex"0g""#, "QL0041"),
+            (r#"hex"abc""#, "QL0042"),
+            (r#"hex"de"#, "QL0040"),
+            (r#"b64"Z-""#, "QL0040"),
+            (r#"b64"Zg""#, "QL0044"),
+            (r#"b64"Zg===""#, "QL0044"),
+            (r#"b64"Z=g=""#, "QL0044"),
+            (r#"b64"Zh==""#, "QL0045"),
+            (r#"b64"Zm9=""#, "QL0045"),
+            (r#"b64"Zg=="#, "QL0040"),
+        ] {
+            let mut lex = Lexer::new(src);
+            assert_eq!(lex.next_token().value, TokenKind::BytesLit(Vec::new()));
+            let diags = lex.take_diagnostics();
+            let codes: Vec<&str> = diags.iter().map(|d| d.code.as_ref()).collect();
+            assert_eq!(codes, vec![expected], "for `{src}`");
+        }
+    }
+
+    #[test]
+    fn bytes_literal_single_line() {
+        let mut lex = Lexer::new("hex\"41\n\"");
+        assert_eq!(lex.next_token().value, TokenKind::BytesLit(Vec::new()));
+        assert_eq!(lex.take_diagnostics().len(), 1);
+    }
+}

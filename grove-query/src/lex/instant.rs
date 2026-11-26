@@ -377,3 +377,290 @@ impl<'src> Lexer<'src> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lex::tests::{assert_eof, assert_ident, assert_token, drain};
+
+    fn utc(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32, ns: u32) -> DateTime<Utc> {
+        let date = NaiveDate::from_ymd_opt(y, mo, d).unwrap();
+        let time = NaiveTime::from_hms_nano_opt(h, mi, s, ns).unwrap();
+        DateTime::<Utc>::from_naive_utc_and_offset(date.and_time(time), Utc)
+    }
+
+    fn assert_instant(src: &str, expected: DateTime<Utc>) {
+        let mut lex = Lexer::new(src);
+        let tok = lex.next_token();
+        assert_eq!(tok.value, TokenKind::InstantLit(expected), "for `{src}`");
+        assert_eof!(lex);
+        assert!(lex.take_diagnostics().is_empty(), "for `{src}`");
+    }
+
+    fn assert_instant_error(src: &str, code: &str, start: usize, end: usize) {
+        let mut lex = Lexer::new(src);
+        drain(&mut lex);
+        let diags = lex.take_diagnostics();
+        assert_eq!(diags.len(), 1, "for `{src}`");
+        assert_eq!(&diags[0].code[..], code, "for `{src}`");
+        assert_eq!(
+            diags[0].labels[0].span,
+            Span::new(start, end),
+            "for `{src}`"
+        );
+    }
+
+    #[test]
+    fn instant_date_forms() {
+        assert_instant("@2026", utc(2026, 1, 1, 0, 0, 0, 0));
+        assert_instant("@2026-02", utc(2026, 2, 1, 0, 0, 0, 0));
+        assert_instant("@2026-02-16", utc(2026, 2, 16, 0, 0, 0, 0));
+        assert_instant("@2026-02-16_14:30", utc(2026, 2, 16, 14, 30, 0, 0));
+        assert_instant("@2026-02-16_14:30:00", utc(2026, 2, 16, 14, 30, 0, 0));
+        assert_instant(
+            "@2026-02-16_14:30:00.123456789",
+            utc(2026, 2, 16, 14, 30, 0, 123456789),
+        );
+        assert_instant(
+            "@2026-02-16_14:30:00.5",
+            utc(2026, 2, 16, 14, 30, 0, 500000000),
+        );
+    }
+
+    #[test]
+    fn instant_leap_year() {
+        assert_instant("@2024-02-29", utc(2024, 2, 29, 0, 0, 0, 0));
+    }
+
+    #[test]
+    fn instant_year_time() {
+        assert_instant("@2024_14:30", utc(2024, 1, 1, 14, 30, 0, 0));
+    }
+
+    #[test]
+    fn instant_negative_and_long_years() {
+        assert_instant("@-0044", utc(-44, 1, 1, 0, 0, 0, 0));
+        assert_instant("@-10000", utc(-10000, 1, 1, 0, 0, 0, 0));
+        assert_instant("@20240", utc(20240, 1, 1, 0, 0, 0, 0));
+        assert_instant("@-2024-01-15", utc(-2024, 1, 15, 0, 0, 0, 0));
+    }
+
+    #[test]
+    fn instant_named_forms() {
+        let mut lex = Lexer::new("@now @today");
+        assert_token!(lex, TokenKind::Now);
+        let tok = lex.next_token();
+        assert_eq!(tok.value, TokenKind::Today(None));
+        assert_eof!(lex);
+    }
+
+    #[test]
+    fn instant_today_with_time() {
+        let mut lex = Lexer::new("@today_08:52:00.000");
+        let tok = lex.next_token();
+        let expect = NaiveTime::from_hms_opt(8, 52, 0).unwrap();
+        assert_eq!(tok.value, TokenKind::Today(Some(expect)));
+        assert_eof!(lex);
+        assert!(lex.take_diagnostics().is_empty());
+    }
+
+    #[test]
+    fn instant_unix_epoch() {
+        assert_instant(
+            "@unix_1767225600",
+            DateTime::<Utc>::from_timestamp(1767225600, 0).unwrap(),
+        );
+    }
+
+    #[test]
+    fn instant_unix_fraction() {
+        assert_instant(
+            "@unix_1767225600.123",
+            DateTime::<Utc>::from_timestamp(1767225600, 123000000).unwrap(),
+        );
+    }
+
+    #[test]
+    fn instant_unix_signed() {
+        assert_instant(
+            "@unix_-123.456",
+            DateTime::<Utc>::from_timestamp(-123, 456000000).unwrap(),
+        );
+        assert_instant(
+            "@unix_+123",
+            DateTime::<Utc>::from_timestamp(123, 0).unwrap(),
+        );
+    }
+
+    #[test]
+    fn instant_stops_at_method_dot() {
+        let mut lex = Lexer::new("@now.year() @2024-01-15.year()");
+        assert_token!(lex, TokenKind::Now);
+        assert_token!(lex, TokenKind::Dot);
+        assert_ident!(lex, "year");
+        assert_token!(lex, TokenKind::LParen);
+        assert_token!(lex, TokenKind::RParen);
+        let tok = lex.next_token();
+        assert_eq!(
+            tok.value,
+            TokenKind::InstantLit(utc(2024, 1, 15, 0, 0, 0, 0))
+        );
+        assert_token!(lex, TokenKind::Dot);
+        assert_ident!(lex, "year");
+        assert_token!(lex, TokenKind::LParen);
+        assert_token!(lex, TokenKind::RParen);
+        assert_eof!(lex);
+        assert!(lex.take_diagnostics().is_empty());
+    }
+
+    #[test]
+    fn instant_invalid_month() {
+        let mut lex = Lexer::new("@2026-13");
+        drain(&mut lex);
+        assert_eq!(lex.take_diagnostics().len(), 1);
+    }
+
+    #[test]
+    fn instant_invalid_day() {
+        assert_instant_error("@2024-02-30", "QL0026", 9, 11);
+        assert_instant_error("@2023-02-29", "QL0026", 9, 11);
+        assert_instant_error("@2024-01-00", "QL0026", 9, 11);
+    }
+
+    #[test]
+    fn instant_year_out_of_range() {
+        assert_instant_error("@300000-01-01", "QL0024", 1, 7);
+        assert_instant_error("@262143-06-15", "QL0024", 1, 7);
+        assert_instant_error("@-300000-06-15", "QL0024", 2, 8);
+        assert_instant_error("@-262144-01-01", "QL0024", 2, 8);
+    }
+
+    #[test]
+    fn instant_year_range_boundaries() {
+        use chrono::Datelike;
+        let (lo, hi) = (NaiveDate::MIN.year(), NaiveDate::MAX.year());
+        assert_instant(&format!("@{hi}-12-31"), utc(hi, 12, 31, 0, 0, 0, 0));
+        assert_instant(&format!("@{lo}-01-01"), utc(lo, 1, 1, 0, 0, 0, 0));
+        let over = format!("@{}-01-01", hi + 1);
+        assert_instant_error(&over, "QL0024", 1, 1 + (hi + 1).to_string().len());
+        let under = format!("@{}-01-01", lo - 1);
+        let digits = (lo - 1).unsigned_abs().to_string().len();
+        assert_instant_error(&under, "QL0024", 2, 2 + digits);
+    }
+
+    #[test]
+    fn instant_invalid_hour() {
+        let mut lex = Lexer::new("@2026-10-20_25:00");
+        drain(&mut lex);
+        assert_eq!(lex.take_diagnostics().len(), 1);
+    }
+
+    #[test]
+    fn instant_invalid_minute() {
+        let mut lex = Lexer::new("@2026-10-20_12:60");
+        drain(&mut lex);
+        assert_eq!(lex.take_diagnostics().len(), 1);
+    }
+
+    #[test]
+    fn instant_invalid_second() {
+        let mut lex = Lexer::new("@2026-10-20_14:30:60");
+        drain(&mut lex);
+        assert_eq!(lex.take_diagnostics().len(), 1);
+    }
+
+    #[test]
+    fn instant_missing_time_colon() {
+        let mut lex = Lexer::new("@2026-10-20_1430");
+        drain(&mut lex);
+        assert_eq!(lex.take_diagnostics().len(), 1);
+    }
+
+    #[test]
+    fn instant_invalid_name() {
+        let mut lex = Lexer::new("@foo");
+        drain(&mut lex);
+        assert_eq!(lex.take_diagnostics().len(), 1);
+    }
+
+    #[test]
+    fn instant_name_with_suffix() {
+        let mut lex = Lexer::new("@todayx");
+        drain(&mut lex);
+        assert_eq!(lex.take_diagnostics().len(), 1);
+    }
+
+    #[test]
+    fn instant_unix_missing_seconds() {
+        let mut lex = Lexer::new("@unix_");
+        drain(&mut lex);
+        assert_eq!(lex.take_diagnostics().len(), 1);
+    }
+
+    #[test]
+    fn instant_unix_overflow() {
+        let mut lex = Lexer::new("@unix_99999999999999999999");
+        drain(&mut lex);
+        assert_eq!(lex.take_diagnostics().len(), 1);
+    }
+
+    #[test]
+    fn instant_stray_suffix() {
+        let mut lex = Lexer::new("@2024x");
+        drain(&mut lex);
+        assert_eq!(lex.take_diagnostics().len(), 1);
+    }
+
+    #[test]
+    fn instant_short_year() {
+        let mut lex = Lexer::new("@202 @-1");
+        drain(&mut lex);
+        assert_eq!(lex.take_diagnostics().len(), 2);
+    }
+
+    #[test]
+    fn instant_fraction_rounded_with_carry() {
+        let mut lex = Lexer::new("@2026-10-16_14:30:00.9999999995");
+        let tok = lex.next_token();
+        assert_eq!(
+            tok.value,
+            TokenKind::InstantLit(utc(2026, 10, 16, 14, 30, 1, 0))
+        );
+        let diags = lex.take_diagnostics();
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].severity, grove_types::Severity::Warning);
+    }
+
+    #[test]
+    fn instant_fraction_rounding_day_rollover() {
+        let mut lex = Lexer::new("@2026-10-16_23:59:59.9999999995");
+        let tok = lex.next_token();
+        assert_eq!(
+            tok.value,
+            TokenKind::InstantLit(utc(2026, 10, 17, 0, 0, 0, 0))
+        );
+        assert_eq!(lex.take_diagnostics().len(), 1);
+    }
+
+    #[test]
+    fn instant_fraction_bankers_half_even() {
+        let mut lex = Lexer::new("@2026-10-16_14:30:00.1234567885");
+        let tok = lex.next_token();
+        assert_eq!(
+            tok.value,
+            TokenKind::InstantLit(utc(2026, 10, 16, 14, 30, 0, 123456788))
+        );
+        assert_eq!(lex.take_diagnostics().len(), 1);
+    }
+
+    #[test]
+    fn instant_unix_fraction_rounding_carry() {
+        let mut lex = Lexer::new("@unix_1.9999999995");
+        let tok = lex.next_token();
+        assert_eq!(
+            tok.value,
+            TokenKind::InstantLit(DateTime::<Utc>::from_timestamp(2, 0).unwrap())
+        );
+        assert_eq!(lex.take_diagnostics().len(), 1);
+    }
+}
