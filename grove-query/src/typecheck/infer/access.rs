@@ -104,3 +104,160 @@ pub(crate) fn element_ty(ty: &QueryType) -> QueryType {
         _ => QueryType::Unknown,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::typecheck::infer::infer;
+    use crate::typecheck::tests::{enum_schema, infer_ok, test_schema};
+    use grove_schema::validated::ScalarType;
+
+    #[test]
+    fn field_access_struct_list() {
+        assert_eq!(
+            infer_ok("users.name", &test_schema()).ty,
+            QueryType::List(Box::new(QueryType::Scalar(ScalarType::String)))
+        );
+    }
+
+    #[test]
+    fn field_access_unknown_field() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _diags) = crate::parse_query("users.unknown");
+        let result = infer(file.unwrap().output().unwrap(), &mut env);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn field_access_optional_value() {
+        assert!(
+            matches!(infer_ok("users.profile", &test_schema()).ty, QueryType::List(inner) if matches!(*inner, QueryType::Optional(_)))
+        );
+    }
+
+    #[test]
+    fn field_access_enum_value() {
+        let schema = enum_schema();
+        let priority_id = schema.enum_by_name("Priority").unwrap().0;
+        assert_eq!(
+            infer_ok("tickets.first().unwrap().priority", &schema).ty,
+            QueryType::Enum(priority_id)
+        );
+    }
+
+    #[test]
+    fn optional_field_access() {
+        assert_eq!(
+            infer_ok("users[age % 5 == 0].first()?.age", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Int).wrap_optional()
+        );
+    }
+
+    #[test]
+    fn deep_optional_tuple_access() {
+        assert_eq!(
+            infer_ok("some(some((1, 2)))??.1", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Int)
+                .wrap_optional()
+                .wrap_optional()
+        );
+    }
+
+    #[test]
+    fn deep_optional_field_and_method() {
+        assert_eq!(
+            infer_ok(
+                r#"some(some({name = "Ada"}))??.name??.to_upper()"#,
+                &test_schema()
+            )
+            .ty,
+            QueryType::Scalar(ScalarType::String)
+                .wrap_optional()
+                .wrap_optional()
+        );
+    }
+
+    #[test]
+    fn tuple_access() {
+        let schema = test_schema();
+        assert_eq!(
+            infer_ok("(\"a\", 1).0", &schema).ty,
+            QueryType::Scalar(ScalarType::String)
+        );
+        assert_eq!(
+            infer_ok("(\"a\", 1).1", &schema).ty,
+            QueryType::Scalar(ScalarType::Int)
+        );
+    }
+
+    #[test]
+    fn tuple_access_chained() {
+        assert_eq!(
+            infer_ok("((\"a\", 1), 2).0.1", &test_schema()).ty,
+            QueryType::Scalar(ScalarType::Int)
+        );
+    }
+
+    #[test]
+    fn tuple_access_optional() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _diags) = crate::parse_query("(\"a\", 1)?.0");
+        assert!(infer(file.unwrap().output().unwrap(), &mut env).is_err());
+    }
+
+    #[test]
+    fn tuple_access_out_of_range() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        for query in ["(\"a\", 1).2", "(\"a\", 1).1000"] {
+            let (file, _diags) = crate::parse_query(query);
+            assert!(
+                infer(file.unwrap().output().unwrap(), &mut env).is_err(),
+                "{query}"
+            );
+        }
+    }
+
+    #[test]
+    fn tuple_access_on_non_tuple() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        for query in ["\"a\".0", "users.0", "[1, 2].0"] {
+            let (file, _diags) = crate::parse_query(query);
+            assert!(
+                infer(file.unwrap().output().unwrap(), &mut env).is_err(),
+                "{query}"
+            );
+        }
+    }
+
+    #[test]
+    fn tuple_access_optional_tuple() {
+        assert_eq!(
+            infer_ok("[(\"a\", 1)].first()?.0", &test_schema()).ty,
+            QueryType::Optional(Box::new(QueryType::Scalar(ScalarType::String)))
+        );
+    }
+
+    #[test]
+    fn tuple_access_optional_schema_field() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        assert!(matches!(
+            infer_ok("users { x = maybe_pos?.0 }", &schema).ty,
+            QueryType::List(_)
+        ));
+        let (file, _diags) = crate::parse_query("users { x = maybe_pos.0 }");
+        assert!(infer(file.unwrap().output().unwrap(), &mut env).is_err());
+    }
+
+    #[test]
+    fn tuple_access_over_scope() {
+        assert!(matches!(
+            infer_ok("users { x = (\"a\", age).1 }", &test_schema()).ty,
+            QueryType::List(_)
+        ));
+    }
+}

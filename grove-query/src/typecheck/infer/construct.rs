@@ -165,3 +165,230 @@ pub(crate) fn projection_base_fields(ty: &QueryType, schema: &ValidatedSchema) -
         _ => Vec::new(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::typecheck::tests::{enum_schema, infer_ok, projected_fields, test_schema};
+    use grove_schema::validated::ScalarType;
+
+    #[test]
+    fn projection_basic() {
+        assert!(matches!(
+            infer_ok("users { name, age }", &test_schema()).ty,
+            QueryType::List(inner)
+            if matches!(
+                *inner,
+                QueryType::Record(RecordSource::Projection(ref fields))
+                if fields.len() == 2
+            )
+        ));
+    }
+
+    #[test]
+    fn projection_single_field() {
+        let result = infer_ok("users { name }", &test_schema());
+        match &result.ty {
+            QueryType::List(inner) => match inner.as_ref() {
+                QueryType::Record(RecordSource::Projection(fields)) => {
+                    assert_eq!(fields.len(), 1);
+                    assert_eq!(fields[0].name, "name");
+                    assert_eq!(fields[0].ty, QueryType::Scalar(ScalarType::String));
+                }
+                other => panic!("expected Record, got {other:?}"),
+            },
+            other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn projection_computed_field() {
+        let result = infer_ok(
+            "users { name, adult = users.first().unwrap().age > 18 }",
+            &test_schema(),
+        );
+        match &result.ty {
+            QueryType::List(inner) => match inner.as_ref() {
+                QueryType::Record(RecordSource::Projection(fields)) => {
+                    assert_eq!(fields.len(), 2);
+                    assert_eq!(fields[0].name, "name");
+                    assert_eq!(fields[1].name, "adult");
+                    assert_eq!(fields[1].ty, QueryType::Scalar(ScalarType::Bool));
+                }
+                other => panic!("expected Record, got {other:?}"),
+            },
+            other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn projection_spread_all_fields() {
+        let result = infer_ok("users { ... }", &test_schema());
+        assert_eq!(
+            projected_fields(result).0,
+            [
+                "name",
+                "age",
+                "score",
+                "balance",
+                "active",
+                "created",
+                "profile",
+                "maybe_pos",
+            ]
+        );
+    }
+
+    #[test]
+    fn projection_spread_existing_preserved() {
+        let result = infer_ok("users { active, ... }", &test_schema());
+        assert_eq!(
+            projected_fields(result).0,
+            [
+                "active",
+                "name",
+                "age",
+                "score",
+                "balance",
+                "created",
+                "profile",
+                "maybe_pos",
+            ]
+        );
+    }
+
+    #[test]
+    fn projection_spread_matched_by_name() {
+        let result = infer_ok("users { n = name, ... }", &test_schema());
+        assert_eq!(
+            projected_fields(result).0,
+            [
+                "n",
+                "name",
+                "age",
+                "score",
+                "balance",
+                "active",
+                "created",
+                "profile",
+                "maybe_pos",
+            ]
+        );
+
+        let result = infer_ok("users { name = 1, ... }", &test_schema());
+        let fields = projected_fields(result);
+        assert_eq!(fields.0[0], "name");
+        assert_eq!(fields.1[0], QueryType::Scalar(ScalarType::Int));
+        assert_eq!(
+            fields.0,
+            [
+                "name",
+                "age",
+                "score",
+                "balance",
+                "active",
+                "created",
+                "profile",
+                "maybe_pos",
+            ]
+        );
+    }
+
+    #[test]
+    fn projection_spread_chained_projection() {
+        let result = infer_ok("users { name, age } { age, ... }", &test_schema());
+        assert_eq!(projected_fields(result).0, ["age", "name"]);
+    }
+
+    #[test]
+    fn projection_spread_literal() {
+        let result = infer_ok("{ a = 1, b = 2 } { b, ... }", &test_schema());
+        assert_eq!(projected_fields(result).0, ["b", "a"]);
+    }
+
+    #[test]
+    fn projection_spread_noop_all_fields_named() {
+        let result = infer_ok(
+            "users { name, age, score, balance, active, created, profile, maybe_pos, ... }",
+            &test_schema(),
+        );
+        assert_eq!(projected_fields(result).0.len(), 8);
+    }
+
+    #[test]
+    fn enum_optional_and_projection() {
+        let schema = enum_schema();
+        let priority_id = schema.enum_by_name("Priority").unwrap().0;
+
+        assert_eq!(
+            infer_ok("some(Priority::High)", &schema).ty,
+            QueryType::Optional(Box::new(QueryType::Enum(priority_id)))
+        );
+
+        let result = infer_ok("tickets { priority }", &schema);
+        match result.ty {
+            QueryType::List(inner) => match *inner {
+                QueryType::Record(RecordSource::Projection(fields)) => {
+                    assert_eq!(fields[0].ty, QueryType::Enum(priority_id));
+                }
+                other => panic!("expected projection record, got {other:?}"),
+            },
+            other => panic!("expected list projection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn projection_empty_error() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("users { }");
+        let result = infer(file.unwrap().output().unwrap(), &mut env);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn projection_duplicate_field_error() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("users { name, name }");
+        let result = infer(file.unwrap().output().unwrap(), &mut env);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn projection_on_non_record_error() {
+        let schema = test_schema();
+        let mut env = TypeEnv::new(&schema);
+        let (file, _) = crate::parse_query("42 { name }");
+        let result = infer(file.unwrap().output().unwrap(), &mut env);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn projection_derived_alias() {
+        let result = infer_ok("users { name, profile?.username }", &test_schema());
+        match &result.ty {
+            QueryType::List(inner) => match inner.as_ref() {
+                QueryType::Record(RecordSource::Projection(fields)) => {
+                    assert_eq!(fields.len(), 2);
+                    assert_eq!(fields[0].name, "name");
+                    assert_eq!(fields[1].name, "username");
+                    assert_eq!(
+                        fields[1].ty,
+                        QueryType::Optional(Box::new(QueryType::Scalar(ScalarType::String)))
+                    );
+                }
+                other => panic!("expected Record, got {other:?}"),
+            },
+            other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn projection_single_record_base() {
+        assert!(matches!(
+            infer_ok("users.first().unwrap() { name, age }", &test_schema()).ty,
+            QueryType::Record(RecordSource::Projection(_))
+        ));
+    }
+}

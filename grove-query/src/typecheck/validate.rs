@@ -297,3 +297,288 @@ pub(super) fn validate_update_arg(
         typed_arg.span,
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::typecheck::tests::{
+        error_codes, mutation_schema, nested_schema, test_schema, typecheck_ok,
+    };
+    use crate::typecheck::typecheck;
+
+    #[test]
+    fn mutation_insert() {
+        let (file, _diags) = crate::parse_query(
+            r#"users.insert({ name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, created = @now });"#,
+        );
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
+        assert!(diags.is_empty(), "expected no errors, got {diags:?}");
+    }
+
+    #[test]
+    fn mutation_update() {
+        let (file, _diags) = crate::parse_query(r#"users[age == 30].update({ age = 31 });"#);
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
+        assert!(diags.is_empty(), "expected no errors, got {diags:?}");
+    }
+
+    #[test]
+    fn mutation_non_owning_row_ref_fields() {
+        let schema = nested_schema();
+        for source in [
+            "users.update({ manager = &users.first().unwrap() });",
+            "users.update({ subordinates = &users });",
+            "users.update({ subordinates = [] });",
+        ] {
+            typecheck_ok(source, &schema);
+        }
+
+        let schema = mutation_schema();
+        for source in [
+            "users.orders.flatten().update({ image = none });",
+            "users.orders.flatten().update({ image = some(&images.first().unwrap()) });",
+            "images.first().unwrap().update({ orders = &users.orders.flatten() });",
+            "images.first().unwrap().update({ orders = [] });",
+            "users.first().unwrap().orders.insert({ id = 1, total = 10, image = some(&images.first().unwrap()) });",
+        ] {
+            typecheck_ok(source, &schema);
+        }
+    }
+
+    #[test]
+    fn mutation_non_owning_row_ref_shape_mismatch() {
+        let schema = nested_schema();
+        assert_eq!(
+            error_codes(
+                "users.update({ manager = users.first().unwrap() });",
+                &schema
+            ),
+            ["QT0046"]
+        );
+        assert_eq!(
+            error_codes("users.update({ manager = none });", &schema),
+            ["QT0046"]
+        );
+        assert_eq!(
+            error_codes(
+                "users.update({ subordinates = &users.first().unwrap() });",
+                &schema
+            ),
+            ["QT0046"]
+        );
+        assert_eq!(
+            error_codes(
+                "users.update({ manager = &users.orders.flatten().first().unwrap() });",
+                &schema
+            ),
+            ["QT0045"]
+        );
+
+        let schema = mutation_schema();
+        assert_eq!(
+            error_codes(
+                "users.orders.flatten().update({ image = some(&users.first().unwrap()) });",
+                &schema
+            ),
+            ["QT0045"]
+        );
+    }
+
+    #[test]
+    fn mutation_non_owning_backrefs_owning_relations_rejected() {
+        let schema = mutation_schema();
+        assert_eq!(
+            error_codes(
+                "users.orders.flatten().update({ user = &users.first().unwrap() });",
+                &schema
+            ),
+            ["QT0043"]
+        );
+        assert_eq!(
+            error_codes(
+                "users.first().unwrap().orders.insert({ id = 1, total = 10, user = &users.first().unwrap() });",
+                &schema
+            ),
+            ["QT0044"]
+        );
+    }
+
+    #[test]
+    fn mutation_row_refs_inside_nested_owned_children() {
+        let schema = mutation_schema();
+        typecheck_ok(
+            r#"users.insert({ id = 1, name = "A", orders = [{ id = 10, total = 1, image = some(&images.first().unwrap()) }] });"#,
+            &schema,
+        );
+        typecheck_ok(
+            r#"users.first().unwrap().update({ orders = [{ id = 10, total = 1, image = some(&images.first().unwrap()) }] });"#,
+            &schema,
+        );
+
+        let schema = nested_schema();
+        typecheck_ok(
+            r#"users.insert({ name = "A", active = true, orders = [{ total = 1.0, items = [{ sku = "x" }] }] });"#,
+            &schema,
+        );
+        typecheck_ok(
+            r#"users.first().unwrap().update({ orders = [{ total = 1.0, items = [{ sku = "x" }] }] });"#,
+            &schema,
+        );
+    }
+
+    #[test]
+    fn mutation_nested_owned_child_row_ref_errors() {
+        let schema = mutation_schema();
+        assert_eq!(
+            error_codes(
+                r#"users.insert({ id = 1, name = "A", orders = [{ id = 10, total = 1, user = &users.first().unwrap() }] });"#,
+                &schema
+            ),
+            ["QT0044"]
+        );
+        assert_eq!(
+            error_codes(
+                r#"users.first().unwrap().update({ orders = [{ id = 10, total = 1, user = &users.first().unwrap() }] });"#,
+                &schema
+            ),
+            ["QT0043"]
+        );
+        assert_eq!(
+            error_codes(
+                r#"users.insert({ id = 1, name = "A", orders = [{ id = 10, total = 1, image = some(&users.first().unwrap()) }] });"#,
+                &schema
+            ),
+            ["QT0045"]
+        );
+        assert_eq!(
+            error_codes(
+                r#"users.insert({ id = 1, name = "A", orders = [{ id = 10, total = 1, image = some(images.first().unwrap()) }] });"#,
+                &schema
+            ),
+            ["QT0046"]
+        );
+
+        let schema = nested_schema();
+        assert_eq!(
+            error_codes(
+                r#"users.insert({ name = "A", active = true, orders = [{ total = 1.0, items = [{ sku = "x", order = &users.orders.flatten().items.flatten().first().unwrap() }] }] });"#,
+                &schema
+            ),
+            ["QT0044"]
+        );
+    }
+
+    #[test]
+    fn mutation_insert_missing_required_field() {
+        let (file, _diags) = crate::parse_query(r#"users.insert({ name = "Alice" });"#);
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
+        assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn mutation_insert_unknown_field() {
+        let (file, _diags) = crate::parse_query(
+            r#"users.insert({ name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, created = @now, bogus = 1 });"#,
+        );
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
+        assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn mutation_insert_wrong_type() {
+        let (file, _diags) = crate::parse_query(
+            r#"users.insert({ name = 42, age = 30, score = 1.0f, balance = 0.0, active = true, created = @now });"#,
+        );
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
+        assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn mutation_update_unknown_field() {
+        let (file, _diags) = crate::parse_query(r#"users[name == "Bob"].update({ bogus = 2 });"#);
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
+        assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn mutation_update_subset() {
+        let (file, _diags) =
+            crate::parse_query(r#"users[name == "Bob"].update({ age = 30, score = 2.5f });"#);
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
+        assert!(diags.is_empty(), "expected no errors, got {diags:?}");
+    }
+
+    #[test]
+    fn mutation_duplicate_field() {
+        let (file, _diags) = crate::parse_query(
+            r#"users.insert({ name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, name = "Bob", created = @now });"#,
+        );
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
+        assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn mutation_insert_optional_field_omitted() {
+        let (file, _diags) = crate::parse_query(
+            r#"users.insert({ name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, created = @now });"#,
+        );
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
+        assert!(diags.is_empty(), "expected no errors, got {diags:?}");
+    }
+
+    #[test]
+    fn mutation_insert_with_ref_field() {
+        let (file, _diags) = crate::parse_query(
+            r#"users.insert({ name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, created = @now, profile = none });"#,
+        );
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn batch_insert() {
+        let (file, _diags) = crate::parse_query(
+            r#"users.insert([
+                    { name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, created = @now },
+                    { name = "Bob", age = 25, score = 2.0f, balance = 2.0, active = false, created = @today },
+                ]);"#,
+        );
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
+        assert!(diags.is_empty(), "expected no errors, got {diags:?}");
+    }
+
+    #[test]
+    fn batch_insert_element_missing_required() {
+        let (file, _diags) = crate::parse_query(
+            r#"users.insert([
+                    { name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, created = @now },
+                    { name = "Bob", score = 2.0f, balance = 0.0, active = true, created = @now },
+                ]);"#,
+        );
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
+        assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn batch_insert_element_mismatched_type() {
+        let (file, _diags) = crate::parse_query(
+            r#"users.insert([
+                    { name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, created = @now },
+                    { name = 42, age = 25, score = 2.0f, balance = 0.0, active = true, created = @now },
+                ]);"#,
+        );
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
+        assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn batch_insert_element_unknown_field() {
+        let (file, _diags) = crate::parse_query(
+            r#"users.insert([
+                    { name = "Alice", age = 30, score = 1.0f, balance = 0.0, active = true, created = @now },
+                    { name = "Bob", age = 25, score = 2.0f, balance = 0.0, active = true, created = @now, foo = 1 },
+                ]);"#,
+        );
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
+        assert!(!diags.is_empty());
+    }
+}

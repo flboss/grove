@@ -197,3 +197,26 @@ pub(super) fn check(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::typecheck::tests::{annotation_schema, infer_ok};
+
+    #[test]
+    fn annotations_record_equality() {
+        let schema = annotation_schema();
+        for source in [
+            "{a = none, b = (1, 2)} as Item",
+            "{b = (1, 2), a = none} as {b: (Int, Int), a: ?String}",
+            "items.first().unwrap() as {a: ?String, b: (Int, Int)}",
+        ] {
+            let result = infer_ok(source, &schema);
+            assert!(!result.ty.is_unknown(), "source: {source}");
+            assert!(
+                !matches!(&result.kind, TypedExprKind::Cast { .. }),
+                "source should be a no-op: {source}"
+            );
+        }
+    }
+}

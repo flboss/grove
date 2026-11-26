@@ -247,3 +247,289 @@ pub(super) fn row_ref_target_of(ty: &QueryType) -> Option<StructId> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::typecheck::tests::{
+        error_codes, infer_ok, mutation_schema, test_schema, typecheck_ok,
+    };
+    use crate::typecheck::{
+        IdentBinding, TargetProvenance, TypedExprKind, TypedMutationStmt, TypedStatement, typecheck,
+    };
+
+    #[test]
+    fn ident_binding_prev() {
+        let schema = test_schema();
+        let user = schema.roots[0].struct_id;
+        let (file, _) = crate::parse_query(r#"users[age == 30].update({ age = prev.age + 1 });"#);
+        let (typed, diags) = typecheck(file.unwrap(), &schema);
+        assert!(diags.is_empty(), "expected no errors, got {diags:?}");
+        let TypedStatement::Mutation(TypedMutationStmt::Update { arg, .. }) =
+            &typed.unwrap().statements[0]
+        else {
+            panic!("expected update statement");
+        };
+        let TypedExprKind::Struct { fields, .. } = &arg.kind else {
+            panic!("expected struct, got {:?}", arg.kind);
+        };
+        let TypedExprKind::Binary { lhs, .. } = &fields[0].1.kind else {
+            panic!("expected binary, got {:?}", fields[0].1.kind);
+        };
+        let TypedExprKind::Field { base, .. } = &lhs.kind else {
+            panic!("expected field, got {:?}", lhs.kind);
+        };
+        let TypedExprKind::Ident {
+            name,
+            binding,
+            depth,
+        } = &base.kind
+        else {
+            panic!("expected ident, got {:?}", base.kind);
+        };
+        assert_eq!(name.value, "prev");
+        assert_eq!(*binding, IdentBinding::Prev { struct_id: user });
+        assert_eq!(*depth, 0);
+    }
+
+    #[test]
+    fn mutation_delete() {
+        let (file, _diags) = crate::parse_query(r#"users[!active].delete();"#);
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
+        assert!(diags.is_empty(), "expected no errors, got {diags:?}");
+    }
+
+    #[test]
+    fn mutation_on_projection_error() {
+        let (file, _diags) = crate::parse_query(r#"users { name }.insert({ name = "Alice" });"#);
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
+        assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn mutation_on_scalar_error() {
+        let (file, _diags) = crate::parse_query(r#"42.insert({ name = "Alice" });"#);
+        let (_typed, diags) = typecheck(file.unwrap(), &test_schema());
+        assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn mutation_optional_depth_preserved() {
+        let typed = typecheck_ok("users.first()?.delete();", &test_schema());
+        let TypedStatement::Mutation(TypedMutationStmt::Delete { opt_depth, .. }) =
+            &typed.statements[0]
+        else {
+            panic!("expected delete mutation");
+        };
+        assert_eq!(*opt_depth, 1);
+    }
+
+    #[test]
+    fn mutation_record_targets() {
+        let schema = test_schema();
+        typecheck_ok("users.first().unwrap().delete();", &schema);
+        typecheck_ok("users.first().unwrap().update({ age = 31 });", &schema);
+        typecheck_ok("users.first()?.delete();", &schema);
+        typecheck_ok("users.first()?.update({ age = 31 });", &schema);
+    }
+
+    #[test]
+    fn mutation_optional_target_errors() {
+        let schema = test_schema();
+        assert_eq!(error_codes("users.first().delete();", &schema), ["QT0035"]);
+        assert_eq!(
+            error_codes("users.first().update({ age = 31 });", &schema),
+            ["QT0035"]
+        );
+        assert_eq!(
+            error_codes("users.first()??.delete();", &schema),
+            ["QT0032"]
+        );
+    }
+
+    #[test]
+    fn mutation_let_targets_rejected() {
+        let schema = mutation_schema();
+        assert_eq!(
+            error_codes("let u = users; u.delete();", &schema),
+            ["QT0036"]
+        );
+        assert_eq!(
+            error_codes(
+                r#"let u = users; u.insert({ id = 1, name = "A", orders = [] });"#,
+                &schema
+            ),
+            ["QT0036"]
+        );
+    }
+
+    #[test]
+    fn mutation_insert_targets() {
+        let schema = mutation_schema();
+        typecheck_ok(
+            r#"users.insert({ id = 1, name = "A", orders = [] });"#,
+            &schema,
+        );
+        typecheck_ok(
+            r#"users[id > 0].insert({ id = 1, name = "A", orders = [] });"#,
+            &schema,
+        );
+        typecheck_ok(
+            r#"users.first().unwrap().orders.insert({ id = 1, total = 10 });"#,
+            &schema,
+        );
+        typecheck_ok(
+            r#"users.first()?.orders?.insert({ id = 1, total = 10 });"#,
+            &schema,
+        );
+        typecheck_ok(
+            r#"images.first().unwrap().orders.insert(&users.orders.flatten());"#,
+            &schema,
+        );
+        typecheck_ok(
+            r#"images.first().unwrap().orders.insert(&users.orders.flatten().first().unwrap());"#,
+            &schema,
+        );
+
+        assert_eq!(
+            error_codes(
+                r#"users.first().unwrap().insert({ id = 1, name = "A", orders = [] });"#,
+                &schema
+            ),
+            ["QT0037"]
+        );
+        assert_eq!(
+            error_codes(
+                r#"users.orders.flatten().insert({ id = 1, total = 10 });"#,
+                &schema
+            ),
+            ["QT0038"]
+        );
+        assert_eq!(
+            error_codes(
+                r#"users.extend(users.take(0)).insert({ id = 1, name = "A", orders = [] });"#,
+                &schema
+            ),
+            ["QT0038"]
+        );
+        assert_eq!(
+            error_codes(
+                r#"images.first().unwrap().orders.insert({ id = 1, total = 10 });"#,
+                &schema
+            ),
+            ["QT0047"]
+        );
+        assert_eq!(
+            error_codes(
+                r#"images.first().unwrap().orders.insert(users.orders.flatten());"#,
+                &schema
+            ),
+            ["QT0047"]
+        );
+        assert_eq!(
+            error_codes(
+                r#"images.first().unwrap().orders.insert(&users.orders.flatten().first());"#,
+                &schema
+            ),
+            ["QT0047"]
+        );
+        assert_eq!(
+            error_codes(r#"images.first().unwrap().orders.insert(&users);"#, &schema),
+            ["QT0045"]
+        );
+    }
+
+    #[test]
+    fn mutation_nested_and_non_owning_delete_targets() {
+        let schema = mutation_schema();
+        typecheck_ok("users.orders.flatten().delete();", &schema);
+        typecheck_ok("users.orders.flatten().update({ total = 1 });", &schema);
+        typecheck_ok("users.first()?.orders?.delete();", &schema);
+        typecheck_ok("images.first().unwrap().orders.delete();", &schema);
+    }
+
+    #[test]
+    fn mutation_projected_and_untraceable_targets() {
+        let schema = mutation_schema();
+        assert_eq!(
+            error_codes(
+                r#"users { id }.insert({ id = 1, name = "A", orders = [] });"#,
+                &schema
+            ),
+            ["QT0019"]
+        );
+        assert_eq!(error_codes("users { id }.delete();", &schema), ["QT0019"]);
+        assert_eq!(
+            error_codes(
+                r#"users.map($).insert({ id = 1, name = "A", orders = [] });"#,
+                &schema
+            ),
+            ["QT0036"]
+        );
+        assert_eq!(error_codes("users.map($).delete();", &schema), ["QT0036"]);
+    }
+
+    #[test]
+    fn mutation_target_provenance_tracked() {
+        let schema = test_schema();
+        let user = schema.roots[0].struct_id;
+        let profile_field = schema.struct_field(user, "profile").unwrap().0;
+
+        assert_eq!(
+            infer_ok("users", &schema).provenance,
+            TargetProvenance::root(0)
+        );
+        assert_eq!(
+            infer_ok("users.filter(active)", &schema).provenance,
+            TargetProvenance::root(0)
+        );
+        assert_eq!(
+            infer_ok("users.first().unwrap()", &schema).provenance,
+            TargetProvenance {
+                rows: true,
+                collection: None,
+            }
+        );
+        assert_eq!(
+            infer_ok("users.first().unwrap().profile", &schema).provenance,
+            TargetProvenance::ref_collection(profile_field)
+        );
+        assert_eq!(
+            infer_ok("users.profile", &schema).provenance,
+            TargetProvenance::ref_collection(profile_field)
+        );
+        assert_eq!(
+            infer_ok("users.name", &schema).provenance,
+            TargetProvenance::NONE
+        );
+
+        assert_eq!(
+            infer_ok("some(users)", &schema).provenance,
+            TargetProvenance::root(0)
+        );
+        assert_eq!(
+            infer_ok("if true { users } else { users }", &schema).provenance,
+            TargetProvenance::root(0)
+        );
+        assert_eq!(
+            infer_ok("users.extend(users.take(0))", &schema).provenance,
+            TargetProvenance {
+                rows: true,
+                collection: None,
+            }
+        );
+        assert_eq!(
+            infer_ok("users.map($)", &schema).provenance,
+            TargetProvenance::NONE
+        );
+        assert_eq!(
+            infer_ok("users { name }", &schema).provenance,
+            TargetProvenance::NONE
+        );
+    }
+
+    #[test]
+    fn mutation_target_provenance_not_propagated_through_let() {
+        let typed = typecheck_ok("let u = users; u", &test_schema());
+        assert_eq!(typed.result.unwrap().provenance, TargetProvenance::NONE);
+    }
+}
