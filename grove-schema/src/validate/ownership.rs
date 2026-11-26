@@ -140,14 +140,9 @@ fn reaches_root(
 
 #[cfg(test)]
 mod tests {
-    use grove_types::Diagnostic;
-
     use super::*;
     use crate::parse_schema;
-
-    fn codes(diags: &[Diagnostic]) -> Vec<&str> {
-        diags.iter().map(|d| d.code.as_ref()).collect()
-    }
+    use crate::validate::tests::codes;
 
     fn stage_ownership(source: &str, f: impl FnOnce(&Builder<'_>)) {
         let (schema, parse_diags) = parse_schema(source);

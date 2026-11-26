@@ -247,7 +247,7 @@ mod tests {
     use crate::parse_schema;
     use crate::validated::{EnumId, EnumUnderlying, Field, ValueType};
 
-    fn codes(diags: &[Diagnostic]) -> Vec<&str> {
+    pub(super) fn codes(diags: &[Diagnostic]) -> Vec<&str> {
         diags.iter().map(|d| d.code.as_ref()).collect()
     }
 

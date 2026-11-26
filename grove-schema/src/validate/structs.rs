@@ -286,15 +286,9 @@ fn ref_struct_name(ty: &TypeExpr) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        parse_schema,
-        validated::{ColumnId, ScalarType, StorageTable, StructId, ValueType},
-    };
-    use grove_types::Diagnostic;
-
-    fn codes(diags: &[Diagnostic]) -> Vec<&str> {
-        diags.iter().map(|d| d.code.as_ref()).collect()
-    }
+    use crate::parse_schema;
+    use crate::validate::tests::codes;
+    use crate::validated::{ColumnId, ScalarType, StorageTable, StructId, ValueType};
 
     fn stage_structs(source: &str, f: impl FnOnce(&Builder<'_>)) {
         let (schema, parse_diags) = parse_schema(source);

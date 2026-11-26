@@ -265,7 +265,7 @@ mod tests {
     use super::*;
     use crate::parse_schema;
 
-    fn codes(diags: &[Diagnostic]) -> Vec<&str> {
+    pub(super) fn codes(diags: &[Diagnostic]) -> Vec<&str> {
         diags.iter().map(|d| d.code.as_ref()).collect()
     }
 

@@ -72,12 +72,8 @@ impl<'src> Parser<'src> {
 
 #[cfg(test)]
 mod tests {
+    use crate::parse::tests::codes;
     use crate::parse_schema;
-    use grove_types::Diagnostic;
-
-    fn codes(diags: &[Diagnostic]) -> Vec<&str> {
-        diags.iter().map(|d| d.code.as_ref()).collect()
-    }
 
     #[test]
     fn root_simple() {

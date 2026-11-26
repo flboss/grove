@@ -217,12 +217,8 @@ impl<'src> Parser<'src> {
 mod tests {
     use super::*;
     use crate::ast::TypeExpr;
+    use crate::parse::tests::codes;
     use crate::parse_schema;
-    use grove_types::Diagnostic;
-
-    fn codes(diags: &[Diagnostic]) -> Vec<&str> {
-        diags.iter().map(|d| d.code.as_ref()).collect()
-    }
 
     #[test]
     fn enum_string_values() {

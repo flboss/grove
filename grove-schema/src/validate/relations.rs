@@ -395,11 +395,7 @@ enum RelationColumns {
 mod tests {
     use super::*;
     use crate::parse_schema;
-    use grove_types::Diagnostic;
-
-    fn codes(diags: &[Diagnostic]) -> Vec<&str> {
-        diags.iter().map(|d| d.code.as_ref()).collect()
-    }
+    use crate::validate::tests::codes;
 
     fn stage_relations(source: &str, f: impl FnOnce(&Builder<'_>)) {
         let (schema, parse_diags) = parse_schema(source);
