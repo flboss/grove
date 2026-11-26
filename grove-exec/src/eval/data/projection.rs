@@ -127,3 +127,51 @@ fn splice_item_refs(value: Val, resolved: &HashMap<(FieldId, Key), Val>) -> Resu
         other => Ok(other),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::eval::data::tests::{related_fields_for, run_seeded_recording};
+    use crate::testdata;
+
+    #[test]
+    fn projection_prefetch_batched_owning_refs() {
+        let schema = testdata::schema();
+        let (_, recording) =
+            run_seeded_recording("users { o = orders.len(), p = profile?.bio }").expect("query");
+        let user = testdata::struct_id(&schema, "User");
+        let profile = testdata::field_id(&schema, user, "profile");
+        let orders = testdata::field_id(&schema, user, "orders");
+        let bio = testdata::field_id(&schema, testdata::struct_id(&schema, "Profile"), "bio");
+        let related = recording.related_fetches.borrow();
+        assert_eq!(
+            related.len(),
+            2,
+            "expected two batched fetches: {related:?}"
+        );
+        assert_eq!(
+            related_fields_for(&schema, &related, orders),
+            Some([].as_slice())
+        );
+        assert_eq!(
+            related_fields_for(&schema, &related, profile),
+            Some([bio].as_slice())
+        );
+    }
+
+    #[test]
+    fn projection_prefetch_only_needed_owning_ref() {
+        let schema = testdata::schema();
+        let (_, recording) = run_seeded_recording("users { o = orders.len() }").expect("query");
+        let user = testdata::struct_id(&schema, "User");
+        let orders = testdata::field_id(&schema, user, "orders");
+        let profile = testdata::field_id(&schema, user, "profile");
+        let related = recording.related_fetches.borrow();
+        assert_eq!(related.len(), 1, "expected only orders: {related:?}");
+        assert_eq!(
+            related_fields_for(&schema, &related, orders),
+            Some([].as_slice())
+        );
+        assert_eq!(related_fields_for(&schema, &related, profile), None);
+        assert_eq!(recording.related_parent_counts.borrow().as_slice(), &[5]);
+    }
+}

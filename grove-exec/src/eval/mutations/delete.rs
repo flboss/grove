@@ -52,3 +52,92 @@ fn collect_delete_target_origins(value: Val) -> Result<HashSet<RowOrigin>, ExecE
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::eval::harness::int;
+    use crate::eval::mutations::tests::*;
+    use crate::storage::{FetchConstraints, Storage};
+
+    #[test]
+    fn delete_record_target() {
+        let schema = cascade_schema();
+        let backend = cascade_backend(&schema);
+        let user = schema.roots[0].struct_id;
+        let order = schema.struct_by_name("Order").unwrap().0;
+
+        let result = run(
+            r#"
+                users.insert({
+                    id = 1,
+                    name = "A",
+                    orders = [{ id = 10, total = 1, items = [] }],
+                });
+                users.find(name == "A").unwrap().delete();
+                users.len()
+                "#,
+            &schema,
+            &backend,
+        );
+
+        assert_eq!(result, Some(int(0)));
+        assert!(
+            backend
+                .fetch(user, &[], &FetchConstraints::EMPTY)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            backend
+                .fetch(order, &[], &FetchConstraints::EMPTY)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn delete_duplicate_targets_deduped() {
+        let schema = cascade_schema();
+        let backend = cascade_backend(&schema);
+        let user = schema.roots[0].struct_id;
+
+        let result = run(
+            r#"
+                users.insert({
+                    id = 1,
+                    name = "A",
+                    orders = [{ id = 10, total = 1, items = [{ id = 100 }] }],
+                });
+                users.extend(users).delete();
+                users.len()
+                "#,
+            &schema,
+            &backend,
+        );
+
+        assert_eq!(result, Some(int(0)));
+        assert!(
+            backend
+                .fetch(user, &[], &FetchConstraints::EMPTY)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn delete_optional_none_target_noop() {
+        let schema = cascade_schema();
+        let backend = cascade_backend(&schema);
+
+        let result = run(
+            r#"
+                users.first()?.delete();
+                users.len()
+                "#,
+            &schema,
+            &backend,
+        );
+
+        assert_eq!(result, Some(int(0)));
+    }
+}

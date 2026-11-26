@@ -89,3 +89,53 @@ impl Env {
         self.element_depth = 0;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::eval::harness::{FIXED_NOW, NoStorage, int, run_src, str};
+    use crate::eval::{EvalCtx, eval};
+    use crate::pushdown::PushdownPlan;
+    use crate::value::Val;
+    use grove_query::{IdentBinding, QueryType, TargetProvenance, TypedExpr, TypedExprKind};
+    use grove_schema::validated::{ScalarType, ValidatedSchema};
+    use grove_types::{NodeId, Span, Spanned};
+
+    #[test]
+    fn eval_let_binding() {
+        assert_eq!(run_src("let x = 1; x"), Ok(int(1)));
+        assert_eq!(run_src("let x = 1; let x = 2; x"), Ok(int(2)));
+        assert_eq!(
+            run_src("let x = true; let x = \"hello\"; x"),
+            Ok(str("hello"))
+        );
+        assert_eq!(run_src("let a = 1; let b = a; b"), Ok(int(1)));
+    }
+
+    #[test]
+    fn eval_env_depth_collections() {
+        let mut env = Env::new();
+        env.define(Rc::from("xs"), Val::list(vec![int(1), Val::None]));
+        let schema = ValidatedSchema::default();
+        let plan = PushdownPlan::disabled(&schema);
+        let mut ctx = EvalCtx::new(&mut env, FIXED_NOW, &NoStorage, &schema, &plan);
+        let span = Span::new(0, 0);
+        let expr = TypedExpr {
+            kind: TypedExprKind::Ident {
+                name: Spanned::new(span, "xs".to_string()),
+                binding: IdentBinding::Let,
+                depth: 0,
+            },
+            ty: QueryType::List(Box::new(QueryType::Optional(Box::new(QueryType::Scalar(
+                ScalarType::Int,
+            ))))),
+            provenance: TargetProvenance::NONE,
+            span,
+            id: NodeId(0),
+        };
+        assert_eq!(
+            eval(&expr, &mut ctx),
+            Ok(Val::list(vec![int(1), Val::None]))
+        );
+    }
+}

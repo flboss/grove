@@ -220,3 +220,41 @@ pub(super) fn method_int_arg(args: &[Val], method: &str) -> Result<i64, ExecErro
     };
     Ok(*n)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::eval::harness::{int, run_src, some};
+
+    #[test]
+    fn eval_deep_optional_methods() {
+        assert_eq!(
+            run_src("some(some([1, 2]))??.map($ + 1)"),
+            Ok(some(some(Val::list(vec![int(2), int(3)]))))
+        );
+        assert_eq!(
+            run_src("some(some([1, 2]))??.filter($ > 1)"),
+            Ok(some(some(Val::list(vec![int(2)]))))
+        );
+        assert_eq!(
+            run_src("some(some([3, 1]))??.sort()"),
+            Ok(some(some(Val::list(vec![int(1), int(3)]))))
+        );
+        assert_eq!(
+            run_src("some(some(\"hi\"))??.len()"),
+            Ok(some(some(int(2))))
+        );
+        assert_eq!(
+            run_src("some(some([1, 2]))??.nth(0)"),
+            Ok(some(some(some(int(1)))))
+        );
+        assert_eq!(
+            run_src("some(some(some(1)))??.unwrap()"),
+            Ok(some(some(int(1))))
+        );
+        assert_eq!(
+            run_src("some(if true {none} else {some([1])})??.len()"),
+            Ok(some(Val::None))
+        );
+    }
+}

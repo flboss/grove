@@ -149,3 +149,52 @@ pub(super) fn collect_update_target_records(
     }
     Ok(targets)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::eval::harness::{int, rec, some, str};
+    use crate::eval::mutations::tests::*;
+    use crate::value::Key;
+    use std::rc::Rc;
+
+    #[test]
+    fn insert_parts_split_base_owned_links() {
+        let schema = mutation_parts_schema();
+        let (user, _, tag) = mutation_parts_ids(&schema);
+        let manager = RowOrigin {
+            struct_id: user,
+            key: Key(99),
+        };
+        let tag_link = RowOrigin {
+            struct_id: tag,
+            key: Key(7),
+        };
+        let manager_field = schema.struct_field(user, "manager").unwrap().0;
+        let tags_field = schema.struct_field(user, "tags").unwrap().0;
+        let orders_field = schema.struct_field(user, "orders").unwrap().0;
+        let id_field = schema.struct_field(user, "id").unwrap().0;
+        let name_field = schema.struct_field(user, "name").unwrap().0;
+
+        let record = RecordVal::new(vec![
+            (Rc::from("id"), int(1)),
+            (Rc::from("name"), str("A")),
+            (Rc::from("manager"), some(Val::RowRef(manager))),
+            (Rc::from("tags"), Val::list(vec![Val::RowRef(tag_link)])),
+            (
+                Rc::from("orders"),
+                Val::list(vec![rec(vec![("id", int(10)), ("total", int(100))])]),
+            ),
+        ]);
+        let parts = record_parts(&schema, user, record).unwrap();
+
+        assert_eq!(parts.base, vec![(id_field, int(1)), (name_field, str("A"))]);
+        assert_eq!(parts.owned.len(), 1);
+        assert_eq!(parts.owned[0].0, orders_field);
+        assert!(matches!(parts.owned[0].1, Val::List(_)));
+        assert_eq!(
+            parts.links,
+            vec![(manager_field, vec![manager]), (tags_field, vec![tag_link]),]
+        );
+    }
+}

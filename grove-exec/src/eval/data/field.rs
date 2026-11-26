@@ -115,3 +115,133 @@ fn record_field(
             message: format!("unknown field `{name}`"),
         })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::eval::harness::{int, run_seeded, run_src, some, str};
+
+    #[test]
+    fn deep_optional_field_access() {
+        assert_eq!(run_src("some(some({a = 1}))??.a"), Ok(some(some(int(1)))));
+        assert_eq!(
+            run_src("some(some({a = some(1)}))??.a"),
+            Ok(some(some(some(int(1)))))
+        );
+        assert_eq!(
+            run_src("some(if true {none} else {some({a = 1})})??.a"),
+            Ok(some(Val::None))
+        );
+    }
+
+    #[test]
+    fn optional_field_access_nested_optional_preserved() {
+        assert_eq!(
+            run_src("some({a=if true {none} else {some(1)}})?.a"),
+            Ok(some(Val::None))
+        );
+        assert_eq!(run_src("some({a=some(1)})?.a"), Ok(some(some(int(1)))));
+    }
+
+    #[test]
+    fn optional_tuple_and_method_nested_optional_preserved() {
+        assert_eq!(
+            run_src("some((if true {none} else {some(1)}, 2))?.0"),
+            Ok(some(Val::None))
+        );
+        assert_eq!(run_src("some([1, 2])?.nth(5)"), Ok(some(Val::None)));
+        assert_eq!(run_src("some([1, 2])?.nth(0)"), Ok(some(some(int(1)))));
+    }
+
+    #[test]
+    fn field_access_ref_base_resolved() {
+        match run_seeded("users { o = orders { n = user.name } }") {
+            Ok(Val::List(rows)) => {
+                assert_eq!(rows.len(), 5);
+                let Val::Record(first) = &rows[0] else {
+                    panic!("expected record");
+                };
+                match first.iter().find(|(name, _)| name.as_ref() == "o") {
+                    Some((_, Val::List(orders))) => {
+                        assert_eq!(orders.len(), 2);
+                        for order in orders {
+                            let Val::Record(order) = order else {
+                                panic!("expected order record, got {order}");
+                            };
+                            assert!(order.iter().any(|(name, value)| {
+                                name.as_ref() == "n" && *value == str("Ada")
+                            }));
+                        }
+                    }
+                    got => panic!("expected orders list, got {got:?}"),
+                }
+            }
+            got => panic!("expected projected users, got {got:?}"),
+        }
+    }
+
+    #[test]
+    fn field_access_optional_ref_base_resolved() {
+        match run_seeded("users { m = manager?.name }") {
+            Ok(Val::List(rows)) => {
+                let Val::Record(first) = &rows[0] else {
+                    panic!("expected record");
+                };
+                match first.iter().find(|(name, _)| name.as_ref() == "m") {
+                    Some((_, Val::Some(name))) => {
+                        assert!(matches!(name.as_ref(), Val::Scalar(_)));
+                    }
+                    got => panic!("expected some(name), got {got:?}"),
+                }
+                assert!(matches!(
+                    &rows[1], Val::Record(second)
+                      if matches!(second.first().unwrap().1, Val::None)
+                ));
+            }
+            got => panic!("expected projected records, got {got:?}"),
+        }
+    }
+
+    #[test]
+    fn field_unowned_shallow_ref_resolution() {
+        match run_seeded("users.manager") {
+            Ok(Val::List(rows)) => match &rows[0] {
+                Val::Some(user) => {
+                    let Val::Record(fields) = user.as_ref() else {
+                        panic!("expected manager record");
+                    };
+                    assert!(fields.iter().any(|(name, value)| {
+                        name.as_ref() == "manager" && matches!(value, Val::Ref { .. })
+                    }));
+                }
+                other => panic!("expected some(manager), got {other}"),
+            },
+            got => panic!("expected manager list, got {got:?}"),
+        }
+    }
+
+    #[test]
+    fn field_optional_owned_shallow_ref_resolution() {
+        match run_seeded("users.profile") {
+            Ok(Val::List(rows)) => {
+                assert_eq!(rows.len(), 5);
+                match &rows[0] {
+                    Val::Some(profile) => {
+                        let Val::Record(profile) = profile.as_ref() else {
+                            panic!("expected profile record");
+                        };
+                        assert!(profile.iter().any(|(name, value)| {
+                            name.as_ref() == "user" && matches!(value, Val::Ref { .. })
+                        }));
+                        assert!(profile.iter().any(|(name, value)| {
+                            name.as_ref() == "bio" && *value == str("AdaBio")
+                        }));
+                    }
+                    other => panic!("expected some(profile), got {other}"),
+                }
+                assert!(matches!(&rows[1], Val::None));
+            }
+            got => panic!("expected profile list, got {got:?}"),
+        }
+    }
+}

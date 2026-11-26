@@ -179,4 +179,237 @@ fn eval_logic(
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    use crate::eval::harness::{bool, bytes, int, run_seeded, run_src, run_src_config, some, str};
+    use crate::value::{Scalar, Val};
+    use grove_types::Span;
+
+    #[test]
+    fn eval_ordered_comparisons() {
+        for (src, expected) in [
+            ("1 < 2", true),
+            ("2 <= 2", true),
+            ("3 > 4", false),
+            ("2 >= 3", false),
+            ("1 < 1", false),
+            ("1.5f < 2.0f", true),
+            ("2.0f <= 2.0f", true),
+            ("1.5 < 2.5", true),
+            ("30.00 < 30.01", true),
+            ("\"a\" < \"b\"", true),
+            ("\"b\" <= \"b\"", true),
+            ("\"abc\" > \"abd\"", false),
+            (r#"hex"00" < hex"0100""#, true),
+            (r#"hex"00" <= hex"00""#, true),
+            (r#"hex"0000" > hex"00""#, true),
+            (r#"hex"ff" > hex"0100""#, true),
+            ("false < true", true),
+            ("true <= true", true),
+            ("@now < @3000-01-02", true),
+            ("#30s > #1s", true),
+            ("#30s >= #30s", true),
+        ] {
+            assert_eq!(run_src(src), Ok(bool(expected)), "{src}");
+        }
+    }
+
+    #[test]
+    fn eval_ordered_tuples() {
+        use std::cmp::Ordering;
+        let span = Span::new(0, 0);
+        assert_eq!(
+            Val::Tuple(vec![int(1), str("a")]).cmp(&Val::Tuple(vec![int(1), str("b")]), span),
+            Ok(Ordering::Less)
+        );
+        assert_eq!(
+            Val::Tuple(vec![int(1), str("a")]).cmp(&Val::Tuple(vec![int(1), str("a")]), span),
+            Ok(Ordering::Equal)
+        );
+        assert_eq!(
+            Val::Tuple(vec![int(2), str("a")]).cmp(&Val::Tuple(vec![int(1), str("z")]), span),
+            Ok(Ordering::Greater)
+        );
+        assert!(
+            Val::Tuple(vec![int(1)])
+                .cmp(&Val::Tuple(vec![int(1), str("a")]), span)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn eval_ordered_nan_aborts() {
+        let off = r#"config { float_checks = false }"#;
+        let err = run_src_config("(0.0f / 0.0f) < 1.0f", off).unwrap_err();
+        assert!(err.to_string().contains("NaN"), "{err}");
+    }
+
+    #[test]
+    fn eval_equality() {
+        for (src, expected) in [
+            ("1 == 1", true),
+            ("1 != 2", true),
+            ("1 == 2", false),
+            ("1.5f == 1.5f", true),
+            ("\"a\" == \"a\"", true),
+            ("\"a\" != \"b\"", true),
+            ("true == true", true),
+            ("true != false", true),
+            ("30.00 == 30.0", true),
+            ("@now == @now", true),
+            ("#30s == #30s", true),
+            (r#"hex"00" == hex"00""#, true),
+            (r#"hex"00" != hex"01""#, true),
+            (r#"hex"0000" == hex"00""#, false),
+            ("some(1) == some(1)", true),
+            ("some(1) != some(2)", true),
+            ("none == some(2)", false),
+            ("some(some(\"a\")) != some(none)", true),
+        ] {
+            assert_eq!(run_src(src), Ok(bool(expected)), "{src}");
+        }
+    }
+
+    #[test]
+    fn eval_equality_non_owning_refs_ignored() {
+        assert_eq!(run_seeded("users == users"), Ok(bool(true)));
+        assert_eq!(run_seeded("users != users"), Ok(bool(false)));
+        assert_eq!(run_seeded("users in (users,)"), Ok(bool(true)));
+    }
+
+    #[test]
+    fn eval_equality_nan() {
+        let off = r#"config { float_checks = false }"#;
+        assert_eq!(
+            run_src_config("(0.0f / 0.0f) == (0.0f / 0.0f)", off),
+            Ok(bool(false))
+        );
+        assert_eq!(
+            run_src_config("(0.0f / 0.0f) != (0.0f / 0.0f)", off),
+            Ok(bool(true))
+        );
+    }
+
+    #[test]
+    fn eval_equality_structural() {
+        assert_eq!(Val::None.eq(&Val::None), Some(true));
+        assert_eq!(
+            Val::list(vec![int(1), Val::None]).eq(&Val::list(vec![int(1), Val::None])),
+            Some(true)
+        );
+        assert_eq!(
+            Val::list(vec![int(1)]).eq(&Val::list(vec![int(1), int(2)])),
+            Some(false)
+        );
+        assert_eq!(
+            Val::Scalar(Scalar::Int(1)).eq(&Val::Scalar(Scalar::Bool(true))),
+            None
+        );
+    }
+
+    #[test]
+    fn eval_in() {
+        for (src, expected) in [
+            ("1 in (1, 2, false)", true),
+            ("9 in (1, 2, 3)", false),
+            ("\"a\" in ([true], 1.0, \"a\")", true),
+            ("\"z\" in (\"a\", 0.0f)", false),
+            (r#"hex"00" in (hex"00", hex"01")"#, true),
+            (r#"hex"02" in (hex"00", hex"01")"#, false),
+            ("2 in (1, \"a\")", false),
+            ("\"b\" in (1, \"a\")", false),
+            ("some(1) in (some(1), 2)", true),
+            ("some(3) in (some(2), 3)", false),
+            ("{ b = 2, a = 1 } in ({ a = 1, b = 2 }, { a = 0 })", true),
+            ("{ b = 2, a = 9 } in ({ a = 1, b = 2 }, { a = 0 })", false),
+        ] {
+            assert_eq!(run_src(src), Ok(bool(expected)), "{src}");
+        }
+    }
+
+    #[test]
+    fn eval_in_composite() {
+        let names = |src: &str| match run_seeded(src) {
+            Ok(Val::List(rows)) => rows
+                .into_iter()
+                .map(|row| match row {
+                    Val::Record(fields) => fields
+                        .into_iter()
+                        .find_map(|(name, value)| (name.as_ref() == "name").then_some(value))
+                        .expect("expected `name` field"),
+                    other => panic!("expected record, got {other}"),
+                })
+                .collect::<Vec<_>>(),
+            got => panic!("expected rows for {src}, got {got:?}"),
+        };
+        assert_eq!(names("users[id in (1, 3)]"), [str("Ada"), str("Cyd")]);
+        assert_eq!(
+            names("users[name in (\"Ada\", \"Eli\")]"),
+            [str("Ada"), str("Eli")]
+        );
+        assert_eq!(names("users[id in (2, \"x\")]"), [str("Bob")]);
+        assert_eq!(
+            names(
+                "users[if nickname.is_some() {nickname.unwrap() in (\"A\", \"C\")} else {false}]"
+            ),
+            [str("Ada"), str("Cyd")]
+        );
+        assert_eq!(
+            names("users[nickname in (none, some(\"A\"))]"),
+            [str("Ada"), str("Bob"), str("Dan")]
+        );
+    }
+
+    #[test]
+    fn eval_logic() {
+        for (src, expected) in [
+            ("true && true", true),
+            ("true && false", false),
+            ("false && true", false),
+            ("true || false", true),
+            ("false || false", false),
+            ("true || false && false", true),
+            ("(true || false) && false", false),
+            ("!false", true),
+            ("!!true", true),
+            ("!(1 != 2)", false),
+        ] {
+            assert_eq!(run_src(src), Ok(bool(expected)), "{src}");
+        }
+    }
+
+    #[test]
+    fn eval_logic_short_circuit() {
+        assert_eq!(run_src("false && (1 / 0 == 0)"), Ok(bool(false)));
+        assert_eq!(run_src("true || (1 / 0 == 0)"), Ok(bool(true)));
+        assert!(
+            run_src("true && (1 / 0 == 0)")
+                .unwrap_err()
+                .to_string()
+                .contains("zero")
+        );
+    }
+
+    #[test]
+    fn eval_bytes_sort_filter_extrema() {
+        assert_eq!(
+            run_src(r#"[hex"02", hex"01"].sort()"#),
+            Ok(Val::list(vec![bytes(&[0x01]), bytes(&[0x02])]))
+        );
+        assert_eq!(
+            run_src(r#"[hex"02", hex"01"].sort_desc()"#),
+            Ok(Val::list(vec![bytes(&[0x02]), bytes(&[0x01])]))
+        );
+        assert_eq!(
+            run_src(r#"[hex"02", hex"01"].min()"#),
+            Ok(some(bytes(&[0x01])))
+        );
+        assert_eq!(
+            run_src(r#"[hex"02", hex"01"].max()"#),
+            Ok(some(bytes(&[0x02])))
+        );
+        assert_eq!(
+            run_src(r#"[hex"00", hex"01"][$ >= hex"01"]"#),
+            Ok(Val::list(vec![bytes(&[0x01])]))
+        );
+    }
+}

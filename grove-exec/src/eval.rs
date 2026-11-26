@@ -8,8 +8,6 @@ mod methods;
 mod mutations;
 mod operators;
 mod session;
-#[cfg(test)]
-mod tests;
 
 #[cfg(test)]
 pub(crate) mod harness;
@@ -70,4 +68,50 @@ pub fn exec_file_with_options(
     options: ExecOptions,
 ) -> Result<Option<Val>, ExecError> {
     ExecSession::new(storage, schema).execute(file, now, options)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::harness::{NoStorage, int, rec, run_optional_with_storage, run_seeded, some, str};
+    use crate::value::Val;
+    use grove_schema::validated::ValidatedSchema;
+
+    #[test]
+    fn exec_file_discarded_exprs() {
+        assert_eq!(run_seeded("let x = 40 + 2; 1 / 0; x"), Ok(int(42)));
+        assert_eq!(run_seeded("let a = 1; let b = a + 2; b"), Ok(int(3)));
+        assert_eq!(
+            run_seeded("users { name, x = 1 / 0 }; roles { name }"),
+            Ok(Val::list(vec![
+                rec(vec![("name", str("admin"))]),
+                rec(vec![("name", str("editor"))]),
+            ]))
+        );
+    }
+
+    #[test]
+    fn exec_standalone_statements() {
+        let schema = ValidatedSchema::default();
+        assert_eq!(
+            run_optional_with_storage("let x = 1;", &schema, &NoStorage),
+            Ok(None)
+        );
+        assert_eq!(run_optional_with_storage("", &schema, &NoStorage), Ok(None));
+        assert_eq!(
+            run_optional_with_storage("let x = 1; x", &schema, &NoStorage),
+            Ok(Some(int(1)))
+        );
+    }
+
+    #[test]
+    fn deep_optional_chain_pushdown_parity() {
+        assert_eq!(
+            run_seeded("users.first()?.nickname??.to_upper()"),
+            Ok(some(some(str("A"))))
+        );
+        assert_eq!(
+            run_seeded("users.first()?.manager??.name"),
+            Ok(some(some(str("Bob"))))
+        );
+    }
 }

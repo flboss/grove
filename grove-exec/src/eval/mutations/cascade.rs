@@ -148,3 +148,185 @@ fn cleanup_non_owned_links(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::eval::harness::{int, rec};
+    use crate::eval::mutations::tests::*;
+    use crate::storage::Storage;
+    use crate::value::Val;
+
+    #[test]
+    fn delete_list_target_recursive_cascade() {
+        let schema = cascade_schema();
+        let backend = cascade_backend(&schema);
+        let user = schema.roots[0].struct_id;
+        let order = schema.struct_by_name("Order").unwrap().0;
+        let item = schema.struct_by_name("Item").unwrap().0;
+
+        let result = run(
+            r#"
+                users.insert([
+                    {
+                        id = 1,
+                        name = "A",
+                        orders = [{
+                            id = 10,
+                            total = 1,
+                            items = [{ id = 100 }, { id = 101 }],
+                        }],
+                    },
+                    {
+                        id = 2,
+                        name = "B",
+                        orders = [{ id = 20, total = 2, items = [] }],
+                    },
+                ]);
+                users[id == 1].delete();
+                users.len()
+                "#,
+            &schema,
+            &backend,
+        );
+
+        assert_eq!(result, Some(int(1)));
+        assert_eq!(
+            backend
+                .fetch(user, &[], &FetchConstraints::EMPTY)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            backend
+                .fetch(order, &[], &FetchConstraints::EMPTY)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            backend
+                .fetch(item, &[], &FetchConstraints::EMPTY)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn delete_one_to_many_fk_cleared() {
+        let schema = one_to_many_schema();
+        let backend = one_to_many_backend(&schema);
+
+        let result = run(
+            r#"
+                parents.first().unwrap().delete();
+                children.first().unwrap() { id, parent }
+                "#,
+            &schema,
+            &backend,
+        );
+
+        assert_eq!(
+            result,
+            Some(rec(vec![("id", int(10)), ("parent", Val::None)]))
+        );
+    }
+
+    #[test]
+    fn delete_self_ref_fk_cleared() {
+        let schema = self_ref_schema();
+        let backend = self_ref_backend(&schema);
+
+        let result = run(
+            r#"
+                users.first().unwrap().delete();
+                users.first().unwrap() { id, manager }
+                "#,
+            &schema,
+            &backend,
+        );
+
+        assert_eq!(
+            result,
+            Some(rec(vec![("id", int(2)), ("manager", Val::None)]))
+        );
+    }
+
+    #[test]
+    fn owning_delete_nested_non_owning_cleaned() {
+        let schema = nested_link_schema();
+        let backend = nested_link_backend(&schema);
+
+        let result = run(
+            r#"
+                users.insert({
+                    id = 1,
+                    name = "u",
+                    favorite = some(&images[id == 1].first().unwrap()),
+                    orders = [{
+                        id = 10,
+                        total = 1,
+                        image = some(&images[id == 1].first().unwrap()),
+                        tags = &tags,
+                    }],
+                });
+                images[id == 1].first().unwrap().delete();
+                tags[id == 1].first().unwrap().delete();
+                (
+                    users.find(id == 1).unwrap().favorite?.id,
+                    users.find(id == 1).unwrap().orders.first().unwrap().image?.id,
+                    users.find(id == 1).unwrap().orders.first().unwrap().tags.id,
+                    users.len(),
+                    images.len(),
+                )
+                "#,
+            &schema,
+            &backend,
+        );
+        assert_eq!(
+            result,
+            Some(Val::Tuple(vec![
+                Val::None,
+                Val::None,
+                Val::list(vec![int(2)]),
+                int(1),
+                int(1),
+            ]))
+        );
+    }
+
+    #[test]
+    fn delete_many_to_many_join_cleaned_for_user() {
+        let schema = many_to_many_schema();
+        let backend = many_to_many_backend(&schema);
+
+        let result = run(
+            r#"
+                users.first().unwrap().delete();
+                roles.map($.users.len())
+                "#,
+            &schema,
+            &backend,
+        );
+
+        assert_eq!(result, Some(Val::list(vec![int(1), int(0)])));
+    }
+
+    #[test]
+    fn delete_many_to_many_join_cleaned_for_role() {
+        let schema = many_to_many_schema();
+        let backend = many_to_many_backend(&schema);
+
+        let result = run(
+            r#"
+                roles.first().unwrap().delete();
+                users.map($.roles.len())
+                "#,
+            &schema,
+            &backend,
+        );
+
+        assert_eq!(result, Some(Val::list(vec![int(1), int(0)])));
+    }
+}

@@ -176,9 +176,12 @@ fn execute_inner<'s>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::eval::harness::{FIXED_NOW, NoStorage};
     use crate::sqlite::SqliteBackend;
     use crate::storage::FetchConstraints;
+    use crate::testdata;
     use crate::value::{Scalar, Val};
+    use grove_query::TypeBindings;
     use grove_schema::validated::{FieldId, StructId};
     use grove_types::Span;
     use rusqlite::Connection;
@@ -231,6 +234,173 @@ mod tests {
         let (typed, diags) = grove_query::typecheck::typecheck(file.unwrap(), schema);
         assert!(diags.is_empty(), "{diags:?}");
         typed.unwrap()
+    }
+
+    fn typed_session(src: &str, schema: &ValidatedSchema, types: &TypeBindings) -> TypedQueryFile {
+        let (file, parse_diags) = grove_query::parse_query(src);
+        assert!(
+            parse_diags
+                .iter()
+                .all(|d| d.severity == grove_types::Severity::Warning),
+            "{parse_diags:?}"
+        );
+        let (typed, diags) =
+            grove_query::typecheck::typecheck_with_bindings(file.unwrap(), schema, types);
+        assert!(diags.is_empty(), "{diags:?}");
+        typed.unwrap()
+    }
+
+    fn record_field<'a>(value: &'a Val, name: &str) -> &'a Val {
+        let Val::Record(fields) = value else {
+            panic!("expected record, got {value:?}");
+        };
+        fields
+            .iter()
+            .find(|(field_name, _)| field_name.as_ref() == name)
+            .map(|(_, value)| value)
+            .expect("expected record field")
+    }
+
+    #[test]
+    fn session_bindings_persistence_alignment() {
+        let schema = ValidatedSchema::default();
+        let mut session = ExecSession::new(&NoStorage, &schema);
+        let mut types = TypeBindings::new();
+
+        let first = typed_session("let x = 41;", &schema, &types);
+        assert_eq!(
+            session.execute(&first, FIXED_NOW, ExecOptions::default()),
+            Ok(None)
+        );
+        for (name, ty) in first.let_bindings() {
+            types.define(name, ty.clone());
+        }
+        assert_eq!(session.binding("x"), Some(&int(41)));
+
+        let second = typed_session("x + 1", &schema, &types);
+        assert_eq!(
+            session.execute(&second, FIXED_NOW, ExecOptions::default()),
+            Ok(Some(int(42)))
+        );
+        assert_eq!(session.bindings().count(), 1);
+    }
+
+    #[test]
+    fn session_rollback_failed_turn() {
+        let schema = ValidatedSchema::default();
+        let mut session = ExecSession::new(&NoStorage, &schema);
+        let mut types = TypeBindings::new();
+
+        let first = typed_session("let x = 1;", &schema, &types);
+        assert_eq!(
+            session.execute(&first, FIXED_NOW, ExecOptions::default()),
+            Ok(None)
+        );
+        for (name, ty) in first.let_bindings() {
+            types.define(name, ty.clone());
+        }
+
+        let failed = typed_session("let y = 2; 1 / 0", &schema, &types);
+        let err = session
+            .execute(&failed, FIXED_NOW, ExecOptions::default())
+            .unwrap_err();
+        assert!(matches!(err, ExecError::Abort { .. }));
+        assert!(session.binding("y").is_none());
+        assert_eq!(session.binding("x"), Some(&int(1)));
+
+        let third = typed_session("x", &schema, &types);
+        assert_eq!(
+            session.execute(&third, FIXED_NOW, ExecOptions::default()),
+            Ok(Some(int(1)))
+        );
+    }
+
+    #[test]
+    fn session_binding_depth_matches_scoped_methods() {
+        let schema = ValidatedSchema::default();
+        let mut session = ExecSession::new(&NoStorage, &schema);
+        let mut types = TypeBindings::new();
+
+        let first = typed_session("let min = 1;", &schema, &types);
+        session
+            .execute(&first, FIXED_NOW, ExecOptions::default())
+            .unwrap();
+        for (name, ty) in first.let_bindings() {
+            types.define(name, ty.clone());
+        }
+
+        let second = typed_session("[1, 2, 3].filter($ > min)", &schema, &types);
+        assert_eq!(
+            session.execute(&second, FIXED_NOW, ExecOptions::default()),
+            Ok(Some(Val::list(vec![int(2), int(3)])))
+        );
+    }
+
+    #[test]
+    fn mutations_writable_storage_required() {
+        let schema = testdata::schema();
+        let mut session = ExecSession::new(&NoStorage, &schema);
+        let typed = typed_session("users.delete();", &schema, &TypeBindings::new());
+
+        let err = session
+            .execute(&typed, FIXED_NOW, ExecOptions::default())
+            .unwrap_err();
+        assert!(matches!(err, ExecError::Unsupported { .. }), "{err:?}");
+        assert_eq!(session.bindings().count(), 0);
+    }
+
+    #[test]
+    fn let_owning_refs_resolved() {
+        let schema = testdata::schema();
+        let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory database");
+        testdata::seed(&mut conn).expect("testdata initialization");
+        let backend = crate::sqlite::SqliteBackend::new(conn, &schema).expect("backend");
+        let mut session = ExecSession::new(&backend, &schema);
+
+        let typed = typed_session(
+            "let u = users.first().unwrap();",
+            &schema,
+            &TypeBindings::new(),
+        );
+        assert_eq!(
+            session.execute(&typed, FIXED_NOW, ExecOptions::default()),
+            Ok(None)
+        );
+        assert!(matches!(
+            record_field(session.binding("u").expect("u binding"), "profile"),
+            Val::Some(inner) if matches!(inner.as_ref(), Val::Record(_))
+        ));
+    }
+
+    #[test]
+    fn session_remove_and_clear() {
+        let schema = ValidatedSchema::default();
+        let mut session = ExecSession::new(&NoStorage, &schema);
+        let mut types = TypeBindings::new();
+
+        for (src, name) in [("let x = 1;", "x"), ("let y = 2;", "y")] {
+            let typed = typed_session(src, &schema, &types);
+            session
+                .execute(&typed, FIXED_NOW, ExecOptions::default())
+                .unwrap();
+            for (name, ty) in typed.let_bindings() {
+                types.define(name, ty.clone());
+            }
+            assert!(session.binding(name).is_some());
+        }
+
+        assert_eq!(session.remove("x"), Some(int(1)));
+        assert!(session.binding("x").is_none());
+        assert!(session.binding("y").is_some());
+
+        session.clear();
+        assert_eq!(session.bindings().count(), 0);
+
+        let typed = typed_session("1", &schema, &TypeBindings::new());
+        assert_eq!(
+            session.execute(&typed, FIXED_NOW, ExecOptions::default()),
+            Ok(Some(int(1)))
+        );
     }
 
     #[test]

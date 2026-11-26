@@ -176,3 +176,182 @@ fn rooted_frame(expr: &TypedExpr, schema: &ValidatedSchema, frames: &[bool]) -> 
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::eval::data::tests::{record_field_value, related_fields_for, run_seeded_recording};
+    use crate::eval::harness::{int, rec, str};
+    use crate::testdata;
+    use crate::value::Scalar;
+
+    #[test]
+    fn filter_prefetch_batched_owning_refs() {
+        let schema = testdata::schema();
+        let (_, recording) =
+            run_seeded_recording("users[orders.len() > 1] { name }").expect("query");
+        let orders = testdata::field_id(&schema, testdata::struct_id(&schema, "User"), "orders");
+        let related = recording.related_fetches.borrow();
+        assert_eq!(related.len(), 1, "expected one batched fetch: {related:?}");
+        assert_eq!(
+            related_fields_for(&schema, &related, orders),
+            Some([].as_slice())
+        );
+        assert_eq!(recording.related_parent_counts.borrow().as_slice(), &[5]);
+    }
+
+    #[test]
+    fn prefetch_refs_behind_non_owning_refs_skipped() {
+        let (result, recording) =
+            run_seeded_recording("users[manager?.orders?.len() == some(1)] { name }")
+                .expect("query");
+        let counts = recording.related_parent_counts.borrow();
+        assert!(!counts.is_empty(), "manager chain resolves lazily");
+        assert!(
+            counts.iter().all(|count| *count == 1),
+            "expected only per-element lazy fetches, got {counts:?}"
+        );
+        match result {
+            Val::List(rows) => {
+                assert_eq!(rows.len(), 2);
+                assert_eq!(record_field_value(&rows[0], "name"), &str("Ada"));
+                assert_eq!(record_field_value(&rows[1], "name"), &str("Cyd"));
+            }
+            other => panic!("expected projected rows, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_prefetch_batched_record_field_refs() {
+        let schema = testdata::schema();
+        let (_, recording) = run_seeded_recording("users.map($.orders.len())").expect("query");
+        let orders = testdata::field_id(&schema, testdata::struct_id(&schema, "User"), "orders");
+        let related = recording.related_fetches.borrow();
+        assert_eq!(related.len(), 1, "expected one batched fetch: {related:?}");
+        assert_eq!(
+            related_fields_for(&schema, &related, orders),
+            Some([].as_slice())
+        );
+        assert_eq!(recording.related_parent_counts.borrow().as_slice(), &[5]);
+    }
+
+    #[test]
+    fn prefetch_nested_owned_scopes() {
+        let (result, recording) =
+            run_seeded_recording("users[orders[items.len() > 0].len() > 0] { name }")
+                .expect("query");
+
+        let counts = recording.related_parent_counts.borrow();
+        assert_eq!(
+            counts.as_slice(),
+            &[5, 3],
+            "expected batched User.orders then Order.items fetches: {counts:?}"
+        );
+        assert_eq!(result, Val::list(vec![rec(vec![("name", str("Bob"))])]));
+    }
+
+    #[test]
+    fn first_record_projection_no_owning_refs_fetched() {
+        let (_, recording) = run_seeded_recording("users.first()?.name").expect("query");
+        assert!(recording.related_fetches.borrow().is_empty(),);
+    }
+
+    #[test]
+    fn field_trigger_owning_pushed_into_fetch_related() {
+        let (result, recording) =
+            run_seeded_recording("users[id <= 2].map($.orders[amount > 150].take(1).len())")
+                .expect("query");
+
+        let related = recording.related_constraints.borrow();
+        assert_eq!(related.len(), 2);
+        for constraints in related.iter() {
+            assert_eq!(constraints.filters.len(), 1);
+            assert!(constraints.sort.is_empty());
+            assert_eq!(constraints.offset, 0);
+            assert_eq!(constraints.limit, Some(1));
+        }
+        assert_eq!(result, Val::list(vec![int(1), int(1)]));
+    }
+
+    #[test]
+    fn field_trigger_non_owning_pushed_into_fetch_related() {
+        let (result, recording) =
+            run_seeded_recording("users[id <= 2].map($.roles.take(1).len())").expect("query");
+
+        let related = recording.related_constraints.borrow();
+        assert_eq!(related.len(), 2);
+        for constraints in related.iter() {
+            assert!(constraints.filters.is_empty());
+            assert!(constraints.sort.is_empty());
+            assert_eq!(constraints.offset, 0);
+            assert_eq!(constraints.limit, Some(1));
+        }
+        assert_eq!(result, Val::list(vec![int(1), int(0)]));
+    }
+
+    #[test]
+    fn ident_trigger_filter_predicate() {
+        let (result, recording) =
+            run_seeded_recording("users[orders[amount > 150].take(1).len() > 0] { name }")
+                .expect("query");
+
+        let related = recording.related_constraints.borrow();
+        assert_eq!(related.len(), 5);
+        for constraints in related.iter() {
+            assert_eq!(constraints.filters.len(), 1);
+            assert_eq!(constraints.limit, Some(1));
+        }
+        assert_eq!(
+            result,
+            Val::list(vec![
+                rec(vec![("name", str("Ada"))]),
+                rec(vec![("name", str("Bob"))]),
+            ])
+        );
+    }
+
+    fn unpack_optional_int(value: &Val) -> Option<i64> {
+        match value {
+            Val::Some(inner) => match inner.as_ref() {
+                Val::Scalar(Scalar::Int(value)) => Some(*value),
+                other => panic!("expected int, got {other:?}"),
+            },
+            Val::None => None,
+            other => panic!("expected optional int, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn related_fetch_first_nth() {
+        let (result, recording) = run_seeded_recording(
+            "users[id <= 2] { a = orders.first()?.amount, b = orders.nth(1)?.amount }",
+        )
+        .expect("query");
+
+        let related = recording.related_constraints.borrow();
+        assert_eq!(related.len(), 4);
+        for pair in related.chunks(2) {
+            assert_eq!(pair[0].offset, 0);
+            assert_eq!(pair[0].limit, Some(1));
+            assert_eq!(pair[1].offset, 1);
+            assert_eq!(pair[1].limit, Some(1));
+        }
+
+        let Val::List(rows) = result else {
+            panic!("expected user rows, got {result:?}");
+        };
+        assert_eq!(
+            unpack_optional_int(record_field_value(&rows[0], "a")),
+            Some(100)
+        );
+        assert_eq!(
+            unpack_optional_int(record_field_value(&rows[0], "b")),
+            Some(200)
+        );
+        assert_eq!(
+            unpack_optional_int(record_field_value(&rows[1], "a")),
+            Some(400)
+        );
+        assert_eq!(unpack_optional_int(record_field_value(&rows[1], "b")), None);
+    }
+}

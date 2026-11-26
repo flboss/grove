@@ -247,3 +247,296 @@ pub(crate) fn lookup_ref(
             message: "Ref data missing from batch fetch result".to_string(),
         })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::eval::data::tests::run_seeded_recording;
+    use crate::eval::harness::{run_seeded, some, str};
+    use crate::sqlite::SqliteBackend;
+    use crate::storage::Storage;
+    use crate::testdata;
+    use crate::value::Scalar;
+
+    #[test]
+    fn root_owning_resolved() {
+        match run_seeded("users") {
+            Ok(Val::List(rows)) => {
+                assert_eq!(rows.len(), 5);
+                // Ada (has profile, 2 orders)
+                let Val::Record(first) = &rows[0] else {
+                    panic!("expected record");
+                };
+                let (_, profile) = first
+                    .iter()
+                    .find(|(name, _)| name.as_ref() == "profile")
+                    .expect("profile field");
+                match profile {
+                    Val::Some(inner) => {
+                        let Val::Record(profile) = inner.as_ref() else {
+                            panic!("expected profile record, got {inner}");
+                        };
+                        assert!(profile.iter().any(|(name, value)| {
+                            name.as_ref() == "bio" && *value == str("AdaBio")
+                        }));
+                        assert!(profile.iter().any(|(name, value)| {
+                            matches!(value, Val::Ref { .. }) && name.as_ref() == "user"
+                        }));
+                    }
+                    got => panic!("expected some(profile), got {got}"),
+                }
+                let (_, orders) = first
+                    .iter()
+                    .find(|(name, _)| name.as_ref() == "orders")
+                    .expect("orders field");
+                let Val::List(orders) = orders else {
+                    panic!("expected orders list, got {orders}");
+                };
+                assert_eq!(orders.len(), 2);
+                for name in ["roles", "manager"] {
+                    assert!(
+                        first.iter().any(|(n, value)| {
+                            n.as_ref() == name && matches!(value, Val::Ref { .. })
+                        }),
+                        "expected unresolved {name} link"
+                    );
+                }
+                assert!(first.iter().any(|(name, value)| {
+                    name.as_ref() == "nickname" && *value == some(str("A"))
+                }));
+                // Bob (no profile, 1 order)
+                let Val::Record(second) = &rows[1] else {
+                    panic!("expected record");
+                };
+                assert!(
+                    second
+                        .iter()
+                        .any(|(name, value)| { name.as_ref() == "profile" && *value == Val::None })
+                );
+                let (_, orders) = second
+                    .iter()
+                    .find(|(name, _)| name.as_ref() == "orders")
+                    .expect("orders field");
+                assert!(matches!(orders, Val::List(items) if items.len() == 1));
+                // Eli (no orders)
+                let Val::Record(fifth) = &rows[4] else {
+                    panic!("expected record");
+                };
+                let (_, orders) = fifth
+                    .iter()
+                    .find(|(name, _)| name.as_ref() == "orders")
+                    .expect("orders field");
+                assert!(matches!(orders, Val::List(items) if items.is_empty()));
+            }
+            got => panic!("expected user rows, got {got:?}"),
+        }
+    }
+
+    #[test]
+    fn unresolved_ref_display() {
+        match run_seeded("users") {
+            Ok(Val::List(rows)) => {
+                let text = rows[0].to_string();
+                assert_eq!(
+                    text.split("ref(").count(),
+                    7,
+                    "expected link rendering: {text}"
+                );
+            }
+            got => panic!("expected user rows, got {got:?}"),
+        }
+    }
+
+    #[test]
+    fn field_optional_ref_resolved() {
+        match run_seeded("users.manager") {
+            Ok(Val::List(rows)) => {
+                assert_eq!(rows.len(), 5);
+                let names: Vec<Option<&str>> = rows
+                    .iter()
+                    .map(|row| match row {
+                        Val::Some(user) => match user.as_ref() {
+                            Val::Record(fields) => Some(
+                                fields
+                                    .iter()
+                                    .find(|(name, _)| name.as_ref() == "name")
+                                    .map(|(_, value)| match value {
+                                        Val::Scalar(Scalar::String(s)) => s.as_str(),
+                                        other => panic!("expected name string, got {other}"),
+                                    })
+                                    .expect("name field"),
+                            ),
+                            other => panic!("expected manager record, got {other}"),
+                        },
+                        Val::None => None,
+                        other => panic!("expected optional manager, got {other}"),
+                    })
+                    .collect();
+                assert_eq!(names, [Some("Bob"), None, Some("Bob"), Some("Ada"), None]);
+            }
+            got => panic!("expected manager list, got {got:?}"),
+        }
+    }
+
+    #[test]
+    fn field_list_ref_resolved() {
+        match run_seeded("users.roles") {
+            Ok(Val::List(rows)) => {
+                assert_eq!(rows.len(), 5);
+                let role_names: Vec<Vec<&str>> = rows
+                    .iter()
+                    .map(|row| match row {
+                        Val::List(roles) => roles
+                            .iter()
+                            .map(|role| match role {
+                                Val::Record(fields) => fields
+                                    .iter()
+                                    .find(|(name, _)| name.as_ref() == "name")
+                                    .map(|(_, value)| match value {
+                                        Val::Scalar(Scalar::String(s)) => s.as_str(),
+                                        other => panic!("expected name string, got {other}"),
+                                    })
+                                    .expect("name field"),
+                                other => panic!("expected role record, got {other}"),
+                            })
+                            .collect(),
+                        other => panic!("expected role list, got {other}"),
+                    })
+                    .collect();
+                assert_eq!(
+                    role_names,
+                    [
+                        vec!["admin", "editor", "editor"],
+                        vec![],
+                        vec!["editor"],
+                        vec![],
+                        vec![],
+                    ]
+                );
+            }
+            got => panic!("expected roles list, got {got:?}"),
+        }
+    }
+
+    #[test]
+    fn dangling_fk_required_ref_error() {
+        let schema = testdata::schema();
+        let user_struct = testdata::struct_id(&schema, "User");
+        let order_struct = testdata::struct_id(&schema, "Order");
+        let user_field = testdata::field_id(&schema, order_struct, "user");
+        let orders_field = testdata::field_id(&schema, user_struct, "orders");
+        let relation = schema.relation_of_field(user_field).expect("user relation");
+        assert_eq!(
+            schema.relations[relation.index()].endpoints(),
+            [user_field, orders_field],
+        );
+        let mut conn =
+            rusqlite::Connection::open_in_memory().expect("in-memory database should open");
+        testdata::seed(&mut conn).expect("testdata initialization should succeed");
+        let backend = SqliteBackend::new(conn, &schema).expect("backend should verify");
+        // 100/Ada, 200/Ada, 300/NULL, 400/Bob
+        let rows = backend
+            .fetch(
+                order_struct,
+                &[testdata::field_id(&schema, order_struct, "amount")],
+                &FetchConstraints::EMPTY,
+            )
+            .expect("fetch orders");
+        assert_eq!(rows.len(), 4);
+        let keys: Vec<Key> = rows.iter().map(|row| row.rowid).collect();
+        let groups = Storage::fetch_related(
+            &backend,
+            relation,
+            true,
+            &keys,
+            &testdata_value_fields(&schema, user_struct),
+            &FetchConstraints::EMPTY,
+        )
+        .expect("fetch_related succeeds");
+        assert_eq!(groups.len(), 4);
+        assert_eq!(groups[0].len(), 1);
+        assert_eq!(groups[3].len(), 1);
+        let empty: Val = Val::list(Vec::new());
+        match wrap_fetched(empty, user_field, Key(2), &schema) {
+            Err(ExecError::Integrity { message }) => assert!(
+                message.contains("resolved to 0 rows"),
+                "expected dangling-FK message, got: {message}"
+            ),
+            got => panic!("expected integrity error, got {got:?}"),
+        }
+    }
+
+    fn testdata_value_fields(schema: &ValidatedSchema, struct_id: StructId) -> Vec<FieldId> {
+        schema.structs[struct_id.index()]
+            .fields
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| !matches!(field, Field::Ref { .. }))
+            .map(|(local, _)| FieldId::new(struct_id, local))
+            .collect()
+    }
+
+    #[test]
+    fn field_pushdown_projection_fields_pruned() {
+        let schema = testdata::schema();
+        let (_, recording) = run_seeded_recording("users { name }").expect("query");
+        let user = testdata::struct_id(&schema, "User");
+        let name = testdata::field_id(&schema, user, "name");
+        assert_eq!(*recording.fetches.borrow(), vec![(user, vec![name])]);
+        let related = recording.related_fetches.borrow();
+        assert!(related.is_empty(), "ref not lazily resolved: {related:?}");
+    }
+
+    #[test]
+    fn field_pushdown_whole_record_fields_kept() {
+        let schema = testdata::schema();
+        let (_, recording) = run_seeded_recording("users").expect("query");
+        let user = testdata::struct_id(&schema, "User");
+        assert_eq!(
+            *recording.fetches.borrow(),
+            vec![(user, testdata_value_fields(&schema, user))]
+        );
+        let related = recording.related_fetches.borrow();
+        assert_eq!(
+            related.len(),
+            3,
+            "expected profile, orders, items: {related:?}"
+        );
+        assert_eq!(
+            recording.related_parent_counts.borrow().as_slice(),
+            &[5, 5, 3]
+        );
+        for (rel, from_first, fields) in related.iter() {
+            let relation = &schema.relations[rel.index()];
+            let endpoint = if *from_first {
+                relation.endpoints()[0]
+            } else {
+                relation.endpoints()[1]
+            };
+            let target =
+                match &schema.structs[endpoint.struct_id().index()].fields[endpoint.local()] {
+                    Field::Ref { target, .. } => *target,
+                    _ => panic!("relation endpoint is not a ref"),
+                };
+            assert_eq!(fields, &testdata_value_fields(&schema, target));
+        }
+    }
+
+    #[test]
+    fn root_fetch_constraints_pushdown() {
+        let schema = testdata::schema();
+        let (_, recording) =
+            run_seeded_recording("users[id > 2].sort_over(name).take(2)").expect("query");
+        let constraints = recording.constraints.borrow();
+        let first = constraints.first().expect("root fetch");
+        assert_eq!(first.filters.len(), 1);
+        assert_eq!(first.sort.len(), 1);
+        assert_eq!(
+            first.sort[0].field,
+            testdata::field_id(&schema, testdata::struct_id(&schema, "User"), "name")
+        );
+        assert!(!first.sort[0].desc);
+        assert_eq!(first.offset, 0);
+        assert_eq!(first.limit, Some(2));
+    }
+}
