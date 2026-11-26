@@ -471,3 +471,376 @@ fn const_int_arg(args: &[TypedMethodArg]) -> Option<u64> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pushdown::tests::*;
+    use crate::storage::{CmpOp, PushExpr};
+    use crate::testdata;
+    use crate::value::Scalar;
+
+    #[test]
+    fn matcher_simple_predicates() {
+        let sources = [
+            "users[id > 2]",
+            "users[name == \"Ada\"]",
+            "users[active]",
+            "users[active == true]",
+            "users[balance > 30.00]",
+            "users[created > @now]",
+            "users[name.contains(\"A\")]",
+            "users[name.starts_with(\"A\")]",
+            "users[name.ends_with(\"a\")]",
+            "users[name.len() > 3]",
+            "users[id in (1, 2, 3)]",
+            "users[active && id > 1]",
+            "users[!(active)]",
+        ];
+        for source in sources {
+            let (file, plan, _schema) = typed_and_plan(source);
+            let constraints = root_constraints(&plan, &file);
+            assert_eq!(constraints.filters.len(), 1, "{source}: {constraints:?}");
+            assert!(constraints.sort.is_empty(), "{source}");
+            assert_eq!(constraints.offset, 0, "{source}");
+            assert_eq!(constraints.limit, None, "{source}");
+        }
+    }
+
+    #[test]
+    fn optional_method_chains_not_pushed() {
+        let (file, plan, _schema) = typed_and_plan("users.first()?.orders?.take(1)");
+        let takes = method_nodes(&file, "take");
+        assert_eq!(takes.len(), 1);
+        assert_eq!(plan.runtime_rewrite(takes[0]), None);
+    }
+
+    #[test]
+    fn filters_composition_across_unpushed() {
+        let (file, plan, schema) =
+            typed_and_plan("users[id > 2][orders.len() > 1][name == \"Ada\"]");
+        let constraints = root_constraints(&plan, &file);
+        assert_eq!(
+            constraints.filters,
+            vec![
+                PushExpr::Cmp {
+                    op: CmpOp::Gt,
+                    lhs: Box::new(PushExpr::Field(field(&schema, "User", "id"))),
+                    rhs: Box::new(PushExpr::Literal(Scalar::Int(2))),
+                },
+                PushExpr::Cmp {
+                    op: CmpOp::Eq,
+                    lhs: Box::new(PushExpr::Field(field(&schema, "User", "name"))),
+                    rhs: Box::new(PushExpr::Literal(Scalar::String("Ada".to_string()))),
+                },
+            ]
+        );
+
+        let (file, plan, _schema) = typed_and_plan("users[orders.len() > 1].take(3)");
+        let constraints = root_constraints(&plan, &file);
+        assert!(constraints.filters.is_empty());
+        assert_eq!(constraints.limit, None);
+        let take = method_nodes(&file, "take");
+        assert_eq!(take.len(), 1);
+        assert_eq!(plan.runtime_rewrite(take[0]), None);
+    }
+
+    #[test]
+    fn unpushed_sort_composition() {
+        let (file, plan, schema) =
+            typed_and_plan("users.sort_over(orders.len()).filter(id > 2).sort_over(name)");
+        let constraints = root_constraints(&plan, &file);
+        assert!(constraints.sort.is_empty());
+        assert_eq!(
+            constraints.filters,
+            vec![PushExpr::Cmp {
+                op: CmpOp::Gt,
+                lhs: Box::new(PushExpr::Field(field(&schema, "User", "id"))),
+                rhs: Box::new(PushExpr::Literal(Scalar::Int(2))),
+            }]
+        );
+    }
+
+    #[test]
+    fn rewrites_composition() {
+        let (file, plan, _schema) = typed_and_plan("users[id > 2].sort_over(name).take(3)");
+        let constraints = root_constraints(&plan, &file);
+        assert_eq!(constraints.filters.len(), 1);
+        assert_eq!(constraints.sort.len(), 1);
+        assert_eq!((constraints.offset, constraints.limit), (0, Some(3)));
+        let roots = root_nodes(&file);
+        assert_eq!(roots.len(), 1);
+        for take in method_nodes(&file, "take") {
+            assert_eq!(
+                plan.rewrite_plan(take).expect("take planned").trigger,
+                roots[0]
+            );
+        }
+
+        let (file, plan, _schema) = typed_and_plan("users[id > 2].take(3).sort_over(name)");
+        let constraints = root_constraints(&plan, &file);
+        assert_eq!(constraints.filters.len(), 1);
+        assert!(constraints.sort.is_empty());
+        assert_eq!((constraints.offset, constraints.limit), (0, Some(3)));
+
+        let (file, plan, _schema) = typed_and_plan("users.take(10).sort_over(id)");
+        let constraints = root_constraints(&plan, &file);
+        assert!(constraints.sort.is_empty());
+        assert_eq!((constraints.offset, constraints.limit), (0, Some(10)));
+
+        let (file, plan, _schema) = typed_and_plan("users.take(10)[id > 2]");
+        let constraints = root_constraints(&plan, &file);
+        assert!(constraints.filters.is_empty());
+        assert_eq!((constraints.offset, constraints.limit), (0, Some(10)));
+    }
+
+    #[test]
+    fn pushdown_chain_termination_on_projection() {
+        let (file, plan, schema) = typed_and_plan("users[id > 2].take(3) { name }");
+        let constraints = root_constraints(&plan, &file);
+        assert_eq!(constraints.filters.len(), 1);
+        assert_eq!((constraints.offset, constraints.limit), (0, Some(3)));
+        assert_fields(&plan, &schema, "User", &["id", "name"]);
+
+        let (file, plan, schema) = typed_and_plan("users { o = orders.take(2) }");
+        let constraints = root_constraints(&plan, &file);
+        assert_eq!((constraints.offset, constraints.limit), (0, None));
+        let orders = testdata::field_id(&schema, testdata::struct_id(&schema, "User"), "orders");
+        let orders_sites = field_ident_nodes(&file, orders);
+        assert_eq!(orders_sites.len(), 1);
+        assert_eq!(
+            plan.constraints_for(orders_sites[0]),
+            Some(&FetchConstraints {
+                filters: vec![],
+                sort: vec![],
+                tie_desc: false,
+                offset: 0,
+                limit: Some(2),
+            })
+        );
+        let take = method_nodes(&file, "take");
+        assert_eq!(take.len(), 1);
+        assert_eq!(
+            plan.rewrite_plan(take[0]),
+            Some(RewritePlan {
+                rewrite: RuntimeRewrite::Skip,
+                trigger: orders_sites[0],
+            })
+        );
+        assert!(plan.prefetch_skip.contains(&orders));
+    }
+
+    #[test]
+    fn related_ident_chains() {
+        let (file, plan, schema) =
+            typed_and_plan("users { o = orders[amount > 100].take(1), r = roles.take(1) }");
+        let user = testdata::struct_id(&schema, "User");
+        let orders = testdata::field_id(&schema, user, "orders");
+        let roles = testdata::field_id(&schema, user, "roles");
+
+        let orders_sites = field_ident_nodes(&file, orders);
+        assert_eq!(orders_sites.len(), 1);
+        let orders_plan = plan
+            .constraints_for(orders_sites[0])
+            .expect("orders trigger constraints");
+        assert_eq!(orders_plan.filters.len(), 1);
+        assert_eq!(orders_plan.limit, Some(1));
+
+        let roles_sites = field_ident_nodes(&file, roles);
+        assert_eq!(roles_sites.len(), 1);
+        let roles_plan = plan
+            .constraints_for(roles_sites[0])
+            .expect("roles trigger constraints");
+        assert!(roles_plan.filters.is_empty());
+        assert_eq!(roles_plan.limit, Some(1));
+
+        assert!(plan.prefetch_skip.contains(&orders));
+        assert!(plan.prefetch_skip.contains(&roles));
+        for take in method_nodes(&file, "take") {
+            let rewrite = plan.rewrite_plan(take).expect("take planned");
+            assert_eq!(rewrite.rewrite, RuntimeRewrite::Skip);
+        }
+    }
+
+    #[test]
+    fn related_empty_chain() {
+        let (file, plan, schema) = typed_and_plan("users { o = orders.len() }");
+        let orders = testdata::field_id(&schema, testdata::struct_id(&schema, "User"), "orders");
+        let sites = field_ident_nodes(&file, orders);
+        assert_eq!(sites.len(), 1);
+        let constraints = plan
+            .constraints_for(sites[0])
+            .expect("related chain entry exists");
+        assert!(constraints.is_empty());
+        assert!(!plan.prefetch_skip.contains(&orders));
+        let len = method_nodes(&file, "len");
+        assert_eq!(len.len(), 1);
+        assert_eq!(plan.rewrite_plan(len[0]), None);
+    }
+
+    #[test]
+    fn related_field_chains() {
+        let (file, plan, schema) = typed_and_plan("users.map($.orders.take(2).len())");
+        let orders = testdata::field_id(&schema, testdata::struct_id(&schema, "User"), "orders");
+        let take = method_nodes(&file, "take");
+        assert_eq!(take.len(), 1);
+        let rewrite = plan.rewrite_plan(take[0]).expect("take planned");
+        assert_eq!(rewrite.rewrite, RuntimeRewrite::Skip);
+        let constraints = plan
+            .constraints_for(rewrite.trigger)
+            .expect("field trigger constraints");
+        assert_eq!(constraints.limit, Some(2));
+        assert!(plan.prefetch_skip.contains(&orders));
+
+        let (file, plan, _schema) = typed_and_plan("users.map($.roles.skip(1).len())");
+        let skip = method_nodes(&file, "skip");
+        assert_eq!(skip.len(), 1);
+        let rewrite = plan.rewrite_plan(skip[0]).expect("take planned");
+        assert_eq!(
+            plan.constraints_for(rewrite.trigger)
+                .expect("field trigger constraints")
+                .offset,
+            1
+        );
+        let roles = testdata::field_id(&schema, testdata::struct_id(&schema, "User"), "roles");
+        assert!(plan.prefetch_skip.contains(&roles));
+    }
+
+    #[test]
+    fn list_base_field_access_not_pushdown_trigger() {
+        let (file, plan, _schema) = typed_and_plan("users.orders.take(2).len()");
+        let take = method_nodes(&file, "take");
+        assert_eq!(take.len(), 1);
+        assert_eq!(plan.rewrite_plan(take[0]), None);
+        assert!(plan.prefetch_skip.is_empty());
+    }
+
+    #[test]
+    fn let_pushdown_chain() {
+        let (file, plan, _schema) = typed_and_plan("let u = users[id > 2].take(3); u");
+        let constraints = root_constraints(&plan, &file);
+        assert_eq!(constraints.filters.len(), 1);
+        assert_eq!((constraints.offset, constraints.limit), (0, Some(3)));
+        for node in method_nodes(&file, "take") {
+            assert_eq!(plan.runtime_rewrite(node), Some(RuntimeRewrite::Skip));
+        }
+    }
+
+    #[test]
+    fn liveness_projection_fields_pruned() {
+        let (_file, plan, schema) = typed_and_plan("users { name }");
+        assert_fields(&plan, &schema, "User", &["name"]);
+        assert_fields(&plan, &schema, "Order", &[]);
+        assert_fields(&plan, &schema, "Profile", &[]);
+    }
+
+    #[test]
+    fn liveness_projection_spread_all_fields_kept() {
+        let (_file, plan, schema) = typed_and_plan("users { name, ... }");
+        assert_fields(
+            &plan,
+            &schema,
+            "User",
+            &non_ref_field_names(&schema, "User"),
+        );
+    }
+
+    #[test]
+    fn liveness_whole_record() {
+        let (_file, plan, schema) = typed_and_plan("users");
+        assert_fields(
+            &plan,
+            &schema,
+            "User",
+            &non_ref_field_names(&schema, "User"),
+        );
+        assert_fields(
+            &plan,
+            &schema,
+            "Profile",
+            &non_ref_field_names(&schema, "Profile"),
+        );
+        assert_fields(
+            &plan,
+            &schema,
+            "Order",
+            &non_ref_field_names(&schema, "Order"),
+        );
+        assert_fields(&plan, &schema, "Role", &[]);
+
+        let (_file, plan, schema) = typed_and_plan("users { m = manager }");
+        assert_fields(
+            &plan,
+            &schema,
+            "User",
+            &non_ref_field_names(&schema, "User"),
+        );
+
+        let (_file, plan, schema) = typed_and_plan("let u = users; u");
+        assert_fields(
+            &plan,
+            &schema,
+            "User",
+            &non_ref_field_names(&schema, "User"),
+        );
+
+        let (_file, plan, schema) = typed_and_plan("roles");
+        assert_fields(
+            &plan,
+            &schema,
+            "Role",
+            &non_ref_field_names(&schema, "Role"),
+        );
+        assert_fields(&plan, &schema, "User", &[]);
+    }
+
+    #[test]
+    fn liveness_partial() {
+        let (_file, plan, schema) = typed_and_plan("users { o = orders { amount } }");
+        assert_fields(&plan, &schema, "User", &[]);
+        assert_fields(&plan, &schema, "Order", &["amount"]);
+
+        let (_file, plan, schema) = typed_and_plan("users { p = profile?.bio }");
+        assert_fields(&plan, &schema, "User", &[]);
+        assert_fields(&plan, &schema, "Profile", &["bio"]);
+
+        let (_file, plan, schema) = typed_and_plan("users { p = profile }");
+        assert_fields(&plan, &schema, "User", &[]);
+        assert_fields(
+            &plan,
+            &schema,
+            "Profile",
+            &non_ref_field_names(&schema, "Profile"),
+        );
+
+        let (_file, plan, schema) = typed_and_plan("users[orders.len() > 1]");
+        assert_fields(
+            &plan,
+            &schema,
+            "User",
+            &non_ref_field_names(&schema, "User"),
+        );
+        assert_fields(
+            &plan,
+            &schema,
+            "Order",
+            &non_ref_field_names(&schema, "Order"),
+        );
+
+        let (_file, plan, schema) = typed_and_plan("users.len()");
+        assert_fields(&plan, &schema, "User", &[]);
+
+        let (_file, plan, schema) = typed_and_plan("users { c = orders.len() }");
+        assert_fields(&plan, &schema, "User", &[]);
+        assert_fields(&plan, &schema, "Order", &[]);
+
+        let (_file, plan, schema) = typed_and_plan("users[active].sort_over(name) { id }");
+        assert_fields(&plan, &schema, "User", &["id", "active", "name"]);
+
+        let (_file, plan, schema) = typed_and_plan("users { e = extra.0 }");
+        assert_fields(&plan, &schema, "User", &["extra"]);
+
+        let (_file, plan, schema) = typed_and_plan("users.map($.name)");
+        assert_fields(&plan, &schema, "User", &["name"]);
+    }
+}

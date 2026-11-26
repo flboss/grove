@@ -198,3 +198,187 @@ impl<'a> PlanBuilder<'a> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pushdown::tests::*;
+    use crate::value::Scalar;
+
+    #[test]
+    fn matcher_bytes_predicates() {
+        let (file, plan, schema) = typed_and_plan(r#"blobs[data == hex"0001"]"#);
+        assert_eq!(
+            root_constraints(&plan, &file).filters,
+            vec![PushExpr::Cmp {
+                op: CmpOp::Eq,
+                lhs: Box::new(PushExpr::Field(field(&schema, "Blob", "data"))),
+                rhs: Box::new(PushExpr::Literal(Scalar::Bytes(vec![0x00, 0x01]))),
+            }]
+        );
+
+        let (file, plan, schema) = typed_and_plan(r#"blobs[data > hex"00"]"#);
+        assert_eq!(
+            root_constraints(&plan, &file).filters,
+            vec![PushExpr::Cmp {
+                op: CmpOp::Gt,
+                lhs: Box::new(PushExpr::Field(field(&schema, "Blob", "data"))),
+                rhs: Box::new(PushExpr::Literal(Scalar::Bytes(vec![0x00]))),
+            }]
+        );
+
+        let (file, plan, schema) = typed_and_plan(r#"blobs[data in (hex"0001", hex"00ff")]"#);
+        assert_eq!(
+            root_constraints(&plan, &file).filters,
+            vec![PushExpr::In {
+                lhs: Box::new(PushExpr::Field(field(&schema, "Blob", "data"))),
+                items: vec![
+                    PushExpr::Literal(Scalar::Bytes(vec![0x00, 0x01])),
+                    PushExpr::Literal(Scalar::Bytes(vec![0x00, 0xff])),
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn bytes_sort_and_unpushed() {
+        let (file, plan, schema) = typed_and_plan("blobs.sort_over(data)");
+        assert_eq!(
+            root_constraints(&plan, &file).sort,
+            vec![SortKey {
+                field: field(&schema, "Blob", "data"),
+                desc: false,
+            }]
+        );
+
+        for source in [
+            r#"blobs[data.len() > 1]"#,
+            r#"blobs[("x" as Bytes) == data]"#,
+        ] {
+            let (file, plan, _schema) = typed_and_plan(source);
+            let constraints = root_constraints(&plan, &file);
+            assert!(
+                constraints.filters.is_empty(),
+                "{source} should not push: {constraints:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn matcher_predicate_translation() {
+        let (file, plan, schema) = typed_and_plan("users[active]");
+        assert_eq!(
+            root_constraints(&plan, &file).filters,
+            vec![PushExpr::Field(field(&schema, "User", "active"))]
+        );
+
+        let (file, plan, schema) = typed_and_plan("users[id in (1, 2, 3)]");
+        assert_eq!(
+            root_constraints(&plan, &file).filters,
+            vec![PushExpr::In {
+                lhs: Box::new(PushExpr::Field(field(&schema, "User", "id"))),
+                items: vec![
+                    PushExpr::Literal(Scalar::Int(1)),
+                    PushExpr::Literal(Scalar::Int(2)),
+                    PushExpr::Literal(Scalar::Int(3)),
+                ],
+            }]
+        );
+
+        let (file, plan, schema) = typed_and_plan("users[created > @now]");
+        assert_eq!(
+            root_constraints(&plan, &file).filters,
+            vec![PushExpr::Cmp {
+                op: CmpOp::Gt,
+                lhs: Box::new(PushExpr::Field(field(&schema, "User", "created"))),
+                rhs: Box::new(PushExpr::Literal(Scalar::Instant(FIXED_NOW))),
+            }]
+        );
+
+        let (file, plan, schema) = typed_and_plan("users[name.contains(\"A\")]");
+        assert_eq!(
+            root_constraints(&plan, &file).filters,
+            vec![PushExpr::StringOp {
+                op: StringOp::Contains,
+                base: Box::new(PushExpr::Field(field(&schema, "User", "name"))),
+                needle: Box::new(PushExpr::Literal(Scalar::String("A".to_string()))),
+            }]
+        );
+    }
+
+    #[test]
+    fn matcher_enum_predicates() {
+        let (file, plan, schema) = typed_and_plan("settings[priority == Priority::High]");
+        assert_eq!(
+            root_constraints(&plan, &file).filters,
+            vec![PushExpr::Cmp {
+                op: CmpOp::Eq,
+                lhs: Box::new(PushExpr::Field(field(&schema, "Setting", "priority"))),
+                rhs: Box::new(PushExpr::Literal(Scalar::String("high".to_string()))),
+            }]
+        );
+
+        let (file, plan, schema) = typed_and_plan("settings[level in (Level::High, Level::Low)]");
+        assert_eq!(
+            root_constraints(&plan, &file).filters,
+            vec![PushExpr::In {
+                lhs: Box::new(PushExpr::Field(field(&schema, "Setting", "level"))),
+                items: vec![
+                    PushExpr::Literal(Scalar::Int(2)),
+                    PushExpr::Literal(Scalar::Int(-1)),
+                ],
+            }]
+        );
+
+        let (file, plan, schema) = typed_and_plan("settings[priority == Priority::High] { name }");
+        assert_eq!(root_constraints(&plan, &file).filters.len(), 1);
+        assert_fields(&plan, &schema, "Setting", &["name", "priority"]);
+    }
+
+    #[test]
+    fn matcher_unsupported_predicates() {
+        let sources = [
+            "users[nickname == some(\"A\")]",
+            "users[profile?.bio?.len() == some(6)]",
+            "users[pos.0 > 1.5f]",
+            "users[orders.len() > 1]",
+            "users[id + 1 > 2]",
+            "users[name.to_upper() == \"ADA\"]",
+        ];
+        for source in sources {
+            let (file, plan, _schema) = typed_and_plan(source);
+            let constraints = root_constraints(&plan, &file);
+            assert!(
+                constraints.filters.is_empty(),
+                "{source} should not push: {constraints:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sort_keys() {
+        let (file, plan, schema) = typed_and_plan("users.sort_over(name, desc id)");
+        assert_eq!(
+            root_constraints(&plan, &file).sort,
+            vec![
+                SortKey {
+                    field: field(&schema, "User", "name"),
+                    desc: false,
+                },
+                SortKey {
+                    field: field(&schema, "User", "id"),
+                    desc: true,
+                },
+            ]
+        );
+
+        let (file, plan, schema) = typed_and_plan("users.sort_desc_over(id)");
+        assert_eq!(
+            root_constraints(&plan, &file).sort,
+            vec![SortKey {
+                field: field(&schema, "User", "id"),
+                desc: true,
+            }]
+        );
+    }
+}

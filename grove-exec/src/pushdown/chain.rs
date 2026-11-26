@@ -295,3 +295,200 @@ impl ChainState {
         self.stage = Stage::Closed { reverse_at: None };
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pushdown::RuntimeRewrite;
+    use crate::pushdown::tests::*;
+    use crate::storage::CmpOp;
+    use crate::value::Scalar;
+
+    #[test]
+    fn take_skip_folding() {
+        let cases: &[(&str, u64, Option<u64>)] = &[
+            ("users.take(10)", 0, Some(10)),
+            ("users.skip(10)", 10, None),
+            ("users.take(30).skip(10)", 10, Some(20)),
+            ("users.skip(10).take(30)", 10, Some(30)),
+            ("users.take(10).take(5)", 0, Some(5)),
+            ("users.take(5).take(10)", 0, Some(5)),
+            ("users.skip(10).skip(20)", 30, None),
+            ("users.skip(30).take(10).skip(5)", 35, Some(5)),
+        ];
+        for &(source, offset, limit) in cases {
+            let (file, plan, _schema) = typed_and_plan(source);
+            let constraints = root_constraints(&plan, &file);
+            assert_eq!(
+                (constraints.offset, constraints.limit),
+                (offset, limit),
+                "{source}"
+            );
+            for name in ["take", "skip"] {
+                for node in method_nodes(&file, name) {
+                    assert_eq!(
+                        plan.runtime_rewrite(node),
+                        Some(RuntimeRewrite::Skip),
+                        "{source}: {name} should be folded"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn first_nth() {
+        let (file, plan, _schema) = typed_and_plan("users.first()");
+        let constraints = root_constraints(&plan, &file);
+        assert_eq!((constraints.offset, constraints.limit), (0, Some(1)));
+        for node in method_nodes(&file, "first") {
+            assert_eq!(plan.runtime_rewrite(node), None);
+        }
+
+        let (file, plan, _schema) = typed_and_plan("users.skip(2).nth(3)");
+        let constraints = root_constraints(&plan, &file);
+        assert_eq!((constraints.offset, constraints.limit), (5, Some(1)));
+        for node in method_nodes(&file, "skip") {
+            assert_eq!(plan.runtime_rewrite(node), Some(RuntimeRewrite::Skip));
+        }
+        for node in method_nodes(&file, "nth") {
+            assert_eq!(plan.runtime_rewrite(node), Some(RuntimeRewrite::First));
+        }
+
+        let (file, plan, _schema) = typed_and_plan("users.take(10).nth(3)");
+        let constraints = root_constraints(&plan, &file);
+        assert_eq!((constraints.offset, constraints.limit), (3, Some(1)));
+
+        let (file, plan, _schema) = typed_and_plan("users.nth(-1)");
+        let constraints = root_constraints(&plan, &file);
+        assert_eq!((constraints.offset, constraints.limit), (0, None));
+        for node in method_nodes(&file, "nth") {
+            assert_eq!(plan.runtime_rewrite(node), None);
+        }
+    }
+
+    #[test]
+    fn pushdown_window_and_predicate_methods() {
+        let (file, plan, _schema) = typed_and_plan("users.last()");
+        let constraints = root_constraints(&plan, &file);
+        assert!(constraints.sort.is_empty());
+        assert!(constraints.tie_desc);
+        assert_eq!(constraints.limit, Some(1));
+        assert_eq!(plan.runtime_rewrite(method_nodes(&file, "last")[0]), None);
+
+        let (file, plan, schema) = typed_and_plan("users.sort_over(id).reverse()");
+        let constraints = root_constraints(&plan, &file);
+        assert_eq!(
+            constraints.sort,
+            vec![SortKey {
+                field: field(&schema, "User", "id"),
+                desc: true,
+            }]
+        );
+        assert!(constraints.tie_desc);
+        assert_eq!(
+            plan.runtime_rewrite(method_nodes(&file, "sort_over")[0]),
+            Some(RuntimeRewrite::Skip)
+        );
+        assert_eq!(
+            plan.runtime_rewrite(method_nodes(&file, "reverse")[0]),
+            Some(RuntimeRewrite::Skip)
+        );
+
+        let (file, plan, _) = typed_and_plan("users.take_back(2)");
+        let constraints = root_constraints(&plan, &file);
+        assert!(constraints.tie_desc);
+        assert_eq!(constraints.limit, Some(2));
+        assert_eq!(
+            plan.runtime_rewrite(method_nodes(&file, "take_back")[0]),
+            Some(RuntimeRewrite::ReverseOutput)
+        );
+
+        let (file, plan, _) = typed_and_plan("users.skip_back(2)");
+        let constraints = root_constraints(&plan, &file);
+        assert!(constraints.tie_desc);
+        assert_eq!((constraints.offset, constraints.limit), (2, None));
+        assert_eq!(
+            plan.runtime_rewrite(method_nodes(&file, "skip_back")[0]),
+            Some(RuntimeRewrite::ReverseOutput)
+        );
+
+        let (file, plan, _) = typed_and_plan("users.take_back(3).take_back(2)");
+        let constraints = root_constraints(&plan, &file);
+        assert_eq!(constraints.limit, Some(2));
+        let nodes = method_nodes(&file, "take_back");
+        assert_eq!(
+            plan.runtime_rewrite(nodes[0]),
+            Some(RuntimeRewrite::ReverseOutput)
+        );
+        assert_eq!(plan.runtime_rewrite(nodes[1]), Some(RuntimeRewrite::Skip));
+
+        let (file, plan, _) = typed_and_plan("users.take_back(5).skip_back(1)");
+        let constraints = root_constraints(&plan, &file);
+        assert_eq!((constraints.offset, constraints.limit), (1, Some(4)));
+        let take_back = method_nodes(&file, "take_back");
+        let skip_back = method_nodes(&file, "skip_back");
+        assert_eq!(
+            plan.runtime_rewrite(take_back[0]),
+            Some(RuntimeRewrite::Skip)
+        );
+        assert_eq!(
+            plan.runtime_rewrite(skip_back[0]),
+            Some(RuntimeRewrite::ReverseOutput)
+        );
+
+        let (file, plan, schema) = typed_and_plan("users.any(active)");
+        let constraints = root_constraints(&plan, &file);
+        assert_eq!(
+            constraints.filters,
+            vec![PushExpr::Field(field(&schema, "User", "active"))]
+        );
+        assert_eq!(constraints.limit, Some(1));
+        assert_eq!(
+            plan.runtime_rewrite(method_nodes(&file, "any")[0]),
+            Some(RuntimeRewrite::NonEmpty)
+        );
+
+        let (file, plan, schema) = typed_and_plan("users.all(active)");
+        let constraints = root_constraints(&plan, &file);
+        assert_eq!(
+            constraints.filters,
+            vec![PushExpr::Not(Box::new(PushExpr::Field(field(
+                &schema, "User", "active"
+            ))))]
+        );
+        assert_eq!(constraints.limit, Some(1));
+        assert_eq!(
+            plan.runtime_rewrite(method_nodes(&file, "all")[0]),
+            Some(RuntimeRewrite::Empty)
+        );
+
+        let (file, plan, schema) = typed_and_plan("users.find(name == \"Dan\")");
+        let constraints = root_constraints(&plan, &file);
+        assert_eq!(
+            constraints.filters,
+            vec![PushExpr::Cmp {
+                op: CmpOp::Eq,
+                lhs: Box::new(PushExpr::Field(field(&schema, "User", "name"))),
+                rhs: Box::new(PushExpr::Literal(Scalar::String("Dan".to_string()))),
+            }]
+        );
+        assert_eq!(constraints.limit, Some(1));
+        assert_eq!(
+            plan.runtime_rewrite(method_nodes(&file, "find")[0]),
+            Some(RuntimeRewrite::First)
+        );
+
+        let (file, plan, _) = typed_and_plan("users.take(1).any(name == \"Bob\")");
+        let constraints = root_constraints(&plan, &file);
+        assert!(constraints.filters.is_empty());
+        assert_eq!(constraints.limit, Some(1));
+        assert_eq!(plan.runtime_rewrite(method_nodes(&file, "any")[0]), None);
+
+        let (file, plan, _) = typed_and_plan("users.take(0).any(active)");
+        let constraints = root_constraints(&plan, &file);
+        assert!(constraints.filters.is_empty());
+        assert_eq!(constraints.limit, Some(0));
+        assert_eq!(plan.runtime_rewrite(method_nodes(&file, "any")[0]), None);
+    }
+}
