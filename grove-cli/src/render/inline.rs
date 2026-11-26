@@ -129,3 +129,67 @@ pub(super) fn cell_styled(ctx: &RenderCtx<'_>, value: &Val, depth: usize) -> Sty
         truncate_styled(abbreviated, cap)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use grove_exec::value::{Key, Val};
+    use grove_query::QueryType;
+    use grove_schema::validated::{FieldId, ScalarType, StructId};
+
+    use crate::args::Format;
+    use crate::render::render;
+    use crate::render::tests::*;
+
+    #[test]
+    fn scalar_and_optional_auto_inline() {
+        let int_ty = QueryType::Scalar(ScalarType::Int);
+        let optional_int = QueryType::Optional(Box::new(int_ty.clone()));
+
+        assert_eq!(render_value(int(42), &int_ty, &options(Format::Auto)), "42");
+        assert_eq!(
+            render_value(Val::None, &optional_int, &options(Format::Auto)),
+            "none"
+        );
+        assert_eq!(
+            render_value(
+                Val::Some(Box::new(int(3))),
+                &optional_int,
+                &options(Format::Auto)
+            ),
+            "some(3)"
+        );
+    }
+
+    #[test]
+    fn scalar_list_auto_inline() {
+        let value = Val::list(vec![int(1), int(2), int(3)]);
+        let ty = QueryType::List(Box::new(QueryType::Scalar(ScalarType::Int)));
+        assert_eq!(
+            render_value(value, &ty, &options(Format::Auto)),
+            "[1, 2, 3]"
+        );
+    }
+
+    #[test]
+    fn tuple_auto_inline() {
+        let value = Val::Tuple(vec![int(1), string("a")]);
+        let ty = QueryType::Tuple(vec![
+            QueryType::Scalar(ScalarType::Int),
+            QueryType::Scalar(ScalarType::String),
+        ]);
+        assert_eq!(
+            render_value(value, &ty, &options(Format::Auto)),
+            "(1, \"a\")"
+        );
+    }
+
+    #[test]
+    fn ref_fallback_without_schema_metadata() {
+        let mut value = Val::Ref {
+            field: FieldId::new(StructId::new(0), 0),
+            parent: Key(7),
+        };
+        let output = render(&mut value, None, &schema(), &options(Format::Auto)).unwrap();
+        assert!(output.contains("ref("), "{output}");
+    }
+}

@@ -189,3 +189,110 @@ pub(super) fn expandable(value: &Val) -> bool {
 pub(super) fn can_expand(ctx: &RenderCtx<'_>, depth: usize) -> bool {
     ctx.options.max_depth == 0 || depth < ctx.options.max_depth
 }
+
+#[cfg(test)]
+mod tests {
+    use std::rc::Rc;
+
+    use grove_exec::value::{Scalar, Val};
+    use grove_query::QueryType;
+    use grove_schema::validated::ScalarType;
+
+    use crate::args::Format;
+    use crate::render::tests::*;
+
+    #[test]
+    fn record_auto_vertical() {
+        let value = user("Alice", 30, true);
+        let output = render_value(value, &record_ty(), &options(Format::Auto));
+        assert_eq!(output, "╭ name  : \"Alice\"\n┊ age   : 30\n╰ active: true");
+    }
+
+    #[test]
+    fn single_field_record_dot() {
+        let value = Val::record(vec![(Rc::from("name"), string("Alice"))]);
+        let output = render_value(value, &record_ty(), &options(Format::Vertical));
+        assert_eq!(output, "· name: \"Alice\"");
+    }
+
+    #[test]
+    fn tuple_vertical_rails() {
+        let value = Val::Tuple(vec![int(1), string("a"), Val::Scalar(Scalar::Bool(true))]);
+        let ty = QueryType::Tuple(vec![
+            QueryType::Scalar(ScalarType::Int),
+            QueryType::Scalar(ScalarType::String),
+            QueryType::Scalar(ScalarType::Bool),
+        ]);
+        let output = render_value(value, &ty, &options(Format::Vertical));
+        assert_eq!(output, "╭ .0: 1\n┊ .1: \"a\"\n╰ .2: true");
+    }
+
+    #[test]
+    fn some_record_vertical() {
+        let value = Val::Some(Box::new(user("Alice", 30, true)));
+        let output = render_value(value, &record_ty(), &options(Format::Vertical));
+        assert_eq!(
+            output,
+            "some\n  ╭ name  : \"Alice\"\n  ┊ age   : 30\n  ╰ active: true"
+        );
+    }
+
+    #[test]
+    fn record_field_some_vertical() {
+        let value = Val::record(vec![(
+            Rc::from("profile"),
+            Val::Some(Box::new(user("Alice", 30, true))),
+        )]);
+        let output = render_value(value, &record_ty(), &options(Format::Vertical));
+        assert_eq!(
+            output,
+            "· profile: some\n    ╭ name  : \"Alice\"\n    ┊ age   : 30\n    ╰ active: true"
+        );
+    }
+
+    #[test]
+    fn some_scalar_compact_vertical() {
+        let value = Val::Some(Box::new(int(3)));
+        let output = render_value(value, &record_ty(), &options(Format::Vertical));
+        assert_eq!(output, "some(3)");
+    }
+
+    #[test]
+    fn record_nested_vertical_rails() {
+        let value = Val::list(vec![user("Alice", 30, true), user("Bob", 9, false)]);
+        let output = render_value(value, &list_record_ty(), &options(Format::Vertical));
+        assert!(output.contains("├─ ╭ name"), "{output}");
+        assert!(output.contains("│  ┊ age"), "{output}");
+        assert!(output.contains("│  ╰ active"), "{output}");
+        assert!(output.contains("└─ ╭ name"), "{output}");
+        assert!(output.contains("   ┊ age"), "{output}");
+        assert!(output.contains("   ╰ active"), "{output}");
+    }
+
+    #[test]
+    fn scalar_list_row_cap() {
+        let value = Val::list(vec![int(1), int(2), int(3)]);
+        let ty = QueryType::List(Box::new(QueryType::Scalar(ScalarType::Int)));
+        let mut options = options(Format::Auto);
+        options.max_rows = 2;
+        let output = render_value(value, &ty, &options);
+        assert!(output.contains("├─ 1"), "{output}");
+        assert!(!output.contains("├─ 3"), "{output}");
+        assert!(output.contains("└─ … 1 more item"), "{output}");
+    }
+
+    #[test]
+    fn nested_list_auto_vertical_indentation() {
+        let value = Val::list(vec![
+            Val::list(vec![int(1), int(2)]),
+            Val::list(vec![int(3)]),
+        ]);
+        let ty = QueryType::List(Box::new(QueryType::List(Box::new(QueryType::Scalar(
+            ScalarType::Int,
+        )))));
+        let output = render_value(value, &ty, &options(Format::Vertical));
+        assert!(output.contains("├─┐"), "{output}");
+        assert!(output.contains("│ ├─ 1"), "{output}");
+        assert!(output.contains("  └─ 3"), "{output}");
+    }
+}

@@ -69,3 +69,22 @@ fn is_scalar_value(value: &Val) -> bool {
 fn is_scalar_list(items: &[Val]) -> bool {
     items.iter().all(is_scalar_value)
 }
+
+#[cfg(test)]
+mod tests {
+    use grove_exec::value::Val;
+
+    use crate::args::Format;
+    use crate::render::tests::*;
+
+    #[test]
+    fn record_list_auto_table() {
+        let value = Val::list(vec![user("Alice", 30, true), user("Bob", 9, false)]);
+        let output = render_value(value, &list_record_ty(), &options(Format::Auto));
+        assert!(output.contains("┌"), "{output}");
+        assert!(output.contains("name"), "{output}");
+        assert!(output.contains("Alice"), "{output}");
+        assert!(output.contains("Bob"), "{output}");
+        assert!(!output.contains(":"), "{output}");
+    }
+}

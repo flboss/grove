@@ -65,3 +65,34 @@ pub(super) fn is_numeric(value: &Val) -> bool {
         _ => false,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use grove_exec::value::Val;
+    use grove_query::QueryType;
+    use grove_schema::validated::ScalarType;
+
+    use crate::args::Format;
+    use crate::render::tests::*;
+
+    #[test]
+    fn color_style_scalar() {
+        let int_ty = QueryType::Scalar(ScalarType::Int);
+        let mut options = options(Format::Auto);
+        options.color = true;
+        let output = render_value(int(7), &int_ty, &options);
+        assert!(output.contains("\x1b[36m7\x1b[0m"), "{output}");
+    }
+
+    #[test]
+    fn table_cells_keep_part_styles() {
+        let value = Val::list(vec![Val::Tuple(vec![Val::Some(Box::new(int(3)))])]);
+        let ty = QueryType::List(Box::new(QueryType::Tuple(vec![QueryType::Optional(
+            Box::new(QueryType::Scalar(ScalarType::Int)),
+        )])));
+        let mut options = options(Format::Table);
+        options.color = true;
+        let output = render_value(value, &ty, &options);
+        assert!(output.contains("some(\x1b[36m3\x1b[0m)"), "{output}");
+    }
+}

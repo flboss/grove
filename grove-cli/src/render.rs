@@ -75,4 +75,71 @@ pub(super) struct RenderCtx<'a> {
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    use std::rc::Rc;
+
+    use grove_exec::value::{Scalar, Val};
+    use grove_query::{QueryType, RecordSource};
+    use grove_schema::ValidatedSchema;
+    use grove_schema::validated::StructId;
+
+    use super::*;
+
+    pub(super) fn schema() -> ValidatedSchema {
+        let source = r#"
+        root users: User;
+        struct User {
+            name: String,
+            age: Int,
+            active: Bool,
+        }
+        enum Role { Admin => "admin", User => "user" }
+    "#;
+        let (schema, diagnostics) = grove_schema::parse_schema(source);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let (schema, diagnostics) = grove_schema::validate(schema.unwrap());
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        schema.unwrap()
+    }
+
+    pub(super) fn options(format: Format) -> RenderOptions {
+        RenderOptions {
+            format,
+            color: false,
+            width: 80,
+            max_rows: 0,
+            max_depth: 6,
+            max_cell_width: 40,
+            headers: true,
+            hide_refs: false,
+        }
+    }
+
+    pub(super) fn int(value: i64) -> Val {
+        Val::Scalar(Scalar::Int(value))
+    }
+
+    pub(super) fn string(value: &str) -> Val {
+        Val::Scalar(Scalar::String(value.to_string()))
+    }
+
+    pub(super) fn user(name: &str, age: i64, active: bool) -> Val {
+        Val::record(vec![
+            (Rc::from("name"), string(name)),
+            (Rc::from("age"), int(age)),
+            (Rc::from("active"), Val::Scalar(Scalar::Bool(active))),
+        ])
+    }
+
+    pub(super) fn record_ty() -> QueryType {
+        QueryType::Record(RecordSource::Schema(StructId::new(0)))
+    }
+
+    pub(super) fn list_record_ty() -> QueryType {
+        QueryType::List(Box::new(record_ty()))
+    }
+
+    pub(super) fn render_value(mut value: Val, ty: &QueryType, options: &RenderOptions) -> String {
+        render(&mut value, Some(ty), &schema(), options).expect("render value")
+    }
+}

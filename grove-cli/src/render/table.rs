@@ -298,3 +298,60 @@ fn record_field_names(schema: &ValidatedSchema, source: &RecordSource) -> Option
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use grove_exec::value::Val;
+    use grove_query::QueryType;
+    use grove_schema::validated::ScalarType;
+
+    use crate::args::Format;
+    use crate::render::render;
+    use crate::render::tests::*;
+
+    #[test]
+    fn empty_record_list_type_headers() {
+        let output = render_value(
+            Val::list(Vec::new()),
+            &list_record_ty(),
+            &options(Format::Auto),
+        );
+        assert!(output.contains("┌"), "{output}");
+        assert!(output.contains("name"), "{output}");
+        assert!(output.contains("age"), "{output}");
+    }
+
+    #[test]
+    fn table_row_cap() {
+        let value = Val::list(vec![
+            user("Alice", 30, true),
+            user("Bob", 9, false),
+            user("Cara", 41, true),
+        ]);
+        let mut options = options(Format::Auto);
+        options.max_rows = 2;
+        let output = render_value(value, &list_record_ty(), &options);
+        assert!(output.contains("1 more row"), "{output}");
+        assert!(!output.contains("Cara"), "{output}");
+        let note_line = output
+            .lines()
+            .find(|line| line.contains("1 more row"))
+            .expect("note line");
+        assert!(note_line.starts_with('│'), "{note_line}");
+        assert!(note_line.ends_with('│'), "{note_line}");
+    }
+
+    #[test]
+    fn table_format_non_tabular_rejected() {
+        let int_ty = QueryType::Scalar(ScalarType::Int);
+        assert!(
+            render(
+                &mut int(1),
+                Some(&int_ty),
+                &schema(),
+                &options(Format::Table)
+            )
+            .is_err()
+        );
+    }
+}

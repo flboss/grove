@@ -59,3 +59,68 @@ fn terminal_width() -> Option<usize> {
 fn terminal_width() -> Option<usize> {
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use std::rc::Rc;
+
+    use grove_exec::value::{Key, Val};
+    use grove_schema::validated::{FieldId, StructId};
+
+    use crate::args::Format;
+    use crate::render::render;
+    use crate::render::tests::*;
+
+    #[test]
+    fn wide_table_auto_vertical_fallback() {
+        let value = Val::list(vec![user("Alice", 30, true), user("Bob", 9, false)]);
+        let mut options = options(Format::Auto);
+        options.width = 20;
+        let output = render_value(value, &list_record_ty(), &options);
+        assert!(!output.contains("┌"), "{output}");
+        assert!(output.contains("name  : \"Alice\""), "{output}");
+    }
+
+    #[test]
+    fn hide_refs_fields_and_list_items_omitted() {
+        let schema = schema();
+        let reference = Val::Ref {
+            field: FieldId::new(StructId::new(0), 0),
+            parent: Key(7),
+        };
+        let mut record = Val::record(vec![
+            (Rc::from("name"), string("Alice")),
+            (Rc::from("link"), reference.clone()),
+        ]);
+        let mut opts = options(Format::Vertical);
+        opts.hide_refs = true;
+        let output = render(&mut record, None, &schema, &opts).unwrap();
+        assert!(output.contains("name"), "{output}");
+        assert!(!output.contains("ref("), "{output}");
+        assert!(!output.contains("&"), "{output}");
+
+        let mut list = Val::list(vec![reference, int(1)]);
+        let mut opts = options(Format::Auto);
+        opts.hide_refs = true;
+        let output = render(&mut list, None, &schema, &opts).unwrap();
+        assert_eq!(output, "[1]");
+    }
+
+    #[test]
+    fn hide_refs_table_columns_removed() {
+        let schema = schema();
+        let reference = Val::Ref {
+            field: FieldId::new(StructId::new(0), 0),
+            parent: Key(7),
+        };
+        let mut value = Val::list(vec![Val::record(vec![
+            (Rc::from("name"), string("Alice")),
+            (Rc::from("link"), reference),
+        ])]);
+        let mut opts = options(Format::Table);
+        opts.hide_refs = true;
+        let output = render(&mut value, None, &schema, &opts).unwrap();
+        assert!(output.contains("name"), "{output}");
+        assert!(!output.contains("link"), "{output}");
+    }
+}
