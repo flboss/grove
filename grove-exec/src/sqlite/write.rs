@@ -615,22 +615,6 @@ impl SqliteWriteTxn<'_, '_> {
             let txn = self.txn()?;
             for chunk in targets.chunks(PARAM_CHUNK) {
                 let placeholders = placeholders(chunk.len());
-                let count_sql =
-                    format!("SELECT COUNT(*) FROM {table} WHERE _rowid_ IN ({placeholders})");
-                let param_values = chunk.iter().map(|target| Value::Integer(target.key.0));
-                let count: i64 = txn
-                    .query_row(
-                        &count_sql,
-                        rusqlite::params_from_iter(param_values),
-                        |row| row.get(0),
-                    )
-                    .map_err(|err| SqliteBackend::storage_error("count link targets", err))?;
-                if count as usize != chunk.len() {
-                    return Err(ExecError::Integrity {
-                        message: "link target row was not found".to_string(),
-                    });
-                }
-
                 let sql =
                     format!("UPDATE {table} SET {fk_column} = ? WHERE _rowid_ IN ({placeholders})");
                 let mut params = Vec::with_capacity(chunk.len() + 1);
@@ -639,8 +623,17 @@ impl SqliteWriteTxn<'_, '_> {
                 let mut stmt = txn
                     .prepare_cached(&sql)
                     .map_err(|err| SqliteBackend::storage_error("link rows (prepare)", err))?;
-                stmt.execute(rusqlite::params_from_iter(params.iter()))
+                let changed = stmt
+                    .execute(rusqlite::params_from_iter(params.iter()))
                     .map_err(|err| SqliteBackend::storage_error("link rows (execute)", err))?;
+                if changed != chunk.len() {
+                    return Err(ExecError::Integrity {
+                        message: format!(
+                            "link target row was not found ({changed}/{})",
+                            chunk.len()
+                        ),
+                    });
+                }
             }
             Ok(())
         } else {
