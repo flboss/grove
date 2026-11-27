@@ -21,7 +21,6 @@ pub(super) enum SqlCacheKey {
         fetch_from_first: bool,
         fields: Vec<FieldId>,
         constraints: FetchConstraints,
-        parents: usize,
     },
 }
 
@@ -50,7 +49,6 @@ impl SqlCacheKey {
         fetch_from_first: bool,
         fields: &[FieldId],
         constraints: &FetchConstraints,
-        parents: usize,
     ) -> bool {
         matches!(
             self,
@@ -59,12 +57,10 @@ impl SqlCacheKey {
                 fetch_from_first: key_first,
                 fields: key_fields,
                 constraints: key_constraints,
-                parents: key_parents,
             } if *key_rel == rel
                 && *key_first == fetch_from_first
                 && key_fields.as_slice() == fields
                 && key_constraints == constraints
-                && *key_parents == parents
         )
     }
 }
@@ -99,7 +95,6 @@ pub(super) fn fingerprint_fetch_related(
     fetch_from_first: bool,
     fields: &[FieldId],
     constraints: &FetchConstraints,
-    parents: usize,
 ) -> u64 {
     let mut state = DefaultHasher::new();
     1u8.hash(&mut state);
@@ -107,7 +102,6 @@ pub(super) fn fingerprint_fetch_related(
     fetch_from_first.hash(&mut state);
     fields.hash(&mut state);
     constraints.hash(&mut state);
-    parents.hash(&mut state);
     state.finish()
 }
 
@@ -275,7 +269,7 @@ mod tests {
         backend
             .fetch_related(rel, false, &[Key(1)], &[amount], &constraints)
             .unwrap();
-        assert_eq!(backend.sql_cache.borrow().len(), 3);
+        assert_eq!(backend.sql_cache.borrow().len(), 2);
     }
 
     #[test]

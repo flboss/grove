@@ -10,6 +10,8 @@ use rusqlite::{Connection, Result};
 
 pub(super) const MODULE_NAME: &CStr = c"sqlite_grove_keys";
 
+pub(super) const TABLE: &str = "\"sqlite_grove_keys\"";
+
 const MODULE: Module<KeysTab> = Module::eponymous_only_module();
 
 /// Shared key list backing the vtab (sorted and deduplicated)
@@ -24,7 +26,6 @@ impl KeySupply {
         }
     }
 
-    #[allow(dead_code)]
     pub(super) fn set(&self, keys: impl IntoIterator<Item = i64>) {
         let mut keys: Vec<i64> = keys.into_iter().collect();
         // enables binary search on keys

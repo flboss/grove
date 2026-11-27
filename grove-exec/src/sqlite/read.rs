@@ -12,6 +12,7 @@ use super::decode::{
     ArraySlot, NodeDraft, Slot, ValueArraySlot, ValueSlot, split_roots, walk_element,
 };
 use super::types::{quote, saturating_i64, scalar_value};
+use super::vtab_keys::TABLE as KEYS_TABLE;
 use super::write::SqliteWriteTxn;
 use crate::error::ExecError;
 use crate::storage::{CmpOp, FetchConstraints, PushExpr, Row, Storage, StringOp, WriteTxn};
@@ -402,23 +403,21 @@ impl Storage for SqliteBackend<'_> {
         let mut select = vec!["g$f._rowid_".to_string()];
         let mut slots = self.plan_fields(target, fields, "g$f", &mut select, &ctx)?;
         let parent_col = select.len();
-        let fingerprint =
-            fingerprint_fetch_related(rel, fetch_from_first, fields, constraints, parents.len());
+        let fingerprint = fingerprint_fetch_related(rel, fetch_from_first, fields, constraints);
         let cached = self.cached_sql(
             fingerprint,
-            |key| key.matches_related(rel, fetch_from_first, fields, constraints, parents.len()),
+            |key| key.matches_related(rel, fetch_from_first, fields, constraints),
             || SqlCacheKey::Related {
                 rel,
                 fetch_from_first,
                 fields: fields.to_vec(),
                 constraints: constraints.clone(),
-                parents: parents.len(),
             },
             || {
                 let target_def = &schema.structs[target.index()];
                 let fetched_table = quote(&schema.tables[target_def.table.index()].name);
                 let known_table = quote(&schema.tables[parent_def.table.index()].name);
-                let from = match relation {
+                let mut from = match relation {
                     Relation::OneToOne {
                         child_ref, fk, pk, ..
                     }
@@ -467,12 +466,14 @@ impl Storage for SqliteBackend<'_> {
                         let y_pk = quote(schema.column_name(*y_pk));
                         format!(
                             "{fetched_table} AS g$f \
-                         JOIN {join_table} AS g$j ON g$j.{x_col} = g$f.{x_pk} \
-                         JOIN {known_table} AS g$k ON g$j.{y_col} = g$k.{y_pk}"
+                            JOIN {join_table} AS g$j ON g$j.{x_col} = g$f.{x_pk} \
+                            JOIN {known_table} AS g$k ON g$j.{y_col} = g$k.{y_pk}"
                         )
                     }
                 };
-                let placeholders = vec!["?"; parents.len()].join(", ");
+                from.push_str(&format!(
+                    " JOIN {KEYS_TABLE} AS g$keys ON g$keys.value = g$k._rowid_"
+                ));
                 let mut params = Vec::new();
                 let mut filters = Vec::with_capacity(constraints.filters.len());
                 for filter in &constraints.filters {
@@ -486,11 +487,11 @@ impl Storage for SqliteBackend<'_> {
                 }
                 let tie_direction = if constraints.tie_desc { "DESC" } else { "ASC" };
                 sort.push(format!("g$f._rowid_ {tie_direction}"));
-                let mut where_clause = format!("g$k._rowid_ IN ({placeholders})");
-                if !filters.is_empty() {
-                    where_clause.push_str(" AND ");
-                    where_clause.push_str(&filters.join(" AND "));
-                }
+                let where_sql = if filters.is_empty() {
+                    String::new()
+                } else {
+                    format!(" WHERE {}", filters.join(" AND "))
+                };
                 let caps = constraints.limit.is_some() || constraints.offset != 0;
                 let sql = if caps {
                     let mut inner = select;
@@ -511,15 +512,15 @@ impl Storage for SqliteBackend<'_> {
                         )));
                     }
                     format!(
-                        "SELECT * FROM (SELECT {} FROM {from} WHERE {where_clause}) \
-                     WHERE {} ORDER BY g$p, g$rn",
+                        "SELECT * FROM (SELECT {} FROM {from}{where_sql}) \
+                        WHERE {} ORDER BY g$p, g$rn",
                         inner.join(", "),
                         outer_where.join(" AND ")
                     )
                 } else {
                     select.push("g$k._rowid_".to_string());
                     format!(
-                        "SELECT {} FROM {from} WHERE {where_clause} ORDER BY {}",
+                        "SELECT {} FROM {from}{where_sql} ORDER BY {}",
                         select.join(", "),
                         sort.join(", ")
                     )
@@ -527,14 +528,13 @@ impl Storage for SqliteBackend<'_> {
                 Ok((sql, params))
             },
         )?;
-        let mut bind: Vec<Value> = parents.iter().map(|key| Value::Integer(key.0)).collect();
-        bind.extend(cached.params.iter().cloned());
+        self.vtab_keys.set(parents.iter().map(|key| key.0));
         let mut stmt = self
             .conn
             .prepare_cached(&cached.sql)
             .map_err(|err| Self::storage_error(&ctx, err))?;
         let mut rows = stmt
-            .query(rusqlite::params_from_iter(bind))
+            .query(rusqlite::params_from_iter(&cached.params))
             .map_err(|err| Self::storage_error(&ctx, err))?;
         let mut index: HashMap<Key, Vec<usize>> = HashMap::new();
         for (i, key) in parents.iter().enumerate() {
@@ -1017,6 +1017,32 @@ mod tests {
             )
             .unwrap();
         assert_eq!(firsts(&groups), vec![vec![int(200)], vec![], vec![]]);
+    }
+
+    #[test]
+    fn fetch_related_duplicate_parents() {
+        let schema = testdata::schema();
+        let backend = test_backend(&schema);
+        let amount = testdata::field_id(&schema, testdata::struct_id(&schema, "Order"), "amount");
+        let rel = rel_named(&schema, "Order", "user", "User", "orders");
+
+        let groups = backend
+            .fetch_related(
+                rel,
+                false,
+                &[Key(1), Key(1), Key(2)],
+                &[amount],
+                &FetchConstraints::EMPTY,
+            )
+            .unwrap();
+        assert_eq!(
+            firsts(&groups),
+            vec![
+                vec![int(100), int(200)],
+                vec![int(100), int(200)],
+                vec![int(400)],
+            ]
+        );
     }
 
     #[test]
