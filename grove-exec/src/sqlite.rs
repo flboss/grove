@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use grove_schema::validated::ValidatedSchema;
 use rusqlite::Connection;
@@ -12,14 +13,17 @@ mod decode;
 mod read;
 mod types;
 mod verify;
+mod vtab_keys;
 mod write;
 
 use cache::SqlCacheEntry;
+use vtab_keys::KeySupply;
 
 pub struct SqliteBackend<'a> {
     conn: Connection,
     schema: &'a ValidatedSchema,
     sql_cache: RefCell<HashMap<u64, Vec<SqlCacheEntry>>>,
+    vtab_keys: Arc<KeySupply>,
 }
 
 impl<'a> SqliteBackend<'a> {
@@ -36,8 +40,11 @@ impl<'a> SqliteBackend<'a> {
             conn,
             schema,
             sql_cache: RefCell::new(HashMap::new()),
+            vtab_keys: Arc::new(KeySupply::new()),
         };
         backend.verify_schema()?;
+        vtab_keys::register(&backend.conn, Arc::clone(&backend.vtab_keys))
+            .map_err(|err| Self::storage_error("register keys table", err))?;
         Ok(backend)
     }
 
