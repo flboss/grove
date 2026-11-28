@@ -62,6 +62,19 @@ impl<'a> SqliteBackend<'a> {
     }
 }
 
+impl Drop for SqliteBackend<'_> {
+    /// refresh SQLite planner statistics before closing a writable file db
+    fn drop(&mut self) {
+        if self.conn.is_readonly("main").unwrap_or(true) {
+            return;
+        }
+        if !matches!(self.conn.path(), Some(path) if !path.is_empty()) {
+            return;
+        }
+        let _ = self.conn.execute_batch("PRAGMA optimize");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::SqliteBackend;
