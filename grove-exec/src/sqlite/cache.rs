@@ -21,6 +21,7 @@ pub(super) enum SqlCacheKey {
         fetch_from_first: bool,
         fields: Vec<FieldId>,
         constraints: FetchConstraints,
+        key_bucket: u8,
     },
 }
 
@@ -49,6 +50,7 @@ impl SqlCacheKey {
         fetch_from_first: bool,
         fields: &[FieldId],
         constraints: &FetchConstraints,
+        key_bucket: u8,
     ) -> bool {
         matches!(
             self,
@@ -57,10 +59,12 @@ impl SqlCacheKey {
                 fetch_from_first: key_first,
                 fields: key_fields,
                 constraints: key_constraints,
+                key_bucket: cached_bucket,
             } if *key_rel == rel
                 && *key_first == fetch_from_first
                 && key_fields.as_slice() == fields
                 && key_constraints == constraints
+                && *cached_bucket == key_bucket
         )
     }
 }
@@ -90,11 +94,17 @@ pub(super) fn fingerprint_fetch(
     state.finish()
 }
 
+/// key count buckets in powers of four
+pub(super) fn key_count_bucket(count: usize) -> u8 {
+    (count.max(1).ilog2() / 2) as u8
+}
+
 pub(super) fn fingerprint_fetch_related(
     rel: RelationId,
     fetch_from_first: bool,
     fields: &[FieldId],
     constraints: &FetchConstraints,
+    key_bucket: u8,
 ) -> u64 {
     let mut state = DefaultHasher::new();
     1u8.hash(&mut state);
@@ -102,6 +112,7 @@ pub(super) fn fingerprint_fetch_related(
     fetch_from_first.hash(&mut state);
     fields.hash(&mut state);
     constraints.hash(&mut state);
+    key_bucket.hash(&mut state);
     state.finish()
 }
 
@@ -270,6 +281,16 @@ mod tests {
             .fetch_related(rel, false, &[Key(1)], &[amount], &constraints)
             .unwrap();
         assert_eq!(backend.sql_cache.borrow().len(), 2);
+
+        backend
+            .fetch_related(rel, false, &[Key(1); 16], &[amount], &constraints)
+            .unwrap();
+        assert_eq!(backend.sql_cache.borrow().len(), 3);
+
+        backend
+            .fetch_related(rel, false, &[Key(1); 17], &[amount], &constraints)
+            .unwrap();
+        assert_eq!(backend.sql_cache.borrow().len(), 3);
     }
 
     #[test]

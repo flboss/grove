@@ -8,7 +8,7 @@ use rusqlite::types::Value;
 use rusqlite::{Transaction, TransactionBehavior};
 
 use super::SqliteBackend;
-use super::cache::{SqlCacheKey, fingerprint_fetch, fingerprint_fetch_related};
+use super::cache::{self, SqlCacheKey};
 use super::decode::{
     ArraySlot, NodeDraft, Slot, ValueArraySlot, ValueSlot, split_roots, walk_element,
 };
@@ -309,7 +309,7 @@ impl Storage for SqliteBackend<'_> {
         let ctx = format!("fetch {struct_name}");
         let mut select = vec!["_rowid_".to_string()];
         let mut slots = self.plan_fields(struct_id, fields, &table, &mut select, &ctx)?;
-        let fingerprint = fingerprint_fetch(struct_id, fields, constraints);
+        let fingerprint = cache::fingerprint_fetch(struct_id, fields, constraints);
         let cached = self.cached_sql(
             fingerprint,
             |key| key.matches_fetch(struct_id, fields, constraints),
@@ -405,15 +405,23 @@ impl Storage for SqliteBackend<'_> {
         let mut select = vec!["g$f._rowid_".to_string()];
         let mut slots = self.plan_fields(target, fields, "g$f", &mut select, &ctx)?;
         let parent_col = select.len();
-        let fingerprint = fingerprint_fetch_related(rel, fetch_from_first, fields, constraints);
+        let key_bucket = cache::key_count_bucket(parents.len());
+        let fingerprint = cache::fingerprint_fetch_related(
+            rel,
+            fetch_from_first,
+            fields,
+            constraints,
+            key_bucket,
+        );
         let cached = self.cached_sql(
             fingerprint,
-            |key| key.matches_related(rel, fetch_from_first, fields, constraints),
+            |key| key.matches_related(rel, fetch_from_first, fields, constraints, key_bucket),
             || SqlCacheKey::Related {
                 rel,
                 fetch_from_first,
                 fields: fields.to_vec(),
                 constraints: constraints.clone(),
+                key_bucket,
             },
             || {
                 let target_def = &schema.structs[target.index()];
@@ -527,6 +535,7 @@ impl Storage for SqliteBackend<'_> {
                         sort.join(", ")
                     )
                 };
+                let sql = format!("{sql} /*g$keys:{key_bucket}*/");
                 Ok((sql, params))
             },
         )?;
