@@ -36,6 +36,7 @@ impl<'a> SqliteBackend<'a> {
             conn.set_db_config(option, false)
                 .map_err(|err| Self::storage_error("disable double-quoted literals", err))?;
         }
+        conn.set_prepared_statement_cache_capacity(128);
         let backend = SqliteBackend {
             conn,
             schema,
