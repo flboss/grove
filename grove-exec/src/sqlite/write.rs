@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use grove_schema::validated::{
     ColumnId, Field, FieldId, Relation, RelationId, StorageTable, StructId, TableId,
@@ -9,6 +10,7 @@ use rusqlite::{OptionalExtension, Transaction};
 
 use super::SqliteBackend;
 use super::types::{encode_value, quote, value_write_width};
+use super::vtab_keys::{KeySupply, TABLE as KEYS_TABLE};
 use crate::error::ExecError;
 use crate::storage::{LinkMode, WriteTxn};
 use crate::value::{Key, RowOrigin, Val};
@@ -22,6 +24,7 @@ fn placeholders(count: usize) -> String {
 pub(super) struct SqliteWriteTxn<'conn, 'schema> {
     pub(super) txn: Option<Transaction<'conn>>,
     pub(super) schema: &'schema ValidatedSchema,
+    pub(super) keys: Arc<KeySupply>,
 }
 
 impl SqliteWriteTxn<'_, '_> {
@@ -369,32 +372,30 @@ impl SqliteWriteTxn<'_, '_> {
         }
         let table = quote(&self.schema.tables[column.table_id().index()].name);
         let column_name = quote(self.schema.column_name(column));
+        let sql = format!(
+            "SELECT g$t._rowid_, g$t.{column_name} FROM {table} AS g$t \
+             JOIN {KEYS_TABLE} AS g$k ON g$k.value = g$t._rowid_"
+        );
+        self.keys.set(rows.iter().map(|origin| origin.key.0));
         let txn = self.txn()?;
         let mut found = HashMap::with_capacity(rows.len());
-        for chunk in rows.chunks(PARAM_CHUNK) {
-            let placeholders = placeholders(chunk.len());
-            let sql = format!(
-                "SELECT _rowid_, {column_name} FROM {table} WHERE _rowid_ IN ({placeholders})"
-            );
-            let params = chunk.iter().map(|origin| Value::Integer(origin.key.0));
-            let mut stmt = txn
-                .prepare_cached(&sql)
-                .map_err(|err| SqliteBackend::storage_error("fetch row keys (prepare)", err))?;
-            let mut query = stmt
-                .query(rusqlite::params_from_iter(params))
-                .map_err(|err| SqliteBackend::storage_error("fetch row keys (query)", err))?;
-            while let Some(row) = query
-                .next()
-                .map_err(|err| SqliteBackend::storage_error("fetch row keys (row)", err))?
-            {
-                let rowid: i64 = row
-                    .get(0)
-                    .map_err(|err| SqliteBackend::storage_error("fetch row keys (rowid)", err))?;
-                let value: Value = row
-                    .get(1)
-                    .map_err(|err| SqliteBackend::storage_error("fetch row keys (value)", err))?;
-                found.insert(rowid, value);
-            }
+        let mut stmt = txn
+            .prepare_cached(&sql)
+            .map_err(|err| SqliteBackend::storage_error("fetch row keys (prepare)", err))?;
+        let mut query = stmt
+            .query([])
+            .map_err(|err| SqliteBackend::storage_error("fetch row keys (query)", err))?;
+        while let Some(row) = query
+            .next()
+            .map_err(|err| SqliteBackend::storage_error("fetch row keys (row)", err))?
+        {
+            let rowid: i64 = row
+                .get(0)
+                .map_err(|err| SqliteBackend::storage_error("fetch row keys (rowid)", err))?;
+            let value: Value = row
+                .get(1)
+                .map_err(|err| SqliteBackend::storage_error("fetch row keys (value)", err))?;
+            found.insert(rowid, value);
         }
 
         let mut values = Vec::with_capacity(rows.len());
@@ -612,28 +613,23 @@ impl SqliteWriteTxn<'_, '_> {
             }
             let table = quote(&self.schema.tables[fk.table_id().index()].name);
             let fk_column = quote(self.schema.column_name(fk));
+            let sql = format!(
+                "UPDATE {table} AS g$t SET {fk_column} = ? \
+                 FROM {KEYS_TABLE} AS g$k WHERE g$k.value = g$t._rowid_"
+            );
+            self.keys.set(targets.iter().map(|target| target.key.0));
+            let expected = self.keys.len();
             let txn = self.txn()?;
-            for chunk in targets.chunks(PARAM_CHUNK) {
-                let placeholders = placeholders(chunk.len());
-                let sql =
-                    format!("UPDATE {table} SET {fk_column} = ? WHERE _rowid_ IN ({placeholders})");
-                let mut params = Vec::with_capacity(chunk.len() + 1);
-                params.push(owner_pk.clone());
-                params.extend(chunk.iter().map(|target| Value::Integer(target.key.0)));
-                let mut stmt = txn
-                    .prepare_cached(&sql)
-                    .map_err(|err| SqliteBackend::storage_error("link rows (prepare)", err))?;
-                let changed = stmt
-                    .execute(rusqlite::params_from_iter(params.iter()))
-                    .map_err(|err| SqliteBackend::storage_error("link rows (execute)", err))?;
-                if changed != chunk.len() {
-                    return Err(ExecError::Integrity {
-                        message: format!(
-                            "link target row was not found ({changed}/{})",
-                            chunk.len()
-                        ),
-                    });
-                }
+            let mut stmt = txn
+                .prepare_cached(&sql)
+                .map_err(|err| SqliteBackend::storage_error("link rows (prepare)", err))?;
+            let changed = stmt
+                .execute([owner_pk])
+                .map_err(|err| SqliteBackend::storage_error("link rows (execute)", err))?;
+            if changed != expected {
+                return Err(ExecError::Integrity {
+                    message: format!("link target row was not found ({changed}/{expected})"),
+                });
             }
             Ok(())
         } else {
@@ -685,12 +681,13 @@ impl SqliteWriteTxn<'_, '_> {
         }
     }
 
+    /// Recursively delete nested array storage rows
     fn delete_array_tree(
         &self,
         storage: &StorageTable,
         element: &ValueType,
+        // parent link keys
         parent_select: &str,
-        params: &[Value],
     ) -> Result<(), ExecError> {
         let mut nodes = Vec::new();
         let mut pos = 0;
@@ -709,7 +706,7 @@ impl SqliteWriteTxn<'_, '_> {
                 "SELECT p.{parent_link} FROM {parent_table} AS p \
                  WHERE p.{parent_key} IN ({parent_select})"
             );
-            self.delete_array_tree(child_storage, child_element, &nested_select, params)?;
+            self.delete_array_tree(child_storage, child_element, &nested_select)?;
         }
         let table = quote(&self.schema.tables[storage.table.index()].name);
         let key = quote(self.schema.column_name(storage.key));
@@ -718,7 +715,7 @@ impl SqliteWriteTxn<'_, '_> {
         let mut stmt = txn
             .prepare_cached(&sql)
             .map_err(|err| SqliteBackend::storage_error("delete array rows (prepare)", err))?;
-        stmt.execute(rusqlite::params_from_iter(params.iter()))
+        stmt.execute([])
             .map_err(|err| SqliteBackend::storage_error("delete array rows (execute)", err))?;
         Ok(())
     }
@@ -912,17 +909,14 @@ impl<'conn, 'schema> WriteTxn for SqliteWriteTxn<'conn, 'schema> {
             return Ok(());
         }
         let table = self.table_name(struct_id)?;
+        let sql = format!("DELETE FROM {table} WHERE _rowid_ IN {KEYS_TABLE}");
+        self.keys.set(keys.iter().map(|key| key.0));
         let txn = self.txn()?;
-        for chunk in keys.chunks(PARAM_CHUNK) {
-            let placeholders = placeholders(chunk.len());
-            let sql = format!("DELETE FROM {table} WHERE _rowid_ IN ({placeholders})");
-            let params = chunk.iter().map(|key| Value::Integer(key.0));
-            let mut stmt = txn
-                .prepare_cached(&sql)
-                .map_err(|err| SqliteBackend::storage_error("delete rows (prepare)", err))?;
-            stmt.execute(rusqlite::params_from_iter(params))
-                .map_err(|err| SqliteBackend::storage_error("delete rows (execute)", err))?;
-        }
+        let mut stmt = txn
+            .prepare_cached(&sql)
+            .map_err(|err| SqliteBackend::storage_error("delete rows (prepare)", err))?;
+        stmt.execute([])
+            .map_err(|err| SqliteBackend::storage_error("delete rows (execute)", err))?;
         Ok(())
     }
 
@@ -951,20 +945,19 @@ impl<'conn, 'schema> WriteTxn for SqliteWriteTxn<'conn, 'schema> {
         let fk = quote(self.schema.column_name(fk));
         let referenced_table = quote(&self.schema.tables[pk.table_id().index()].name);
         let pk = quote(self.schema.column_name(pk));
+        let sql = format!(
+            "UPDATE {referencing_table} AS g$r SET {fk} = NULL \
+             FROM {referenced_table} AS g$p \
+             JOIN {KEYS_TABLE} AS g$k ON g$k.value = g$p._rowid_ \
+             WHERE g$r.{fk} = g$p.{pk}"
+        );
+        self.keys.set(referenced.iter().map(|key| key.0));
         let txn = self.txn()?;
-        for chunk in referenced.chunks(PARAM_CHUNK) {
-            let placeholders = placeholders(chunk.len());
-            let sql = format!(
-                "UPDATE {referencing_table} SET {fk} = NULL WHERE {fk} IN \
-                 (SELECT {pk} FROM {referenced_table} WHERE _rowid_ IN ({placeholders}))"
-            );
-            let params = chunk.iter().map(|key| Value::Integer(key.0));
-            let mut stmt = txn
-                .prepare_cached(&sql)
-                .map_err(|err| SqliteBackend::storage_error("clear FK (prepare)", err))?;
-            stmt.execute(rusqlite::params_from_iter(params))
-                .map_err(|err| SqliteBackend::storage_error("clear FK (execute)", err))?;
-        }
+        let mut stmt = txn
+            .prepare_cached(&sql)
+            .map_err(|err| SqliteBackend::storage_error("clear FK (prepare)", err))?;
+        stmt.execute([])
+            .map_err(|err| SqliteBackend::storage_error("clear FK (execute)", err))?;
         Ok(())
     }
 
@@ -1006,20 +999,18 @@ impl<'conn, 'schema> WriteTxn for SqliteWriteTxn<'conn, 'schema> {
         let join_col = quote(self.schema.column_name(join_col));
         let pk_table = quote(&self.schema.tables[pk.table_id().index()].name);
         let pk = quote(self.schema.column_name(pk));
+        let sql = format!(
+            "DELETE FROM {join_table} WHERE {join_col} IN \
+             (SELECT g$p.{pk} FROM {pk_table} AS g$p \
+              JOIN {KEYS_TABLE} AS g$k ON g$k.value = g$p._rowid_)"
+        );
+        self.keys.set(keys.iter().map(|key| key.0));
         let txn = self.txn()?;
-        for chunk in keys.chunks(PARAM_CHUNK) {
-            let placeholders = placeholders(chunk.len());
-            let sql = format!(
-                "DELETE FROM {join_table} WHERE {join_col} IN \
-                 (SELECT {pk} FROM {pk_table} WHERE _rowid_ IN ({placeholders}))"
-            );
-            let params = chunk.iter().map(|key| Value::Integer(key.0));
-            let mut stmt = txn
-                .prepare_cached(&sql)
-                .map_err(|err| SqliteBackend::storage_error("delete join rows (prepare)", err))?;
-            stmt.execute(rusqlite::params_from_iter(params))
-                .map_err(|err| SqliteBackend::storage_error("delete join rows (execute)", err))?;
-        }
+        let mut stmt = txn
+            .prepare_cached(&sql)
+            .map_err(|err| SqliteBackend::storage_error("delete join rows (prepare)", err))?;
+        stmt.execute([])
+            .map_err(|err| SqliteBackend::storage_error("delete join rows (execute)", err))?;
         Ok(())
     }
 
@@ -1049,35 +1040,29 @@ impl<'conn, 'schema> WriteTxn for SqliteWriteTxn<'conn, 'schema> {
                 storage,
                 ..
             } => {
-                for chunk in keys.chunks(PARAM_CHUNK) {
-                    let placeholders = placeholders(chunk.len());
-                    let link = quote(self.schema.column_name(*link));
-                    let parent_select = format!(
-                        "SELECT o.{link} FROM {table} AS o WHERE o._rowid_ IN ({placeholders})"
-                    );
-                    let params: Vec<Value> =
-                        chunk.iter().map(|key| Value::Integer(key.0)).collect();
-                    self.delete_array_tree(storage, element, &parent_select, &params)?;
-                }
+                let link = quote(self.schema.column_name(*link));
+                let parent_select = format!(
+                    "SELECT g$o.{link} FROM {table} AS g$o \
+                     JOIN {KEYS_TABLE} AS g$k ON g$k.value = g$o._rowid_"
+                );
+                self.keys.set(keys.iter().map(|key| key.0));
+                self.delete_array_tree(storage, element, &parent_select)?;
             }
             Field::Value { ty, columns, .. } if ty.has_array() => {
                 let mut nodes = Vec::new();
                 let mut pos = 0;
                 collect_top_level_arrays(ty, &mut pos, &mut nodes);
-                for chunk in keys.chunks(PARAM_CHUNK) {
-                    let placeholders = placeholders(chunk.len());
-                    let params: Vec<Value> =
-                        chunk.iter().map(|key| Value::Integer(key.0)).collect();
-                    for (storage, element, node_pos) in &nodes {
-                        let link = columns.get(*node_pos).ok_or_else(|| ExecError::Internal {
-                            message: "array position has no owner column".to_string(),
-                        })?;
-                        let link = quote(self.schema.column_name(*link));
-                        let parent_select = format!(
-                            "SELECT o.{link} FROM {table} AS o WHERE o._rowid_ IN ({placeholders})"
-                        );
-                        self.delete_array_tree(storage, element, &parent_select, &params)?;
-                    }
+                self.keys.set(keys.iter().map(|key| key.0));
+                for (storage, element, node_pos) in &nodes {
+                    let link = columns.get(*node_pos).ok_or_else(|| ExecError::Internal {
+                        message: "array position has no owner column".to_string(),
+                    })?;
+                    let link = quote(self.schema.column_name(*link));
+                    let parent_select = format!(
+                        "SELECT g$o.{link} FROM {table} AS g$o \
+                         JOIN {KEYS_TABLE} AS g$k ON g$k.value = g$o._rowid_"
+                    );
+                    self.delete_array_tree(storage, element, &parent_select)?;
                 }
             }
             _ => {}

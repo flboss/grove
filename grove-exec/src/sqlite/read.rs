@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use grove_schema::validated::{
     Field, FieldId, Relation, RelationId, ScalarType, StructId, ValueType,
@@ -286,6 +287,7 @@ impl Storage for SqliteBackend<'_> {
         Ok(Box::new(SqliteWriteTxn {
             txn: Some(txn),
             schema: self.schema,
+            keys: Arc::clone(&self.vtab_keys),
         }))
     }
 
